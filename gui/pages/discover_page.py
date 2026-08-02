@@ -69,6 +69,7 @@ class DiscoverPage(BasePage):
         self._preload_limit = 3  # 最多预加载到第 3 页，防无限翻页
         self._cat_buttons: list = []
         self._cat_collapsed = True
+        self._cat_bar_populated = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -212,6 +213,7 @@ class DiscoverPage(BasePage):
             if child.widget():
                 child.widget().deleteLater()
         self._cat_buttons = []
+        self._cat_bar_populated = False
 
     def _load_categories(self) -> None:
         """加载分类按钮到折叠栏。未配置分类 → 直接进作品列表。"""
@@ -260,20 +262,16 @@ class DiscoverPage(BasePage):
         return btn
 
     def _refresh_cat_buttons(self, all_url: str) -> None:
-        """按折叠状态显示前 N 个或全部分类按钮。"""
-        while self.cat_bar.count():
-            child = self.cat_bar.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+        """按折叠状态显示前 N 个或全部分类按钮。
 
-        visible = (
-            self._cat_buttons
-            if not self._cat_collapsed
-            else self._cat_buttons[:COLLAPSED_CATEGORY_COUNT + 1]
-        )
-        for btn, _ in visible:
-            self.cat_bar.addWidget(btn)
-        self.cat_bar.addStretch(1)
+        按钮对象一次性建好，折叠/展开只切换可见性（不重建，避免"消失"）。
+        """
+        # 若按钮已加入布局，直接切换可见性
+        if self._cat_bar_populated:
+            self._apply_visibility()
+        else:
+            self._populate_cat_bar()
+            self._apply_visibility()
 
         # 更新展开按钮文字
         if self._cat_collapsed and len(self._cat_buttons) > COLLAPSED_CATEGORY_COUNT + 1:
@@ -283,8 +281,21 @@ class DiscoverPage(BasePage):
         # 默认选中"全部"
         self._current_cat_url = all_url
 
+    def _populate_cat_bar(self) -> None:
+        """把全部按钮加入布局（只做一次）。"""
+        for btn, _ in self._cat_buttons:
+            self.cat_bar.addWidget(btn)
+        self.cat_bar.addStretch(1)
+        self._cat_bar_populated = True
+
+    def _apply_visibility(self) -> None:
+        """按折叠状态隐藏/显示按钮。"""
+        for idx, (btn, _) in enumerate(self._cat_buttons):
+            visible = idx <= COLLAPSED_CATEGORY_COUNT or not self._cat_collapsed
+            btn.setVisible(visible)
+
     def _toggle_categories(self) -> None:
-        """展开/收起分类按钮。"""
+        """展开/收起分类按钮（只切换状态，不重建）。"""
         self._cat_collapsed = not self._cat_collapsed
         disc = self._current_source.get_discovery_config()
         all_url = (
