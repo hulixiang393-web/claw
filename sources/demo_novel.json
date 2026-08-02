@@ -1,0 +1,46 @@
+{
+  "$schema_version": 2,
+  "$id": "demo_novel",
+  "$type": "novel",
+  "$name": "演示小说站",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://example.com",
+    "description": "演示用小说源",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["免费"]
+  },
+  "transports": {
+    "base_url": "https://example.com",
+    "headers": { "User-Agent": "Mozilla/5.0 SpiderDemo/1.0" },
+    "timeout": 10,
+    "retries": 3,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "search": {
+      "base_url": "/search",
+      "method": "GET",
+      "query_template": "?keyword={keyword}",
+      "item": {
+        "root_selector": { "css": ".book-item" },
+        "fields": {
+          "title": { "css": "a.title" },
+          "url": { "css": "a.title", "attr": "href" },
+          "cover": { "css": "img", "attr": "src" }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 3, "max_results": 20 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": ".site-header" }
+    }
+  }
+}

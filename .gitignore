@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 运行时数据
+data/
+logs/
+downloads/
+library/
+
+# 截图/临时
+nav_screenshot.png
+
+# 系统
+.DS_Store
+Thumbs.db
