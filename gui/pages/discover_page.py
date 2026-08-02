@@ -1,10 +1,11 @@
 """发现界面（DiscoverPage）。
 
 对应 ui-discover.md：
-- 顶部源选择器：只列配置了 endpoints.discovery 的源（分组 + 健康灯）
-- 分类行：源配置了分类项才显示
-- 作品列表：卡片流 + 懒加载滚动（滚动到底加载下一页）
-- 详情抽屉占位 / 全量抓取占位（第二次实现）
+- 顶部源选择器：只列配置了 endpoints.discovery 的源
+- 分类折叠栏：横向滚动，默认折叠；点「展开分类」进完整分类视图
+- 作品网格：多列卡片流 + 懒加载滚动（封面异步加载）
+- 详情抽屉：点作品拉详情显示右侧抽屉
+- 全量抓取：确认弹窗 + 进度 + JSON 索引
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -29,6 +32,11 @@ from framework.theme_manager import ThemeManager
 
 from gui.components import WorkCard, DetailDrawer
 from .base_page import BasePage
+
+# 分类折叠栏默认显示的按钮数（其余收起，点展开显示全部）
+COLLAPSED_CATEGORY_COUNT = 6
+# 作品网格列数
+GRID_COLUMNS = 5
 
 
 class DiscoverPage(BasePage):
@@ -57,6 +65,9 @@ class DiscoverPage(BasePage):
         self._loading = False
         self._has_more = True
         self._current_cat_url = None
+        self._work_count = 0
+        self._cat_buttons: list = []
+        self._cat_collapsed = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -74,11 +85,39 @@ class DiscoverPage(BasePage):
         top.addWidget(self.bulk_btn)
         layout.addLayout(top)
 
-        # ---- 分类行 ----
-        self.cat_bar = QHBoxLayout()
-        layout.addLayout(self.cat_bar)
+        # ---- 分类折叠栏：横向滚动容器 + 展开按钮 ----
+        cat_frame = QFrame()
+        cat_frame.setObjectName("catBar")
+        cat_layout = QVBoxLayout(cat_frame)
+        cat_layout.setContentsMargins(8, 4, 8, 4)
+        cat_layout.setSpacing(2)
 
-        # ---- 主体：作品列表（懒加载） + 右侧详情抽屉 ----
+        cat_scroll_row = QHBoxLayout()
+        cat_scroll_row.setSpacing(4)
+
+        self.cat_scroll = QScrollArea()
+        self.cat_scroll.setWidgetResizable(True)
+        self.cat_scroll.setFixedHeight(42)
+        self.cat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.cat_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cat_scroll_row.addWidget(self.cat_scroll, stretch=1)
+
+        self.cat_toggle_btn = QPushButton("展开分类 ▾")
+        self.cat_toggle_btn.setFixedWidth(90)
+        self.cat_toggle_btn.clicked.connect(self._toggle_categories)
+        cat_scroll_row.addWidget(self.cat_toggle_btn)
+
+        cat_layout.addLayout(cat_scroll_row)
+        layout.addWidget(cat_frame)
+
+        # 分类按钮容器（横向排列）
+        self.cat_container = QWidget()
+        self.cat_bar = QHBoxLayout(self.cat_container)
+        self.cat_bar.setContentsMargins(0, 0, 0, 0)
+        self.cat_bar.setSpacing(6)
+        self.cat_scroll.setWidget(self.cat_container)
+
+        # ---- 主体：作品网格（懒加载） + 右侧详情抽屉 ----
         body = QHBoxLayout()
         body.setSpacing(12)
 
@@ -88,9 +127,9 @@ class DiscoverPage(BasePage):
         body.addWidget(self.scroll, stretch=1)
 
         self.list_container = QWidget()
-        self.list_layout = QVBoxLayout(self.list_container)
-        self.list_layout.setContentsMargins(0, 0, 0, 0)
-        self.list_layout.setSpacing(0)
+        self.grid_layout = QGridLayout(self.list_container)
+        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.grid_layout.setSpacing(12)
         self.scroll.setWidget(self.list_container)
 
         # 详情抽屉
@@ -134,18 +173,21 @@ class DiscoverPage(BasePage):
         self._current_page = 0
         self._has_more = True
         self._current_cat_url = None
+        self._cat_collapsed = True
         self._load_categories()
         self._reset_works()
 
     # ------------------------------------------------------------------ #
-    def _load_categories(self) -> None:
-        """加载当前源的分类。未配置分类 → 直接进作品列表。"""
-        # 清旧分类按钮
+    def _clear_cat_buttons(self) -> None:
         while self.cat_bar.count():
             child = self.cat_bar.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
+        self._cat_buttons = []
 
+    def _load_categories(self) -> None:
+        """加载分类按钮到折叠栏。未配置分类 → 直接进作品列表。"""
+        self._clear_cat_buttons()
         if self._current_source is None:
             return
         try:
@@ -155,47 +197,83 @@ class DiscoverPage(BasePage):
             return
 
         if not cats:
-            # 无分类 → 用作品列表入口（works_list_url 优先，其次 discovery.list_url）
+            # 无分类 → 用作品列表入口
             disc = self._current_source.get_discovery_config()
-            list_url = (
+            self._current_cat_url = (
                 disc.get("works_list_url")
                 or disc.get("list_url")
                 or self._current_source.base_url
             )
-            self._current_cat_url = list_url
+            self.cat_toggle_btn.setVisible(False)
             return
 
-        # 显示分类按钮 + "全部"
+        self.cat_toggle_btn.setVisible(True)
         disc = self._current_source.get_discovery_config()
         all_url = (
             disc.get("works_list_url")
             or disc.get("list_url")
             or self._current_source.base_url
         )
-        all_btn = QPushButton("全部")
-        all_btn.setCheckable(True)
-        all_btn.setChecked(True)
-        all_btn.clicked.connect(lambda: self._on_category(None, all_btn))
-        self.cat_bar.addWidget(all_btn)
+        # 全部按钮
+        all_btn = self._make_cat_button("全部", None, True)
+        self._cat_buttons.append((all_btn, None))
         for cat in cats:
-            btn = QPushButton(cat.title)
-            btn.setCheckable(True)
-            btn.clicked.connect(lambda _, c=cat, b=btn: self._on_category(c, b))
+            btn = self._make_cat_button(cat.title, cat, False)
+            self._cat_buttons.append((btn, cat))
+
+        self._refresh_cat_buttons(all_url)
+
+    def _make_cat_button(self, text, cat, checked) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setCheckable(True)
+        btn.setChecked(checked)
+        btn.setStyleSheet("padding: 4px 12px; font-size: 12px; border-radius: 6px;")
+        btn.clicked.connect(lambda _, c=cat, b=btn: self._on_category(c, b))
+        return btn
+
+    def _refresh_cat_buttons(self, all_url: str) -> None:
+        """按折叠状态显示前 N 个或全部分类按钮。"""
+        while self.cat_bar.count():
+            child = self.cat_bar.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        visible = (
+            self._cat_buttons
+            if not self._cat_collapsed
+            else self._cat_buttons[:COLLAPSED_CATEGORY_COUNT + 1]
+        )
+        for btn, _ in visible:
             self.cat_bar.addWidget(btn)
         self.cat_bar.addStretch(1)
-        # 默认选中"全部" → 用作品列表入口
+
+        # 更新展开按钮文字
+        if self._cat_collapsed and len(self._cat_buttons) > COLLAPSED_CATEGORY_COUNT + 1:
+            self.cat_toggle_btn.setText(f"展开分类 ▾ ({len(self._cat_buttons)-1})")
+        else:
+            self.cat_toggle_btn.setText("收起分类 ▴")
+        # 默认选中"全部"
         self._current_cat_url = all_url
 
+    def _toggle_categories(self) -> None:
+        """展开/收起分类按钮。"""
+        self._cat_collapsed = not self._cat_collapsed
+        disc = self._current_source.get_discovery_config()
+        all_url = (
+            disc.get("works_list_url")
+            or disc.get("list_url")
+            or self._current_source.base_url
+        )
+        self._refresh_cat_buttons(all_url)
+
     def _on_category(self, cat, btn) -> None:
-        # 单选互斥
-        for i in range(self.cat_bar.count()):
-            w = self.cat_bar.itemAt(i).widget()
-            if isinstance(w, QPushButton) and w is not btn:
-                w.setChecked(False)
+        """点分类按钮：单选互斥 + 加载该分类作品。"""
+        for b, _ in self._cat_buttons:
+            if b is not btn:
+                b.setChecked(False)
         btn.setChecked(True)
         disc = self._current_source.get_discovery_config()
         if cat is None:
-            # 全部 → 作品列表入口
             self._current_cat_url = (
                 disc.get("works_list_url")
                 or disc.get("list_url")
@@ -207,17 +285,19 @@ class DiscoverPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def _reset_works(self) -> None:
-        """清空列表，重新从第 1 页加载。"""
+        """清空网格，重新从第 1 页加载。"""
         self._clear_works()
         self._current_page = 0
         self._has_more = True
+        self._work_count = 0
         self._load_next_page()
 
     def _clear_works(self) -> None:
-        while self.list_layout.count():
-            child = self.list_layout.takeAt(0)
+        while self.grid_layout.count():
+            child = self.grid_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
+        self._work_count = 0
 
     def _load_next_page(self) -> None:
         if self._loading or not self._has_more or self._current_source is None:
@@ -246,11 +326,15 @@ class DiscoverPage(BasePage):
         self._loading = False
 
     def _append_works(self, works) -> None:
+        """把作品卡片按网格排列（每行 GRID_COLUMNS 个）。"""
         for w in works:
+            row, col = divmod(self._work_count, GRID_COLUMNS)
             card = WorkCard(w)
             card.clicked.connect(self._on_work_clicked)
-            self.list_layout.addWidget(card)
+            self.grid_layout.addWidget(card, row, col)
+            self._work_count += 1
 
+    # ------------------------------------------------------------------ #
     def _on_work_clicked(self, work: Work) -> None:
         """点作品 → 拉详情 → 显示右侧抽屉。"""
         self.status_label.setText(f"加载详情：{work.title}")

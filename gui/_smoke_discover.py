@@ -130,18 +130,27 @@ def main():
     print("源选择器:", page.source_combo.currentText())
 
     # 分类按钮（2 分类 + 全部）
-    cat_buttons = []
-    for i in range(page.cat_bar.count()):
-        w = page.cat_bar.itemAt(i).widget()
-        if isinstance(w, type(page.bulk_btn)) and w.text() not in ("抓取全部 · 开发中", "抓取全部"):
-            cat_buttons.append(w)
+    cat_buttons = [btn for btn, _ in page._cat_buttons]
     print("分类按钮:", [b.text() for b in cat_buttons])
     assert any(b.text() == "玄幻" for b in cat_buttons)
+    # 折叠状态：默认只显示前 COLLAPSED_COUNT+1 个
+    visible = [page.cat_bar.itemAt(i).widget() for i in range(page.cat_bar.count())]
+    visible = [w for w in visible if isinstance(w, type(page.bulk_btn))]
+    assert len(visible) == min(len(cat_buttons), 7), len(visible)
+    print("折叠可见按钮:", [w.text() for w in visible])
+
+    # 展开分类
+    page._toggle_categories()
+    app.processEvents()
+    expanded = [page.cat_bar.itemAt(i).widget() for i in range(page.cat_bar.count())]
+    expanded = [w for w in expanded if isinstance(w, type(page.bulk_btn))]
+    assert len(expanded) == len(cat_buttons), (len(expanded), len(cat_buttons))
+    print("展开后按钮数:", len(expanded))
 
     # 加载作品
     page._reset_works()
     app.processEvents()
-    cards = [page.list_layout.itemAt(i).widget() for i in range(page.list_layout.count())]
+    cards = [page.grid_layout.itemAt(i).widget() for i in range(page.grid_layout.count())]
     cards = [c for c in cards if c is not None]
     print("作品卡片数:", len(cards))
     assert len(cards) == 2, len(cards)
