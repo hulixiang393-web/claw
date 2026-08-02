@@ -8,6 +8,7 @@ from .stats_row import StatsRow
 from .recent_searches import RecentSearches
 from .mini_progress import MiniProgress
 from .empty_state import EmptyState
+from .work_card import WorkCard
 
 __all__ = [
     "MascotWidget",
@@ -15,4 +16,5 @@ __all__ = [
     "RecentSearches",
     "MiniProgress",
     "EmptyState",
+    "WorkCard",
 ]

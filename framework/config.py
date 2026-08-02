@@ -97,6 +97,25 @@ class SourceConfig:
         api_endpoints = self.raw.get("api_endpoints") or {}
         return bool(endpoints.get("discovery") or api_endpoints.get("discovery"))
 
+    def get_discovery_config(self) -> dict:
+        """读取 endpoints.discovery（返回 {} 若未配置）。"""
+        endpoints = self.raw.get("endpoints") or {}
+        return endpoints.get("discovery") or {}
+
+    def get_search_config(self) -> dict:
+        """读取 endpoints.search（返回 {} 若未配置）。"""
+        endpoints = self.raw.get("endpoints") or {}
+        return endpoints.get("search") or {}
+
+    def get_detail_config(self) -> dict:
+        """读取 endpoints.detail（返回 {} 若未配置）。"""
+        endpoints = self.raw.get("endpoints") or {}
+        return endpoints.get("detail") or {}
+
+    def transports(self) -> dict:
+        """读取 transports 配置。"""
+        return self.raw.get("transports") or {}
+
 
 def load_source(path: str | Path) -> SourceConfig:
     """从磁盘加载一份源配置。坏 JSON → ConfigError。"""

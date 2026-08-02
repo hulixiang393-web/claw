@@ -27,8 +27,13 @@ from framework.settings_manager import SettingsManager
 from framework.source_manager import SourceManager
 from framework.search_history import SearchHistory
 from framework.theme_manager import ThemeManager
+from framework.http import HttpClient
+from framework.parser import Parser
+from framework.selfcheck import StructureChecker
+from framework.discovery import Discovery
 
 from gui.pages.home_page import HomePage
+from gui.pages.discover_page import DiscoverPage
 
 # 导航栏顺序（对应 ui-index.md）
 TABS = [
@@ -43,7 +48,7 @@ TABS = [
 ]
 
 # 已实现界面
-IMPLEMENTED_TABS = {"home"}
+IMPLEMENTED_TABS = {"home", "discover"}
 
 
 class MainWindow(QMainWindow):
@@ -62,6 +67,12 @@ class MainWindow(QMainWindow):
             health_file=base_dir / "data" / "health.json",
         )
         self.search_history = SearchHistory(base_dir / "data" / "search_history.json")
+
+        # 爬取执行链
+        self.http = HttpClient()
+        self.parser = Parser()
+        self.checker = StructureChecker(self.http, self.parser)
+        self.discovery = Discovery(self.http, self.parser, self.checker)
 
         # Tab 索引映射
         self._tab_index = {key: i for i, (_, key) in enumerate(TABS)}
@@ -89,13 +100,27 @@ class MainWindow(QMainWindow):
     def _build_pages(self) -> None:
         """构建导航栏各 Tab。未实现界面在标签后标注「·开发中」。"""
         for label, key in TABS:
-            if key in IMPLEMENTED_TABS:
+            if key == "home":
                 page = self._build_home()
+                tab_label = label
+            elif key == "discover":
+                page = self._build_discover()
+                tab_label = label
+            elif key in IMPLEMENTED_TABS:
+                page = self._build_home()  # 其他已实现暂用首页占位
                 tab_label = label
             else:
                 page = self._build_placeholder(label)
                 tab_label = f"{label}·开发中"
             self.tabs.addTab(page, tab_label)
+
+    def _build_discover(self) -> DiscoverPage:
+        return DiscoverPage(
+            source_manager=self.source_manager,
+            discovery=self.discovery,
+            event_bus=self.event_bus,
+            theme_manager=self.theme_manager,
+        )
 
     def _build_home(self) -> HomePage:
         page = HomePage(
