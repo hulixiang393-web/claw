@@ -65,6 +65,7 @@
           }
         },
         "body": {
+          "render": "playwright",
           "root_selector": { "css": ".comicpage .cropped" },
           "fields": {
             "url": { "css": "div", "attr": "data-src" }

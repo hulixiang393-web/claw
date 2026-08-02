@@ -239,15 +239,28 @@ class Content:
         """漫画：抓取一话的全部分页图片 URL。
 
         对应 endpoints.content.page：
-        - list.fields.url → 图片 URL（可带 data-src/data-original attr）
-        - list.paginator  → 分页（长话翻页）
+        - render: playwright → 用 Playwright 渲染（分片加密站）
+        - 普通源 → HTML 提取图片 URL
         """
-        self._checker.check(source, self._abs_url(source, chapter_url))
-        html = self._get(source, chapter_url)
-        doc = self._parser.parse(html)
-
         content_cfg = source.raw.get("endpoints", {}).get("content") or {}
         block = content_cfg.get("page") or {}
+        abs_url = self._abs_url(source, chapter_url)
+
+        # Playwright 渲染策略（分片加密图片）
+        if block.get("render") == "playwright":
+            try:
+                from .playwright_helper import fetch_rendered_images_sync
+
+                return fetch_rendered_images_sync(abs_url)
+            except Exception as exc:
+                raise ContentMissingError(
+                    f"Playwright 渲染图片失败（{chapter_url}）：{exc}",
+                    source_id=source.source_id,
+                ) from exc
+
+        self._checker.check(source, abs_url)
+        html = self._get(source, chapter_url)
+        doc = self._parser.parse(html)
         # 图片列表优先 body，兼容旧 list
         list_cfg = block.get("body") or block.get("list") or {}
         root_sel = list_cfg.get("root_selector")
