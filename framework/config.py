@@ -92,13 +92,13 @@ class SourceConfig:
 
     # ---- 便捷访问 ------------------------------------------------------ #
     def has_discovery(self) -> bool:
-        """是否配置了 HTML 发现规则（决定是否出现在发现界面）。
+        """是否配置了发现规则（决定是否出现在发现界面）。
 
-        仅认 endpoints.discovery（HTML selector）。api_endpoints（JSON API）
-        待内核支持 JSONPath 解析后再接入发现界面。
+        认 endpoints.discovery（HTML）或 api_endpoints.discovery（JSON API）。
         """
         endpoints = self.raw.get("endpoints") or {}
-        return bool(endpoints.get("discovery"))
+        api_endpoints = self.raw.get("api_endpoints") or {}
+        return bool(endpoints.get("discovery") or api_endpoints.get("discovery"))
 
     def get_discovery_config(self) -> dict:
         """读取 endpoints.discovery（返回 {} 若未配置）。"""

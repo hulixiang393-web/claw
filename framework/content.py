@@ -92,11 +92,18 @@ class Content:
 
         detail_cfg = source.get_detail_config()
         fields = detail_cfg.get("fields") or {}
+        title = self._parser.extract_first(doc, fields.get("title"))
+        # 书名修正：若 title 像是站点名（短/非书名），尝试 og:novel:book_name
+        book_fields = fields.get("book_name")
+        if book_fields:
+            book = self._parser.extract_first(doc, book_fields)
+            if book:
+                title = book
         detail = Detail(
             source_id=source.source_id,
             content_type=source.content_type,
             url=url,
-            title=self._parser.extract_first(doc, fields.get("title")),
+            title=title,
             author=self._parser.extract_first(doc, fields.get("author")),
             cover=self._parser.extract_first(
                 doc, fields.get("cover"), source.base_url
@@ -108,13 +115,18 @@ class Content:
         tags = self._parser.extract(doc, fields.get("tags"))
         detail.tags = tags
 
-        # 章节列表（按类型取 content 配置）
-        detail.chapters = self._fetch_chapters(source, doc)
+        # 章节列表（按类型取 content 配置，传书名用于标题清理）
+        detail.chapters = self._fetch_chapters(source, doc, book_title=detail.title)
         return detail
 
     # ------------------------------------------------------------------ #
-    def _fetch_chapters(self, source: SourceConfig, doc) -> List[Chapter]:
-        """从详情页提取章节列表。按 content_type 读 content 配置。"""
+    def _fetch_chapters(self, source: SourceConfig, doc, book_title: str = "") -> List[Chapter]:
+        """从详情页提取章节列表。按 content_type 读 content 配置。
+
+        支持源配置：
+        - list.chapter_order: "desc" → HTML 倒序，反转成正序（asc）
+        - list.title_clean: true    → 从章节标题移除书名
+        """
         content_cfg = source.raw.get("endpoints", {}).get("content") or {}
         if source.content_type == "novel":
             block = content_cfg.get("chapter") or {}
@@ -131,12 +143,39 @@ class Content:
         items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         chapters: List[Chapter] = []
         seen = set()
+
+        def clean_title(t: str) -> str:
+            """从章节标题移除书名 + 清理多余分隔符/后缀词。"""
+            t = t.strip()
+            if not t:
+                return t
+            if book_title:
+                t = t.replace(book_title, "")
+            import re as _re
+            # 移除《》及其中的书名残留（含空《》）
+            t = _re.sub(r"《[^》]*》", "", t)
+            # 移除常见后缀词
+            for suffix in ("最新章节", "全文阅读", "全文免费阅读", "最新", "TXT", "txt"):
+                t = t.replace(suffix, "")
+            # 清理孤立分隔符
+            t = t.replace(" - ", " ").strip(" -：:　 ").strip()
+            t = _re.sub(r"\s+", " ", t)
+            return t
+
         for it in items:
             url = it.get("url", "")
             if not url or url in seen:
                 continue
             seen.add(url)
-            chapters.append(Chapter(title=it.get("title", ""), url=url))
+            title = it.get("title", "")
+            if list_cfg.get("title_clean"):
+                title = clean_title(title)
+            chapters.append(Chapter(title=title or f"第{len(chapters)+1}章", url=url))
+
+        # 倒序反转（HTML 倒序 → 正序）
+        order = list_cfg.get("chapter_order", "asc")
+        if order == "desc":
+            chapters.reverse()
         return chapters
 
     # ------------------------------------------------------------------ #

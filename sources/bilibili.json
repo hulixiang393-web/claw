@@ -24,12 +24,12 @@
   },
   "api_endpoints": {
     "discovery": {
-      "url": "https://api.bilibili.com/pgc/web/rank/list?season_type=4&day=3",
+      "url": "https://api.bilibili.com/pgc/season/rank/web/list?season_type=1&day=3",
       "method": "GET",
       "response_path": "data.list",
       "item_fields": {
         "title": "title",
-        "url": "https://www.bilibili.com/bangumi/media/md{media_id}",
+        "url": "url",
         "cover": "cover"
       }
     },
@@ -39,7 +39,7 @@
       "response_path": "data.result",
       "item_fields": {
         "title": "title",
-        "url": "https://www.bilibili.com{arcurl}",
+        "url": "{arcurl}",
         "cover": "cover"
       }
     }

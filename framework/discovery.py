@@ -124,11 +124,12 @@ class Discovery:
     def list_works(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
         """抓取一页作品列表（懒加载用）。
 
-        分页由源配置 paginator 驱动（source-schema-v2 §5）：
-        - increment : URL 页码替换（{page} 占位 或 page_placeholder 正则）
-        - next_link : 抓页面「下一页」链接（需先请求首页）
-        - cursor    : ?offset=N 游标偏移
+        优先 api_endpoints（JSON API 站），否则 HTML selector。
         """
+        api = source.raw.get("api_endpoints") or {}
+        if api.get("discovery") or api.get("search"):
+            return self._list_works_api(source, url, page)
+
         fetch_url = self._build_page_url(source, url, page)
         self._checker.check(source, self._abs_url(source, fetch_url))
         html = self._get(source, fetch_url)
@@ -165,6 +166,97 @@ class Discovery:
                 )
             )
         return works
+
+    def _list_works_api(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
+        """API 站（api_endpoints）JSON 解析作品列表。"""
+        import json
+
+        api = source.raw.get("api_endpoints") or {}
+        cfg = api.get("discovery") or api.get("search") or {}
+        if not cfg:
+            return []
+
+        # 构造请求 URL（用传入 url 或 api 配置）
+        api_url = cfg.get("url") or url
+        api_url = str(api_url).replace("{page}", str(page))
+        abs_url = self._abs_url(source, api_url)
+
+        # GET JSON
+        resp_json = self._http.get_json(
+            abs_url,
+            headers=self._headers(source),
+            timeout=self._timeout(source),
+            retries=self._retries(source),
+        )
+
+        # 提取列表项
+        items = resp_json
+        rpath = cfg.get("response_path")
+        if rpath:
+            items = self._simple_getpath(resp_json, rpath)
+        if not isinstance(items, list):
+            return []
+
+        item_fields = cfg.get("item_fields") or {}
+        works: List[Work] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            title = self._template_value(it, item_fields.get("title"))
+            url_v = self._template_value(it, item_fields.get("url"))
+            if not title or not url_v:
+                continue
+            url_v = self._resolve_tpl(source.base_url, url_v)
+            works.append(
+                Work(
+                    title=str(title),
+                    url=str(url_v),
+                    cover=str(self._template_value(it, item_fields.get("cover")) or ""),
+                    source_id=source.source_id,
+                    source_name=source.source_name,
+                )
+            )
+        return works
+
+    @staticmethod
+    def _simple_getpath(data, path: str):
+        """简化的 JSONPath：data.list → data["list"]；data.list.0 → 列表首项。"""
+        import re as _re
+
+        cur = data
+        for part in path.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return None
+        return cur
+
+    @staticmethod
+    def _template_value(item: dict, field_spec):
+        """字段值：若是模板（含 {}）则填充，否则直接取值。"""
+        if field_spec is None:
+            return ""
+        if isinstance(field_spec, str):
+            if "{" in field_spec:
+                # 模板如 https://bilibili.com/bangumi/media/md{media_id}
+                result = field_spec
+                import re as _re
+
+                for m in _re.finditer(r"\{(\w+)\}", field_spec):
+                    key = m.group(1)
+                    val = item.get(key, "")
+                    result = result.replace("{" + key + "}", str(val))
+                return result
+            return item.get(field_spec, "")
+        return ""
+
+    @staticmethod
+    def _resolve_tpl(base, url):
+        from urllib.parse import urljoin
+
+        if url.startswith("http"):
+            return url
+        return urljoin(base, url)
 
     def _build_page_url(self, source: SourceConfig, url: str, page: int) -> str:
         """按源配置 paginator 构造第 page 页的 URL。"""

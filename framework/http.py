@@ -49,6 +49,23 @@ class HttpClient:
                     self._sleeper(min(0.5 * (2 ** attempt), 2.0))
         raise RequestError(f"请求失败 GET {url}：{last_error}")
 
+    def get_json(
+        self,
+        url: str,
+        headers: Optional[dict] = None,
+        proxy: Optional[str] = None,
+        timeout: float = 10.0,
+        retries: int = 3,
+    ) -> dict:
+        """GET 并解析 JSON 响应。"""
+        import json
+
+        text = self.get_text(url, headers, proxy, timeout, retries)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+
     def _get_once(self, url, headers, proxy, timeout) -> str:
         if self._session is not None:
             proxies = {"http": proxy, "https": proxy} if proxy else None

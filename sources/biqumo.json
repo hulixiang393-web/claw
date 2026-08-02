@@ -59,6 +59,7 @@
     "detail": {
       "fields": {
         "title": { "css": "h1" },
+        "book_name": { "css": "meta[property='og:novel:book_name']", "attr": "content" },
         "author": { "css": "meta[property='og:novel:author']", "attr": "content" },
         "status": { "css": ".info .status" }
       }
@@ -67,6 +68,8 @@
       "chapter": {
         "list": {
           "root_selector": { "css": ".cataloglist ul li a" },
+          "chapter_order": "desc",
+          "title_clean": true,
           "fields": {
             "title": { "css": "a" },
             "url": { "css": "a", "attr": "href" }
