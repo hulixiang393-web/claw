@@ -1,0 +1,95 @@
+{
+  "$schema_version": 2,
+  "$id": "biqumo",
+  "$type": "novel",
+  "$name": "笔趣阁(魔)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.biqumo.com",
+    "description": "笔趣阁魔镜 - 小说源（测试用）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["小说", "免费"]
+  },
+  "transports": {
+    "base_url": "https://www.biqumo.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0"
+    },
+    "timeout": 12,
+    "retries": 3,
+    "interval_ms": 600
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/",
+      "works_list_url": "/sort/1/1/",
+      "list_paginator": { "type": "increment", "start": 1, "step": 1, "param": "page" },
+      "list_item": {
+        "root_selector": { "css": ".main-nav li a" },
+        "fields": {
+          "title": { "css": "a" },
+          "url": { "css": "a", "attr": "href" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search.html",
+      "method": "POST",
+      "keyword_param": "s",
+      "body_format": "form",
+      "item": {
+        "root_selector": { "css": ".book-grid li" },
+        "fields": {
+          "title": { "css": ".bmeta h3 a" },
+          "url": { "css": ".bmeta h3 a", "attr": "href" },
+          "cover": { "css": ".bcover img", "attr": "src" },
+          "author": { "css": ".bmeta p a" },
+          "update": { "css": ".bmeta p" }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": { "css": "h1" },
+        "author": { "css": "meta[property='og:novel:author']", "attr": "content" },
+        "status": { "css": ".info .status" }
+      }
+    },
+    "content": {
+      "chapter": {
+        "list": {
+          "root_selector": { "css": ".cataloglist ul li a" },
+          "fields": {
+            "title": { "css": "a" },
+            "url": { "css": "a", "attr": "href" }
+          }
+        },
+        "body": {
+          "selector": { "css": "#chaptercontent p" },
+          "attr": "text"
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 20 },
+    "detail": { "max_pages": 1 },
+    "chapter": { "max_pages": 100, "max_items": 200 }
+  },
+  "decryption": {
+    "targets": {
+      "content": {
+        "strategy": "base64_decode",
+        "source": "obfuscated_script"
+      }
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": ".brand h1" }
+    }
+  }
+}

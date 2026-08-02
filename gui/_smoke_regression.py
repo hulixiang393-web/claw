@@ -21,10 +21,10 @@ def main():
 
     # 首页统计卡片值
     home = win.tabs.widget(0)
-    assert home.stats_row.card_novel.value_label.text() == "1"
-    assert home.stats_row.card_comic.value_label.text() == "1"
-    assert home.stats_row.card_video.value_label.text() == "0"
-    assert home.stats_row.card_enabled.value_label.text() == "2"
+    assert home.stats_row.card_novel.value_label.text() == str(sm.count_by_type()["novel"])
+    assert home.stats_row.card_comic.value_label.text() == str(sm.count_by_type()["comic"])
+    assert home.stats_row.card_video.value_label.text() == str(sm.count_by_type()["video"])
+    assert home.stats_row.card_enabled.value_label.text() == str(sm.count_enabled())
     print("首页统计卡片:",
           f"小说={home.stats_row.card_novel.value_label.text()}",
           f"漫画={home.stats_row.card_comic.value_label.text()}",

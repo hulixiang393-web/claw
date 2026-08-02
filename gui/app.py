@@ -31,6 +31,9 @@ from framework.http import HttpClient
 from framework.parser import Parser
 from framework.selfcheck import StructureChecker
 from framework.discovery import Discovery
+from framework.content import Content
+from framework.decrypter import Decrypter
+from framework.bulk_fetch import BulkFetch
 
 from gui.pages.home_page import HomePage
 from gui.pages.discover_page import DiscoverPage
@@ -73,6 +76,13 @@ class MainWindow(QMainWindow):
         self.parser = Parser()
         self.checker = StructureChecker(self.http, self.parser)
         self.discovery = Discovery(self.http, self.parser, self.checker)
+        self.decrypter = Decrypter(self.http)
+        self.content = Content(self.http, self.parser, self.checker, self.decrypter)
+        self.bulk_fetch = BulkFetch(
+            self.discovery,
+            event_bus=self.event_bus,
+            index_dir=base_dir / "data",
+        )
 
         # Tab 索引映射
         self._tab_index = {key: i for i, (_, key) in enumerate(TABS)}
@@ -115,12 +125,18 @@ class MainWindow(QMainWindow):
             self.tabs.addTab(page, tab_label)
 
     def _build_discover(self) -> DiscoverPage:
-        return DiscoverPage(
+        page = DiscoverPage(
             source_manager=self.source_manager,
             discovery=self.discovery,
+            content=self.content,
+            bulk_fetch=self.bulk_fetch,
             event_bus=self.event_bus,
             theme_manager=self.theme_manager,
         )
+        page.read_requested.connect(
+            lambda detail: self.tabs.setCurrentIndex(self._tab_index["reader"])
+        )
+        return page
 
     def _build_home(self) -> HomePage:
         page = HomePage(

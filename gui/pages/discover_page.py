@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -21,19 +21,26 @@ from PySide6.QtWidgets import (
 )
 
 from framework.discovery import Discovery, Work
+from framework.content import Content
+from framework.bulk_fetch import BulkFetch
 from framework.events import EventBus
 from framework.source_manager import SourceManager
 from framework.theme_manager import ThemeManager
 
-from gui.components import WorkCard
+from gui.components import WorkCard, DetailDrawer
 from .base_page import BasePage
 
 
 class DiscoverPage(BasePage):
+    # 对外信号：开始阅读 → 跳阅读器 Tab（App 层接）
+    read_requested = Signal(object)
+
     def __init__(
         self,
         source_manager: SourceManager,
         discovery: Discovery,
+        content: Content,
+        bulk_fetch: BulkFetch,
         event_bus: EventBus,
         theme_manager: ThemeManager,
         parent=None,
@@ -41,6 +48,8 @@ class DiscoverPage(BasePage):
         super().__init__(parent)
         self._manager = source_manager
         self._discovery = discovery
+        self._content = content
+        self._bulk_fetch = bulk_fetch
         self._bus = event_bus
         self._theme_manager = theme_manager
         self._current_source = None
@@ -59,8 +68,8 @@ class DiscoverPage(BasePage):
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         top.addWidget(self.source_combo, stretch=1)
 
-        self.bulk_btn = QPushButton("抓取全部 · 开发中")
-        self.bulk_btn.setFixedWidth(130)
+        self.bulk_btn = QPushButton("抓取全部")
+        self.bulk_btn.setFixedWidth(90)
         self.bulk_btn.clicked.connect(self._on_bulk_fetch)
         top.addWidget(self.bulk_btn)
         layout.addLayout(top)
@@ -69,17 +78,29 @@ class DiscoverPage(BasePage):
         self.cat_bar = QHBoxLayout()
         layout.addLayout(self.cat_bar)
 
-        # ---- 作品列表（懒加载滚动）----
+        # ---- 主体：作品列表（懒加载） + 右侧详情抽屉 ----
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        layout.addWidget(self.scroll, stretch=1)
+        body.addWidget(self.scroll, stretch=1)
 
         self.list_container = QWidget()
         self.list_layout = QVBoxLayout(self.list_container)
         self.list_layout.setContentsMargins(0, 0, 0, 0)
         self.list_layout.setSpacing(0)
         self.scroll.setWidget(self.list_container)
+
+        # 详情抽屉
+        self.detail_drawer = DetailDrawer()
+        self.detail_drawer.read_requested.connect(self._on_read)
+        self.detail_drawer.open_url_requested.connect(self._on_open_url)
+        self.detail_drawer.download_requested.connect(self._on_download)
+        body.addWidget(self.detail_drawer)
+
+        layout.addLayout(body, stretch=1)
 
         # 滚动到底触发
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -134,11 +155,10 @@ class DiscoverPage(BasePage):
             return
 
         if not cats:
-            # 无分类 → 用作品列表入口（search.base_url 优先，其次 discovery.list_url）
-            search = self._current_source.get_search_config()
+            # 无分类 → 用作品列表入口（works_list_url 优先，其次 discovery.list_url）
             disc = self._current_source.get_discovery_config()
             list_url = (
-                search.get("base_url")
+                disc.get("works_list_url")
                 or disc.get("list_url")
                 or self._current_source.base_url
             )
@@ -146,9 +166,12 @@ class DiscoverPage(BasePage):
             return
 
         # 显示分类按钮 + "全部"
-        search = self._current_source.get_search_config()
         disc = self._current_source.get_discovery_config()
-        all_url = search.get("base_url") or disc.get("list_url") or self._current_source.base_url
+        all_url = (
+            disc.get("works_list_url")
+            or disc.get("list_url")
+            or self._current_source.base_url
+        )
         all_btn = QPushButton("全部")
         all_btn.setCheckable(True)
         all_btn.setChecked(True)
@@ -171,11 +194,10 @@ class DiscoverPage(BasePage):
                 w.setChecked(False)
         btn.setChecked(True)
         disc = self._current_source.get_discovery_config()
-        search = self._current_source.get_search_config()
         if cat is None:
             # 全部 → 作品列表入口
             self._current_cat_url = (
-                search.get("base_url")
+                disc.get("works_list_url")
                 or disc.get("list_url")
                 or self._current_source.base_url
             )
@@ -230,11 +252,61 @@ class DiscoverPage(BasePage):
             self.list_layout.addWidget(card)
 
     def _on_work_clicked(self, work: Work) -> None:
-        # 详情抽屉：第二次实现，先提示
-        self.status_label.setText(f"[详情待实现] {work.title}")
+        """点作品 → 拉详情 → 显示右侧抽屉。"""
+        self.status_label.setText(f"加载详情：{work.title}")
+        source = self._manager.get(work.source_id) if work.source_id else self._current_source
+        if source is None:
+            return
+        try:
+            detail = self._content.fetch_detail(source, work.url)
+        except Exception as exc:
+            self.status_label.setText(f"详情加载失败：{exc}")
+            return
+        self.detail_drawer.show_detail(detail)
+        self.status_label.setText("")
 
     def _on_bulk_fetch(self) -> None:
-        self.status_label.setText("全量抓取功能开发中，后续完善。")
+        """全量抓取：确认弹窗 → 后台执行 → 进度。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        if self._current_source is None:
+            return
+        source = self._current_source
+        ret = QMessageBox.question(
+            self,
+            "确认全量抓取",
+            f"将遍历「{source.source_name}」全部分类/列表页，"
+            f"建立作品元数据索引（不下载正文，默认最多 20 页/分类）。\n\n继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+
+        self.status_label.setText("全量抓取中...")
+        self.bulk_btn.setEnabled(False)
+        try:
+            stats = self._bulk_fetch.fetch_all(source)
+            self.status_label.setText(
+                f"全量抓取完成：{stats['categories']} 个分类，{stats['works']} 部作品"
+            )
+        except Exception as exc:
+            self.status_label.setText(f"全量抓取失败：{exc}")
+        finally:
+            self.bulk_btn.setEnabled(True)
+
+    def _on_read(self, detail) -> None:
+        """开始阅读 → 跳阅读器 Tab（占位）。"""
+        self.read_requested.emit(detail)
+
+    def _on_open_url(self, url: str) -> None:
+        """打开源详情页（浏览器）。"""
+        import webbrowser
+
+        webbrowser.open(url)
+
+    def _on_download(self, detail) -> None:
+        """下载 → 占位提示（下载界面后续实现）。"""
+        self.status_label.setText(f"[下载待实现] {detail.title}")
 
     def _on_scroll(self, value: int) -> None:
         """滚动接近底部（阈值 200px）触发加载下一页。"""

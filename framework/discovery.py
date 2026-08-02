@@ -70,9 +70,15 @@ class Discovery:
     def _interval_ms(self, source: SourceConfig) -> int:
         return int(source.transports().get("interval_ms") or 0)
 
+    def _abs_url(self, source: SourceConfig, url: str) -> str:
+        from urllib.parse import urljoin
+
+        return urljoin(source.base_url, url) if not url.startswith("http") else url
+
     def _get(self, source: SourceConfig, url: str) -> str:
+        abs_url = self._abs_url(source, url)
         return self._http.get_text(
-            url,
+            abs_url,
             headers=self._headers(source),
             timeout=self._timeout(source),
             retries=self._retries(source),
@@ -89,7 +95,7 @@ class Discovery:
             return []  # 未配置分类规则 → 无分类
 
         list_url = disc.get("list_url") or source.base_url
-        self._checker.check(source, list_url)
+        self._checker.check(source, self._abs_url(source, list_url))
         html = self._get(source, list_url)
         doc = self._parser.parse(html)
 
@@ -110,7 +116,7 @@ class Discovery:
         # 分页：若 URL 含 {page} 则替换
         fetch_url = url.replace("{page}", str(page)) if "{page}" in url else url
 
-        self._checker.check(source, fetch_url)
+        self._checker.check(source, self._abs_url(source, fetch_url))
         html = self._get(source, fetch_url)
         doc = self._parser.parse(html)
 
