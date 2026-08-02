@@ -180,7 +180,6 @@ QPushButton {{
 QPushButton:hover {{
     background-color: {accent};
     transform: scale(1.03);
-    box-shadow: {shadow_glow};
 }}
 QPushButton:pressed {{
     background-color: {accent2};
@@ -211,7 +210,7 @@ QFrame {{
 QFrame#statsCard {{
     background-color: {bg2};
     border-radius: {radius_md};
-    box-shadow: {shadow1};
+    border: 1px solid {stroke};
 }}
 
 /* ---------- 列表 ---------- */
@@ -270,7 +269,7 @@ QTabBar::tab {{
 QTabBar::tab:selected {{
     background-color: {accent};
     color: #ffffff;
-    box-shadow: {shadow_glow};
+    border: 2px solid {accent};
 }}
 QTabBar::tab:hover:!selected {{
     background-color: {bg3};

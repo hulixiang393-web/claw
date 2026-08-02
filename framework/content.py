@@ -194,3 +194,85 @@ class Content:
             raise ContentMissingError(
                 f"正文解密失败（{url}）：{exc}", source_id=source.source_id
             )
+
+    # ------------------------------------------------------------------ #
+    def fetch_comic_pages(self, source: SourceConfig, chapter_url: str) -> List[str]:
+        """漫画：抓取一话的全部分页图片 URL。
+
+        对应 endpoints.content.page：
+        - list.fields.url → 图片 URL（可带 data-src/data-original attr）
+        - list.paginator  → 分页（长话翻页）
+        """
+        self._checker.check(source, self._abs_url(source, chapter_url))
+        html = self._get(source, chapter_url)
+        doc = self._parser.parse(html)
+
+        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        block = content_cfg.get("page") or {}
+        # 图片列表优先 body，兼容旧 list
+        list_cfg = block.get("body") or block.get("list") or {}
+        root_sel = list_cfg.get("root_selector")
+        fields = list_cfg.get("fields") or {}
+        if not root_sel or not fields.get("url"):
+            raise ContentMissingError(
+                "源未配置漫画图片规则（content.page）",
+                source_id=source.source_id,
+            )
+
+        # 图片字段可能用 data-src / data-original 懒加载属性
+        url_sel = fields.get("url")
+        if url_sel and isinstance(url_sel, dict):
+            attr = url_sel.get("attr")
+            if attr in (None, "src"):
+                # 尝试 data-src / data-original 兜底
+                for lazy_attr in ("data-src", "data-original", "src"):
+                    sel = dict(url_sel)
+                    sel["attr"] = lazy_attr
+                    imgs = self._parser.extract(doc, sel, source.base_url)
+                    if imgs:
+                        return self._filter_ad_images(imgs, source)
+        # 常规提取
+        imgs = self._parser.extract(doc, url_sel, source.base_url)
+        return self._filter_ad_images(imgs, source)
+
+    def fetch_video_episode(self, source: SourceConfig, episode_url: str) -> str:
+        """视频：抓取单集播放地址（解密后返回真实地址）。
+
+        对应 endpoints.content.episode：
+        - play_url.selector → 播放地址提取
+        - decryption        → 解密（B站 wbi 签名等）
+        """
+        self._checker.check(source, self._abs_url(source, episode_url))
+        html = self._get(source, episode_url)
+        doc = self._parser.parse(html)
+
+        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        block = content_cfg.get("episode") or {}
+        play_cfg = block.get("play_url") or {}
+        play_sel = play_cfg.get("selector")
+        if not play_sel:
+            raise ContentMissingError(
+                "源未配置播放地址规则（content.episode.play_url）",
+                source_id=source.source_id,
+            )
+        play = self._parser.extract_first(doc, play_sel, source.base_url)
+        if not play:
+            raise ContentMissingError(
+                f"未解析到播放地址（{episode_url}）", source_id=source.source_id
+            )
+        # 解密（如 wbi 签名、加密地址）
+        if self._decrypter is not None:
+            return self._decrypter.decrypt(source, play, "video_url")
+        return play
+
+    @staticmethod
+    def _filter_ad_images(images: List[str], source: SourceConfig) -> List[str]:
+        """剔除广告图（URL 含 ad/banner/promo 等标记）。"""
+        ad_markers = ("/ad", "ad_", "banner", "promo", "advert", ".gif")
+        filtered = []
+        for url in images:
+            low = url.lower()
+            if any(m in low for m in ad_markers):
+                continue
+            filtered.append(url)
+        return filtered

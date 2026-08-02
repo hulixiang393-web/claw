@@ -76,7 +76,11 @@ class Discovery:
         return urljoin(source.base_url, url) if not url.startswith("http") else url
 
     def _get(self, source: SourceConfig, url: str) -> str:
+        from urllib.parse import quote
+
         abs_url = self._abs_url(source, url)
+        # 中文参数等需 URL 编码（保留结构字符）
+        abs_url = quote(abs_url, safe=":/?=&%#")
         return self._http.get_text(
             abs_url,
             headers=self._headers(source),

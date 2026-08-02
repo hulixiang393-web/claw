@@ -16,7 +16,8 @@ from PySide6.QtCore import QObject, QUrl
 from PySide6.QtGui import QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
-MAX_CONCURRENT = 4  # 同时最多 4 个封面请求
+MAX_CONCURRENT = 6  # 同时最多 6 个封面请求（调大提升加载速度）
+REQUEST_TIMEOUT_MS = 8000  # 请求超时 8s，防止慢图/404 阻塞队列
 
 
 class _CoverLoader(QObject):
@@ -43,6 +44,7 @@ class _CoverLoader(QObject):
             url, callback = self._queue.pop(0)
             request = QNetworkRequest(QUrl(url))
             request.setHeader(QNetworkRequest.UserAgentHeader, "Mozilla/5.0 SpiderDemo")
+            request.setTransferTimeout(REQUEST_TIMEOUT_MS)  # 超时，防卡队列
             self._active += 1
             # 用属性存回调，reply 完成后取出
             reply = self._manager.get(request)
@@ -53,10 +55,11 @@ class _CoverLoader(QObject):
         self._active -= 1
         pixmap = None
         try:
-            data = reply.readAll()
-            p = QPixmap()
-            if p.loadFromData(data) and not p.isNull():
-                pixmap = p
+            if reply.error() == QNetworkReply.NoError:
+                data = reply.readAll()
+                p = QPixmap()
+                if p.loadFromData(data) and not p.isNull():
+                    pixmap = p
         except Exception:
             pixmap = None
         reply.deleteLater()

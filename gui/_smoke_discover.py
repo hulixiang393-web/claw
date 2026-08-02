@@ -129,6 +129,17 @@ def main():
     assert page.source_combo.count() == 1, page.source_combo.count()
     print("源选择器:", page.source_combo.currentText())
 
+    # 轮询等待分类异步加载完成
+    from PySide6.QtCore import QEventLoop, QTimer
+    import time as _time
+    _t0 = _time.time()
+    while not page._cat_buttons and _time.time() - _t0 < 6:
+        loop_cat = QEventLoop()
+        QTimer.singleShot(200, loop_cat.quit)
+        loop_cat.exec()
+        app.processEvents()
+    print("分类加载耗时:", round(_time.time() - _t0, 1), "s")
+
     # 分类按钮（2 分类 + 全部）
     cat_buttons = [btn for btn, _ in page._cat_buttons]
     print("分类按钮:", [b.text() for b in cat_buttons])
@@ -168,8 +179,12 @@ def main():
     print("作品卡片数:", len(cards))
     assert len(cards) == 2, len(cards)
 
-    # 详情抽屉：点作品 → 拉详情 → 抽屉显示
+    # 详情抽屉：点作品 → 后台拉详情 → 等待 → 抽屉显示
+    from PySide6.QtCore import QEventLoop, QTimer
     page._on_work_clicked(cards[0].work)
+    loop2 = QEventLoop()
+    QTimer.singleShot(3000, loop2.quit)
+    loop2.exec()
     app.processEvents()
     assert page.detail_drawer.is_open(), "抽屉应打开"
     print("详情抽屉标题:", page.detail_drawer.title.text())

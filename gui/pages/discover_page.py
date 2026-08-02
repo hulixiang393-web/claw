@@ -66,6 +66,7 @@ class DiscoverPage(BasePage):
         self._has_more = True
         self._current_cat_url = None
         self._work_count = 0
+        self._source_epoch = 0  # 源切换序号，防止旧请求回调竞态
         self._preload_limit = 3  # 最多预加载到第 3 页，防无限翻页
         self._cat_buttons: list = []
         self._cat_collapsed = True
@@ -183,7 +184,8 @@ class DiscoverPage(BasePage):
         viewport.mouseReleaseEvent = on_release
 
     def _reload_sources(self) -> None:
-        """只列配置了 discovery 的源。"""
+        """只列配置了 discovery 的源（避免多次触发切换）。"""
+        self.source_combo.blockSignals(True)
         self.source_combo.clear()
         sources = self._manager.discoverable_sources()
         for s in sources:
@@ -191,20 +193,24 @@ class DiscoverPage(BasePage):
             self.source_combo.addItem(label, s)
         if sources:
             self.source_combo.setCurrentIndex(0)
-        else:
-            self.status_label.setText("没有可浏览的源：请在源管理中添加配置了发现规则的源")
-            self._show_empty()
+        self.source_combo.blockSignals(False)
+        # 手动触发一次源切换
+        self._on_source_changed(self.source_combo.currentIndex())
 
     def _on_source_changed(self, index: int) -> None:
         if index < 0:
             return
+        # 递增序号：使旧源的加载回调失效（防止快速切换竞态/卡死）
+        self._source_epoch += 1
         self._current_source = self.source_combo.itemData(index)
         self._current_page = 0
         self._has_more = True
         self._current_cat_url = None
         self._cat_collapsed = True
+        self.status_label.setText("正在加载分类...")
+        self._loading = False  # 取消旧加载状态
         self._load_categories()
-        self._reset_works()
+        # 作品加载在 _on_categories_loaded 分类就绪后触发
 
     # ------------------------------------------------------------------ #
     def _clear_cat_buttons(self) -> None:
@@ -216,14 +222,24 @@ class DiscoverPage(BasePage):
         self._cat_bar_populated = False
 
     def _load_categories(self) -> None:
-        """加载分类按钮到折叠栏。未配置分类 → 直接进作品列表。"""
+        """后台加载分类（不阻塞 UI）。"""
         self._clear_cat_buttons()
         if self._current_source is None:
             return
-        try:
-            cats = self._discovery.list_categories(self._current_source)
-        except Exception as exc:
-            self.status_label.setText(f"分类加载失败：{exc}")
+        epoch = self._source_epoch
+        task = _FetchCategoriesTask(self._discovery, self._current_source)
+        task.signals.finished.connect(
+            lambda cats, err, e=epoch: self._on_categories_loaded(cats, err, e)
+        )
+        self._cat_task = task  # 持有引用，防止被 GC（信号才可靠）
+        QThreadPool.globalInstance().start(task)
+
+    def _on_categories_loaded(self, cats, err, epoch: int) -> None:
+        """分类加载完成。若源已切换（epoch 不符）则丢弃。"""
+        if epoch != self._source_epoch:
+            return  # 旧源请求，丢弃
+        if err:
+            self.status_label.setText(f"分类加载失败：{err}")
             return
 
         if not cats:
@@ -235,6 +251,7 @@ class DiscoverPage(BasePage):
                 or self._current_source.base_url
             )
             self.cat_toggle_btn.setVisible(False)
+            self._reset_works()
             return
 
         self.cat_toggle_btn.setVisible(True)
@@ -252,6 +269,8 @@ class DiscoverPage(BasePage):
             self._cat_buttons.append((btn, cat))
 
         self._refresh_cat_buttons(all_url)
+        # 分类就绪后加载作品
+        self._reset_works()
 
     def _make_cat_button(self, text, cat, checked) -> QPushButton:
         btn = QPushButton(text)
@@ -350,6 +369,7 @@ class DiscoverPage(BasePage):
         source = self._current_source
         cat_url = self._current_cat_url
         discovery = self._discovery
+        epoch = self._source_epoch
 
         self.status_label.setText("正在加载第 %d 页..." % page)
         self.status_label.setVisible(True)
@@ -358,13 +378,15 @@ class DiscoverPage(BasePage):
         thread_pool = QThreadPool.globalInstance()
         runnable = _FetchWorksTask(discovery, source, cat_url, page)
         runnable.signals.finished.connect(
-            lambda works, err: self._on_page_loaded(works, err, page)
+            lambda works, err, e=epoch, p=page: self._on_page_loaded(works, err, p, e)
         )
         self._fetch_task = runnable  # 持有引用，防止被 GC
         thread_pool.start(runnable)
 
-    def _on_page_loaded(self, works, err, page: int) -> None:
+    def _on_page_loaded(self, works, err, page: int, epoch: int) -> None:
         """后台抓取完成，更新 UI（回到主线程）。"""
+        if epoch != self._source_epoch:
+            return  # 源已切换，丢弃旧结果
         self._loading = False
         if err:
             self._has_more = False
@@ -400,15 +422,20 @@ class DiscoverPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def _on_work_clicked(self, work: Work) -> None:
-        """点作品 → 拉详情 → 显示右侧抽屉。"""
+        """点作品 → 后台拉详情 → 显示右侧抽屉（不阻塞 UI）。"""
         self.status_label.setText(f"加载详情：{work.title}")
         source = self._manager.get(work.source_id) if work.source_id else self._current_source
         if source is None:
             return
-        try:
-            detail = self._content.fetch_detail(source, work.url)
-        except Exception as exc:
-            self.status_label.setText(f"详情加载失败：{exc}")
+        # 后台拉详情，避免主线程卡顿
+        task = _FetchDetailTask(self._content, source, work.url)
+        task.signals.finished.connect(self._on_detail_loaded)
+        self._detail_task = task  # 持有引用
+        QThreadPool.globalInstance().start(task)
+
+    def _on_detail_loaded(self, detail, err) -> None:
+        if err or detail is None:
+            self.status_label.setText(f"详情加载失败：{err}")
             return
         self.detail_drawer.show_detail(detail)
         self.status_label.setText("")
@@ -497,3 +524,46 @@ class _FetchWorksTask(QRunnable):
             self.signals.finished.emit(works, err)
         except RuntimeError:
             pass  # 页面已销毁，忽略信号
+
+
+class _FetchDetailTask(QRunnable):
+    """后台拉详情（不阻塞 UI）。"""
+
+    def __init__(self, content, source, url):
+        super().__init__()
+        self.signals = _FetchWorkerSignals()  # finished(detail, err)
+        self._content = content
+        self._source = source
+        self._url = url
+
+    def run(self) -> None:
+        detail, err = None, None
+        try:
+            detail = self._content.fetch_detail(self._source, self._url)
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+        try:
+            self.signals.finished.emit(detail, err)
+        except RuntimeError:
+            pass
+
+
+class _FetchCategoriesTask(QRunnable):
+    """后台加载分类（不阻塞 UI）。"""
+
+    def __init__(self, discovery, source):
+        super().__init__()
+        self.signals = _FetchWorkerSignals()  # finished(cats, err)
+        self._discovery = discovery
+        self._source = source
+
+    def run(self) -> None:
+        cats, err = [], None
+        try:
+            cats = self._discovery.list_categories(self._source)
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+        try:
+            self.signals.finished.emit(cats, err)
+        except RuntimeError:
+            pass

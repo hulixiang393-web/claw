@@ -1,0 +1,97 @@
+{
+  "$schema_version": 2,
+  "$id": "comicbox",
+  "$type": "comic",
+  "$name": "漫画盒(comicbox)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.comicbox.xyz",
+    "description": "漫画盒 - 漫画源（免费章节可用）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["漫画", "免费"]
+  },
+  "transports": {
+    "base_url": "https://www.comicbox.xyz",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+      "Referer": "https://www.comicbox.xyz/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/tags",
+      "list_item": {
+        "root_selector": { "css": ".sp-tags a" },
+        "url_pattern": "booklist\\?tag=",
+        "fields": {
+          "title": { "css": "a" },
+          "url": { "css": "a", "attr": "href" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/booklist",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "item": {
+        "root_selector": { "css": ".sp-booklist-grid .sp-booklist-card" },
+        "fields": {
+          "title": { "css": "a", "attr": "title" },
+          "url": { "css": "a", "attr": "href" },
+          "cover": { "css": ".sp-booklist-cover .cropped", "attr": "data-src" }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": { "css": "h1" },
+        "author": { "css": ".sp-author a" },
+        "status": { "css": ".sp-book-status" },
+        "summary": { "css": ".sp-book-desc" }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": { "css": ".sp-chapter-grid .sp-chapter-item" },
+          "fields": {
+            "title": { "css": "a", "attr": "title" },
+            "url": { "css": "a", "attr": "href" }
+          }
+        },
+        "body": {
+          "root_selector": { "css": ".comicpage .cropped" },
+          "fields": {
+            "url": { "css": "div", "attr": "data-src" }
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 20 },
+    "detail": { "max_pages": 1 },
+    "chapter": { "max_pages": 50, "max_items": 100 }
+  },
+  "decryption": {
+    "targets": {
+      "image": {
+        "strategy": "custom_endpoint",
+        "endpoint": "https://www.comicbox.xyz/decrypt",
+        "request_field": "url",
+        "response_field": "url"
+      }
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": ".sp-tags" }
+    }
+  }
+}

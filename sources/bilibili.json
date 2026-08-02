@@ -1,0 +1,74 @@
+{
+  "$schema_version": 2,
+  "$id": "bilibili",
+  "$type": "video",
+  "$name": "B站",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.bilibili.com",
+    "description": "B站视频源 - 番剧/动画（发现列表用公开API，播放地址需 wbi 签名）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "番剧", "动画"]
+  },
+  "transports": {
+    "base_url": "https://www.bilibili.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+      "Referer": "https://www.bilibili.com/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 800
+  },
+  "api_endpoints": {
+    "discovery": {
+      "url": "https://api.bilibili.com/pgc/web/rank/list?season_type=4&day=3",
+      "method": "GET",
+      "response_path": "data.list",
+      "item_fields": {
+        "title": "title",
+        "url": "https://www.bilibili.com/bangumi/media/md{media_id}",
+        "cover": "cover"
+      }
+    },
+    "search": {
+      "url": "https://api.bilibili.com/x/web-interface/search/type?search_type=bangumi&keyword={keyword}",
+      "method": "GET",
+      "response_path": "data.result",
+      "item_fields": {
+        "title": "title",
+        "url": "https://www.bilibili.com{arcurl}",
+        "cover": "cover"
+      }
+    }
+  },
+  "endpoints": {
+    "detail": {
+      "fields": {
+        "title": { "css": "h1" }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 20 },
+    "detail": { "max_pages": 1 }
+  },
+  "decryption": {
+    "targets": {
+      "video_url": {
+        "strategy": "custom_endpoint",
+        "endpoint": "https://api.bilibili.com/x/player/playurl",
+        "request_field": "bvid",
+        "response_field": "data"
+      }
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": ".site-header" }
+    }
+  }
+}

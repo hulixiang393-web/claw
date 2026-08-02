@@ -37,6 +37,7 @@ from framework.bulk_fetch import BulkFetch
 
 from gui.pages.home_page import HomePage
 from gui.pages.discover_page import DiscoverPage
+from gui.pages.reader_page import ReaderPage
 
 # 导航栏顺序（对应 ui-index.md）
 TABS = [
@@ -51,7 +52,7 @@ TABS = [
 ]
 
 # 已实现界面
-IMPLEMENTED_TABS = {"home", "discover"}
+IMPLEMENTED_TABS = {"home", "discover", "reader"}
 
 
 class MainWindow(QMainWindow):
@@ -109,12 +110,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _build_pages(self) -> None:
         """构建导航栏各 Tab。未实现界面在标签后标注「·开发中」。"""
+        self.reader = None  # 占位，_build_reader 时创建
         for label, key in TABS:
             if key == "home":
                 page = self._build_home()
                 tab_label = label
             elif key == "discover":
                 page = self._build_discover()
+                tab_label = label
+            elif key == "reader":
+                page = self._build_reader()
                 tab_label = label
             elif key in IMPLEMENTED_TABS:
                 page = self._build_home()  # 其他已实现暂用首页占位
@@ -123,6 +128,15 @@ class MainWindow(QMainWindow):
                 page = self._build_placeholder(label)
                 tab_label = f"{label}·开发中"
             self.tabs.addTab(page, tab_label)
+
+    def _build_reader(self) -> ReaderPage:
+        from gui.pages.reader_page import ReaderPage
+
+        self.reader = ReaderPage(
+            source_manager=self.source_manager,
+            content=self.content,
+        )
+        return self.reader
 
     def _build_discover(self) -> DiscoverPage:
         page = DiscoverPage(
@@ -133,10 +147,21 @@ class MainWindow(QMainWindow):
             event_bus=self.event_bus,
             theme_manager=self.theme_manager,
         )
-        page.read_requested.connect(
-            lambda detail: self.tabs.setCurrentIndex(self._tab_index["reader"])
-        )
+        page.read_requested.connect(self._open_reader)
         return page
+
+    def _open_reader(self, detail) -> None:
+        """从发现详情抽屉「开始阅读」→ 打开阅读器。"""
+        if detail is None or self.reader is None:
+            self.tabs.setCurrentIndex(self._tab_index["reader"])
+            return
+        self.reader.open(
+            detail.source_id,
+            detail.url,
+            detail.content_type,
+            detail.chapters[0].url if detail.chapters else "",
+        )
+        self.tabs.setCurrentIndex(self._tab_index["reader"])
 
     def _build_home(self) -> HomePage:
         page = HomePage(
