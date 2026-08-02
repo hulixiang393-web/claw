@@ -25,7 +25,12 @@
     "discovery": {
       "list_url": "/",
       "works_list_url": "/sort/1/1/",
-      "list_paginator": { "type": "increment", "start": 1, "step": 1, "param": "page" },
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "page_placeholder": "\\d+(?=/$)"
+      },
       "list_item": {
         "root_selector": { "css": ".main-nav li a" },
         "url_pattern": "/sort/\\d+/1/",

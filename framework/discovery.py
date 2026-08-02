@@ -120,11 +120,12 @@ class Discovery:
     def list_works(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
         """抓取一页作品列表（懒加载用）。
 
-        url 为列表页/分类 URL；page 通过 {page} 占位注入。
+        分页由源配置 paginator 驱动（source-schema-v2 §5）：
+        - increment : URL 页码替换（{page} 占位 或 page_placeholder 正则）
+        - next_link : 抓页面「下一页」链接（需先请求首页）
+        - cursor    : ?offset=N 游标偏移
         """
-        # 分页：若 URL 含 {page} 则替换
-        fetch_url = url.replace("{page}", str(page)) if "{page}" in url else url
-
+        fetch_url = self._build_page_url(source, url, page)
         self._checker.check(source, self._abs_url(source, fetch_url))
         html = self._get(source, fetch_url)
         doc = self._parser.parse(html)
@@ -160,3 +161,36 @@ class Discovery:
                 )
             )
         return works
+
+    def _build_page_url(self, source: SourceConfig, url: str, page: int) -> str:
+        """按源配置 paginator 构造第 page 页的 URL。"""
+        import re as _re
+
+        disc = source.get_discovery_config()
+        paginator = disc.get("list_paginator") or {}
+        ptype = paginator.get("type") or "increment"
+
+        if ptype == "increment":
+            # 1) {page} 占位替换
+            if "{page}" in url:
+                return url.replace("{page}", str(page))
+            # 2) page_placeholder 正则：替换 URL 中页码位
+            placeholder = paginator.get("page_placeholder")
+            if placeholder:
+                return _re.sub(placeholder, str(page), url, count=1)
+            # 3) 默认：?param=N
+            param = paginator.get("param") or "page"
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}{param}={page}"
+
+        if ptype == "cursor":
+            # ?offset=N
+            param = paginator.get("param") or "offset"
+            start = int(paginator.get("start") or 0)
+            step = int(paginator.get("step") or 20)
+            offset = start + (page - 1) * step
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}{param}={offset}"
+
+        # next_link / 默认：页码参数
+        return f"{url}?page={page}"

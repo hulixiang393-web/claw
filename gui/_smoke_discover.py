@@ -147,8 +147,21 @@ def main():
     assert len(expanded) == len(cat_buttons), (len(expanded), len(cat_buttons))
     print("展开后按钮数:", len(expanded))
 
-    # 加载作品
+    # 加载作品（异步后台线程，用 QEventLoop 等待完成）
     page._reset_works()
+    from PySide6.QtCore import QEventLoop, QTimer
+    loop = QEventLoop()
+    QTimer.singleShot(5000, loop.quit)  # 5 秒超时
+    page._loading = True
+    orig = page._on_page_loaded
+
+    def _done(*a):
+        orig(*a)
+        loop.quit()
+
+    page._on_page_loaded = _done
+    loop.exec()
+    page._on_page_loaded = orig
     app.processEvents()
     cards = [page.grid_layout.itemAt(i).widget() for i in range(page.grid_layout.count())]
     cards = [c for c in cards if c is not None]

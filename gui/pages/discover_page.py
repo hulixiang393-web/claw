@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -66,6 +66,7 @@ class DiscoverPage(BasePage):
         self._has_more = True
         self._current_cat_url = None
         self._work_count = 0
+        self._preload_limit = 3  # 最多预加载到第 3 页，防无限翻页
         self._cat_buttons: list = []
         self._cat_collapsed = True
 
@@ -327,30 +328,55 @@ class DiscoverPage(BasePage):
         self._work_count = 0
 
     def _load_next_page(self) -> None:
+        """异步加载下一页：后台线程抓作品，加载中显示状态，完成后更新网格。"""
         if self._loading or not self._has_more or self._current_source is None:
             return
         if self._current_cat_url is None:
             return
         self._loading = True
-        self.status_label.setText("加载中...")
         self._current_page += 1
-        try:
-            works = self._discovery.list_works(
-                self._current_source, self._current_cat_url, self._current_page
-            )
-        except Exception as exc:
-            self.status_label.setText(f"加载失败：{exc}")
-            self._has_more = False
-            self._loading = False
-            return
+        page = self._current_page
+        source = self._current_source
+        cat_url = self._current_cat_url
+        discovery = self._discovery
 
+        self.status_label.setText("正在加载第 %d 页..." % page)
+        self.status_label.setVisible(True)
+
+        # 后台线程抓取
+        thread_pool = QThreadPool.globalInstance()
+        runnable = _FetchWorksTask(discovery, source, cat_url, page)
+        runnable.signals.finished.connect(
+            lambda works, err: self._on_page_loaded(works, err, page)
+        )
+        self._fetch_task = runnable  # 持有引用，防止被 GC
+        thread_pool.start(runnable)
+
+    def _on_page_loaded(self, works, err, page: int) -> None:
+        """后台抓取完成，更新 UI（回到主线程）。"""
+        self._loading = False
+        if err:
+            self._has_more = False
+            self.status_label.setText(f"加载失败：{err}")
+            return
         if not works:
             self._has_more = False
             self.status_label.setText("到底啦～")
         else:
             self._append_works(works)
-            self.status_label.setText(f"已加载 {self._current_page} 页")
-        self._loading = False
+            self.status_label.setText(f"已加载 {self._current_page} 页 · 共 {self._work_count} 部")
+        # 自动继续加载下一页直到填满视口（预加载）
+        self._maybe_preload()
+
+    def _maybe_preload(self) -> None:
+        """内容未填满视口时预加载，但最多额外预加载 PRELOAD_LIMIT 页（防失控）。"""
+        if self._loading or not self._has_more:
+            return
+        preloaded = self._current_page
+        if preloaded >= self._preload_limit:
+            return
+        if self.scroll.verticalScrollBar().maximum() < self.scroll.height():
+            self._load_next_page()
 
     def _append_works(self, works) -> None:
         """把作品卡片按网格排列（每行 GRID_COLUMNS 个）。"""
@@ -431,3 +457,32 @@ class DiscoverPage(BasePage):
 
     def _show_empty(self) -> None:
         self._clear_works()
+
+
+class _FetchWorkerSignals(QObject):
+    """后台抓取任务信号。"""
+
+    finished = Signal(object, object)  # (works, err)
+
+
+class _FetchWorksTask(QRunnable):
+    """后台抓取一页作品（QThreadPool）。"""
+
+    def __init__(self, discovery, source, cat_url, page):
+        super().__init__()
+        self.signals = _FetchWorkerSignals()
+        self._discovery = discovery
+        self._source = source
+        self._cat_url = cat_url
+        self._page = page
+
+    def run(self) -> None:
+        works, err = [], None
+        try:
+            works = self._discovery.list_works(self._source, self._cat_url, self._page)
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+        try:
+            self.signals.finished.emit(works, err)
+        except RuntimeError:
+            pass  # 页面已销毁，忽略信号
