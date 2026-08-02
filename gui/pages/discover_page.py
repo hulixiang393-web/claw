@@ -97,10 +97,11 @@ class DiscoverPage(BasePage):
 
         self.cat_scroll = QScrollArea()
         self.cat_scroll.setWidgetResizable(True)
-        self.cat_scroll.setFixedHeight(42)
-        self.cat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.cat_scroll.setFixedHeight(44)
+        self.cat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.cat_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         cat_scroll_row.addWidget(self.cat_scroll, stretch=1)
+        self._setup_cat_scroll_drag()
 
         self.cat_toggle_btn = QPushButton("展开分类 ▾")
         self.cat_toggle_btn.setFixedWidth(90)
@@ -153,6 +154,32 @@ class DiscoverPage(BasePage):
         self._reload_sources()
 
     # ------------------------------------------------------------------ #
+    def _setup_cat_scroll_drag(self) -> None:
+        """分类栏支持鼠标拖拽横向平移。"""
+        viewport = self.cat_scroll.viewport()
+        self._drag_pressed = False
+        self._drag_last_x = 0
+
+        def on_press(event):
+            self._drag_pressed = True
+            self._drag_last_x = event.position().x()
+            viewport.setCursor(Qt.ClosedHandCursor)
+
+        def on_move(event):
+            if self._drag_pressed:
+                dx = event.position().x() - self._drag_last_x
+                hbar = self.cat_scroll.horizontalScrollBar()
+                hbar.setValue(hbar.value() - int(dx))
+                self._drag_last_x = event.position().x()
+
+        def on_release(event):
+            self._drag_pressed = False
+            viewport.setCursor(Qt.ArrowCursor)
+
+        viewport.mousePressEvent = on_press
+        viewport.mouseMoveEvent = on_move
+        viewport.mouseReleaseEvent = on_release
+
     def _reload_sources(self) -> None:
         """只列配置了 discovery 的源。"""
         self.source_combo.clear()

@@ -39,8 +39,10 @@ class WorkCard(QFrame):
 
         title = QLabel(work.title or "无标题")
         title.setWordWrap(True)
-        title.setMaximumHeight(40)
+        title.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        title.setMinimumHeight(36)
         layout.addWidget(title)
+        self._title = title
 
         src = QLabel(work.source_name or "")
         src.setStyleSheet("color: palette(dark); font-size: 10px;")

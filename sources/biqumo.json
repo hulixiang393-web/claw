@@ -28,6 +28,7 @@
       "list_paginator": { "type": "increment", "start": 1, "step": 1, "param": "page" },
       "list_item": {
         "root_selector": { "css": ".main-nav li a" },
+        "url_pattern": "/sort/\\d+/1/",
         "fields": {
           "title": { "css": "a" },
           "url": { "css": "a", "attr": "href" }

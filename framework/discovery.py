@@ -87,12 +87,19 @@ class Discovery:
 
     # ------------------------------------------------------------------ #
     def list_categories(self, source: SourceConfig) -> List[Category]:
-        """抓取分类列表。未配置分类项 → 返回 []。"""
+        """抓取分类列表。未配置分类项 → 返回 []。
+
+        支持 list_item.url_pattern 过滤：只保留 URL 匹配该正则的分类
+        （过滤掉首页/logo/作者链接等非分类项）。
+        """
         disc = source.get_discovery_config()
         list_item = disc.get("list_item") or {}
         fields = list_item.get("fields") or {}
         if not fields.get("title") or not fields.get("url"):
             return []  # 未配置分类规则 → 无分类
+
+        url_pattern = list_item.get("url_pattern")
+        import re as _re
 
         list_url = disc.get("list_url") or source.base_url
         self._checker.check(source, self._abs_url(source, list_url))
@@ -104,6 +111,8 @@ class Discovery:
         cats: List[Category] = []
         for i, t in enumerate(titles):
             u = urls[i] if i < len(urls) else ""
+            if url_pattern and not _re.search(url_pattern, u):
+                continue  # 不匹配分类 URL 模式 → 跳过（非真实分类）
             cats.append(Category(title=t, url=u))
         return cats
 
