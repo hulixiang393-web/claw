@@ -40,15 +40,19 @@ class StructureChecker:
         return strategy, selector, interval_hours
 
     def check(self, source: SourceConfig, url: str) -> bool:
-        """自检。返回 True=通过或跳过；strict 失败抛 StructureChangedError。"""
+        """自检。返回 True=通过或跳过；strict 失败抛 StructureChangedError。
+
+        interval_hours 为 0 时也加最小缓存 60s，避免短时间重复自检。
+        """
         strategy, selector, interval_hours = self._get_config(source)
         if strategy == "off" or selector is None:
             return True
 
-        # interval 缓存：间隔内不重复自检
+        # interval 缓存：间隔内不重复自检；0 也加最小 60s 缓存
         now = time.time()
+        min_interval = max(interval_hours * 3600, 60)  # 至少 60s 缓存
         last = self._last_check.get(source.source_id)
-        if last and interval_hours > 0 and now - last[0] < interval_hours * 3600:
+        if last and now - last[0] < min_interval:
             return last[1]
 
         try:
@@ -59,7 +63,6 @@ class StructureChecker:
                 retries=int(source.raw.get("transports", {}).get("retries") or 3),
             )
         except Exception:
-            # 请求失败按自检失败处理
             ok = False
         else:
             doc = self._parser.parse(html)
