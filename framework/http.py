@@ -66,6 +66,45 @@ class HttpClient:
         except json.JSONDecodeError:
             return {}
 
+    def post_form(
+        self,
+        url: str,
+        form_data: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        proxy: Optional[str] = None,
+        timeout: float = 10.0,
+        retries: int = 3,
+    ) -> str:
+        """POST 表单并返回响应文本。"""
+        from urllib.parse import urlencode
+
+        self._sleeper(0.0)
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                post_headers = dict(headers or {})
+                post_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                if self._session is not None:
+                    resp = self._session.post(
+                        url,
+                        data=urlencode(form_data or {}),
+                        headers=post_headers,
+                        timeout=timeout,
+                    )
+                    resp.raise_for_status()
+                    return resp.text
+                import urllib.request
+
+                body = urlencode(form_data or {}).encode("utf-8")
+                req = urllib.request.Request(url, data=body, headers=post_headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt < retries:
+                    self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+        raise RequestError(f"请求失败 POST {url}：{last_error}")
+
     def _get_once(self, url, headers, proxy, timeout) -> str:
         if self._session is not None:
             proxies = {"http": proxy, "https": proxy} if proxy else None

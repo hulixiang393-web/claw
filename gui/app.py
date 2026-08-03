@@ -34,10 +34,12 @@ from framework.discovery import Discovery
 from framework.content import Content
 from framework.decrypter import Decrypter
 from framework.bulk_fetch import BulkFetch
+from framework.search import Search
 
 from gui.pages.home_page import HomePage
 from gui.pages.discover_page import DiscoverPage
 from gui.pages.reader_page import ReaderPage
+from gui.pages.search_page import SearchPage
 
 # 导航栏顺序（对应 ui-index.md）
 TABS = [
@@ -52,7 +54,7 @@ TABS = [
 ]
 
 # 已实现界面
-IMPLEMENTED_TABS = {"home", "discover", "reader"}
+IMPLEMENTED_TABS = {"home", "discover", "reader", "search"}
 
 
 class MainWindow(QMainWindow):
@@ -84,6 +86,7 @@ class MainWindow(QMainWindow):
             event_bus=self.event_bus,
             index_dir=base_dir / "data",
         )
+        self.search = Search(self.http, self.parser, self.discovery)
 
         # Tab 索引映射
         self._tab_index = {key: i for i, (_, key) in enumerate(TABS)}
@@ -121,6 +124,9 @@ class MainWindow(QMainWindow):
             elif key == "reader":
                 page = self._build_reader()
                 tab_label = label
+            elif key == "search":
+                page = self._build_search()
+                tab_label = label
             elif key in IMPLEMENTED_TABS:
                 page = self._build_home()  # 其他已实现暂用首页占位
                 tab_label = label
@@ -149,6 +155,12 @@ class MainWindow(QMainWindow):
         )
         page.read_requested.connect(self._open_reader)
         return page
+
+    def _build_search(self) -> SearchPage:
+        return SearchPage(
+            source_manager=self.source_manager,
+            search=self.search,
+        )
 
     def _open_reader(self, detail) -> None:
         """从发现详情抽屉「开始阅读」→ 打开阅读器。"""

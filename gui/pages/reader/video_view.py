@@ -43,6 +43,13 @@ class VideoView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        # ---- 内嵌播放区（QWebEngineView，软件内观看）----
+        self.embed_container = QWidget()
+        self.embed_layout = QVBoxLayout(self.embed_container)
+        self.embed_layout.setContentsMargins(0, 0, 0, 0)
+        self._embed_view = None
+        layout.addWidget(self.embed_container, stretch=1)
+
         # ---- 分集列表 ----
         self.ep_list = QListWidget()
         self.ep_list.itemClicked.connect(self._on_ep_clicked)
@@ -85,6 +92,11 @@ class VideoView(QWidget):
                     idx = i
                     break
         self.ep_list.setCurrentRow(idx)
+        if not detail.chapters:
+            # 无分集列表（如 B站番剧 season 页）→ 直接内嵌播放页
+            self.play_label.setText("正在加载播放页...")
+            self._open_embed(detail.url)
+            return
         self._load_episode(idx)
 
     def _load_episode(self, idx: int) -> None:
@@ -123,20 +135,29 @@ class VideoView(QWidget):
         if self._current_play:
             webbrowser.open(self._current_play)
 
-    def _open_embed(self) -> None:
-        """在应用内观看（方案B 增强）：尝试用源播放页 URL。"""
-        if self._detail and self._current_idx >= 0:
+    def _open_embed(self, url: str | None = None) -> None:
+        """在应用内观看：QWebEngineView 嵌入播放页（不弹窗）。"""
+        target = url
+        if target is None and self._detail and self._current_idx >= 0:
             ep = self._episodes[self._current_idx]
-            # 尝试加载源详情页（站点自带播放器）
-            try:
-                from PySide6.QtWebEngineWidgets import QWebEngineView
-                from PySide6.QtCore import QUrl
+            target = ep.url
+        if target is None and self._detail:
+            target = self._detail.url  # 无分集时用详情页 URL（番剧 season 页）
+        if not target:
+            self.play_label.setText("无可用播放地址")
+            return
+        try:
+            from PySide6.QtWebEngineWidgets import QWebEngineView
+            from PySide6.QtCore import QUrl
 
-                self._embed_view = QWebEngineView(self)
-                self._embed_view.setUrl(QUrl(ep.url))
-                self._embed_view.show()
-            except ImportError:
-                self.play_label.setText("内嵌播放需要 QtWebEngine，未安装。可用外部播放器打开。")
+            if self._embed_view is None:
+                self._embed_view = QWebEngineView(self.embed_container)
+                self.embed_layout.addWidget(self._embed_view)
+            self._embed_view.setUrl(QUrl(target))
+            self._embed_view.show()
+            self.embed_container.setVisible(True)
+        except ImportError:
+            self.play_label.setText("内嵌播放需要 QtWebEngine，未安装。可用外部播放器打开。")
 
 
 class _VideoSignals(QObject):

@@ -180,6 +180,14 @@ class _ComicImageLabel(QLabel):
         self.setCursor(Qt.OpenHandCursor)
 
     def load(self) -> None:
+        # Playwright 返回的本地文件路径 → 直接读
+        if self.url and (self.url.startswith(("file://", "/", "\\")) or "\\" in self.url or self.url.startswith(".")):
+            path = self.url.replace("file://", "")
+            from PySide6.QtGui import QPixmap
+
+            pix = QPixmap(path)
+            self._on_image(pix if not pix.isNull() else None)
+            return
         from gui.components.cover_loader import CoverLoader
 
         CoverLoader.instance().load(self.url, self._on_image)
