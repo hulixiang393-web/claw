@@ -355,6 +355,41 @@
 | `engine_args.viewport` | `object` | 视口大小 |
 | `engine_args.fingerprint` | `object` | 指纹伪装 |
 
+**当前框架实际实现（render_config，content.page.render = "playwright" 时生效）**：
+
+| 键 | 类型 | 默认 | 用途 |
+|---|---|---|---|
+| `wait_for` | `string` | `"canvas"` | 渲染目标选择器（等它出现再提取） |
+| `wait_until` | `enum` | `"domcontentloaded"` | 页面就绪策略：`domcontentloaded` / `networkidle` / `load` |
+| `extra_delay_ms` | `int` | `2500` | JS 绘制后的额外等待（ms） |
+| `timeout_ms` | `int` | `30000` | 页面加载超时（ms） |
+| `click_selector` | `string` | 无 | 渲染后点击该元素（展开弹层/触发更多内容） |
+| `scroll_to_bottom` | `bool` | `false` | 是否滚动到页底触发懒加载 |
+| `extract_mode` | `enum` | `"canvas"` | 提取方式：`canvas`（加密分片图 base64）/ `img`（图片 URL）/ `text`（JS 渲染文本） |
+| `page_container_selector` | `string` | 无 | 页容器选择器（如 `div.cropped`），用于统计期望页数并等待全部绘制 |
+| `scroll_step_px` | `int` | `600` | 滚动步长（懒加载画布，如 comicbox 用 900 触发绘制） |
+| `scroll_stale_rounds` | `int` | `6` | 连续几轮无新内容判定到底 |
+| `proxy`（transports） | `string` | 自动探测 | 浏览器代理，缺省读系统代理（Clash 7890） |
+
+> **「边滚边收集」说明**：部分漫画站（如 comicbox）的 canvas 是"视口内复用"的——滚出视口即被 JS 回收。框架采取**滚动过程中逐步提取**（而非滚动完再一次性提取），并在滚到底后深等（等尾部 canvas 集中绘制）再补一轮，保证长章节图片爬全。
+
+示例：
+```json
+"content": {
+  "page": {
+    "render": "playwright",
+    "render_config": {
+      "wait_for": "canvas",
+      "wait_until": "domcontentloaded",
+      "extra_delay_ms": 3000,
+      "scroll_to_bottom": true,
+      "extract_mode": "canvas",
+      "page_container_selector": "div.cropped"
+    }
+  }
+}
+```
+
 </details>
 
 ---

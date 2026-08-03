@@ -169,14 +169,30 @@ class SearchPage(BasePage):
         else:
             self.status_label.setText(f"共 {len(results)} 条结果")
 
+    def _columns(self) -> int:
+        """按可视宽度计算结果列数（与发现页一致，自适应不溢出）。"""
+        view_w = self.scroll.viewport().width() or self.width() or 900
+        cols = max(2, view_w // 170)
+        return min(cols, 8)
+
+    def _apply_column_stretch(self, cols: int) -> None:
+        """每列等宽，卡片均匀分布。"""
+        for i in range(self.grid_layout.columnCount()):
+            self.grid_layout.setColumnStretch(i, 0)
+        for i in range(cols):
+            self.grid_layout.setColumnStretch(i, 1)
+
     def _show_results(self) -> None:
         self._clear_grid()
         items = self._results
         if self._filter_source:
             items = [r for r in items if r.source_id == self._filter_source]
-        for r in items:
+        cols = self._columns()
+        for idx, r in enumerate(items):
+            row, col = divmod(idx, cols)
             card = WorkCard(r)
-            self.grid_layout.addWidget(card)
+            self.grid_layout.addWidget(card, row, col)
+        self._apply_column_stretch(cols)
 
     def _clear_grid(self) -> None:
         while self.grid_layout.count():

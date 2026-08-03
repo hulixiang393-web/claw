@@ -113,7 +113,7 @@ class VideoView(QWidget):
         task.signals.finished.connect(self._on_play_loaded)
         self._video_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
-        self.episode_changed.emit((self._detail, ep.title))
+        self.episode_changed.emit((self._detail, ep.title, ep.url))
 
     def _on_ep_clicked(self, item) -> None:
         idx = item.data(Qt.UserRole)

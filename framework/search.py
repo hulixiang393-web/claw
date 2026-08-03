@@ -136,7 +136,7 @@ class Search:
         abs_url = urljoin(source.base_url, api_url)
         resp = self._http.get_json(
             abs_url,
-            headers=source.transports().get("headers") or {},
+            headers=source.request_headers(),
             timeout=float(source.transports().get("timeout") or 10),
         )
         items = resp
@@ -170,7 +170,7 @@ class Search:
     def _http_get(self, source: SourceConfig, url: str) -> str:
         return self._http.get_text(
             url,
-            headers=source.transports().get("headers") or {},
+            headers=source.request_headers(),
             timeout=float(source.transports().get("timeout") or 10),
             retries=int(source.transports().get("retries") or 3),
         )
@@ -181,7 +181,7 @@ class Search:
         return self._http.post_form(
             url,
             form_data=data,
-            headers=source.transports().get("headers") or {},
+            headers=source.request_headers(),
             timeout=float(source.transports().get("timeout") or 10),
         )
 

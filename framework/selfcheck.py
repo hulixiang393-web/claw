@@ -58,7 +58,7 @@ class StructureChecker:
         try:
             html = self._http.get_text(
                 url,
-                headers=source.raw.get("transports", {}).get("headers"),
+                headers=source.request_headers(),
                 timeout=float(source.raw.get("transports", {}).get("timeout") or 10),
                 retries=int(source.raw.get("transports", {}).get("retries") or 3),
             )

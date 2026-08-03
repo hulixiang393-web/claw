@@ -23,8 +23,10 @@ class WorkCard(QFrame):
         self.work = work
         self.setObjectName("workCard")
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumWidth(150)
-        self.setMaximumWidth(170)
+        # 弹性宽度：由网格列数决定，不固定，避免窗口窄时横向溢出
+        self.setMinimumWidth(120)
+        # 固定卡片高度：封面 180 + 标题 + 来源，保证网格每行等高
+        self.setFixedHeight(272)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -42,6 +44,7 @@ class WorkCard(QFrame):
         title.setWordWrap(True)
         title.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         title.setMinimumHeight(36)
+        title.setMaximumHeight(54)  # 限 2 行，长标题截断，保持卡片等高
         layout.addWidget(title)
         self._title = title
 
@@ -59,13 +62,23 @@ class WorkCard(QFrame):
         CoverLoader.instance().load(url, self._on_cover_ready)
 
     def _on_cover_ready(self, pixmap) -> None:
-        """CoverLoader 回调：更新封面。"""
-        if pixmap is not None:
-            from PySide6.QtCore import Qt as _Qt
-            scaled = pixmap.scaled(
-                140, 180, _Qt.KeepAspectRatio, _Qt.SmoothTransformation
-            )
-            self._cover.setPixmap(scaled)
+        """CoverLoader 回调：更新封面。
+
+        统一裁剪到容器尺寸（140×180）：不同横竖比例的封面，
+        用 KeepAspectRatioByExpanding 铺满后居中裁剪，保证视觉大小一致。
+        """
+        if pixmap is None:
+            return  # 保留占位符
+        from PySide6.QtCore import Qt as _Qt
+        # 先按比例铺满容器，再居中裁剪到容器尺寸
+        scaled = pixmap.scaled(
+            140, 180, _Qt.KeepAspectRatioByExpanding, _Qt.SmoothTransformation
+        )
+        # 居中裁剪到 140×180
+        sx = max(0, (scaled.width() - 140) // 2)
+        sy = max(0, (scaled.height() - 180) // 2)
+        cropped = scaled.copy(sx, sy, min(140, scaled.width()), min(180, scaled.height()))
+        self._cover.setPixmap(cropped)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         self.clicked.emit(self.work)

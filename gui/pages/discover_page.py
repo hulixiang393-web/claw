@@ -10,6 +10,10 @@
 
 from __future__ import annotations
 
+import logging
+
+log = logging.getLogger(__name__)
+
 from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (
     QComboBox,
@@ -71,6 +75,8 @@ class DiscoverPage(BasePage):
         self._cat_buttons: list = []
         self._cat_collapsed = True
         self._cat_bar_populated = False
+        self._works: list = []  # 已加载作品全量（resize 自适应列宽时重排用）
+        self._last_columns = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -100,7 +106,8 @@ class DiscoverPage(BasePage):
 
         self.cat_scroll = QScrollArea()
         self.cat_scroll.setWidgetResizable(True)
-        self.cat_scroll.setFixedHeight(44)
+        # 高度 60：给横向滚动条（分类多时弹出）预留空间，避免遮住分类按钮文字
+        self.cat_scroll.setFixedHeight(60)
         self.cat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.cat_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         cat_scroll_row.addWidget(self.cat_scroll, stretch=1)
@@ -142,6 +149,10 @@ class DiscoverPage(BasePage):
         self.detail_drawer.open_url_requested.connect(self._on_open_url)
         self.detail_drawer.download_requested.connect(self._on_download)
         body.addWidget(self.detail_drawer)
+
+        # 点作品区空白处 → 关闭详情抽屉
+        self.scroll.viewport().installEventFilter(self)
+        self._close_drawer_on_outside_click = True
 
         layout.addLayout(body, stretch=1)
 
@@ -209,6 +220,9 @@ class DiscoverPage(BasePage):
         self._cat_collapsed = True
         self.status_label.setText("正在加载分类...")
         self._loading = False  # 取消旧加载状态
+        # 立即清空旧源的作品网格，避免换源瞬间旧内容残留/溢出
+        self._clear_works()
+        self._clear_cat_buttons()
         self._load_categories()
         # 作品加载在 _on_categories_loaded 分类就绪后触发
 
@@ -239,7 +253,17 @@ class DiscoverPage(BasePage):
         if epoch != self._source_epoch:
             return  # 旧源请求，丢弃
         if err:
-            self.status_label.setText(f"分类加载失败：{err}")
+            # 分类加载失败（网络/站点改版）→ 用作品列表入口兜底加载，
+            # 避免出现"必须点一下分类才出作品"的空窗
+            disc = self._current_source.get_discovery_config()
+            self._current_cat_url = (
+                disc.get("works_list_url")
+                or disc.get("list_url")
+                or self._current_source.base_url
+            )
+            self.cat_toggle_btn.setVisible(False)
+            self.status_label.setText(f"分类加载失败：{err}，正在加载作品...")
+            self._reset_works()
             return
 
         if not cats:
@@ -276,7 +300,10 @@ class DiscoverPage(BasePage):
         btn = QPushButton(text)
         btn.setCheckable(True)
         btn.setChecked(checked)
-        btn.setStyleSheet("padding: 4px 12px; font-size: 12px; border-radius: 6px;")
+        # min-height 26：横向滚动条弹出时按钮文字不被压住
+        btn.setStyleSheet(
+            "padding: 4px 12px; font-size: 12px; border-radius: 6px; min-height: 26px;"
+        )
         btn.clicked.connect(lambda _, c=cat, b=btn: self._on_category(c, b))
         return btn
 
@@ -356,6 +383,7 @@ class DiscoverPage(BasePage):
             if child.widget():
                 child.widget().deleteLater()
         self._work_count = 0
+        self._works = []
 
     def _load_next_page(self) -> None:
         """异步加载下一页：后台线程抓作品，加载中显示状态，完成后更新网格。"""
@@ -398,8 +426,84 @@ class DiscoverPage(BasePage):
         else:
             self._append_works(works)
             self.status_label.setText(f"已加载 {self._current_page} 页 · 共 {self._work_count} 部")
+            # 漫画封面需 Playwright 恢复：后台恢复，完成后刷新卡片
+            if self._needs_cover_recovery(works):
+                self._start_cover_recovery(epoch, page_works=works)
         # 自动继续加载下一页直到填满视口（预加载）
         self._maybe_preload()
+
+    def _needs_cover_recovery(self, works) -> bool:
+        """检查这批作品是否需要封面恢复（漫画分片加密站）。"""
+        return any(getattr(w, "_needs_cover_recovery", False) for w in works)
+
+    def _start_cover_recovery(self, epoch: int, page_works=None) -> None:
+        """后台恢复当前页漫画封面，完成后刷新卡片封面图。
+
+        page_works: 本次加载的那一批作品（page 粒度），避免传全量导致
+        恢复页与实际作品不对齐（翻页后新页作品不在恢复页里）。
+        """
+        source = self._current_source
+        base_url = self._current_cat_url or (
+            source.get_discovery_config().get("works_list_url")
+            or source.get_discovery_config().get("list_url")
+            or source.base_url
+        )
+        # 构造当前页 URL（含 ?page=N），使 Playwright 渲染的页面与作品批次一致
+        from urllib.parse import urlencode
+
+        sep = "&" if "?" in base_url else "?"
+        works_url = f"{base_url}{sep}{urlencode({'page': self._current_page})}"
+        targets = page_works if page_works is not None else self._works
+        book_urls = [w.url for w in targets if w.url]
+        if not book_urls:
+            return
+        task = _CoverRecoveryTask(source, works_url, book_urls, epoch)
+        task.signals.finished.connect(
+            lambda covers, e=epoch: self._on_covers_recovered(covers, e)
+        )
+        self._cover_task = task  # 防 GC
+        QThreadPool.globalInstance().start(task)
+        self.status_label.setText("正在恢复封面...")
+
+    def _on_covers_recovered(self, covers: dict, epoch: int) -> None:
+        """封面恢复完成，刷新对应 WorkCard 封面图。"""
+        if epoch != self._source_epoch:
+            return
+        if not covers:
+            self.status_label.setText(f"已加载 {self._current_page} 页 · 共 {self._work_count} 部")
+            return
+        # 用已恢复的 data URI 刷新 Work._cover 和 WorkCard
+        for w in self._works:
+            if w.url in covers:
+                w.cover = covers[w.url]
+        # 重建卡片封面
+        hit = 0
+        cards = self.list_container.findChildren(WorkCard)
+        for card in cards:
+            if card.work.url in covers:
+                from PySide6.QtGui import QPixmap
+                from PySide6.QtCore import Qt as _Qt
+                # data URI → QPixmap
+                data_uri = covers[card.work.url]
+                if data_uri.startswith("data:"):
+                    import base64
+                    try:
+                        _, b64 = data_uri.split(",", 1)
+                        pix = QPixmap()
+                        pix.loadFromData(base64.b64decode(b64))
+                        if not pix.isNull():
+                            scaled = pix.scaled(
+                                140, 180, _Qt.KeepAspectRatioByExpanding, _Qt.SmoothTransformation
+                            )
+                            sx = max(0, (scaled.width() - 140) // 2)
+                            sy = max(0, (scaled.height() - 180) // 2)
+                            cropped = scaled.copy(sx, sy, min(140, scaled.width()), min(180, scaled.height()))
+                            card._cover.setPixmap(cropped)
+                            hit += 1
+                    except Exception:
+                        pass
+        log.info("[discover] 封面恢复命中 %d 张 / %d 卡片", hit, len(cards))
+        self.status_label.setText(f"已加载 {self._current_page} 页 · 共 {self._work_count} 部")
 
     def _maybe_preload(self) -> None:
         """内容未填满视口时预加载，但最多额外预加载 PRELOAD_LIMIT 页（防失控）。"""
@@ -411,14 +515,50 @@ class DiscoverPage(BasePage):
         if self.scroll.verticalScrollBar().maximum() < self.scroll.height():
             self._load_next_page()
 
-    def _append_works(self, works) -> None:
-        """把作品卡片按网格排列（每行 GRID_COLUMNS 个）。"""
-        for w in works:
-            row, col = divmod(self._work_count, GRID_COLUMNS)
+    def _columns(self) -> int:
+        """按可视宽度计算作品列数，避免固定列数导致横向溢出。"""
+        view_w = self.scroll.viewport().width() or self.width() or 900
+        cols = max(2, view_w // 170)  # 每列期望 ~170px
+        return min(cols, 8)
+
+    def _apply_column_stretch(self, cols: int) -> None:
+        """让网格每列等宽，卡片均匀分布（避免某列标题长导致列宽参差）。"""
+        for i in range(self.grid_layout.columnCount()):
+            self.grid_layout.setColumnStretch(i, 0)
+        for i in range(cols):
+            self.grid_layout.setColumnStretch(i, 1)
+
+    def _reflow(self) -> None:
+        """窗口尺寸变化时按新列数重排作品网格。"""
+        cols = self._columns()
+        if cols == self._last_columns:
+            return
+        self._last_columns = cols
+        self._clear_works()
+        self._work_count = 0
+        for w in self._works:
+            row, col = divmod(self._work_count, cols)
             card = WorkCard(w)
             card.clicked.connect(self._on_work_clicked)
             self.grid_layout.addWidget(card, row, col)
             self._work_count += 1
+        self._apply_column_stretch(cols)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._reflow()
+
+    def _append_works(self, works) -> None:
+        """把作品卡片按网格排列（每行自适应列数个）。"""
+        self._works.extend(works)
+        cols = self._columns()
+        for w in works:
+            row, col = divmod(self._work_count, cols)
+            card = WorkCard(w)
+            card.clicked.connect(self._on_work_clicked)
+            self.grid_layout.addWidget(card, row, col)
+            self._work_count += 1
+        self._apply_column_stretch(cols)
 
     # ------------------------------------------------------------------ #
     def _on_work_clicked(self, work: Work) -> None:
@@ -488,6 +628,31 @@ class DiscoverPage(BasePage):
         vbar = self.scroll.verticalScrollBar()
         if value >= vbar.maximum() - 200:
             self._load_next_page()
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        """点作品网格空白区域 → 关闭详情抽屉。
+
+        点击任何作品卡片（含其内部子控件）都不关闭；只有真正点到
+        网格空白处才关闭。向上遍历 parent 判断是否在卡片内。
+        """
+        from PySide6.QtCore import QEvent
+        from gui.components import WorkCard
+
+        if obj is self.scroll.viewport() and event.type() == QEvent.MouseButtonPress:
+            pos = self.list_container.mapFrom(self.scroll.viewport(), event.position().toPoint())
+            hit = self.list_container.childAt(pos)
+            # 向上遍历：点击是否落在某个作品卡片（或其子控件）内
+            node = hit
+            inside_card = False
+            while node is not None:
+                if isinstance(node, WorkCard):
+                    inside_card = True
+                    break
+                node = node.parentWidget()
+            if not inside_card and self.detail_drawer.is_open():
+                self.detail_drawer.hide_detail()
+                self.status_label.setText("")
+        return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
@@ -565,5 +730,44 @@ class _FetchCategoriesTask(QRunnable):
             err = str(exc)
         try:
             self.signals.finished.emit(cats, err)
+        except RuntimeError:
+            pass
+
+
+class _CoverRecoverySignals(QObject):
+    """封面恢复信号。"""
+
+    finished = Signal(object)  # (covers: dict{work_url: data_uri})
+
+
+class _CoverRecoveryTask(QRunnable):
+    """后台恢复一页漫画封面（Playwright canvas 提取 → data URI）。"""
+
+    def __init__(self, source, booklist_url, book_urls, epoch):
+        super().__init__()
+        self.signals = _CoverRecoverySignals()
+        self._source = source
+        self._booklist_url = booklist_url
+        self._book_urls = book_urls
+        self._epoch = epoch
+
+    def run(self) -> None:
+        covers = {}
+        try:
+            from urllib.parse import urljoin
+
+            from framework.comic_cover_recovery import recover_booklist_covers_sync
+
+            base = self._source.base_url
+            abs_url = self._booklist_url if self._booklist_url.startswith("http") else urljoin(base, self._booklist_url)
+            covers = recover_booklist_covers_sync(
+                abs_url,
+                self._book_urls,
+                proxy=self._source.transports().get("proxy"),
+            )
+        except Exception:
+            covers = {}
+        try:
+            self.signals.finished.emit(covers)
         except RuntimeError:
             pass

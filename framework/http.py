@@ -66,6 +66,52 @@ class HttpClient:
         except json.JSONDecodeError:
             return {}
 
+    def post_json(
+        self,
+        url: str,
+        json_body: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        proxy: Optional[str] = None,
+        timeout: float = 10.0,
+        retries: int = 3,
+    ) -> dict:
+        """POST JSON 并解析响应 JSON。供解密 custom_endpoint 等调用。"""
+        import json as _json
+
+        self._sleeper(0.0)
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                post_headers = dict(headers or {})
+                post_headers.setdefault("Content-Type", "application/json")
+                if self._session is not None:
+                    resp = self._session.post(
+                        url,
+                        json=json_body or {},
+                        headers=post_headers,
+                        timeout=timeout,
+                    )
+                    resp.raise_for_status()
+                    text = resp.text
+                else:
+                    import urllib.request
+
+                    body = _json.dumps(json_body or {}).encode("utf-8")
+                    req = urllib.request.Request(
+                        url, data=body, headers=post_headers
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        text = resp.read().decode("utf-8", errors="replace")
+                try:
+                    return _json.loads(text)
+                except _json.JSONDecodeError:
+                    return {}
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt < retries:
+                    self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+        raise RequestError(f"请求失败 POST {url}：{last_error}")
+
     def post_form(
         self,
         url: str,

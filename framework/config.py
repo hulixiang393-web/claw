@@ -119,6 +119,18 @@ class SourceConfig:
         """读取 transports 配置。"""
         return self.raw.get("transports") or {}
 
+    def request_headers(self) -> dict:
+        """合并 transports.headers 与 cookie 的完整请求头。
+
+        cookie 可配置在 transports.cookie（种子爬取/登录站用），
+        合并为 Cookie 头，避免各业务模块重复拼接。
+        """
+        headers = dict(self.transports().get("headers") or {})
+        cookie = self.transports().get("cookie")
+        if cookie and not headers.get("Cookie"):
+            headers["Cookie"] = cookie
+        return headers
+
 
 def load_source(path: str | Path) -> SourceConfig:
     """从磁盘加载一份源配置。坏 JSON → ConfigError。"""

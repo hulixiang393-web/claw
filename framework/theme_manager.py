@@ -294,8 +294,20 @@ QScrollBar::handle:vertical {{
     background-color: {stroke};
     border-radius: {radius_sm};
 }}
+/* 横向滚动条：细窄不遮内容（分类栏等） */
+QScrollBar:horizontal {{
+    background: transparent;
+    height: 8px;
+    border-radius: {radius_sm};
+}}
+QScrollBar::handle:horizontal {{
+    background-color: {stroke};
+    border-radius: {radius_sm};
+    min-width: 30px;
+}}
 QScrollBar::add-line, QScrollBar::sub-line {{
     height: 0;
+    width: 0;
 }}
 
 /* ---------- 标签/徽章 ---------- */

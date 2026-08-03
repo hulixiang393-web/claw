@@ -33,11 +33,13 @@ class ReaderPage(BasePage):
         self,
         source_manager: SourceManager,
         content: Content,
+        reading_progress=None,
         parent=None,
     ):
         super().__init__(parent)
         self._manager = source_manager
         self._content = content
+        self._reading_progress = reading_progress
         self._current_source_id = None
         self._current_book_url = None
 
@@ -68,6 +70,31 @@ class ReaderPage(BasePage):
         self.stack.addWidget(self.comic_view)
         self.stack.addWidget(self.video_view)
         layout.addWidget(self.stack, stretch=1)
+
+        # ---- 阅读进度记忆：换章/换集时自动记录 ----
+        if reading_progress is not None:
+            self.novel_view.chapter_changed.connect(self._on_progress_signal)
+            self.comic_view.chapter_changed.connect(self._on_progress_signal)
+            self.video_view.episode_changed.connect(self._on_progress_signal)
+
+    def _on_progress_signal(self, payload) -> None:
+        """记录阅读进度（换章/换集触发）。payload=(detail, title, url)。"""
+        if self._reading_progress is None or not isinstance(payload, (tuple, list)):
+            return
+        detail, title = payload[0], payload[1]
+        url = payload[2] if len(payload) > 2 else ""
+        if detail is None:
+            return
+        try:
+            self._reading_progress.save(
+                detail.source_id,
+                detail.url,
+                detail.content_type,
+                url,
+                title,
+            )
+        except Exception:
+            pass  # 记忆失败不影响阅读
 
     # ------------------------------------------------------------------ #
     def open(self, source_id: str, book_url: str, content_type: str, start_chapter_url: str = "") -> None:

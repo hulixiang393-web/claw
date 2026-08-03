@@ -59,7 +59,7 @@ class Discovery:
 
     # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
-        return source.transports().get("headers") or {}
+        return source.request_headers()
 
     def _timeout(self, source: SourceConfig) -> float:
         return float(source.transports().get("timeout") or 10)
@@ -99,24 +99,62 @@ class Discovery:
         disc = source.get_discovery_config()
         list_item = disc.get("list_item") or {}
         fields = list_item.get("fields") or {}
-        if not fields.get("title") or not fields.get("url"):
+        has_cat_fields = bool(
+            fields.get("title")
+            and (fields.get("url") or fields.get("data_val") or list_item.get("tag_url_template"))
+        )
+        if not has_cat_fields:
             return []  # 未配置分类规则 → 无分类
 
         url_pattern = list_item.get("url_pattern")
         import re as _re
 
-        list_url = disc.get("list_url") or source.base_url
+        # 分类可能放在专属分类页而非首页：优先 list_categories_url，
+        # 否则 list_url，再回退首页/站点根
+        list_url = (
+            disc.get("list_categories_url")
+            or disc.get("list_url")
+            or source.base_url
+        )
         self._checker.check(source, self._abs_url(source, list_url))
         html = self._get(source, list_url)
         doc = self._parser.parse(html)
 
         titles = self._parser.extract(doc, fields.get("title"))
         urls = self._parser.extract(doc, fields.get("url"), source.base_url)
+        # 分类项可能只有标签值（data-val）而无 href：用 tag 字段名提取
+        # data_val 字段（如 data-val，供 ?tag={val} 构造 URL）
+        tag_vals = self._parser.extract(doc, fields.get("data_val"))
+        pass_filters = []
+        for pat in (url_pattern,):
+            if pat:
+                pass_filters.append(pat)
         cats: List[Category] = []
+        seen_links: set = set()
         for i, t in enumerate(titles):
             u = urls[i] if i < len(urls) else ""
-            if url_pattern and not _re.search(url_pattern, u):
-                continue  # 不匹配分类 URL 模式 → 跳过（非真实分类）
+            tv = tag_vals[i] if i < len(tag_vals) else ""
+            if pass_filters:
+                if u and not _re.search(pass_filters[0], u):
+                    continue  # 显式 url 不匹配模式 → 跳过
+            # 分类目录条：用 data_val（tag）构造专属分类页 URL
+            tag_template = list_item.get("tag_url_template")
+            if tv and tag_template:
+                u = tag_template.replace("{tag}", tv)
+            elif tv and not u:
+                # 无 url → 用 list_url + ?tag={val}
+                u = f"{disc.get('list_url', '/booklist')}?tag={tv}"
+            if not u:
+                continue
+            # 跳过分隔占位（data-val=-1，非真实分类）。仅当处于
+            # data_val 标签模式（tag_vals 非空）时才需要对 -1/空做过滤，
+            # 普通链接分类源（无 data_val）不受影响。
+            tag_mode = bool(tag_vals)
+            if tag_mode and tv in ("-1", ""):
+                continue
+            if u in seen_links:
+                continue
+            seen_links.add(u)
             cats.append(Category(title=t, url=u))
         return cats
 
@@ -135,13 +173,24 @@ class Discovery:
         html = self._get(source, fetch_url)
         doc = self._parser.parse(html)
 
-        # 作品项选择器：优先 search.item，其次 discovery.list_item
+        # 作品项选择器：优先 works_list_item（专属作品列表），
+        # 其次 search.item，最后 list_item（分类项，通常不用于作品列表）
         disc = source.get_discovery_config()
         search = source.get_search_config()
+        works_list_item = disc.get("works_list_item") or {}
         list_item = disc.get("list_item") or {}
         search_item = search.get("item") or {}
-        root_sel = search_item.get("root_selector") or list_item.get("root_selector")
-        fields = search_item.get("fields") or list_item.get("fields") or {}
+        root_sel = (
+            works_list_item.get("root_selector")
+            or search_item.get("root_selector")
+            or list_item.get("root_selector")
+        )
+        fields = (
+            works_list_item.get("fields")
+            or search_item.get("fields")
+            or list_item.get("fields")
+            or {}
+        )
 
         if not root_sel or not fields:
             raise ContentMissingError(
@@ -165,7 +214,23 @@ class Discovery:
                     source_name=source.source_name,
                 )
             )
+        # 封面走加密渲染（works_list_item.cover_render == "playwright"）：
+        # 标记源需要封面恢复，但不在这里同步执行（太慢会阻塞 QRunnable），
+        # 由 GUI 层调 discover_page 起异步任务恢复封面后刷新卡片。
+        if works and works_list_item.get("cover_render") == "playwright":
+            works[0]._needs_cover_recovery = True  # 标记即可
         return works
+
+    def _recover_covers(self, source: SourceConfig, booklist_url: str, works: List[Work]) -> dict:
+        """批量恢复一页漫画封面 → {work_url: data_uri}。"""
+        from .comic_cover_recovery import recover_booklist_covers_sync
+
+        book_urls = [w.url for w in works if w.url]
+        return recover_booklist_covers_sync(
+            self._abs_url(source, booklist_url),
+            book_urls,
+            proxy=source.transports().get("proxy"),
+        )
 
     def _list_works_api(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
         """API 站（api_endpoints）JSON 解析作品列表。"""

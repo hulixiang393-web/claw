@@ -2,12 +2,12 @@
   "$schema_version": 2,
   "$id": "comicbox",
   "$type": "comic",
-  "$name": "漫画盒(comicbox)",
+  "$name": "漫画盒",
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
     "homepage": "https://www.comicbox.xyz",
-    "description": "漫画盒 - 漫画源（免费章节可用）",
+    "description": "漫画盒 - 漫画源（分类在专属分类页）",
     "lang": "zh-CN",
     "region": "cn",
     "tags": ["漫画", "免费"]
@@ -15,7 +15,9 @@
   "transports": {
     "base_url": "https://www.comicbox.xyz",
     "headers": {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
       "Referer": "https://www.comicbox.xyz/"
     },
     "timeout": 15,
@@ -24,35 +26,56 @@
   },
   "endpoints": {
     "discovery": {
-      "list_url": "/tags",
+      "list_url": "/booklist",
+      "list_categories_url": "/booklist?tag=NTR",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
       "list_item": {
-        "root_selector": { "css": ".sp-tags a" },
-        "url_pattern": "booklist\\?tag=",
+        "root_selector": { "xpath": "//dd[contains(@class,'sp-filter-item') and contains(@onclick,\"'tag'\")]" },
+        "tag_url_template": "/booklist?tag={tag}",
         "fields": {
-          "title": { "css": "a" },
-          "url": { "css": "a", "attr": "href" }
+          "title": { "css": "dd.sp-filter-item" },
+          "data_val": { "css": "dd.sp-filter-item", "attr": "data-val" }
+        }
+      },
+      "works_list_item": {
+        "root_selector": { "css": ".sp-booklist-grid a.sp-booklist-card" },
+        "cover_render": "playwright",
+        "fields": {
+          "title": { "css": ".sp-booklist-title" },
+          "url": { "css": "a.sp-booklist-card", "attr": "href" },
+          "cover": { "css": ".cropped", "attr": "data-src" },
+          "author": { "css": ".sp-booklist-meta" },
+          "update": { "css": ".sp-book-end-badge" }
         }
       }
     },
     "search": {
-      "base_url": "/booklist",
+      "base_url": "/search",
       "method": "GET",
       "keyword_param": "keyword",
       "item": {
-        "root_selector": { "css": ".sp-booklist-grid .sp-booklist-card" },
+        "root_selector": { "css": ".sp-search-grid a.sp-search-card" },
         "fields": {
-          "title": { "css": "a", "attr": "title" },
-          "url": { "css": "a", "attr": "href" },
-          "cover": { "css": ".sp-booklist-cover .cropped", "attr": "data-src" }
+          "title": { "css": ".sp-search-card-title" },
+          "url": { "css": "a.sp-search-card", "attr": "href" },
+          "cover": { "css": ".cropped", "attr": "data-src" },
+          "author": { "css": ".sp-search-card-desc" }
         }
       }
     },
     "detail": {
       "fields": {
         "title": { "css": "h1" },
-        "author": { "css": ".sp-author a" },
-        "status": { "css": ".sp-book-status" },
-        "summary": { "css": ".sp-book-desc" }
+        "author": { "css": ".sp-book-author" },
+        "status": { "css": ".sp-book-meta-item span" },
+        "summary": { "css": ".sp-book-summary" },
+        "cover": { "css": ".sp-book-cover .cropped", "attr": "data-src" },
+        "tags": { "css": ".sp-book-tag" }
       }
     },
     "content": {
@@ -60,39 +83,37 @@
         "list": {
           "root_selector": { "css": ".sp-chapter-grid .sp-chapter-item" },
           "fields": {
-            "title": { "css": "a", "attr": "title" },
-            "url": { "css": "a", "attr": "href" }
+            "title": { "css": "a.sp-chapter-item", "attr": "title" },
+            "url": { "css": "a.sp-chapter-item", "attr": "href" }
           }
         },
         "body": {
           "render": "playwright",
+          "render_config": {
+            "wait_for": "canvas",
+            "wait_until": "domcontentloaded",
+            "extra_delay_ms": 3000,
+            "scroll_to_bottom": true,
+            "extract_mode": "canvas",
+            "page_container_selector": "div.cropped"
+          },
           "root_selector": { "css": ".comicpage .cropped" },
           "fields": {
-            "url": { "css": "div", "attr": "data-src" }
+            "url": { "css": "div.cropped", "attr": "data-src" }
           }
         }
       }
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 20 },
+    "search": { "max_pages": 1, "max_results": 48 },
     "detail": { "max_pages": 1 },
-    "chapter": { "max_pages": 50, "max_items": 100 }
-  },
-  "decryption": {
-    "targets": {
-      "image": {
-        "strategy": "custom_endpoint",
-        "endpoint": "https://www.comicbox.xyz/decrypt",
-        "request_field": "url",
-        "response_field": "url"
-      }
-    }
+    "chapter": { "max_pages": 50, "max_items": 300 }
   },
   "diagnostics": {
     "selfcheck": {
       "strategy": "soft",
-      "selector": { "css": ".sp-tags" }
+      "selector": { "css": ".sp-booklist-grid" }
     }
   }
 }

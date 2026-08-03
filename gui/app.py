@@ -73,6 +73,12 @@ class MainWindow(QMainWindow):
             health_file=base_dir / "data" / "health.json",
         )
         self.search_history = SearchHistory(base_dir / "data" / "search_history.json")
+        # 阅读进度记忆（当天续读，24h 未入书架则清理）
+        self.reading_progress = None
+        from framework.reading_progress import ReadingProgress
+
+        self.reading_progress = ReadingProgress(base_dir / "data" / "reading_progress.json")
+        self.reading_progress.prune(shelf_cb=None)  # 启动时清理过期记忆
 
         # 爬取执行链
         self.http = HttpClient()
@@ -141,6 +147,7 @@ class MainWindow(QMainWindow):
         self.reader = ReaderPage(
             source_manager=self.source_manager,
             content=self.content,
+            reading_progress=self.reading_progress,
         )
         return self.reader
 

@@ -39,6 +39,7 @@ class NovelView(QWidget):
         self._chapters = []
         self._current_idx = -1
         self._font_size = 17
+        self._auto_loading = False  # 防止自动翻章重复触发
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -60,6 +61,11 @@ class NovelView(QWidget):
         toolbar.addWidget(self.font_down)
         toolbar.addWidget(self.font_up)
 
+        self.mode_btn = QPushButton("翻页模式")
+        self.mode_btn.setFixedWidth(90)
+        self.mode_btn.clicked.connect(self._toggle_mode)
+        toolbar.addWidget(self.mode_btn)
+
         toolbar.addStretch(1)
         self.progress_label = QLabel("")
         toolbar.addWidget(self.progress_label)
@@ -75,6 +81,12 @@ class NovelView(QWidget):
         self.toc_list.setVisible(False)
         body.addWidget(self.toc_list)
 
+        # 正文区：滚动模式 + 翻页模式，用 QStackedWidget 切换
+        from PySide6.QtWidgets import QStackedWidget, QTextEdit
+
+        self.body_stack = QStackedWidget()
+
+        # -- 滚动模式（默认）--
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -83,8 +95,42 @@ class NovelView(QWidget):
         self.text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.scroll.setWidget(self.text)
-        body.addWidget(self.scroll, stretch=1)
+        self.body_stack.addWidget(self.scroll)
+
+        # -- 翻页模式 --
+        self.pager_widget = QWidget()
+        self.pager_layout = QVBoxLayout(self.pager_widget)
+        self.pager_layout.setContentsMargins(0, 0, 0, 0)
+        self.pager_layout.setSpacing(6)
+        self.paged_scroll = QScrollArea()
+        self.paged_scroll.setWidgetResizable(True)
+        self.paged_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.paged_label = QLabel()
+        self.paged_label.setWordWrap(True)
+        self.paged_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.paged_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.paged_scroll.setWidget(self.paged_label)
+        self.pager_layout.addWidget(self.paged_scroll, stretch=1)
+        # 翻页导航
+        self.pager_nav = QHBoxLayout()
+        self.pager_prev = QPushButton("← 上一页")
+        self.pager_next = QPushButton("下一页 →")
+        self.pager_prev.clicked.connect(lambda: self._pager_turn(-1))
+        self.pager_next.clicked.connect(lambda: self._pager_turn(1))
+        self.pager_nav.addWidget(self.pager_prev)
+        self.pager_nav.addStretch(1)
+        self.pager_indicator = QLabel("")
+        self.pager_nav.addWidget(self.pager_indicator)
+        self.pager_nav.addStretch(1)
+        self.pager_nav.addWidget(self.pager_next)
+        self.pager_layout.addLayout(self.pager_nav)
+        self.body_stack.addWidget(self.pager_widget)
+
+        body.addWidget(self.body_stack, stretch=1)
         layout.addLayout(body, stretch=1)
+
+        # 自动加载下一章：读到当前章底部时无缝衔接
+        self.scroll.verticalScrollBar().valueChanged.connect(self._maybe_auto_next)
 
         # ---- 底部导航 ----
         nav = QHBoxLayout()
@@ -96,6 +142,11 @@ class NovelView(QWidget):
         nav.addWidget(self.next_btn)
         layout.addLayout(nav)
 
+        self._mode = "scroll"  # scroll / pager
+        self._pages = [""]
+        self._page_count = 1
+        self._current_page = 0
+        self._paged_full_text = ""
         self._apply_font()
 
     # ------------------------------------------------------------------ #
@@ -131,10 +182,11 @@ class NovelView(QWidget):
 
         # 已缓存 → 直接显示
         if hasattr(ch, "_cached_text") and ch._cached_text:
-            self.text.setText(ch._cached_text)
+            self._auto_loading = False  # 缓存命中也要解除自动翻章锁
+            self._display_chapter(ch, ch._cached_text)
             self.scroll.verticalScrollBar().setValue(0)
             self._update_progress()
-            self.chapter_changed.emit((self._detail, ch.title))
+            self.chapter_changed.emit((self._detail, ch.title, ch.url))
             return
 
         self.text.setText("正在加载...")
@@ -145,15 +197,27 @@ class NovelView(QWidget):
         task.signals.finished.connect(self._on_chapter_loaded)
         self._chapter_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
-        self.chapter_changed.emit((self._detail, ch.title))
+        self.chapter_changed.emit((self._detail, ch.title, ch.url))
+
+    def _display_chapter(self, ch, text: str) -> None:
+        """正文前加章节编号行（如「第12章」），不含标题文字。"""
+        from framework.content import chapter_label
+        label = chapter_label(ch.title) or f"第{self._current_idx + 1}章"
+        full = f"【{label}】\n\n{text}"
+        self.text.setText(full)
+        # 翻页视图同步
+        self._paged_full_text = full
+        self._repaginate()
+        self._pager_show_page(0)
 
     def _on_chapter_loaded(self, ch, text, err) -> None:
         if err:
             self.text.setText(f"加载失败：{err}")
             return
         ch._cached_text = text
+        self._auto_loading = False  # 自动翻章完成，解除锁定
         if self._current_idx >= 0 and ch.url == self._chapters[self._current_idx].url:
-            self.text.setText(text)
+            self._display_chapter(ch, text)
             self.scroll.verticalScrollBar().setValue(0)
             self._update_progress()
 
@@ -170,6 +234,23 @@ class NovelView(QWidget):
         if 0 <= nxt < len(self._chapters):
             self._load_chapter(nxt)
 
+    def _maybe_auto_next(self, value: int) -> None:
+        """读到当前章底部时，自动加载下一章（无缝衔接）。
+
+        条件：不在自动翻章加载中、滚动近底部、不是最后一章。
+        """
+        if self._auto_loading:
+            return
+        if self._current_idx < 0 or self._current_idx >= len(self._chapters) - 1:
+            return
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() == 0:
+            return
+        if value >= vbar.maximum() - 40:  # 距底部 < 40px 视为读完
+            self._auto_loading = True
+            self._load_chapter(self._current_idx + 1)
+            # 加载完成后清除标志（在 _on_chapter_loaded 里）
+
     def _adjust_font(self, delta: int) -> None:
         self._font_size += delta
         self._font_size = max(12, min(28, self._font_size))
@@ -179,6 +260,61 @@ class NovelView(QWidget):
         self.text.setStyleSheet(
             f"font-size: {self._font_size}px; line-height: 1.8; padding: 8px 12px;"
         )
+        self.paged_label.setStyleSheet(
+            f"font-size: {self._font_size}px; line-height: 1.8; padding: 12px 20px;"
+        )
+        self._repaginate()
+        self._pager_show_page(self._current_page)
+
+    # ------------------------------------------------------------------ #
+    def _toggle_mode(self) -> None:
+        """滚动 / 翻页 模式切换。"""
+        if self._mode == "scroll":
+            self._mode = "pager"
+            self.mode_btn.setText("滚动模式")
+            self.body_stack.setCurrentWidget(self.pager_widget)
+            self._repaginate()
+            self._pager_show_page(self._current_page)
+        else:
+            self._mode = "scroll"
+            self.mode_btn.setText("翻页模式")
+            self.body_stack.setCurrentWidget(self.scroll)
+            self.scroll.verticalScrollBar().setValue(0)
+
+    def _repaginate(self):
+        """按字数把正文拆成多页（每页约 CHARS_PER_PAGE 字）。"""
+        text = getattr(self, "_paged_full_text", "") or ""
+        if not text:
+            self._pages = [""]
+            self._page_count = 1
+            self._current_page = 0
+            return
+        # 每页按字数切（字号/宽度动态变化时字数固定，行为确定）
+        chars_per = 900
+        self._pages = [
+            text[i:i + chars_per] for i in range(0, len(text), chars_per)
+        ]
+        self._page_count = len(self._pages)
+        if self._current_page >= self._page_count:
+            self._current_page = 0
+
+    def _pager_show_page(self, page: int) -> None:
+        """跳到第 page 页（0 基）。"""
+        if not hasattr(self, "_pages") or not self._pages:
+            self._repaginate()
+        if page < 0 or page >= self._page_count:
+            return
+        self._current_page = page
+        self.paged_label.setText(self._pages[page])
+        self.paged_scroll.verticalScrollBar().setValue(0)
+        self.pager_indicator.setText(f"{page + 1} / {self._page_count} 页")
+
+    def _pager_turn(self, delta: int) -> None:
+        """翻到上一页/下一页。"""
+        self._repaginate()
+        nxt = self._current_page + delta
+        if 0 <= nxt < self._page_count:
+            self._pager_show_page(nxt)
 
     def _update_progress(self) -> None:
         total = len(self._chapters)

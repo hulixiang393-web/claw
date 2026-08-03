@@ -68,9 +68,10 @@ class BulkFetch:
 
     # ------------------------------------------------------------------ #
     def _works_entry(self, source: SourceConfig) -> str:
-        """无分类时的作品入口 URL。"""
+        """无分类时的作品入口 URL。优先 works_list_url（真正的作品列表），
+        再回退 list_url / 站点根。"""
         disc = source.get_discovery_config()
-        return disc.get("list_url") or source.base_url
+        return disc.get("works_list_url") or disc.get("list_url") or source.base_url
 
     def _fetch_category(self, source: SourceConfig, url: str) -> List[Work]:
         """抓取一个分类的所有页（软上限 max_pages）。"""

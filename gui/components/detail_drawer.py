@@ -37,6 +37,20 @@ class DetailDrawer(QFrame):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
+        # 顶栏：标题占位 + 关闭按钮
+        header = QHBoxLayout()
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(28, 28)
+        self.close_btn.setToolTip("关闭详情")
+        self.close_btn.setStyleSheet(
+            "font-size: 14px; border: none; border-radius: 14px;"
+            "background: palette(midlight); color: palette(text);"
+        )
+        self.close_btn.clicked.connect(self.hide_detail)
+        header.addStretch(1)
+        header.addWidget(self.close_btn)
+        layout.addLayout(header)
+
         # 封面占位
         self.cover = QLabel("🖼")
         self.cover.setAlignment(Qt.AlignCenter)
