@@ -66,9 +66,16 @@ class WorkCard(QFrame):
 
         统一裁剪到容器尺寸（140×180）：不同横竖比例的封面，
         用 KeepAspectRatioByExpanding 铺满后居中裁剪，保证视觉大小一致。
+
+        注意：封面是异步加载，回调到达时卡片可能已被回收（刷新/切页），
+        此时 self._cover 的 C++ 对象已删除，需先判断存活再访问。
         """
         if pixmap is None:
             return  # 保留占位符
+        import shiboken6
+
+        if not shiboken6.isValid(self._cover):
+            return  # 卡片已销毁，跳过
         from PySide6.QtCore import Qt as _Qt
         # 先按比例铺满容器，再居中裁剪到容器尺寸
         scaled = pixmap.scaled(

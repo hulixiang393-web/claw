@@ -93,11 +93,27 @@ class Discovery:
     def list_categories(self, source: SourceConfig) -> List[Category]:
         """抓取分类列表。未配置分类项 → 返回 []。
 
-        支持 list_item.url_pattern 过滤：只保留 URL 匹配该正则的分类
-        （过滤掉首页/logo/作者链接等非分类项）。
+        支持两种来源：
+        - list_item.categories 静态列表（API 站无分类 HTML 时硬编码，如 B 站分区）
+        - list_item.fields HTML 抓取（普通站），含 url_pattern 过滤
         """
         disc = source.get_discovery_config()
         list_item = disc.get("list_item") or {}
+
+        # 静态分类列表（API 站）：categories = [{title, url}, ...]
+        static = list_item.get("categories") or []
+        if static:
+            cats = []
+            seen: set = set()
+            for c in static:
+                if not isinstance(c, dict) or not c.get("title") or not c.get("url"):
+                    continue
+                if c["url"] in seen:
+                    continue
+                seen.add(c["url"])
+                cats.append(Category(title=c["title"], url=c["url"]))
+            return cats
+
         fields = list_item.get("fields") or {}
         has_cat_fields = bool(
             fields.get("title")
@@ -233,18 +249,72 @@ class Discovery:
         )
 
     def _list_works_api(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
-        """API 站（api_endpoints）JSON 解析作品列表。"""
+        """API 站（api_endpoints）JSON 解析作品列表。
+
+        支持 fallback_url：当分类 URL 无有效关键词（如"全部"）时，
+        回退到 fallback_url（全站热门接口），用 fallback_response_path /
+        fallback_item_fields 解析。
+        """
         import json
+        import re as _re
+        from urllib.parse import parse_qs, urlparse, urlencode
 
         api = source.raw.get("api_endpoints") or {}
         cfg = api.get("discovery") or api.get("search") or {}
         if not cfg:
             return []
 
-        # 构造请求 URL（用传入 url 或 api 配置）
-        api_url = cfg.get("url") or url
-        api_url = str(api_url).replace("{page}", str(page))
-        abs_url = self._abs_url(source, api_url)
+        # 从传入分类 URL 解析 query 参数（如 tids=1&keyword=新番）
+        url_qs = parse_qs(urlparse(url).query) if "?" in url else {}
+        cat_params = {k: v[0] for k, v in url_qs.items()}
+
+        # 判断是否回退（无有效关键词 → 全站热门接口）
+        use_fallback = False
+        if cfg.get("fallback_url"):
+            kw = cat_params.get("keyword") or ""
+            if not kw:
+                use_fallback = True
+
+        if use_fallback:
+            api_url = str(cfg.get("fallback_url"))
+            api_url = api_url.replace("{page}", str(page))
+            api_url = _re.sub(r"\{[^}]+\}", "", api_url)
+            abs_url = self._abs_url(source, api_url)
+            # popular 参数：ps/pn/rid
+            params = cfg.get("params") or {}
+            filled = {k: str(v) for k, v in params.items()}
+            filled = {k: v.replace("{page}", str(page)) for k, v in filled.items()}
+            # 忽略 keyword/tids 占位（popular 不需要）
+            filled = {k: _re.sub(r"\{[^}]+\}", "", v) for k, v in filled.items()}
+            qs = urlencode(filled)
+            abs_url = abs_url + ("&" if "?" in abs_url else "?") + qs
+            rpath = cfg.get("fallback_response_path")
+            item_fields = cfg.get("fallback_item_fields") or {}
+        else:
+            # search/type + keyword/tids
+            api_url = str(cfg.get("url") or url)
+            api_url = api_url.replace("{page}", str(page))
+            api_url = _re.sub(r"\{[^}]+\}", "", api_url)
+            abs_url = self._abs_url(source, api_url)
+            params = cfg.get("params") or {}
+            filled = {k: str(v) for k, v in params.items()}
+            filled = {k: v.replace("{page}", str(page)) for k, v in filled.items()}
+            # 用分类 URL 的 query 参数覆盖占位（tids/keyword）
+            for k, v in cat_params.items():
+                if f"{{{k}}}" in str(filled.get(k, "")) or k in filled:
+                    filled[k] = v
+            # 未填的占位符清空
+            filled = {k: _re.sub(r"\{[^}]+\}", "", v) for k, v in filled.items()}
+            sign_cfg = cfg.get("sign") or {}
+            strategy = sign_cfg.get("strategy")
+            if strategy:
+                from .signers import get_signer
+
+                filled = get_signer(strategy, self._http).sign(filled)
+            qs = urlencode(filled)
+            abs_url = abs_url + ("&" if "?" in abs_url else "?") + qs
+            rpath = cfg.get("response_path")
+            item_fields = cfg.get("item_fields") or {}
 
         # GET JSON
         resp_json = self._http.get_json(
@@ -256,13 +326,11 @@ class Discovery:
 
         # 提取列表项
         items = resp_json
-        rpath = cfg.get("response_path")
         if rpath:
             items = self._simple_getpath(resp_json, rpath)
         if not isinstance(items, list):
             return []
 
-        item_fields = cfg.get("item_fields") or {}
         works: List[Work] = []
         for it in items:
             if not isinstance(it, dict):
@@ -277,6 +345,8 @@ class Discovery:
                     title=str(title),
                     url=str(url_v),
                     cover=str(self._template_value(it, item_fields.get("cover")) or ""),
+                    author=str(self._template_value(it, item_fields.get("author")) or ""),
+                    update=str(self._template_value(it, item_fields.get("update")) or ""),
                     source_id=source.source_id,
                     source_name=source.source_name,
                 )
@@ -312,7 +382,17 @@ class Discovery:
                     val = item.get(key, "")
                     result = result.replace("{" + key + "}", str(val))
                 return result
+            if "." in field_spec:
+                # 嵌套路径如 owner.name 逐层取值
+                cur = item
+                for part in field_spec.split("."):
+                    if isinstance(cur, dict) and part in cur:
+                        cur = cur[part]
+                    else:
+                        return ""
+                return cur
             return item.get(field_spec, "")
+
         return ""
 
     @staticmethod

@@ -3,8 +3,8 @@
 对应 ui-reader.md 视频功能点：
 - 分集列表，点击选看
 - 播放地址提取（解密后展示）
-- 复制地址 / 外部播放器打开（方案A，主）
-- 在应用内观看（方案B，增强，QWebEngineView 可选）
+- 在应用内观看：调 mpv 独立窗口实时播 dash 双流（B 站音视频分离）
+- 复制地址 / 外部播放器打开
 """
 
 from __future__ import annotations
@@ -39,16 +39,10 @@ class VideoView(QWidget):
         self._episodes = []
         self._current_idx = -1
         self._current_play = ""
+        self._player = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-
-        # ---- 内嵌播放区（QWebEngineView，软件内观看）----
-        self.embed_container = QWidget()
-        self.embed_layout = QVBoxLayout(self.embed_container)
-        self.embed_layout.setContentsMargins(0, 0, 0, 0)
-        self._embed_view = None
-        layout.addWidget(self.embed_container, stretch=1)
 
         # ---- 分集列表 ----
         self.ep_list = QListWidget()
@@ -93,11 +87,13 @@ class VideoView(QWidget):
                     break
         self.ep_list.setCurrentRow(idx)
         if not detail.chapters:
-            # 无分集列表（如 B站番剧 season 页）→ 直接内嵌播放页
+            # 无分集列表（如 B站番剧 season 页）→ 直接播放详情页
             self.play_label.setText("正在加载播放页...")
             self._open_embed(detail.url)
             return
         self._load_episode(idx)
+        # 进入即自动播放当前集（mpv 独立窗口）
+        self._open_embed(self._episodes[idx].url)
 
     def _load_episode(self, idx: int) -> None:
         if self._source is None or not (0 <= idx < len(self._episodes)):
@@ -136,28 +132,39 @@ class VideoView(QWidget):
             webbrowser.open(self._current_play)
 
     def _open_embed(self, url: str | None = None) -> None:
-        """在应用内观看：QWebEngineView 嵌入播放页（不弹窗）。"""
+        """在应用内观看：调 mpv 独立窗口播放（B 站 dash 音视频双流）。"""
+        if self._source is None:
+            self.play_label.setText("尚未加载作品")
+            return
+        # 当前分集 URL
         target = url
-        if target is None and self._detail and self._current_idx >= 0:
-            ep = self._episodes[self._current_idx]
-            target = ep.url
+        if target is None and self._current_idx >= 0 and self._episodes:
+            target = self._episodes[self._current_idx].url
         if target is None and self._detail:
-            target = self._detail.url  # 无分集时用详情页 URL（番剧 season 页）
+            target = self._detail.url
         if not target:
             self.play_label.setText("无可用播放地址")
             return
-        try:
-            from PySide6.QtWebEngineWidgets import QWebEngineView
-            from PySide6.QtCore import QUrl
 
-            if self._embed_view is None:
-                self._embed_view = QWebEngineView(self.embed_container)
-                self.embed_layout.addWidget(self._embed_view)
-            self._embed_view.setUrl(QUrl(target))
-            self._embed_view.show()
-            self.embed_container.setVisible(True)
-        except ImportError:
-            self.play_label.setText("内嵌播放需要 QtWebEngine，未安装。可用外部播放器打开。")
+        self.play_label.setText("正在获取播放流...")
+        # 后台取 dash 双流，再拉起 mpv（避免网络阻塞 UI）
+        task = _LoadStreamTask(self._content, self._source, target)
+        task.signals.finished.connect(self._on_stream_loaded)
+        self._stream_task = task  # 持有引用防 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_stream_loaded(self, video, audio, title, err) -> None:
+        if err or not video:
+            self.play_label.setText(f"获取播放流失败：{err or '无播放地址'}")
+            return
+        self._current_play = video
+        self.play_label.setText(f"正在打开 mpv 播放：{title}")
+        # 拉起 mpv（懒创建，复用实例）
+        if self._player is None:
+            from framework.mpv_player import MpvPlayer
+
+            self._player = MpvPlayer()
+        self._player.play(video, audio, title=title)
 
 
 class _VideoSignals(QObject):
@@ -183,5 +190,33 @@ class _LoadVideoTask(QRunnable):
             err = str(exc)
         try:
             self.signals.finished.emit(self._episode, play, err)
+        except RuntimeError:
+            pass
+
+
+class _StreamSignals(QObject):
+    """双流播放信号。"""
+    finished = Signal(object, object, object, object)  # (video, audio, title, err)
+
+
+class _LoadStreamTask(QRunnable):
+    """后台获取 dash 双流（视频轨+音频轨）供 mpv 播放。"""
+
+    def __init__(self, content, source, episode_url, title=""):
+        super().__init__()
+        self.signals = _StreamSignals()
+        self._content = content
+        self._source = source
+        self._url = episode_url
+        self._title = title
+
+    def run(self) -> None:
+        video, audio, err = "", "", None
+        try:
+            video, audio = self._content.fetch_video_streams(self._source, self._url)
+        except Exception as exc:
+            err = str(exc)
+        try:
+            self.signals.finished.emit(video, audio, self._title, err)
         except RuntimeError:
             pass

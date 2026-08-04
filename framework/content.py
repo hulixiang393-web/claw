@@ -312,7 +312,16 @@ class Content:
 
     # ------------------------------------------------------------------ #
     def fetch_detail(self, source: SourceConfig, url: str) -> Detail:
-        """抓取详情页：元数据 + 章节列表。"""
+        """抓取详情页：元数据 + 章节列表。
+
+        优先 api_endpoints.detail（JSON API，可选 sign 签名）；
+        否则走 endpoints.detail HTML 解析。
+        """
+        api = source.raw.get("api_endpoints") or {}
+        detail_api = api.get("detail") or {}
+        if detail_api:
+            return self._fetch_detail_api(source, url, detail_api)
+
         self._checker.check(source, self._abs_url(source, url))
         html = self._get(source, url)
         doc = self._parser.parse(html)
@@ -345,6 +354,104 @@ class Content:
         # 章节列表（按类型取 content 配置，传书名用于标题清理）
         detail.chapters = self._fetch_chapters(source, doc, book_title=detail.title)
         return detail
+
+    # ------------------------------------------------------------------ #
+    def _fetch_detail_api(self, source: SourceConfig, url: str, cfg: dict) -> Detail:
+        """api_endpoints.detail：JSON API 取详情元数据 + 章节列表。
+
+        支持 sign 签名。字段映射用 field_extractors（目标字段 → JSONPath）。
+        章节列表用 chapters 块：
+            items          JSONPath 到章节列表
+            title / number 每项标题/序号字段名
+            url_template   章节 URL 模板（可用 {cid} / {page} / {part} 占位）
+        """
+        from urllib.parse import urlencode, urljoin, quote
+
+        api_url = str(cfg.get("url") or "")
+        params = cfg.get("params") or {}
+        filled = {}
+        m_bv = _re.search(r"(BV[0-9A-Za-z]+)", url)
+        bvid = m_bv.group(1) if m_bv else url.split("/")[-1]
+        for k, v in params.items():
+            filled[k] = str(v).replace("{bvid}", bvid).replace("{id}", bvid)
+        sign_cfg = cfg.get("sign") or {}
+        strategy = sign_cfg.get("strategy")
+        if strategy:
+            from .signers import get_signer
+
+            signer = get_signer(strategy, self._http)
+            filled = signer.sign(filled)
+        qs = urlencode(filled)
+        abs_url = urljoin(source.base_url, api_url)
+        if "?" in api_url:
+            abs_url = f"{abs_url}&{qs}"
+        else:
+            abs_url = f"{abs_url}?{qs}"
+        resp = self._http.get_json(
+            abs_url,
+            headers=self._headers(source),
+            timeout=self._timeout(source),
+            retries=self._retries(source),
+        )
+        if not isinstance(resp, dict):
+            return Detail(source_id=source.source_id, content_type=source.content_type, url=url)
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+
+        extractors = cfg.get("field_extractors") or {}
+        title = self._jsonpath(data, extractors.get("title")) or ""
+        detail = Detail(
+            source_id=source.source_id,
+            content_type=source.content_type,
+            url=url,
+            title=str(title),
+            author=str(self._jsonpath(data, extractors.get("author")) or ""),
+            cover=str(self._jsonpath(data, extractors.get("cover")) or ""),
+            status=str(self._jsonpath(data, extractors.get("status")) or ""),
+            summary=str(self._jsonpath(data, extractors.get("summary")) or ""),
+        )
+        # 标签（可空，逗号分隔列表）
+        tags = self._jsonpath(data, extractors.get("tags"))
+        if isinstance(tags, list):
+            detail.tags = [str(t) for t in tags]
+        elif tags:
+            detail.tags = [str(t) for t in str(tags).split(",")]
+
+        # 章节列表
+        chapters_cfg = cfg.get("chapters") or {}
+        items = self._jsonpath(data, chapters_cfg.get("items"))
+        if isinstance(items, list):
+            title_key = chapters_cfg.get("title") or "title"
+            num_key = chapters_cfg.get("number")
+            url_tpl = chapters_cfg.get("url_template") or url
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                c_title = str(it.get(title_key) or f"第{len(detail.chapters)+1}集")
+                c_url = url_tpl
+                if num_key:
+                    c_url = c_url.replace("{cid}", str(it.get(num_key) or ""))
+                c_url = c_url.replace("{bvid}", bvid).replace("{id}", bvid)
+                # 模板里 {title}/{part} 等占位填充
+                for m in _re.finditer(r"\{(\w+)\}", c_url):
+                    c_url = c_url.replace("{" + m.group(1) + "}", str(it.get(m.group(1), "")))
+                detail.chapters.append(Chapter(title=c_title, url=c_url))
+        return detail
+
+    @staticmethod
+    def _jsonpath(node, path: str):
+        """极简 JSONPath：data.owner.name / data.list.0 点号路径。"""
+        if not path:
+            return None
+        cur = node
+        for part in str(path).split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            elif isinstance(cur, list) and part.lstrip("-").isdigit():
+                idx = int(part)
+                cur = cur[idx] if -len(cur) <= idx < len(cur) else None
+            else:
+                return None
+        return cur
 
     # ------------------------------------------------------------------ #
     def _fetch_chapters(self, source: SourceConfig, doc, book_title: str = "") -> List[Chapter]:
@@ -431,7 +538,57 @@ class Content:
 
     # ------------------------------------------------------------------ #
     def fetch_chapter(self, source: SourceConfig, url: str) -> str:
-        """抓取单章正文。按类型取正文选择器。"""
+        """抓取单章正文。按类型取正文选择器，支持章节分页拼接。
+
+        长章节在部分站点会拆成多页（如 xxx.html / xxx_1.html / xxx_2.html）。
+        若源配置 content.chapter.pagination 开启，则通过页脚导航「下一章」
+        链接判定：URL 基路径（去 _<数字>.html 后缀）与当前页相同 → 同章续页，
+        继续抓取并拼接；否则为真正的下一章，停止。
+        """
+        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        if source.content_type == "novel":
+            block = content_cfg.get("chapter") or {}
+        elif source.content_type == "comic":
+            block = content_cfg.get("page") or {}
+        else:
+            block = content_cfg.get("episode") or {}
+        # 章内分页（source-schema §9.2 body.paginator）：novel 默认开启自动探测，
+        # 长章节跨多页（xxx.html / xxx_1.html）时拼接；seen+max 防死循环。
+        pag_cfg = (block or {}).get("pagination") or {}
+        pag_enabled = bool(pag_cfg.get("enabled", True))
+        # 正文抓取（可能分页）
+        pages = []
+        cur = url
+        seen = set()
+        max_pages = int(pag_cfg.get("max_pages") or 20)
+        while cur and len(pages) < max_pages:
+            page_text, nxt = self._fetch_chapter_page(source, cur, pag_enabled)
+            if page_text:
+                pages.append(page_text)
+            # 分页判定：URL 基路径（去 _<数字>.html）相同 → 同章续页继续抓
+            if not nxt:
+                break
+            nxt_abs = self._abs_url(source, nxt)
+            cur_base = self._chapter_base(cur)
+            nxt_base = self._chapter_base(nxt_abs)
+            if cur_base == nxt_base and nxt_abs not in seen:
+                seen.add(nxt_abs)
+                cur = nxt_abs
+                continue
+            break  # 基路径不同 → 是真正的下一章或重复，停止分页
+        return "\n".join(pages)
+
+    def _fetch_chapter_page(
+        self, source: SourceConfig, url: str, pag_enabled: bool = True
+    ) -> tuple:
+        """抓取单页正文，返回 (plain_text, next_page_url 或 "")。
+
+        自动探测分页链接（pag_enabled 时）：
+        1. 源配置 content.chapter.pagination.next_selector 显式给出「下一页」选择器；
+        2. 否则从页面导航（read-nav / .nav 等）找「下一页」文本的链接；
+        3. 再兜底从页面找 _<数字>.html 的分页链接。
+        返回的 nxt 是否同章续页由调用方 _chapter_base 判定。
+        """
         self._checker.check(source, self._abs_url(source, url))
         html = self._get(source, url)
         doc = self._parser.parse(html)
@@ -445,14 +602,79 @@ class Content:
             block = content_cfg.get("episode") or {}
         body = block.get("body") or {}
         selector = body.get("selector")
+
+        nxt = ""
+        if pag_enabled:
+            # 显式续页配置优先：body.paginator.next_link.selector（source-schema §9.2）
+            body_pag = body.get("paginator") or {}
+            next_sel = (body_pag.get("next_link") or {}).get("selector")
+            if next_sel:
+                nxt = self._parser.extract_first(doc, next_sel, self._abs_url(source, url))
+            else:
+                # 自动探测：导航区「下一页」链接
+                nxt = self._detect_next_page(doc, source, url)
+            if nxt:
+                nxt = self._abs_url(source, nxt)
+
         if not selector:
             raise ContentMissingError("源未配置正文选择器", source_id=source.source_id)
 
         paragraphs = self._parser.extract(doc, selector)
         if not paragraphs:
             # 正文选择器未命中：可能是混淆/加密正文，尝试解密
-            return self._decrypt_chapter(source, html, url)
-        return "\n".join(paragraphs)
+            text = self._decrypt_chapter(source, html, url)
+        else:
+            text = "\n".join(paragraphs)
+        return text, nxt
+
+    def _detect_next_page(self, doc, source: SourceConfig, url: str) -> str:
+        """自动探测章节分页的「下一页」链接。
+
+        依次尝试：
+        1. 文本为「下一页/下页/尾页」的 <a> 链接；
+        2. 页脚导航（read-nav / pagenav 等）内与当前页**同基路径**的链接
+           （即 _<数字>.html 分页续页）；
+        3. 页面任意同基路径的 _<数字>.html 链接。
+        返回原始 href（可能相对），无则空串。
+        """
+        base = self._chapter_base(self._abs_url(source, url))
+        url_abs = self._abs_url(source, url)
+
+        # 页脚导航内同基路径链接（read-nav / pagenav 等）。
+        # 导航按「上一章 | 目录 | 下一章」排列；同章续页链接带 _<数字>.html
+        # 后缀且基路径相同，取导航中**最后一个**这样的链接（"下一页"通常在末尾）。
+        # 自指链接（href 指向当前页）排除。
+        for cls in ("read-nav", "chapter-page-nav", "pagenav", "bottem1"):
+            for nav in doc.xpath(f'//*[contains(concat(" ", normalize-space(@class), " "), " {cls} ")]'):
+                match = ""
+                for a in nav.xpath('.//a[@href]'):
+                    href = a.get("href") or ""
+                    if not href:
+                        continue
+                    href_abs = self._abs_url(source, href)
+                    if (self._chapter_base(href_abs) == base
+                            and href_abs != url_abs
+                            and "_" in href):  # 同基路径 + 带 _ 后缀 → 续页
+                        match = href
+                if match:
+                    return match
+        # 兜底：页面任意同基路径的 _<数字>.html 链接
+        for a in doc.xpath('//a[@href]'):
+            href = a.get("href") or ""
+            if (href and self._chapter_base(self._abs_url(source, href)) == base
+                    and "_" in href):
+                return href
+        return ""
+
+    @staticmethod
+    def _chapter_base(url: str) -> str:
+        """去 URL 的 _<数字>.html 分页后缀，返回基路径。
+
+        https://x/1/73976498_1.html → https://x/1/73976498.html
+        https://x/1/73976498.html   → https://x/1/73976498.html
+        """
+        import re as _re2
+        return _re2.sub(r"_(\d+)\.html$", ".html", url)
 
     def _decrypt_chapter(self, source: SourceConfig, html: str, url: str) -> str:
         """正文被混淆时的解密路径（源配置 decryption 驱动）。"""
@@ -601,13 +823,74 @@ class Content:
         imgs = self._parser.extract(doc, url_sel, source.base_url)
         return self._filter_ad_images(imgs, source)
 
+    def fetch_comic_pages_batch(
+        self,
+        source: SourceConfig,
+        chapter_urls: List[str],
+        render_cfg: Optional[dict] = None,
+    ) -> dict:
+        """批量抓取多话漫画图片（**复用同一个 Chromium 实例**）。
+
+        仅用于 render: playwright 的加密分片源（如 comicbox）。
+        把 N 话的 Playwright 渲染收敛到 1 次浏览器启动，大幅降低下载耗时。
+
+        返回 {chapter_url: [base64 data URI 列表]}；单话渲染失败 → 值为 None。
+        render_cfg 可显式传入；缺省时从源配置 content.page 解析。
+        """
+        if not chapter_urls:
+            return {}
+        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        block = content_cfg.get("page") or {}
+        body_cfg = block.get("body") or {}
+        abs_urls = [self._abs_url(source, u) for u in chapter_urls]
+        if render_cfg is None:
+            rc = block.get("render_config") or body_cfg.get("render_config") or {}
+            render_cfg = {
+                "wait_for": rc.get("wait_for", "canvas"),
+                "wait_until": rc.get("wait_until", "domcontentloaded"),
+                "timeout_ms": rc.get("timeout_ms", 30000),
+                "extra_delay_ms": rc.get("extra_delay_ms", 2500),
+                "scroll_to_bottom": rc.get("scroll_to_bottom", False),
+                "extract_mode": rc.get("extract_mode", "canvas"),
+                "proxy": source.transports().get("proxy"),
+            }
+        from .playwright_helper import fetch_rendered_pages_batch_sync
+
+        raw = fetch_rendered_pages_batch_sync(abs_urls, render_cfg)
+        # 以原始 chapter_url 为 key 返回（调用方用 ch.url 直接查）
+        return {u: raw.get(a) for u, a in zip(chapter_urls, abs_urls)}
+
+    def fetch_video_streams(self, source: SourceConfig, episode_url: str) -> tuple:
+        """视频：抓取单集 dash 音视频双流（播放用）。
+
+        返回 (video_url, audio_url)；非 dash/无音频时 audio_url 为 ""。
+        mpv 播放 dash 需要同时喂视频轨+音频轨（B 站音视频分离）。
+        """
+        api = source.raw.get("api_endpoints") or {}
+        episode_api = api.get("episode") or {}
+        if episode_api:
+            streams = self._fetch_episode_api(source, episode_url, episode_api, want_streams=True)
+            if isinstance(streams, dict):
+                return streams.get("video", ""), streams.get("audio", "")
+            if streams:
+                return streams, ""
+        # HTML 兜底：单 URL
+        return self.fetch_video_episode(source, episode_url), ""
+
     def fetch_video_episode(self, source: SourceConfig, episode_url: str) -> str:
         """视频：抓取单集播放地址（解密后返回真实地址）。
 
-        对应 endpoints.content.episode：
-        - play_url.selector → 播放地址提取
-        - decryption        → 解密（B站 wbi 签名等）
+        优先 api_endpoints.episode（JSON API，可选 sign 签名）；
+        否则 endpoints.content.episode HTML 解析（play_url.selector）。
         """
+        # JSON API 播放地址（api_endpoints.episode）
+        api = source.raw.get("api_endpoints") or {}
+        episode_api = api.get("episode") or {}
+        if episode_api:
+            play = self._fetch_episode_api(source, episode_url, episode_api)
+            if play:
+                return play
+
         self._checker.check(source, self._abs_url(source, episode_url))
         html = self._get(source, episode_url)
         doc = self._parser.parse(html)
@@ -630,6 +913,84 @@ class Content:
         if self._decrypter is not None:
             return self._decrypter.decrypt(source, play, "video_url")
         return play
+
+    def _fetch_episode_api(self, source: SourceConfig, episode_url: str, cfg: dict, want_streams: bool = False) -> str | dict:
+        """api_endpoints.episode：JSON API 取播放地址（支持 sign 签名）。
+
+        want_streams=True 时返回 {"video": ..., "audio": ...}（dash 音视频分离）。
+        """
+        import copy
+        from urllib.parse import urlencode, urljoin, quote
+
+        api_url = str(cfg.get("url") or "")
+        params = cfg.get("params") or {}
+        filled = {}
+        # 占位符：{bvid}/{cid}/{id} 从 episode_url 提取；{keyword} 不适用
+        for k, v in params.items():
+            val = str(v)
+            val = val.replace("{id}", episode_url.split("/")[-1])
+            # 从 episode_url 尝试提取 bvid / cid
+            m_bv = _re.search(r"(BV[0-9A-Za-z]+)", episode_url)
+            if m_bv:
+                val = val.replace("{bvid}", m_bv.group(1))
+            m_cid = _re.search(r"(?:cid|p)=(\d+)", episode_url)
+            if m_cid:
+                val = val.replace("{cid}", m_cid.group(1))
+            filled[k] = val
+        sign_cfg = cfg.get("sign") or {}
+        strategy = sign_cfg.get("strategy")
+        if strategy:
+            from .signers import get_signer
+
+            signer = get_signer(strategy, self._http)
+            filled = signer.sign(filled)
+        qs = urlencode(filled)
+        abs_url = urljoin(source.base_url, api_url)
+        if "?" in api_url:
+            abs_url = f"{abs_url}&{qs}"
+        else:
+            abs_url = f"{abs_url}?{qs}"
+        resp = self._http.get_json(
+            abs_url,
+            headers=self._headers(source),
+            timeout=self._timeout(source),
+            retries=self._retries(source),
+        )
+        rpath = cfg.get("response_path") or ""
+        node = resp
+        if rpath:
+            node = self._jsonpath(resp, rpath)
+            if node is None:
+                return ""
+        # 取播放地址：优先 extractors（目标字段→JSONPath），否则字符串/第一值
+        extractors = cfg.get("field_extractors") or {}
+        url_path = extractors.get("play_url") or ""
+        if url_path:
+            play = self._jsonpath(resp if not url_path.startswith(".") else node, url_path) if url_path else node
+        else:
+            play = node
+        # 若是列表，取首个非空元素；若是带 baseUrl 的对象，取 baseUrl
+        if isinstance(play, list):
+            play = next((it for it in play if it), "")
+            if isinstance(play, dict):
+                play = next((play[k] for k in ("baseUrl", "url") if play.get(k)), "")
+        elif isinstance(play, dict):
+            play = next((play[k] for k in ("baseUrl", "base_url", "url") if play.get(k)), "")
+        play_url = str(play) if play else ""
+
+        # dash 双流：额外取音频轨 URL（B 站音视频分离）
+        if want_streams:
+            audio_url = ""
+            audio_path = extractors.get("audio_url") or ""
+            if audio_path:
+                au = self._jsonpath(resp, audio_path)
+                if isinstance(au, list):
+                    au = next((it for it in au if it), "")
+                if isinstance(au, dict):
+                    au = next((au[k] for k in ("baseUrl", "url") if au.get(k)), "")
+                audio_url = str(au) if au else ""
+            return {"video": play_url, "audio": audio_url}
+        return play_url
 
     @staticmethod
     def _filter_ad_images(images: List[str], source: SourceConfig) -> List[str]:

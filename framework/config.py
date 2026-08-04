@@ -35,6 +35,7 @@ class SourceConfig:
     tags: list = field(default_factory=list)
     raw: dict = field(default_factory=dict)  # 原始 JSON，供后续完整解析
     source_path: str = ""
+    _buvid3: str = field(default="", init=False, repr=False)  # 缓存，复用连接
 
     @classmethod
     def from_dict(cls, data: Any, path: str = "<memory>") -> "SourceConfig":
@@ -101,9 +102,13 @@ class SourceConfig:
         return bool(endpoints.get("discovery") or api_endpoints.get("discovery"))
 
     def get_discovery_config(self) -> dict:
-        """读取 endpoints.discovery（返回 {} 若未配置）。"""
+        """读取 endpoints.discovery（返回 {} 若未配置）。
+
+        兼容 API 站：endpoints.discovery 为空时回退 api_endpoints.discovery。
+        """
         endpoints = self.raw.get("endpoints") or {}
-        return endpoints.get("discovery") or {}
+        api_endpoints = self.raw.get("api_endpoints") or {}
+        return endpoints.get("discovery") or api_endpoints.get("discovery") or {}
 
     def get_search_config(self) -> dict:
         """读取 endpoints.search（返回 {} 若未配置）。"""
@@ -124,11 +129,19 @@ class SourceConfig:
 
         cookie 可配置在 transports.cookie（种子爬取/登录站用），
         合并为 Cookie 头，避免各业务模块重复拼接。
+        支持 {buvid3} 占位符：每次请求自动生成随机 buvid3（B 站风控绕过用）。
         """
         headers = dict(self.transports().get("headers") or {})
         cookie = self.transports().get("cookie")
-        if cookie and not headers.get("Cookie"):
-            headers["Cookie"] = cookie
+        if cookie:
+            if "{buvid3}" in cookie:
+                if not self._buvid3:
+                    import uuid
+
+                    self._buvid3 = f"{uuid.uuid4()}infoc"
+                cookie = cookie.replace("{buvid3}", self._buvid3)
+            if not headers.get("Cookie"):
+                headers["Cookie"] = cookie
         return headers
 
 

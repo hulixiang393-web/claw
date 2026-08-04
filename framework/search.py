@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urlencode, urljoin
 
 from .config import SourceConfig
 from .discovery import Discovery
@@ -127,13 +127,41 @@ class Search:
         return results
 
     def _search_api(self, source: SourceConfig, keyword: str) -> List[SearchResult]:
-        """API 站搜索（api_endpoints.search）。"""
+        """API 站搜索（api_endpoints.search）。
+
+        支持两种 URL 构造：
+        - params 对象：结构化参数，自动 URL encode，支持 sign 策略签名。
+        - url 模板：URL 含 {keyword} 占位，手动拼接。
+        """
         api = source.raw.get("api_endpoints") or {}
         cfg = api.get("search") or {}
         if not cfg:
             return []
-        api_url = str(cfg.get("url") or "").replace("{keyword}", quote(keyword))
-        abs_url = urljoin(source.base_url, api_url)
+        api_url = str(cfg.get("url") or "")
+        params = cfg.get("params") or {}
+
+        if params:
+            # 结构化 params：填充占位符 + URL encode + 可选签名
+            filled = {}
+            for k, v in params.items():
+                val = str(v).replace("{keyword}", keyword).replace("{page}", "1")
+                filled[k] = val
+            sign_cfg = cfg.get("sign") or {}
+            strategy = sign_cfg.get("strategy")
+            if strategy:
+                from .signers import get_signer
+
+                signer = get_signer(strategy, self._http)
+                filled = signer.sign(filled)
+            qs = urlencode(filled)
+            abs_url = urljoin(source.base_url, api_url)
+            if "?" in api_url:
+                abs_url = f"{abs_url}&{qs}"
+            else:
+                abs_url = f"{abs_url}?{qs}"
+        else:
+            api_url = api_url.replace("{keyword}", quote(keyword))
+            abs_url = urljoin(source.base_url, api_url)
         resp = self._http.get_json(
             abs_url,
             headers=source.request_headers(),
@@ -155,16 +183,34 @@ class Search:
             if not title or not url:
                 continue
             url = urljoin(source.base_url, url)
+            cover = self._clean_cover(self._tpl(it, item_fields.get("cover")))
             results.append(
                 SearchResult(
-                    title=str(title),
+                    title=self._clean_title(str(title)),
                     url=str(url),
                     source_id=source.source_id,
                     source_name=source.source_name,
-                    cover=str(self._tpl(it, item_fields.get("cover")) or ""),
+                    cover=str(cover or ""),
+                    author=str(self._tpl(it, item_fields.get("author")) or ""),
+                    update=str(self._tpl(it, item_fields.get("update")) or ""),
                 )
             )
         return results
+
+    @staticmethod
+    def _clean_title(title: str) -> str:
+        """去标题中的 HTML 标签（如 B 站搜索结果 <em class='keyword'>）。"""
+        import re
+
+        return re.sub(r"<[^>]+>", "", title).strip()
+
+    @staticmethod
+    def _clean_cover(cover: str) -> str:
+        """封面修复：协议相对 URL（//xxx）补 https 头。"""
+        cover = (cover or "").strip()
+        if cover.startswith("//"):
+            return "https:" + cover
+        return cover
 
     # ------------------------------------------------------------------ #
     def _http_get(self, source: SourceConfig, url: str) -> str:

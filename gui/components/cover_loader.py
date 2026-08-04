@@ -35,13 +35,15 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 _BROWSER_UA = BROWSER_UA
-MAX_CONCURRENT = 6  # 同时最多 6 个封面请求（调大提升加载速度）
+MAX_CONCURRENT = 16  # 同时最多 16 个封面请求（提升一页 20 张封面加载速度）
 REQUEST_TIMEOUT_MS = 8000  # 请求超时 8s，防止慢图/404 阻塞队列
 
 # 图片 CDN → 所属主站（用于 Referer）。命中后按主站域名回填 Referer。
 _REFERER_RULES = (
     # comicbox 图床 → 主站
     ("ccavbox.com", "https://www.comicbox.xyz/"),
+    # B 站封面 CDN → B 站（防风控，部分环境需 Referer 才放行）
+    ("hdslb.com", "https://www.bilibili.com/"),
 )
 
 
