@@ -117,9 +117,20 @@
       "params": {
         "bvid": "{bvid}",
         "cid": "{cid}",
-        "qn": "64",
+        "qn": "{quality}",
         "fnval": "16",
         "platform": "pc"
+      },
+      "quality": {
+        "param": "qn",
+        "default": "best",
+        "map": {
+          "best": "127",
+          "1080p": "80",
+          "720p": "64",
+          "480p": "32",
+          "360p": "16"
+        }
       },
       "response_path": "data.dash.video.0.baseUrl",
       "field_extractors": {

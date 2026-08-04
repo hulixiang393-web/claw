@@ -25,6 +25,7 @@ from framework.source_manager import SourceManager
 from .reader.novel_view import NovelView
 from .reader.comic_view import ComicView
 from .reader.video_view import VideoView
+from .reader.epub_view import EpubView
 from .base_page import BasePage
 
 
@@ -59,16 +60,21 @@ class ReaderPage(BasePage):
         self.open_btn = QPushButton("打开源详情")
         self.open_btn.clicked.connect(self._open_source_page)
         info.addWidget(self.open_btn)
+        self.epub_btn = QPushButton("打开本地 epub")
+        self.epub_btn.clicked.connect(self._pick_epub)
+        info.addWidget(self.epub_btn)
         layout.addLayout(info)
 
-        # ---- 三视图切换 ----
+        # ---- 四视图切换 ----
         self.stack = QStackedWidget()
         self.novel_view = NovelView(content)
         self.comic_view = ComicView(content)
         self.video_view = VideoView(content)
+        self.epub_view = EpubView()
         self.stack.addWidget(self.novel_view)
         self.stack.addWidget(self.comic_view)
         self.stack.addWidget(self.video_view)
+        self.stack.addWidget(self.epub_view)
         layout.addWidget(self.stack, stretch=1)
 
         # ---- 阅读进度记忆：换章/换集时自动记录 ----
@@ -76,9 +82,14 @@ class ReaderPage(BasePage):
             self.novel_view.chapter_changed.connect(self._on_progress_signal)
             self.comic_view.chapter_changed.connect(self._on_progress_signal)
             self.video_view.episode_changed.connect(self._on_progress_signal)
+            # epub 本地阅读：用文件路径作 key 续读
+            self.epub_view.chapter_changed.connect(self._on_progress_signal)
 
     def _on_progress_signal(self, payload) -> None:
-        """记录阅读进度（换章/换集触发）。payload=(detail, title, url)。"""
+        """记录阅读进度（换章/换集触发）。payload=(detail, title, url)。
+
+        epub 本地书：payload=(epub_path, chapter_title)，用文件路径作 key。
+        """
         if self._reading_progress is None or not isinstance(payload, (tuple, list)):
             return
         detail, title = payload[0], payload[1]
@@ -86,6 +97,12 @@ class ReaderPage(BasePage):
         if detail is None:
             return
         try:
+            # epub 本地文件：payload[0] 是路径字符串，用路径作 book_url
+            if isinstance(detail, str):
+                self._reading_progress.save(
+                    "", detail, "epub", detail, title or ""
+                )
+                return
             self._reading_progress.save(
                 detail.source_id,
                 detail.url,
@@ -140,6 +157,28 @@ class ReaderPage(BasePage):
 
         if self._current_book_url:
             webbrowser.open(self._current_book_url)
+
+    def _pick_epub(self) -> None:
+        """文件选择：打开本地 epub。"""
+        from PySide6.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开 epub 电子书", "", "EPUB 文件 (*.epub)"
+        )
+        if path:
+            self.open_epub(path)
+
+    def open_epub(self, path: str) -> None:
+        """打开本地 epub（独立 epub 阅读器）。"""
+        self._current_source_id = ""
+        self._current_book_url = ""
+        self.title_label.setText("epub 阅读")
+        self.source_label.setText(path)
+        self.stack.setCurrentWidget(self.epub_view)
+        if self.epub_view.open(path):
+            self.title_label.setText(self.epub_view._chapters[0].title if self.epub_view._chapters else "epub")
+        else:
+            self.title_label.setText("epub 打开失败")
 
     def refresh(self) -> None:
         pass

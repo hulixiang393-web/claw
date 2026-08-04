@@ -40,7 +40,7 @@ DEFAULTS: dict = {
         "naming_template": "{title}_{chapter_no}_{chapter_title}",
         "merge_chapters_into_one_file": False,
         "skip_existing": True,
-        "max_concurrent_downloads": 4,
+        "max_concurrent_downloads": 6,
     },
     "library": {
         "shelf_export_dir": "library",

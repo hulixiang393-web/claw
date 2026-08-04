@@ -109,29 +109,18 @@ class Downloader:
         return self._download_video(source, task, chapter, index)
 
     def _download_novel(self, source, task, chapter, index: int) -> int:
-        book_dir = self.book_dir(task)
-        book_dir.mkdir(parents=True, exist_ok=True)
-        path = book_dir / f"{self._chapter_name(task, chapter, index)}.txt"
-        if self._skip_file(path):
-            return 0
+        # 只产出 epub：抓正文累积到 task.epub_chapters，全书写完统一合成
         text = self._content.fetch_chapter(source, chapter.url)
         raw = (text or "").encode("utf-8")
-        path.write_bytes(raw)
+        task.epub_chapters.append((chapter.title or f"第{index+1}章", text or ""))
         return len(raw)
 
     def _download_comic(self, source, task, chapter, index: int) -> int:
-        book_dir = self.book_dir(task)
-        book_dir.mkdir(parents=True, exist_ok=True)
-        cdir = book_dir / self._chapter_name(task, chapter, index)
-        if self._skip_dir(cdir):
-            return 0
+        # 只产出 epub：抓图片字节累积，全书写完统一合成
         images = self._content.fetch_comic_pages(source, chapter.url)
-        cdir.mkdir(parents=True, exist_ok=True)
-        total = 0
-        for i, img in enumerate(images, 1):
-            path = cdir / f"img_{i:03d}{self._img_ext(img)}"
-            total += self._save_image(img, path)
-        return total
+        img_bytes = [self._image_bytes(img) for img in images]
+        task.epub_chapters.append((chapter.title or f"第{index+1}话", img_bytes))
+        return sum(len(b) for b in img_bytes)
 
     def _download_video(self, source, task, chapter, index: int) -> int:
         book_dir = self.book_dir(task)
@@ -140,7 +129,9 @@ class Downloader:
         if self._skip_file(path):
             return 0
         # dash 双流 → ffmpeg 合并成单 mp4（B 站音视频分离）
-        video, audio = self._content.fetch_video_streams(source, chapter.url)
+        video, audio = self._content.fetch_video_streams(
+            source, chapter.url, quality=getattr(task, "quality", "") or ""
+        )
         if not video:
             raise RuntimeError(f"未获取到播放流：{chapter.title or chapter.url}")
         from .ffmpeg_merger import FFmpegMerger
@@ -162,24 +153,11 @@ class Downloader:
         """
         if not chapters or not indices:
             return {}
-        book_dir = self.book_dir(task)
-        book_dir.mkdir(parents=True, exist_ok=True)
-
-        # 过滤出真正需要下载的话（skip_existing）
-        to_download = []
-        for idx in indices:
-            ch = chapters[idx]
-            cdir = book_dir / self._chapter_name(task, ch, idx)
-            if self._skip_dir(cdir):
-                continue
-            to_download.append((idx, ch))
-
-        if not to_download:
-            # 全部已下载 → 全跳过
-            return {idx: 0 for idx in indices}
+        # 只产出 epub：批量渲染后把图片字节累积到 task.epub_chapters
 
         # 批量渲染（一次浏览器启动）
-        chapter_urls = [ch.url for _, ch in to_download]
+        chapter_urls = [ch.url for ch in chapters]
+        to_download = list(zip(indices, chapters))
         try:
             result_map = self._content.fetch_comic_pages_batch(
                 source, chapter_urls
@@ -187,20 +165,16 @@ class Downloader:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"批量 Playwright 渲染失败: {exc}") from exc
 
-        # 逐话落盘
+        # 逐话累积图片字节
         out: dict[int, int] = {}
         for idx, ch in to_download:
-            cdir = book_dir / self._chapter_name(task, ch, idx)
             images = result_map.get(ch.url)
             if images is None:
                 raise RuntimeError(f"渲染失败：{ch.title or ch.url}")
-            cdir.mkdir(parents=True, exist_ok=True)
-            total = 0
-            for i, img in enumerate(images, 1):
-                path = cdir / f"img_{i:03d}{self._img_ext(img)}"
-                total += self._save_image(img, path)
-            out[idx] = total
-        # 跳过的话标记 0
+            img_bytes = [self._image_bytes(img) for img in images]
+            task.epub_chapters.append((ch.title or f"第{idx+1}话", img_bytes))
+            out[idx] = sum(len(b) for b in img_bytes)
+        # 未处理的话标记 0
         for idx in indices:
             if idx not in out:
                 out[idx] = 0
@@ -218,11 +192,38 @@ class Downloader:
 
     def _save_image(self, img: str, path: Path) -> int:
         """保存单张图：data URI 解码 / http URL 下载。返回字节数。"""
-        if img.startswith("data:"):
-            _, b64 = img.split(",", 1)
-            raw = base64.b64decode(b64)
-            path.write_bytes(raw)
-            return len(raw)
-        raw = self._http.get_bytes(img)
+        raw = self._image_bytes(img)
         path.write_bytes(raw)
         return len(raw)
+
+    def _image_bytes(self, img: str) -> bytes:
+        """单张图字节：data URI 解码 / http URL 下载。不落盘（供 epub 累积）。"""
+        if img.startswith("data:"):
+            _, b64 = img.split(",", 1)
+            return base64.b64decode(b64)
+        return self._http.get_bytes(img)
+
+    # ------------------------------------------------------------------ #
+    def finalize_epub(self, task) -> Path:
+        """把 task.epub_chapters 累积的内容合成为单本 epub 落盘。
+
+        novel: chapters = [(title, text), ...]
+        comic: chapters = [(title, [img_bytes, ...]), ...]
+        返回 epub 路径。epub_chapters 为空时抛 RuntimeError。
+        """
+        from .epub_builder import build_comic_epub, build_novel_epub
+
+        if not task.epub_chapters:
+            raise RuntimeError("无章节内容，无法合成 epub")
+        book_dir = self.book_dir(task)
+        book_dir.mkdir(parents=True, exist_ok=True)
+        out = book_dir / f"{sanitize_filename(task.title or 'untitled')}.epub"
+        if self._skip_file(out):
+            return out  # 已存在（续传）
+        ctype = task.content_type
+        title = task.title or "untitled"
+        if ctype == "comic":
+            build_comic_epub(title, out, task.epub_chapters)
+        else:
+            build_novel_epub(title, out, task.epub_chapters)
+        return out

@@ -59,6 +59,7 @@ class _SearchTask(QRunnable):
 
 class SearchPage(BasePage):
     search_clicked = Signal(str)  # 搜索触发（首页接）
+    open_requested = Signal(str, str, str)  # (source_id, url, content_type) 打开作品
 
     def __init__(self, source_manager: SourceManager, search: Search, parent=None):
         super().__init__(parent)
@@ -191,8 +192,20 @@ class SearchPage(BasePage):
         for idx, r in enumerate(items):
             row, col = divmod(idx, cols)
             card = WorkCard(r)
+            # 点卡片 → 打开详情/阅读器
+            card.clicked.connect(lambda _, rr=r: self._emit_open(rr))
             self.grid_layout.addWidget(card, row, col)
         self._apply_column_stretch(cols)
+
+    def _emit_open(self, result) -> None:
+        """点搜索结果卡片 → 打开 reader 播放/阅读。"""
+        if not getattr(result, "url", "") or not getattr(result, "source_id", ""):
+            return
+        try:
+            src = self._manager.get(result.source_id)
+        except Exception:
+            return
+        self.open_requested.emit(result.source_id, result.url, src.content_type)
 
     def _clear_grid(self) -> None:
         while self.grid_layout.count():

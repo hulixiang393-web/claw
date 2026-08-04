@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
+import time
+
+from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -40,6 +42,10 @@ class NovelView(QWidget):
         self._current_idx = -1
         self._font_size = 17
         self._auto_loading = False  # 防止自动翻章重复触发
+        self._auto_prev_loading = False  # 防止向上自动翻章重复触发
+        self._last_auto_nav_ts = 0.0  # 上次自动翻章时间戳（防循环：新章滚到顶部又触发翻章）
+        self._edge_armed = False  # 边沿触发武装：离开边界区才允许再次触发翻章
+        self._prefetch_idx = -2  # 正在后台预加载的章节 idx（<0 表示空闲）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -173,18 +179,25 @@ class NovelView(QWidget):
             item.setData(Qt.UserRole, i)
             self.toc_list.addItem(item)
 
-    def _load_chapter(self, idx: int) -> None:
-        """加载指定章节正文（后台线程）。"""
+    def _load_chapter(self, idx: int, scroll_to_end: bool = False) -> None:
+        """加载指定章节正文（后台线程）。
+
+        scroll_to_end=True：加载后定位到章尾（向上自动翻章时用）；
+        滚动模式滚到底，翻页模式跳到最后一页。
+        """
         if self._source is None or not (0 <= idx < len(self._chapters)):
             return
         self._current_idx = idx
         ch = self._chapters[idx]
 
+        self._scroll_on_load = getattr(self, "_scroll_on_load", 0)  # 0=顶部; 1=底部
+        self._scroll_on_load = 1 if scroll_to_end else 0
+
         # 已缓存 → 直接显示
         if hasattr(ch, "_cached_text") and ch._cached_text:
             self._auto_loading = False  # 缓存命中也要解除自动翻章锁
-            self._display_chapter(ch, ch._cached_text)
-            self.scroll.verticalScrollBar().setValue(0)
+            self._auto_prev_loading = False
+            self._display_chapter(ch, ch._cached_text, scroll_to_end)
             self._update_progress()
             self.chapter_changed.emit((self._detail, ch.title, ch.url))
             return
@@ -199,7 +212,7 @@ class NovelView(QWidget):
         QThreadPool.globalInstance().start(task)
         self.chapter_changed.emit((self._detail, ch.title, ch.url))
 
-    def _display_chapter(self, ch, text: str) -> None:
+    def _display_chapter(self, ch, text: str, scroll_to_end: bool = False) -> None:
         """正文前加章节编号行（如「第12章」），不含标题文字。"""
         from framework.content import chapter_label
         label = chapter_label(ch.title) or f"第{self._current_idx + 1}章"
@@ -208,7 +221,31 @@ class NovelView(QWidget):
         # 翻页视图同步
         self._paged_full_text = full
         self._repaginate()
-        self._pager_show_page(0)
+        if scroll_to_end:
+            self._pager_show_page(self._page_count - 1)  # 定位到本章最后一页
+        else:
+            self._pager_show_page(0)
+        # 滚动模式定位（程序化滚动，blockSignals 避免误触发对向自动翻章）
+        vbar = self.scroll.verticalScrollBar()
+        if scroll_to_end:
+            # 等 layout 完成后再滚到底（QTimer 后置，确保 maximum 已更新）
+            vbar.blockSignals(True)
+            vbar.setValue(0)
+            vbar.blockSignals(False)
+            QTimer.singleShot(0, self._scroll_to_bottom_silently)
+        else:
+            vbar.blockSignals(True)
+            vbar.setValue(0)
+            vbar.blockSignals(False)
+        # 后台预加载下一章：翻章时命中缓存秒开，不用现场等网络
+        self._prefetch_next(self._current_idx)
+
+    def _scroll_to_bottom_silently(self) -> None:
+        """无触发地滚到底（blockSignals 包住，防自动翻章循环）。"""
+        vbar = self.scroll.verticalScrollBar()
+        vbar.blockSignals(True)
+        vbar.setValue(vbar.maximum())
+        vbar.blockSignals(False)
 
     def _on_chapter_loaded(self, ch, text, err) -> None:
         if err:
@@ -216,9 +253,10 @@ class NovelView(QWidget):
             return
         ch._cached_text = text
         self._auto_loading = False  # 自动翻章完成，解除锁定
+        self._auto_prev_loading = False
         if self._current_idx >= 0 and ch.url == self._chapters[self._current_idx].url:
-            self._display_chapter(ch, text)
-            self.scroll.verticalScrollBar().setValue(0)
+            scroll_to_end = bool(getattr(self, "_scroll_on_load", 0))
+            self._display_chapter(ch, text, scroll_to_end)
             self._update_progress()
 
     # ------------------------------------------------------------------ #
@@ -235,21 +273,49 @@ class NovelView(QWidget):
             self._load_chapter(nxt)
 
     def _maybe_auto_next(self, value: int) -> None:
-        """读到当前章底部时，自动加载下一章（无缝衔接）。
+        """滚动近底部 → 自动下一章；滚动回顶部 → 自动上一章（双向自然衔接）。
 
-        条件：不在自动翻章加载中、滚动近底部、不是最后一章。
+        边沿触发：翻章后解除武装（_edge_armed=False），必须离开边界区
+        （滚回中段）再回到边界才再次触发。避免翻到上一章末尾/下一章开头
+        后停在边界上被 re-layout 或微小滚动反复触发而"瞎跳"。
         """
-        if self._auto_loading:
-            return
-        if self._current_idx < 0 or self._current_idx >= len(self._chapters) - 1:
+        if self._current_idx < 0:
             return
         vbar = self.scroll.verticalScrollBar()
         if vbar.maximum() == 0:
             return
-        if value >= vbar.maximum() - 40:  # 距底部 < 40px 视为读完
+        if self._mode != "scroll":
+            return  # 翻页模式走 _pager_turn 的章边界跳转
+        max_v = vbar.maximum()
+        # 是否在边界区
+        at_top = value <= 2
+        at_bottom = value >= max_v - 40
+        # 离开边界区（回到中段）→ 重新武装，允许下次边界触发
+        if not at_top and not at_bottom:
+            self._edge_armed = True
+            return
+        if not self._edge_armed:
+            return  # 未武装（刚翻完章停在边界）→ 忽略
+        last = len(self._chapters) - 1
+        # 向下：近底部且非末章 → 下一章
+        if at_bottom:
+            if self._auto_loading or self._current_idx >= last:
+                return
             self._auto_loading = True
+            self._edge_armed = False  # 触发后解除武装
+            self._last_auto_nav_ts = time.time()
             self._load_chapter(self._current_idx + 1)
-            # 加载完成后清除标志（在 _on_chapter_loaded 里）
+            # 加载完成后 _on_chapter_loaded 会清锁
+        # 向上：滚回顶部（值=0）且非首章 → 上一章，并跳到上一章末尾
+        elif at_top:
+            if self._auto_prev_loading or self._current_idx <= 0:
+                return
+            self._auto_prev_loading = True
+            self._edge_armed = False  # 触发后解除武装
+            self._last_auto_nav_ts = time.time()
+            # 定位到上一章末尾（scroll_to_end → _display_chapter 滚到底/最后一页）
+            self._load_chapter(self._current_idx - 1, scroll_to_end=True)
+            # 跳到上一章末尾在 _on_chapter_loaded 里处理（need_scroll_bottom）
 
     def _adjust_font(self, delta: int) -> None:
         self._font_size += delta
@@ -310,15 +376,66 @@ class NovelView(QWidget):
         self.pager_indicator.setText(f"{page + 1} / {self._page_count} 页")
 
     def _pager_turn(self, delta: int) -> None:
-        """翻到上一页/下一页。"""
+        """翻到上一页/下一页；越过章边界时自动切换章节（自然衔接）。
+
+        - 下一页到最后页后再翻 → 下一章第一页
+        - 上一页到第一页后再翻 → 上一章最后一页
+        """
         self._repaginate()
         nxt = self._current_page + delta
         if 0 <= nxt < self._page_count:
             self._pager_show_page(nxt)
+            return
+        # 越过章边界
+        if delta > 0:
+            if self._auto_loading or self._current_idx >= len(self._chapters) - 1:
+                return
+            self._auto_loading = True
+            self._load_chapter(self._current_idx + 1, scroll_to_end=False)
+        else:
+            if self._auto_prev_loading or self._current_idx <= 0:
+                return
+            self._auto_prev_loading = True
+            self._load_chapter(self._current_idx - 1, scroll_to_end=True)
+
 
     def _update_progress(self) -> None:
         total = len(self._chapters)
         self.progress_label.setText(f"第{self._current_idx + 1}/{total}章")
+
+    # ------------------------------------------------------------------ #
+    def _prefetch_next(self, idx: int) -> None:
+        """后台预加载下一章（idx+1），翻章时命中缓存秒开。
+
+        显示某章后触发：下一章未缓存且无进行中预取 → 后台抓取存 _cached_text。
+        串行：同一时间只预取 1 章，避免并发拉多个章节抢占网络/内存。
+        """
+        if self._source is None:
+            return
+        nxt = idx + 1
+        if not (0 <= nxt < len(self._chapters)):
+            return
+        # 资源就绪则无需预取
+        nxt_ch = self._chapters[nxt]
+        if hasattr(nxt_ch, "_cached_text") and nxt_ch._cached_text:
+            return
+        if self._prefetch_idx == nxt:
+            return  # 该章已在预取中
+        if self._prefetch_idx >= 0 and self._prefetch_idx != nxt:
+            return  # 已有其他章在预取（串行）
+        self._prefetch_idx = nxt
+        from PySide6.QtCore import QThreadPool
+        task = _LoadChapterTask(self._content, self._source, nxt_ch)
+        task.signals.finished.connect(self._on_prefetch_done)
+        self._prefetch_task = task  # 持引用防 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_prefetch_done(self, ch, text, err) -> None:
+        """预取完成：若有正文则写缓存，供翻章命中秒开。"""
+        self._prefetch_idx = -2  # 清预取锁，允许下一个
+        if err or not text:
+            return
+        ch._cached_text = text
 
 
 class _LoadChapterSignals(QObject):

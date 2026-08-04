@@ -35,11 +35,13 @@ from framework.content import Content
 from framework.decrypter import Decrypter
 from framework.bulk_fetch import BulkFetch
 from framework.search import Search
+from framework.download_queue import DownloadQueue
 
 from gui.pages.home_page import HomePage
 from gui.pages.discover_page import DiscoverPage
 from gui.pages.reader_page import ReaderPage
 from gui.pages.search_page import SearchPage
+from gui.pages.download_page import DownloadPage
 
 # 导航栏顺序（对应 ui-index.md）
 TABS = [
@@ -54,7 +56,7 @@ TABS = [
 ]
 
 # 已实现界面
-IMPLEMENTED_TABS = {"home", "discover", "reader", "search"}
+IMPLEMENTED_TABS = {"home", "discover", "reader", "search", "download"}
 
 
 class MainWindow(QMainWindow):
@@ -93,6 +95,13 @@ class MainWindow(QMainWindow):
             index_dir=base_dir / "data",
         )
         self.search = Search(self.http, self.parser, self.discovery)
+        self.download_queue = DownloadQueue(
+            content=self.content,
+            http=self.http,
+            settings=self.settings,
+            source_manager=self.source_manager,
+            event_bus=self.event_bus,
+        )
 
         # Tab 索引映射
         self._tab_index = {key: i for i, (_, key) in enumerate(TABS)}
@@ -133,6 +142,9 @@ class MainWindow(QMainWindow):
             elif key == "search":
                 page = self._build_search()
                 tab_label = label
+            elif key == "download":
+                page = self._build_download()
+                tab_label = label
             elif key in IMPLEMENTED_TABS:
                 page = self._build_home()  # 其他已实现暂用首页占位
                 tab_label = label
@@ -161,13 +173,64 @@ class MainWindow(QMainWindow):
             theme_manager=self.theme_manager,
         )
         page.read_requested.connect(self._open_reader)
+        page.download_requested.connect(self._open_download_dialog)
         return page
 
     def _build_search(self) -> SearchPage:
-        return SearchPage(
+        page = SearchPage(
             source_manager=self.source_manager,
             search=self.search,
         )
+        page.open_requested.connect(self._open_from_search)
+        return page
+
+    def _open_from_search(self, source_id: str, url: str, content_type: str) -> None:
+        """搜索页点结果卡片 → 打开 reader 播放/阅读。"""
+        if self.reader is None:
+            return
+        self.reader.open(source_id, url, content_type)
+        self.tabs.setCurrentIndex(self._tab_index["reader"])
+
+    def _build_download(self) -> DownloadPage:
+        from gui.pages.download_page import DownloadPage
+
+        self.download_page = DownloadPage(
+            queue=self.download_queue,
+            event_bus=self.event_bus,
+            settings=self.settings,
+        )
+        # 下载完成「打开阅读」→ 内置 epub 阅读器
+        self.download_page.open_epub_requested.connect(self._open_epub)
+        return self.download_page
+
+    def _open_epub(self, path: str) -> None:
+        """下载页「打开阅读」→ 用内置 epub 阅读器打开。"""
+        if self.reader is None or not path:
+            return
+        self.reader.open_epub(path)
+        self.tabs.setCurrentIndex(self._tab_index["reader"])
+
+    def _open_download_dialog(self, detail) -> None:
+        """发现详情抽屉「下载」→ 弹章节范围对话框 → 入队。"""
+        from gui.components.download_range_dialog import (
+            DownloadRangeDialog,
+            build_selection,
+        )
+
+        if detail is None:
+            return
+        chapters = list(getattr(detail, "chapters", None) or [])
+        total = len(chapters)
+        dialog = DownloadRangeDialog(
+            detail.title, total, content_type=detail.content_type, parent=self
+        )
+        if dialog.exec() == dialog.DialogCode.Accepted:
+            selection = build_selection(total, dialog.selection())
+            self.download_queue.add_task(
+                detail, selected=selection, quality=dialog.quality()
+            )
+            # 跳转到下载页查看进度
+            self.tabs.setCurrentWidget(self.download_page)
 
     def _open_reader(self, detail) -> None:
         """从发现详情抽屉「开始阅读」→ 打开阅读器。"""

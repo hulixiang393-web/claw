@@ -60,16 +60,25 @@ class FFmpegMerger:
 
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        is_remote = video_url.startswith(("http://", "https://"))
         headers = f"Referer: {self._referer}\r\nUser-Agent: {self.UA}\r\n"
 
-        cmd = [self._ffmpeg, "-y", "-headers", headers, "-i", video_url]
+        # 远程 URL 才加 -headers（本地文件路径加了会报 Option headers not found）
+        cmd = [self._ffmpeg, "-y"]
+        if is_remote:
+            cmd += ["-headers", headers]
+        cmd += ["-i", video_url]
         if audio_url:
-            cmd += ["-headers", headers, "-i", audio_url]
+            if is_remote:
+                cmd += ["-headers", headers]
+            cmd += ["-i", audio_url]
         cmd += ["-c:v", "copy", "-c:a", "aac", "-shortest", str(out_path)]
         if not audio_url:
             # 仅视频轨：去掉音频编码参数和 -shortest
-            cmd = [self._ffmpeg, "-y", "-headers", headers, "-i", video_url,
-                   "-c:v", "copy", "-an", str(out_path)]
+            cmd = [self._ffmpeg, "-y"]
+            if is_remote:
+                cmd += ["-headers", headers]
+            cmd += ["-i", video_url, "-c:v", "copy", "-an", str(out_path)]
 
         try:
             proc = subprocess.run(

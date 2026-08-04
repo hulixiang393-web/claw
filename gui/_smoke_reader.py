@@ -108,6 +108,121 @@ def main():
     print("目录章节数:", novel.toc_list.count())
     assert novel.toc_list.count() == 2
 
+    # ---- 双向翻章测试（小说翻页模式） ----
+    # 切到翻页模式
+    novel._toggle_mode()
+    assert novel._mode == "pager", novel._mode
+    # 初始在第1章第0页 → 向上翻应触发上一章（但已是首章，不应跳）
+    novel._auto_prev_loading = False
+    novel._current_page = 0
+    novel._pager_turn(-1)  # 已是首章，不应跳转
+    assert novel._current_idx == 0, f"首章不应向上跳，当前idx={novel._current_idx}"
+    # 跳到第2章第0页 → 向上翻应回第1章最后一页
+    novel._load_chapter(1, scroll_to_end=False)
+    app.processEvents()
+    # 等待第二章加载
+    from PySide6.QtCore import QEventLoop as _EL, QTimer as _T
+    _lp = _EL()
+    _T.singleShot(1500, _lp.quit)
+    _lp.exec()
+    app.processEvents()
+    assert novel._current_idx == 1, f"应停在第二章，idx={novel._current_idx}"
+    novel._current_page = 0
+    novel._pager_turn(-1)  # 第2章第0页再向上 → 回第1章最后一页
+    app.processEvents()
+    _lp2 = _EL()
+    _T.singleShot(1500, _lp2.quit)
+    _lp2.exec()
+    app.processEvents()
+    assert novel._current_idx == 0, f"向上翻应回第一章，idx={novel._current_idx}"
+    # 回第一章后应定位到最后一页
+    assert novel._current_page == novel._page_count - 1, \
+        f"应定位到第一章最后一页，page={novel._current_page}/{novel._page_count}"
+    print(f"  [ok] 小说翻页模式双向跳章（回第一章第{novel._current_page+1}页）")
+
+    # ---- 双向翻章测试（漫画） ----
+    from gui.pages.reader.comic_view import ComicView
+    comic = ComicView(content)
+    comic.resize(600, 800)
+    comic.show()
+    comic._chapters = detail.chapters  # 复用两章
+    comic._current_idx = 1
+    comic._images = ["data:image/png;base64," + "A" * 200 for _ in range(20)]
+    comic._render_images()
+    # 离屏下图片不足以撑高 scrollbar → 手动设 range 模拟可滚动内容
+    comic.scroll.verticalScrollBar().setRange(0, 1000)
+    comic._auto_prev_loading = False
+    comic._load_episode(1)  # 第2话
+    assert comic._current_idx == 1
+    comic._current_idx = 1
+    # 边沿触发状态机：未武装停在边界不触发；离开边界才武装；武装后回边界触发
+    comic._edge_armed = False
+    comic._auto_prev_loading = False
+    comic._maybe_auto_next(0)  # 顶部未武装 → 不触发
+    assert not comic._auto_prev_loading, "未武装滚回顶部不应触发向上跳话"
+    comic._maybe_auto_next(500)  # 滚回中段 → 武装
+    assert comic._edge_armed, "离开边界应重新武装"
+    comic._auto_prev_loading = False
+    comic._maybe_auto_next(0)  # 武装后滚回顶部 → 触发上一话
+    # mock 无 fetch_comic_pages → 锁设过即验证触发逻辑成立
+    assert comic._auto_prev_loading, "武装后滚回顶部应触发向上跳话锁"
+    assert not comic._edge_armed, "触发后应解除武装"
+    # 停在顶部（边界）不再触发（未武装）
+    comic._auto_prev_loading = False
+    comic._maybe_auto_next(0)
+    assert not comic._auto_prev_loading, "触发后停在顶部不应再次跳话"
+    print(f"  [ok] 漫画向上边沿触发（未武装不跳 + 离开武装 + 回边界触发 + 触发后解除）")
+
+    # ---- 小说滚动模式：向上滑到顶 → 上一章末尾（不重回开头） ----
+    from gui.pages.reader.novel_view import NovelView
+
+    class _LongContent:
+        """返回超长正文，确保 QLabel 可滚动。"""
+        def fetch_chapter(self, source, url):
+            idx = int(url.rsplit("c", 1)[1])
+            return f"第{idx}章正文补充内容。" * 200
+
+    nv = NovelView(_LongContent())
+    nv.resize(600, 800)
+    nv.show()
+    long_detail = Detail(
+        source_id="demo", content_type="novel", url="http://example.com/book/long",
+        title="长文测试",
+        chapters=[Chapter("第一章", "http://example.com/long/c1"),
+                  Chapter("第二章", "http://example.com/long/c2")],
+    )
+    nv.load(object(), long_detail, "")
+    _lp3 = _EL()
+    _T.singleShot(1000, _lp3.quit)
+    _lp3.exec()
+    app.processEvents()
+    # 跳到第二章（顶部开始）
+    nv._load_chapter(1, scroll_to_end=False)
+    _lp4 = _EL()
+    _T.singleShot(1000, _lp4.quit)
+    _lp4.exec()
+    app.processEvents()
+    assert nv._current_idx == 1, f"应在第二章，idx={nv._current_idx}"
+    # 真实用户行为：向上滑 → 先离开顶部（进中段，边沿武装），再滑回顶部（触发）
+    vbar = nv.scroll.verticalScrollBar()
+    mid = vbar.maximum() // 2
+    nv._maybe_auto_next(mid)  # 离开边界区 → _edge_armed=True
+    assert nv._edge_armed, "滚回中段应重新武装"
+    nv._auto_prev_loading = False
+    nv._maybe_auto_next(0)  # 滚回顶部 → 触发向上翻章
+    _lp5 = _EL()
+    _T.singleShot(1200, _lp5.quit)
+    _lp5.exec()
+    app.processEvents()
+    assert nv._current_idx == 0, f"向上滑应回第一章，idx={nv._current_idx}"
+    vbar = nv.scroll.verticalScrollBar()
+    assert vbar.value() >= vbar.maximum() - 5, \
+        f"应定位到第一章末尾，value={vbar.value()}/max={vbar.maximum()}"
+    # 停在上一章末尾（边界）不应再触发向下（未武装）
+    nv._maybe_auto_next(vbar.maximum())
+    assert nv._current_idx == 0, f"停在末尾不应触发向下跳，idx={nv._current_idx}"
+    print(f"  [ok] 小说滚动模式向上翻章定位上一章末尾且不反弹（value={vbar.value()}/{vbar.maximum()}）")
+
     print("\n=== 阅读器小说视图离屏测试通过 ===")
 
 

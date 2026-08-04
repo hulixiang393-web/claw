@@ -19,7 +19,7 @@
     "naming_template": "{title}_{chapter_no}_{chapter_title}",
     "merge_chapters_into_one_file": false,
     "skip_existing": true,
-    "max_concurrent_downloads": 4
+    "max_concurrent_downloads": 6
   },
   "library": {
     "shelf_export_dir": "library",

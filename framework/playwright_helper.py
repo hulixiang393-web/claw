@@ -384,3 +384,172 @@ def fetch_rendered_images_sync(
             page_container_selector, scroll_step_px, scroll_stale_rounds,
         )
     )
+
+
+async def _render_one_url(
+    page,
+    url: str,
+    wait_for: str,
+    wait_until: str,
+    timeout_ms: int,
+    extra_delay_ms: int,
+    scroll_to_bottom: bool,
+    extract_mode: str,
+):
+    """在给定 page（复用浏览器）上渲染单个 URL 并提取。
+
+    由 fetch_rendered_pages_batch 调用；单次 goto 一个 URL，收集该页全部图片
+    base64 URI（canvas 合并结果）。滚到底边滚边收集，末段深等。
+    """
+    await page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+    try:
+        await page.wait_for_selector(wait_for, timeout=12000)
+    except Exception:
+        pass
+
+    drawn: dict = {}  # {cropped_id: data_uri}
+    if scroll_to_bottom:
+        async def _collect_drawn() -> None:
+            items = await page.evaluate(
+                """() => {
+                    const cs = Array.from(document.querySelectorAll('canvas'))
+                        .filter(c => c.width > 20 && c.height > 20);
+                    const out = [];
+                    for (const c of cs) {
+                        let node = c;
+                        while (node && !(node.classList && node.classList.contains('cropped'))) {
+                            node = node.parentElement;
+                        }
+                        if (!node || !node.id) continue;
+                        try {
+                            const uri = c.toDataURL('image/jpeg', 0.85);
+                            if (uri.length > 2000) out.push([node.id, uri]);
+                        } catch(e) {}
+                    }
+                    return out;
+                }"""
+            )
+            for cid, uri in items:
+                drawn[cid] = uri
+
+        step = 1000
+        no_new = 0
+        for _ in range(120):
+            await page.evaluate(f"window.scrollBy(0, {step})")
+            await page.wait_for_timeout(80)
+            prev = len(drawn)
+            await _collect_drawn()
+            no_new = 0 if len(drawn) > prev else no_new + 1
+            if no_new >= 10:
+                break
+        await page.wait_for_timeout(2500)
+        await _collect_drawn()
+
+    await page.wait_for_timeout(extra_delay_ms)
+
+    # 提取
+    images: List[str] = []
+    if extract_mode == "text":
+        text = await page.evaluate("() => document.body.innerText")
+        images = [t.strip() for t in (text or "").splitlines() if t.strip()] or []
+    elif extract_mode == "img":
+        imgs = await page.query_selector_all("img")
+        for img in imgs[:500]:
+            try:
+                src = await img.get_attribute("data-src") or await img.get_attribute("src")
+                if src:
+                    images.append(src)
+            except Exception:
+                pass
+    elif drawn:
+        images = [uri for _, uri in sorted(drawn.items(), key=lambda kv: _page_sort_key(kv[0]))]
+    else:
+        # 未滚动：等待并提取当前可见 canvas
+        collected = await page.evaluate(
+            """() => {
+                const canvases = document.querySelectorAll('canvas');
+                const out = [];
+                for (const c of canvases) {
+                    if (c.width === 0 || c.height === 0) continue;
+                    let node = c;
+                    while (node && !(node.classList && node.classList.contains('cropped'))) {
+                        node = node.parentElement;
+                    }
+                    try {
+                        const uri = c.toDataURL('image/jpeg', 0.85);
+                        if (uri.length < 2000) continue;
+                        out.push([node ? node.id : '', uri]);
+                    } catch(e) {}
+                }
+                return out;
+            }"""
+        )
+        for cid, uri in collected:
+            drawn[cid] = uri
+        images = [uri for _, uri in drawn.items()]
+    return images
+
+
+async def _fetch_pages_batch(
+    urls: List[str],
+    render_cfg: dict,
+    per_url_cfg: dict,
+) -> List[object]:
+    """一次浏览器调度，逐 URL 渲染。返回常与 urls 等长（单话失败用无异常标记）。"""
+    from playwright.async_api import async_playwright
+
+    def _cfg(c, scope):
+        return (scope.get(c) if scope.get(c) is not None else render_cfg.get(c)) or "canvas"
+
+    results = {}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            context_opts = {
+                "user_agent": _default_user_agent(),
+                "viewport": {"width": 900, "height": 2000},
+            }
+            used_proxy = _pick_proxy(render_cfg.get("proxy"))
+            if used_proxy:
+                context_opts["proxy"] = {"server": used_proxy}
+            context = await browser.new_context(**context_opts)
+            page = await context.new_page()
+            try:
+                for url in urls:
+                    per = per_url_cfg.get(url, {})
+                    cfg = {
+                        "wait_for": per.get("wait_for", render_cfg.get("wait_for", "canvas")),
+                        "wait_until": per.get("wait_until", render_cfg.get("wait_until", "domcontentloaded")),
+                        "timeout_ms": int(per.get("timeout_ms", render_cfg.get("timeout_ms", 30000))),
+                        "extra_delay_ms": int(per.get("extra_delay_ms", render_cfg.get("extra_delay_ms", 2500))),
+                        "scroll_to_bottom": per.get("scroll_to_bottom", render_cfg.get("scroll_to_bottom", False)),
+                        "extract_mode": per.get("extract_mode", render_cfg.get("extract_mode", "canvas")),
+                    }
+                    try:
+                        imgs = await _render_one_url(page, url, **cfg)
+                        # 记录是否成功（失败以 None 标记由调用方决定）
+                        results[url] = imgs if imgs else None
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("[playwright] 批量渲染失败 %s: %s", url, exc)
+                        results[url] = None
+            finally:
+                await page.close()
+                await context.close()
+        finally:
+            await browser.close()
+    return results
+
+
+def fetch_rendered_pages_batch_sync(
+    urls: List[str],
+    render_cfg: dict,
+    per_url_cfg: Optional[dict] = None,
+) -> dict:
+    """批量渲染多个 URL，复用同一个 Chromium 实例。
+
+    返回 {url: [base64 data URI 列表]}；单个 URL 渲染失败 → 值为 None。
+    相比逐话 fetch_rendered_images_sync（每话启动一次浏览器），
+    把 N 话渲染收敛到 1 次浏览器启动，大幅降低下载耗时与内存。
+    """
+    per_url_cfg = per_url_cfg or {}
+    return asyncio.run(_fetch_pages_batch(urls, render_cfg, per_url_cfg))

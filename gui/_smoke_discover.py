@@ -189,6 +189,18 @@ def main():
     assert page.detail_drawer.is_open(), "抽屉应打开"
     print("详情抽屉标题:", page.detail_drawer.title.text())
 
+    # 抽屉显示后，模拟列数变化触发 reflow → 网格卡片应保留（不清空 _works）
+    page._last_columns = 0  # 强制列数变化
+    page._reflow()
+    app.processEvents()
+    cards_after = [page.grid_layout.itemAt(i).widget() for i in range(page.grid_layout.count())]
+    cards_after = [c for c in cards_after if c is not None]
+    print("reflow 后卡片数:", len(cards_after), "/ _works:", len(page._works))
+    # 修复前：_clear_works 清空 _works → reflow 后 0 卡片（内容消失）
+    # 修复后：_clear_grid_widgets 保留 _works → 卡片与 _works 一致
+    assert len(cards_after) == len(page._works) and len(cards_after) > 0, \
+        f"reflow 后应保留全部卡片，卡片={len(cards_after)} works={len(page._works)}"
+
     # 全量抓取（真实 bulk_fetch 逻辑，MockHttp 返回作品）
     stats = bulk.fetch_all(page._current_source)
     assert stats["works"] > 0, stats

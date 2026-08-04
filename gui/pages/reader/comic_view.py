@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
+import time
+
+from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -48,6 +50,9 @@ class ComicView(QWidget):
         self._mode = "gallery"  # gallery / flip
         self._zoom = 1.0
         self._auto_loading = False  # 自动翻话锁，防重复触发
+        self._auto_prev_loading = False  # 向上自动翻话锁，防重复触发
+        self._last_auto_nav_ts = 0.0  # 上次自动翻话时间戳（防循环）
+        self._edge_armed = False  # 边沿触发武装：离开边界区才允许再次触发翻话
         self._prefetched = {}  # {url: {"images":[...], "count":N}} 预渲染的后续话
         self._prefetch_queue = []  # 串行预渲染队列（同一时间只渲染 1 话）
         self._prefetch_busy = False  # 是否正在预渲染
@@ -135,21 +140,20 @@ class ComicView(QWidget):
     def _toggle_toc(self) -> None:
         self.toc_list.setVisible(not self.toc_list.isVisible())
 
-    def _load_episode(self, idx: int) -> None:
+    def _load_episode(self, idx: int, scroll_to_end: bool = False) -> None:
         if self._source is None or not (0 <= idx < len(self._chapters)):
             return
         self._current_idx = idx
         ch = self._chapters[idx]
         self.toc_list.setCurrentRow(idx)  # 目录高亮当前话
+        self._scroll_on_load = 1 if scroll_to_end else 0
 
         # 【速度优化】已缓存本话图片 → 直接显示，秒开不重爬
         if hasattr(ch, "_cached_images") and ch._cached_images:
             self._images = ch._cached_images
             self.progress_label.setText(f"第{idx+1}/{len(self._chapters)}话 · {len(self._images)}张")
             self._render_images()
-            self._auto_loading = False
-            self.chapter_changed.emit((self._detail, ch.title, ch.url))
-            self._prefetch_future(idx, PREFETCH_COUNT)
+            self._finish_episode_load(ch)
             return
 
         # 已预渲染下一话（图片已就绪）→ 直接用
@@ -161,9 +165,7 @@ class ComicView(QWidget):
                 f"第{idx+1}/{len(self._chapters)}话 · {len(self._images)}张"
             )
             self._render_images()
-            self._auto_loading = False
-            self.chapter_changed.emit((self._detail, ch.title, ch.url))
-            self._prefetch_future(idx, PREFETCH_COUNT)
+            self._finish_episode_load(ch)
             return
 
         if prefetch := prefetched:
@@ -184,18 +186,43 @@ class ComicView(QWidget):
         # 注：预加载不在此发起——等当前话加载完成（_on_images_loaded）再预渲染后续话，
         # 避免预渲染抢资源拖慢当前话首屏。
 
+    def _finish_episode_load(self, ch) -> None:
+        """加载完成后统一收尾：清翻话锁 + 定位（顶部/话尾）+ 续读信号。"""
+        self._auto_loading = False
+        self._auto_prev_loading = False
+        # 程序化定位后解除边沿武装：停在边界（顶部/话尾）时不触发自动跳话，
+        # 用户滚回中段（_edge_armed=True）再回边界才重新触发
+        self._edge_armed = False
+        self.chapter_changed.emit((self._detail, ch.title, ch.url))
+        if self._scroll_on_load == 1:
+            # 定位到上一话末尾（等 layout 完成后再滚，blockSignals 防自动翻话循环）
+            QTimer.singleShot(0, self._scroll_to_bottom_silently)
+        else:
+            vbar = self.scroll.verticalScrollBar()
+            vbar.blockSignals(True)
+            vbar.setValue(0)
+            vbar.blockSignals(False)
+        self._prefetch_future(self._current_idx, PREFETCH_COUNT)
+
+    def _scroll_to_bottom_silently(self) -> None:
+        """无触发地滚到底（blockSignals 包住，防自动翻话循环）。"""
+        vbar = self.scroll.verticalScrollBar()
+        vbar.blockSignals(True)
+        vbar.setValue(vbar.maximum())
+        vbar.blockSignals(False)
+
     def _on_images_loaded(self, ch, images, err) -> None:
         if err:
             self.progress_label.setText(f"加载失败：{err}")
             self._auto_loading = False  # 加载失败也要解锁，防死锁
+            self._auto_prev_loading = False
             return
         self._images = images
         ch._cached_images = images  # 缓存本话，避免重复爬
         self.progress_label.setText(f"第{self._current_idx+1}/{len(self._chapters)}话 · {len(images)}张")
         self._render_images()
-        self._auto_loading = False  # 自动翻话完成，解锁
         # 当前话加载完成后再串行预渲染后续话（切话秒开，且不抢当前话资源）
-        self._prefetch_future(self._current_idx, PREFETCH_COUNT)
+        self._finish_episode_load(ch)
 
     # ------------------------------------------------------------------ #
     def _prefetch_future(self, idx: int, n: int) -> None:
@@ -294,23 +321,46 @@ class ComicView(QWidget):
             self._load_episode(nxt)
 
     def _maybe_auto_next(self, value: int) -> None:
-        """读到当前话底部（最后一张图滚到底）→ 自动加载下一话（无缝衔接）。
+        """滚动到底 → 自动下一话；滚到顶 → 自动上一话（双向自然衔接）。
 
-        条件：不在自动翻话中、不是最后一话、有滚动空间。
+        边沿触发：翻话后解除武装（_edge_armed=False），必须离开边界区
+        （滚回中段）再回到边界才再次触发，避免停在边界时被反复触发而"瞎跳"。
         """
-        if self._auto_loading:
-            return
-        if self._current_idx < 0 or self._current_idx >= len(self._chapters) - 1:
+        if self._current_idx < 0:
             return
         if not self._images:  # 本话图片还没加载完，不触发
             return
         vbar = self.scroll.verticalScrollBar()
         if vbar.maximum() == 0:
             return
-        if value >= vbar.maximum() - 40:  # 距底部 < 40px 视为读完本话
+        if self._mode != "gallery":
+            return  # 横向翻页模式走独立的翻页边界逻辑
+        max_v = vbar.maximum()
+        total = len(self._chapters)
+        at_top = value <= 2
+        at_bottom = value >= max_v - 40
+        # 离开边界区（回到中段）→ 重新武装
+        if not at_top and not at_bottom:
+            self._edge_armed = True
+            return
+        if not self._edge_armed:
+            return  # 未武装（刚翻完话停在边界）→ 忽略
+        # 向下：近底部 → 下一话
+        if at_bottom:
+            if self._auto_loading or self._current_idx >= total - 1:
+                return
             self._auto_loading = True
-            self._load_episode(self._current_idx + 1)
-            # 解锁在 _on_images_loaded 完成时
+            self._edge_armed = False
+            self._last_auto_nav_ts = time.time()
+            self._load_episode(self._current_idx + 1, scroll_to_end=False)
+        # 向上：滚回顶部 → 上一话，并定位到上一话末尾
+        elif at_top:
+            if self._auto_prev_loading or self._current_idx <= 0:
+                return
+            self._auto_prev_loading = True
+            self._edge_armed = False
+            self._last_auto_nav_ts = time.time()
+            self._load_episode(self._current_idx - 1, scroll_to_end=True)
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         # Ctrl+滚轮缩放

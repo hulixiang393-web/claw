@@ -46,6 +46,8 @@ GRID_COLUMNS = 5
 class DiscoverPage(BasePage):
     # 对外信号：开始阅读 → 跳阅读器 Tab（App 层接）
     read_requested = Signal(object)
+    # 对外信号：下载 → App 层弹章节范围对话框并入队
+    download_requested = Signal(object)
 
     def __init__(
         self,
@@ -385,6 +387,18 @@ class DiscoverPage(BasePage):
         self._work_count = 0
         self._works = []
 
+    def _clear_grid_widgets(self) -> None:
+        """只清空网格卡片（保留 self._works 数据）。
+
+        供需要重排列数、但不丢弃已加载数据的场景（_reflow）使用。
+        区别于 _clear_works（后者连 _works 一起清空，用于换源/切分类）。
+        """
+        while self.grid_layout.count():
+            child = self.grid_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self._work_count = 0
+
     def _load_next_page(self) -> None:
         """异步加载下一页：后台线程抓作品，加载中显示状态，完成后更新网格。"""
         if self._loading or not self._has_more or self._current_source is None:
@@ -529,12 +543,17 @@ class DiscoverPage(BasePage):
             self.grid_layout.setColumnStretch(i, 1)
 
     def _reflow(self) -> None:
-        """窗口尺寸变化时按新列数重排作品网格。"""
+        """窗口尺寸变化时按新列数重排作品网格。
+
+        注意：只重排卡片，不清空 self._works 数据（区别于 _clear_works）。
+        否则抽屉显示/隐藏导致列数变化时，_clear_works 会把已加载作品
+        列表一并清空，重建后网格变空（点详情页"内容消失"）。
+        """
         cols = self._columns()
         if cols == self._last_columns:
             return
         self._last_columns = cols
-        self._clear_works()
+        self._clear_grid_widgets()
         self._work_count = 0
         for w in self._works:
             row, col = divmod(self._work_count, cols)
@@ -620,8 +639,8 @@ class DiscoverPage(BasePage):
         webbrowser.open(url)
 
     def _on_download(self, detail) -> None:
-        """下载 → 占位提示（下载界面后续实现）。"""
-        self.status_label.setText(f"[下载待实现] {detail.title}")
+        """下载 → 转发给 App 层（弹章节范围对话框并入队）。"""
+        self.download_requested.emit(detail)
 
     def _on_scroll(self, value: int) -> None:
         """滚动接近底部（阈值 200px）触发加载下一页。"""

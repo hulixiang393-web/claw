@@ -211,7 +211,12 @@
 | `list.paginator` | `paginator` | 章节列表翻页器 |
 | `body.attr` | `string` | 取属性（默认取文本） |
 | `body.attr_path` | `string` | 任意属性（如 `data-src`） |
-| `body.paginator` | `paginator` | 章内分页器（`next_link`） |
+| `body.paginator` | `paginator` | 章内分页器（`next_link`）。长章节跨多页（如 `xxx.html` / `xxx_1.html` / `xxx_2.html`）时，`next_link.selector` 指向"下一页"链接；框架抓完全部续页拼接后返回正文 |
+
+> **章内分页（novel）**：框架默认对 novel 源开启分页探测——抓完一页正文后，
+> 从页脚导航（`read-nav` 等）找同章续页链接（URL 基路径相同且带 `_<数字>.html`
+> 后缀），跨页拼接；用 `body.paginator.next_link.selector` 可显式指定续页链接，
+> 缺省时框架自动探测。防死循环：`max_pages` 上限 + URL 去重（seen）。
 | `body.filter` | `object` | 内容层过滤（见下） |
 | `list.root_selector.exclude` | `array<selector>` | 排除广告节点 |
 

@@ -49,6 +49,37 @@ class HttpClient:
                     self._sleeper(min(0.5 * (2 ** attempt), 2.0))
         raise RequestError(f"请求失败 GET {url}：{last_error}")
 
+    def get_bytes(
+        self,
+        url: str,
+        headers: Optional[dict] = None,
+        proxy: Optional[str] = None,
+        timeout: float = 10.0,
+        retries: int = 3,
+    ) -> bytes:
+        """GET 返回响应字节（图片等二进制内容）。重试耗尽抛 RequestError。"""
+        self._sleeper(0.0)
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                if self._session is not None:
+                    proxies = {"http": proxy, "https": proxy} if proxy else None
+                    resp = self._session.get(
+                        url, headers=headers, proxies=proxies, timeout=timeout
+                    )
+                    resp.raise_for_status()
+                    return resp.content
+                import urllib.request
+
+                req = urllib.request.Request(url, headers=headers or {})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt < retries:
+                    self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+        raise RequestError(f"请求失败 GET {url}：{last_error}")
+
     def get_json(
         self,
         url: str,

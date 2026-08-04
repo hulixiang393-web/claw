@@ -58,12 +58,16 @@ class Search:
         self._http = http
         self._parser = parser
         self._discovery = discovery
+        self._ytdlp = None  # 懒加载单例
 
     # ------------------------------------------------------------------ #
     def search_one(self, source: SourceConfig, keyword: str) -> List[SearchResult]:
-        """单源搜索。优先 api_endpoints.search，否则 endpoints.search。"""
+        """单源搜索。优先 yt-dlp 引擎，其次 api_endpoints.search，否则 endpoints.search。"""
         api = source.raw.get("api_endpoints") or {}
-        if api.get("search"):
+        search_cfg = api.get("search") or {}
+        if search_cfg.get("engine") == "ytdlp":
+            return self._search_ytdlp(source, keyword, search_cfg)
+        if search_cfg:
             return self._search_api(source, keyword)
         return self._search_html(source, keyword)
 
@@ -126,6 +130,35 @@ class Search:
             )
         return results
 
+    # ------------------------------------------------------------------ #
+    def _search_ytdlp(self, source: SourceConfig, keyword: str, cfg: dict) -> List[SearchResult]:
+        """yt-dlp 引擎搜索。搜索前缀/URL 模板从源配置读（通用化）。"""
+        constraints = source.raw.get("constraints") or {}
+        cs = constraints.get("search") or {}
+        limit = int(cfg.get("max_results") or cs.get("max_results") or 20)
+        prefix = str(cfg.get("search_prefix") or "ytsearch")
+        url_tpl = str(cfg.get("url_template") or "https://www.youtube.com/watch?v={id}")
+        if self._ytdlp is None:
+            from .ytdlp import Ytdlp
+
+            self._ytdlp = Ytdlp()
+        items = self._ytdlp.search(keyword, limit=limit, prefix=prefix, url_tpl=url_tpl)
+        results = []
+        for it in items:
+            if not it.get("title") or not it.get("url"):
+                continue
+            results.append(
+                SearchResult(
+                    title=self._clean_title(str(it["title"])),
+                    url=str(it["url"]),
+                    source_id=source.source_id,
+                    source_name=source.source_name,
+                    cover=str(it.get("cover") or ""),
+                    author=str(it.get("author") or ""),
+                )
+            )
+        return results
+
     def _search_api(self, source: SourceConfig, keyword: str) -> List[SearchResult]:
         """API 站搜索（api_endpoints.search）。
 
@@ -140,61 +173,69 @@ class Search:
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
 
-        if params:
-            # 结构化 params：填充占位符 + URL encode + 可选签名
-            filled = {}
-            for k, v in params.items():
-                val = str(v).replace("{keyword}", keyword).replace("{page}", "1")
-                filled[k] = val
-            sign_cfg = cfg.get("sign") or {}
-            strategy = sign_cfg.get("strategy")
-            if strategy:
-                from .signers import get_signer
+        # 翻页：读 constraints.search.max_pages（默认 1），多页合并去重
+        constraints = source.raw.get("constraints") or {}
+        max_pages = int((constraints.get("search") or {}).get("max_pages") or 1)
 
-                signer = get_signer(strategy, self._http)
-                filled = signer.sign(filled)
-            qs = urlencode(filled)
-            abs_url = urljoin(source.base_url, api_url)
-            if "?" in api_url:
-                abs_url = f"{abs_url}&{qs}"
+        results: List[SearchResult] = []
+        seen_urls: set = set()
+        for page in range(1, max_pages + 1):
+            if params:
+                filled = {}
+                for k, v in params.items():
+                    val = str(v).replace("{keyword}", keyword).replace("{page}", str(page))
+                    filled[k] = val
+                sign_cfg = cfg.get("sign") or {}
+                strategy = sign_cfg.get("strategy")
+                if strategy:
+                    from .signers import get_signer
+
+                    signer = get_signer(strategy, self._http)
+                    filled = signer.sign(filled)
+                qs = urlencode(filled)
+                abs_url = urljoin(source.base_url, api_url)
+                if "?" in api_url:
+                    abs_url = f"{abs_url}&{qs}"
+                else:
+                    abs_url = f"{abs_url}?{qs}"
             else:
-                abs_url = f"{abs_url}?{qs}"
-        else:
-            api_url = api_url.replace("{keyword}", quote(keyword))
-            abs_url = urljoin(source.base_url, api_url)
-        resp = self._http.get_json(
-            abs_url,
-            headers=source.request_headers(),
-            timeout=float(source.transports().get("timeout") or 10),
-        )
-        items = resp
-        rpath = cfg.get("response_path")
-        if rpath:
-            items = self._simple_getpath(resp, rpath)
-        if not isinstance(items, list):
-            return []
-        item_fields = cfg.get("item_fields") or {}
-        results = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            title = self._tpl(it, item_fields.get("title"))
-            url = self._tpl(it, item_fields.get("url"))
-            if not title or not url:
-                continue
-            url = urljoin(source.base_url, url)
-            cover = self._clean_cover(self._tpl(it, item_fields.get("cover")))
-            results.append(
-                SearchResult(
-                    title=self._clean_title(str(title)),
-                    url=str(url),
-                    source_id=source.source_id,
-                    source_name=source.source_name,
-                    cover=str(cover or ""),
-                    author=str(self._tpl(it, item_fields.get("author")) or ""),
-                    update=str(self._tpl(it, item_fields.get("update")) or ""),
-                )
+                api_url2 = api_url.replace("{keyword}", quote(keyword))
+                abs_url = urljoin(source.base_url, api_url2)
+            resp = self._http.get_json(
+                abs_url,
+                headers=source.request_headers(),
+                timeout=float(source.transports().get("timeout") or 10),
             )
+            items = resp
+            rpath = cfg.get("response_path")
+            if rpath:
+                items = self._simple_getpath(resp, rpath)
+            if not isinstance(items, list) or not items:
+                break
+            item_fields = cfg.get("item_fields") or {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                title = self._tpl(it, item_fields.get("title"))
+                url = self._tpl(it, item_fields.get("url"))
+                if not title or not url:
+                    continue
+                url = urljoin(source.base_url, url)
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                cover = self._clean_cover(self._tpl(it, item_fields.get("cover")))
+                results.append(
+                    SearchResult(
+                        title=self._clean_title(str(title)),
+                        url=str(url),
+                        source_id=source.source_id,
+                        source_name=source.source_name,
+                        cover=str(cover or ""),
+                        author=str(self._tpl(it, item_fields.get("author")) or ""),
+                        update=str(self._tpl(it, item_fields.get("update")) or ""),
+                    )
+                )
         return results
 
     @staticmethod

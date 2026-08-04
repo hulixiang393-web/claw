@@ -1,0 +1,105 @@
+{
+  "$schema_version": 2,
+  "$id": "pornhub",
+  "$type": "video",
+  "$name": "PornHub",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://cn.pornhub.com",
+    "description": "PornHub 视频源（HTML 搜索/发现 + yt-dlp 高清流）",
+    "lang": "en",
+    "region": "en",
+    "tags": ["视频", "成人", "ytdlp"]
+  },
+  "transports": {
+    "base_url": "https://cn.pornhub.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://cn.pornhub.com/"
+    },
+    "cookie": "age_verified=1; accessAgeDisclaimerPH=1; accessAgeDisclaimerUK=1; accessPH=1; platform=pc",
+    "timeout": 20,
+    "retries": 3,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/video?page=1",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          { "title": "最新视频", "url": "/video?page=1" },
+          { "title": "最多观看", "url": "/video?o=mv&page=1" },
+          { "title": "最热评分", "url": "/video?o=tr&page=1" },
+          { "title": "高清视频", "url": "/hd?page=1" },
+          { "title": "女优", "url": "/pornstars?page=1" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "li.pcVideoListItem" },
+        "fields": {
+          "title": { "css": "span.title a" },
+          "url": { "css": "a[href*='/view_video.php?viewkey=']", "attr": "href" },
+          "cover": { "css": "img", "attr": "src" },
+          "author": { "css": ".videoUploaderBlock a" },
+          "duration": { "css": "var.duration" },
+          "views": { "css": ".views var" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/video/search",
+      "method": "GET",
+      "keyword_param": "search",
+      "item": {
+        "root_selector": { "css": "li.pcVideoListItem" },
+        "fields": {
+          "title": { "css": "span.title a" },
+          "url": { "css": "a[href*='/view_video.php?viewkey=']", "attr": "href" },
+          "cover": { "css": "img", "attr": "src" },
+          "author": { "css": ".videoUploaderBlock a" },
+          "update": { "css": "var.duration" }
+        }
+      }
+    }
+  },
+  "api_endpoints": {
+    "detail": {
+      "engine": "ytdlp",
+      "url": "{url}"
+    },
+    "episode": {
+      "engine": "ytdlp",
+      "format": "best"
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": { "quality": "best" }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 36 },
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 1, "max_items": 20 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": "li.pcVideoListItem" }
+    }
+  }
+}

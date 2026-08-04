@@ -1,0 +1,601 @@
+"""下载队列（download_queue.py）。
+
+管理下载任务的并发调度、暂停/继续/取消、失败重试与进度广播。
+
+- 并发槽：active 数 < concurrent 时从 WAITING 队首取任务启动 worker
+- 事件：经 EventBus 广播（source_id = task_id，供 MiniProgress 划归）
+- 框架层纯 Python，不依赖 GUI；UI 线程安全由 GUI 侧订阅方自行桥接
+
+事件契约：
+    DOWNLOAD_STARTED   payload={"task_id","title","total"}
+    DOWNLOAD_PROGRESS  payload={"task_id","done","total","speed_mbs","title"}
+    DOWNLOAD_COMPLETED payload={"task_id","title","done","total"}
+    DOWNLOAD_FAILED    payload={"task_id","title","error"}
+对应 core.md「download_queue.py 下载队列」与 ui-download.md。
+"""
+
+from __future__ import annotations
+
+import itertools
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+try:
+    from PySide6.QtCore import QThreadPool, QRunnable
+except ImportError:  # 纯 Python 环境（无 Qt）时降级 threading
+    QThreadPool = None
+    QRunnable = None
+
+from .downloader import Downloader
+from .errors import SourceError
+from .events import (
+    Event,
+    EVENT_DOWNLOAD_COMPLETED,
+    EVENT_DOWNLOAD_FAILED,
+    EVENT_DOWNLOAD_PROGRESS,
+    EVENT_DOWNLOAD_STARTED,
+)
+
+
+class _DownloadWorker:
+    """QThreadPool 可执行的下载 worker（封装 _run_task 执行）。
+
+    与 DownloadQueue 的 _run_task 解耦：Queue 只做调度，worker 只负责跑。
+    保留 _active_workers 计数语义（并发槽仍由 Queue 的 _concurrent 控制）。
+    提供 is_alive() 兼容 threading.Thread 语义，供 resume_* 判断 worker 是否还在跑。
+    """
+
+    def __init__(self, queue: "DownloadQueue", task: "DownloadTask"):
+        self._queue = queue
+        self._task = task
+        self._running = threading.Event()
+
+    def is_alive(self) -> bool:
+        """正在 run() 中（与 threading.Thread.is_alive 语义一致）。"""
+        return self._running.is_set()
+
+    def run(self) -> None:
+        self._running.set()
+        try:
+            self._queue._run_task(self._task)
+        finally:
+            self._running.clear()
+
+
+class TaskStatus:
+    """任务状态常量。"""
+
+    WAITING = "waiting"
+    DOWNLOADING = "downloading"
+    PAUSED = "paused"
+    CANCELED = "canceled"
+    DONE = "done"
+    FAILED = "failed"
+
+
+# 单章失败最大尝试次数（含首次）
+MAX_ATTEMPTS = 3
+
+
+@dataclass
+class DownloadTask:
+    """一个下载任务（一本书/一部作品的全部或指定章节）。"""
+
+    task_id: str
+    source_id: str
+    content_type: str
+    url: str
+    title: str
+    chapters: List = field(default_factory=list)      # List[Chapter]
+    selected: List[bool] = field(default_factory=list)  # 与 chapters 等长的勾选
+    quality: str = ""                                    # 视频画质（best/1080p/...），非视频为空
+    epub_chapters: list = field(default_factory=list)    # epub 累积：[(标题, 文本)或(标题,[图字节])]
+    epub_chapters: List = field(default_factory=list)    # epub 累积材料（novel:文本 / comic:图字节）
+    epub_ok: bool = False                                # epub 是否已成功合成
+    status: str = TaskStatus.WAITING
+    done: int = 0
+    total: int = 0
+    failed: List[str] = field(default_factory=list)   # 失败章节标题
+    error: str = ""                                    # 最近一次错误信息
+    bytes_written: int = 0
+    start_time: float = 0.0
+    end_time: float = 0.0
+    out_dir: str = ""
+    cancel_evt: threading.Event = field(default_factory=threading.Event)
+    pause_evt: threading.Event = field(default_factory=threading.Event)
+    worker: Optional[threading.Thread] = None          # 当前 worker 线程
+
+    # ------------------------------------------------------------------ #
+    @property
+    def elapsed(self) -> float:
+        """已用秒数（含暂停期，简单估算）。"""
+        if self.start_time <= 0:
+            return 0.0
+        end = self.end_time if self.end_time > 0 else time.time()
+        return max(0.0, end - self.start_time)
+
+    @property
+    def remaining_s(self) -> float:
+        """剩余时间估算：剩余章节 × (已用/已下)。ui-download.md 公式。"""
+        if self.done <= 0 or self.total <= 0:
+            return 0.0
+        return max(0.0, (self.total - self.done) * self.elapsed / self.done)
+
+    @property
+    def speed_mbs(self) -> float:
+        """平均下载速度（MB/s）。"""
+        if self.elapsed <= 0 or self.bytes_written <= 0:
+            return 0.0
+        return (self.bytes_written / 1048576.0) / self.elapsed
+
+
+class DownloadQueue:
+    """并发下载队列（线程安全）。"""
+
+    def __init__(self, content, http, settings, source_manager, event_bus=None):
+        self._content = content
+        self._http = http
+        self._settings = settings
+        self._manager = source_manager
+        self._bus = event_bus
+        self._downloader = Downloader(content, http, settings)
+        self._lock = threading.RLock()
+        self._tasks: List[DownloadTask] = []
+        self._seq = itertools.count(1)
+        self._concurrent = max(
+            1, int(settings.get("download", "max_concurrent_downloads", 4))
+        )
+        self._active_workers = 0
+
+    # ------------------------------------------------------------------ #
+    # 事件广播
+    # ------------------------------------------------------------------ #
+    def _emit(self, etype: str, payload: dict, task: DownloadTask) -> None:
+        if self._bus is None:
+            return
+        try:
+            self._bus.emit(Event(etype, payload, source_id=task.task_id))
+        except Exception:
+            pass  # 订阅者异常不影响下载
+
+    # ------------------------------------------------------------------ #
+    # 对外 API
+    # ------------------------------------------------------------------ #
+    def add_task(self, detail, selected: Optional[List[bool]] = None, quality: str = "") -> DownloadTask:
+        """加入下载任务。selected 与 detail.chapters 等长（False 跳过）；省略则全选。
+        quality: 视频画质（best/1080p/...），非视频忽略。"""
+        chapters = list(detail.chapters or [])
+        if selected is None:
+            selected = [True] * len(chapters)
+        selected = list(selected)
+        if len(selected) < len(chapters):
+            selected.extend([True] * (len(chapters) - len(selected)))
+        selected = selected[: len(chapters)]
+
+        with self._lock:
+            task = DownloadTask(
+                task_id=f"dl-{next(self._seq)}",
+                source_id=detail.source_id,
+                content_type=detail.content_type,
+                url=detail.url,
+                title=detail.title or detail.url,
+                chapters=chapters,
+                selected=selected,
+                quality=quality,
+                total=sum(selected),
+            )
+            task.out_dir = str(self._downloader.book_dir(task))
+            self._tasks.append(task)
+        self._emit(
+            EVENT_DOWNLOAD_STARTED,
+            {"task_id": task.task_id, "title": task.title, "total": task.total},
+            task,
+        )
+        self._maybe_dispatch()
+        return task
+
+    def tasks(self) -> List[DownloadTask]:
+        """全部任务快照（调用方自行按状态分组）。"""
+        with self._lock:
+            return list(self._tasks)
+
+    def get(self, task_id: str) -> Optional[DownloadTask]:
+        with self._lock:
+            return self._find(task_id)
+
+    # ---- 单任务控制 ---------------------------------------------------- #
+    def pause_task(self, task_id: str) -> None:
+        with self._lock:
+            t = self._find(task_id)
+            if t is None:
+                return
+            if t.status == TaskStatus.WAITING:
+                t.status = TaskStatus.PAUSED  # 未启动即暂停
+            elif t.status in (TaskStatus.DOWNLOADING, TaskStatus.PAUSED):
+                t.pause_evt.set()  # worker 会在章节边界阻塞
+            else:
+                return
+
+    def resume_task(self, task_id: str) -> None:
+        with self._lock:
+            t = self._find(task_id)
+            if t is None or t.status != TaskStatus.PAUSED:
+                return
+            t.pause_evt.clear()
+            if t.worker is not None and t.worker.is_alive():
+                t.status = TaskStatus.DOWNLOADING  # worker 仍在运行，直接恢复
+            else:
+                t.status = TaskStatus.WAITING  # 从未启动，重新入队
+        self._maybe_dispatch()
+
+    def cancel_task(self, task_id: str) -> None:
+        with self._lock:
+            t = self._find(task_id)
+            if t is None:
+                return
+            t.cancel_evt.set()
+            t.pause_evt.clear()  # 解除暂停阻塞，让 worker 尽快退出
+            if t.status in (TaskStatus.WAITING, TaskStatus.PAUSED):
+                # 无运行中 worker，直接标记；运行中由 worker 在章节边界退出
+                t.status = TaskStatus.CANCELED
+                t.end_time = time.time()
+
+    def retry_task(self, task_id: str) -> None:
+        """失败任务清零计数重新入队。"""
+        with self._lock:
+            t = self._find(task_id)
+            if t is None or t.status != TaskStatus.FAILED:
+                return
+            t.status = TaskStatus.WAITING
+            t.failed = []
+            t.error = ""
+            t.done = 0
+            t.bytes_written = 0
+            t.start_time = 0.0
+            t.end_time = 0.0
+            t.cancel_evt = threading.Event()
+            t.pause_evt = threading.Event()
+        self._maybe_dispatch()
+
+    def remove_done(self, task_id: str) -> None:
+        """从列表移除（文件保留）。仅限终态：DONE / FAILED / CANCELED。"""
+        with self._lock:
+            t = self._find(task_id)
+            if t is None:
+                return
+            if t.status in (
+                TaskStatus.DONE,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELED,
+            ):
+                self._tasks.remove(t)
+
+    # ---- 队列级控制 ---------------------------------------------------- #
+    def pause_all(self) -> None:
+        with self._lock:
+            for t in self._tasks:
+                if t.status in (TaskStatus.WAITING, TaskStatus.DOWNLOADING):
+                    self._do_pause(t)
+
+    def resume_all(self) -> None:
+        with self._lock:
+            for t in self._tasks:
+                if t.status == TaskStatus.PAUSED:
+                    t.pause_evt.clear()
+                    t.status = (
+                        TaskStatus.DOWNLOADING
+                        if t.worker is not None and t.worker.is_alive()
+                        else TaskStatus.WAITING
+                    )
+        self._maybe_dispatch()
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            for t in self._tasks:
+                t.cancel_evt.set()
+                t.pause_evt.clear()
+                if t.status in (TaskStatus.WAITING, TaskStatus.PAUSED):
+                    t.status = TaskStatus.CANCELED
+                    t.end_time = time.time()
+
+    def set_concurrency(self, n: int) -> None:
+        """运行时调整并发槽（clamp 1~8）。"""
+        with self._lock:
+            self._concurrent = max(1, min(8, int(n)))
+        self._maybe_dispatch()
+
+    @property
+    def concurrent(self) -> int:
+        with self._lock:
+            return self._concurrent
+
+    # ------------------------------------------------------------------ #
+    # 调度
+    # ------------------------------------------------------------------ #
+    def _find(self, task_id: str) -> Optional[DownloadTask]:
+        return next((t for t in self._tasks if t.task_id == task_id), None)
+
+    @staticmethod
+    def _do_pause(t: DownloadTask) -> None:
+        if t.status == TaskStatus.WAITING:
+            t.status = TaskStatus.PAUSED
+        elif t.status == TaskStatus.DOWNLOADING:
+            t.pause_evt.set()
+
+    def _maybe_dispatch(self) -> None:
+        """并发槽有空位且队首有 WAITING → 启动 worker。
+
+        派发时**立即把任务标记为 DOWNLOADING**（而非等 worker 线程起来再标）：
+        否则在启动线程的窗口内，另一次 dispatch 会再次选到该 WAITING 任务，
+        导致同一任务被派发两次、双 worker 同时下载（done 翻倍）。
+        """
+        while True:
+            with self._lock:
+                if self._active_workers >= self._concurrent:
+                    return
+                nxt = next(
+                    (t for t in self._tasks if t.status == TaskStatus.WAITING), None
+                )
+                if nxt is None:
+                    return
+                # 先标记，杜绝重复派发竞态
+                nxt.status = TaskStatus.DOWNLOADING
+                self._active_workers += 1
+            self._spawn_worker(nxt)
+
+    def _spawn_worker(self, task: DownloadTask) -> None:
+        """启动 worker：优先 Qt QThreadPool（GUI 响应不卡顿），降级 threading。"""
+        if QThreadPool is not None:
+            runner = _DownloadWorker(self, task)
+            with self._lock:
+                task.worker = runner  # ref（QRunnable 也做句柄）
+            QThreadPool.globalInstance().start(runner)
+            return
+        th = threading.Thread(
+            target=self._run_task, args=(task,), name=f"dl-{task.task_id}", daemon=True
+        )
+        with self._lock:
+            task.worker = th
+        th.start()
+
+    # ------------------------------------------------------------------ #
+    # worker 执行
+    # ------------------------------------------------------------------ #
+    def _run_task(self, task: DownloadTask) -> None:
+        with self._lock:
+            task.status = TaskStatus.DOWNLOADING
+            task.start_time = time.time()
+        try:
+            self._download_all(task)
+            # 小说/漫画：全部章节下载完后合成为单本 epub（只产出 epub）
+            if task.content_type in ("novel", "comic"):
+                self._downloader.finalize_epub(task)
+        except Exception as exc:  # noqa: BLE001 —— 兜底，整任务失败
+            with self._lock:
+                task.error = str(exc)
+                task.failed.append("（整体）")
+                task.status = TaskStatus.FAILED
+        finally:
+            with self._lock:
+                task.worker = None
+                self._active_workers -= 1
+                task.end_time = time.time()
+            self._emit_final(task)
+            self._maybe_dispatch()
+
+    def _download_all(self, task: DownloadTask) -> None:
+        source = self._manager.get(task.source_id) if self._manager else None
+        if source is None:
+            raise SourceError(f"源不存在：{task.source_id}")
+        if task.total <= 0:
+            return
+
+        # ── 漫画批量路径：所有待下载话一次性 Playwright 渲染，避免 N 次启动浏览器 ──
+        if task.content_type == "comic":
+            self._download_comic_batch(task, source)
+            return
+
+        # ── 普通路径（novel / video，逐章串行） ──
+        for i, ch in enumerate(task.chapters):
+            if not task.selected[i]:
+                continue
+            # 取消 / 暂停检查（每章边界）
+            if task.cancel_evt.is_set():
+                break
+            while task.pause_evt.is_set():
+                with self._lock:
+                    task.status = TaskStatus.PAUSED
+                if task.cancel_evt.wait(0.3):
+                    break
+            if task.cancel_evt.is_set():
+                break
+            with self._lock:
+                task.status = TaskStatus.DOWNLOADING
+
+            # 单章下载（失败自动重试 MAX_ATTEMPTS 次）
+            last_err = ""
+            for attempt in range(MAX_ATTEMPTS):
+                try:
+                    nbytes = self._downloader.download_chapter(source, task, ch, i)
+                    with self._lock:
+                        task.done += 1
+                        task.bytes_written += max(0, nbytes)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_err = str(exc)
+                    if task.cancel_evt.is_set():
+                        break
+                    if attempt < MAX_ATTEMPTS - 1:
+                        time.sleep(min(0.5 * (2 ** attempt), 2.0))  # 退避
+            else:
+                with self._lock:
+                    task.failed.append(ch.title or f"第{i + 1}章")
+                    task.error = last_err
+
+            with self._lock:
+                if task.cancel_evt.is_set():
+                    break
+                task.end_time = time.time()
+                done = task.done
+                total = task.total
+                speed = task.speed_mbs
+            self._emit(
+                EVENT_DOWNLOAD_PROGRESS,
+                {
+                    "task_id": task.task_id,
+                    "done": done,
+                    "total": total,
+                    "speed_mbs": speed,
+                    "title": task.title,
+                },
+                task,
+            )
+
+        # 终态判定
+        with self._lock:
+            task.end_time = time.time()
+            if task.cancel_evt.is_set():
+                task.status = TaskStatus.CANCELED
+            elif task.failed:
+                task.status = TaskStatus.FAILED
+            else:
+                task.status = TaskStatus.DONE
+
+    def _download_comic_batch(self, task: DownloadTask, source) -> None:
+        """漫画专用批量下载：一次 Playwright 渲染全部待下载话。
+
+        与 _download_comic_batch（Downloader 侧）区别：
+        - 本函数由 DownloadQueue 调度，含暂停/取消/进度/重试/终态判定；
+        - Downloader.download_comic_batch 只负责渲染+落盘字节数。
+        每 5~10 话为一批（避免单次 Chromium 渲染话太多内存涨），
+        批内失败自动重试，取消/暂停在批边界检查。
+        """
+        import math
+
+        BATCH_SIZE = 8  # 每批渲染话数（控制 Chromium 峰值内存）
+
+        # 收集待下载的章节索引
+        pending = [i for i in range(len(task.chapters)) if task.selected[i]]
+        if not pending:
+            with self._lock:
+                task.status = TaskStatus.DONE
+            return
+
+        # 批处理
+        num_batches = math.ceil(len(pending) / BATCH_SIZE)
+        for batch_idx in range(num_batches):
+            if task.cancel_evt.is_set():
+                break
+            # 暂停等待
+            while task.pause_evt.is_set():
+                with self._lock:
+                    task.status = TaskStatus.PAUSED
+                if task.cancel_evt.wait(0.3):
+                    break
+            if task.cancel_evt.is_set():
+                break
+            with self._lock:
+                task.status = TaskStatus.DOWNLOADING
+
+            batch_indices = pending[batch_idx * BATCH_SIZE:(batch_idx + 1) * BATCH_SIZE]
+            batch_chapters = [task.chapters[i] for i in batch_indices]
+
+            # 重试逻辑（batch 失败时重试最多 MAX_ATTEMPTS 次）
+            last_err = ""
+            for attempt in range(MAX_ATTEMPTS):
+                try:
+                    result = self._downloader.download_comic_batch(
+                        source, task, batch_chapters, batch_indices,
+                    )
+                    # 成功：更新进度（含跳过章节，done 也 +1）
+                    with self._lock:
+                        for idx, nbytes in result.items():
+                            task.done += 1
+                            task.bytes_written += max(0, nbytes)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_err = str(exc)
+                    if task.cancel_evt.is_set():
+                        break
+                    if attempt < MAX_ATTEMPTS - 1:
+                        time.sleep(min(0.5 * (2 ** attempt), 2.0))
+            else:
+                # 全部重试仍失败
+                with self._lock:
+                    for idx in batch_indices:
+                        ch = task.chapters[idx]
+                        task.failed.append(ch.title or f"第{idx + 1}话")
+                    task.error = last_err
+
+            # 发进度
+            with self._lock:
+                task.end_time = time.time()
+                done = task.done
+                total = task.total
+                speed = task.speed_mbs
+            self._emit(
+                EVENT_DOWNLOAD_PROGRESS,
+                {
+                    "task_id": task.task_id,
+                    "done": done,
+                    "total": total,
+                    "speed_mbs": speed,
+                    "title": task.title,
+                },
+                task,
+            )
+
+        # 终态判定
+        with self._lock:
+            task.end_time = time.time()
+            if task.cancel_evt.is_set():
+                task.status = TaskStatus.CANCELED
+            elif task.failed:
+                task.status = TaskStatus.FAILED
+            else:
+                task.status = TaskStatus.DONE
+
+    def _emit_final(self, task: DownloadTask) -> None:
+        if task.status == TaskStatus.DONE:
+            self._emit(
+                EVENT_DOWNLOAD_COMPLETED,
+                {
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "done": task.done,
+                    "total": task.total,
+                },
+                task,
+            )
+        elif task.status == TaskStatus.FAILED:
+            self._emit(
+                EVENT_DOWNLOAD_FAILED,
+                {"task_id": task.task_id, "title": task.title, "error": task.error},
+                task,
+            )
+        # CANCELED 不广播终态（用户主动取消，无需通知）
+
+
+# --------------------------------------------------------------------------- #
+# Qt worker（可选）：QThreadPool 调度的下载任务
+# --------------------------------------------------------------------------- #
+if QRunnable is not None:
+
+    class _DownloadWorker(QRunnable):
+        """在 Qt 线程池中执行单个下载任务。
+
+        Qt 线程池复用池内线程、AMQ 模型并发，直连 GUI 主线程的事件循环，
+        比 raw threading.Thread 对 UI 响应更友好（下载时不卡界面）。
+        保留 queue 的暂停/取消/进度语义（经 task 的 Event + queue._run_task）。
+        """
+
+        def __init__(self, queue, task):
+            super().__init__()
+            self.setAutoDelete(True)
+            self._queue = queue
+            self._task = task
+
+        def run(self) -> None:
+            self._queue._run_task(self._task)

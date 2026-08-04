@@ -56,6 +56,7 @@ class Discovery:
         self._http = http
         self._parser = parser
         self._checker = checker
+        self._ytdlp = None  # 懒加载单例
 
     # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
@@ -264,6 +265,14 @@ class Discovery:
         if not cfg:
             return []
 
+        # yt-dlp 引擎：从分类 URL 取 keyword，调 yt-dlp 搜索
+        if cfg.get("engine") == "ytdlp":
+            from urllib.parse import parse_qs, urlparse
+
+            url_qs = parse_qs(urlparse(url).query) if "?" in url else {}
+            kw = url_qs.get("keyword", [""])[0] or cfg.get("default_keyword") or "热门"
+            return self._list_works_ytdlp(source, kw)
+
         # 从传入分类 URL 解析 query 参数（如 tids=1&keyword=新番）
         url_qs = parse_qs(urlparse(url).query) if "?" in url else {}
         cat_params = {k: v[0] for k, v in url_qs.items()}
@@ -347,6 +356,34 @@ class Discovery:
                     cover=str(self._template_value(it, item_fields.get("cover")) or ""),
                     author=str(self._template_value(it, item_fields.get("author")) or ""),
                     update=str(self._template_value(it, item_fields.get("update")) or ""),
+                    source_id=source.source_id,
+                    source_name=source.source_name,
+                )
+            )
+        return works
+
+    def _list_works_ytdlp(self, source: SourceConfig, keyword: str) -> List[Work]:
+        """yt-dlp 引擎：按关键词搜索返回作品列表（发现页用）。"""
+        if self._ytdlp is None:
+            from .ytdlp import Ytdlp
+
+            self._ytdlp = Ytdlp()
+        limit = 20
+        try:
+            items = self._ytdlp.search(keyword, limit=limit)
+        except Exception:
+            return []
+        cfg = source.raw.get("api_endpoints", {}).get("discovery") or {}
+        works: List[Work] = []
+        for it in items:
+            if not it.get("title") or not it.get("url"):
+                continue
+            works.append(
+                Work(
+                    title=it["title"],
+                    url=it["url"],
+                    cover=it.get("cover") or "",
+                    author=it.get("author") or "",
                     source_id=source.source_id,
                     source_name=source.source_name,
                 )

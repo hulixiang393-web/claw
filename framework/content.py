@@ -120,8 +120,9 @@ def _extract_chapter_number(title: str) -> tuple | None:
         if v is not None:
             volume = v
     # 章号：中文「第X章/话/回/集/节」或英文「Ch.X」「CHAPTER X」
+    # （话/話 兼容简繁；回/囘 变体；集/節）
     m_ch = _re.search(
-        r"(?:第\s*([0-9０-９零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXLCDMivxlcdm]+)\s*(?:章|话|回|集|节)|(?:Ch(?:apter)?\.?\s*([0-9０-９IVXLCDMivxlcdm]+)))",
+        r"(?:第\s*([0-9０-９零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXLCDMivxlcdm]+)\s*(?:章|话|話|回|囘|集|節|节)|(?:Ch(?:apter)?\.?\s*([0-9０-９IVXLCDMivxlcdm]+)))",
         title,
         _re.IGNORECASE,
     )
@@ -159,6 +160,12 @@ def _extract_chapter_number(title: str) -> tuple | None:
         v = _roman_to_int(m.group(1))
         if v is not None and v <= 9999:
             return (0, v)
+    # 退化：标题结尾带数字（如「书名 2」「名3」），常见于短篇集/番外连载，
+    # 数字是章节序号（无「第X话」前缀）。仅在标题非纯数字开头时兜底提取。
+    m = _re.match(r".+[ \t#・\-—\.]?([０-９\d]{1,5})\s*$", title)
+    if m and not _re.match(r"\s*[０-９\d]", title):
+        v = _to_int_full(m.group(1))
+        return (0, v)
     return None
 
 
@@ -169,8 +176,9 @@ def _to_int_full(s: str) -> int:
 
 
 # 章节编号前缀：只取「第X章/话/回/集/节」或「Vol.X」「Ch.X」，不含标题文字
+# （话/話 简繁；回/囘；集/節 兼容）
 _CHAPTER_LABEL = _re.compile(
-    r"第\s*[0-9０-９零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXLCDMivxlcdm]+\s*(?:章|话|回|集|节)"
+    r"第\s*[0-9０-９零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXLCDMivxlcdm]+\s*(?:章|话|話|回|囘|集|節|节)"
     r"|Vol\.?\s*[0-9０-９IVXLCDMivxlcdm]+"
     r"|Ch(?:apter)?\.?\s*[0-9０-９IVXLCDMivxlcdm]+",
     _re.IGNORECASE,
@@ -281,6 +289,9 @@ class Content:
         self._parser = parser
         self._checker = checker
         self._decrypter = decrypter
+        # yt-dlp 流 URL 缓存（同视频短时复用，避免重复签名等待）
+        self._ytdlp_stream_cache: dict = {}
+        self._ytdlp = None  # 懒加载单例，复用 yt-dlp 子进程
 
     # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
@@ -320,6 +331,8 @@ class Content:
         api = source.raw.get("api_endpoints") or {}
         detail_api = api.get("detail") or {}
         if detail_api:
+            if detail_api.get("engine") == "ytdlp":
+                return self._fetch_detail_ytdlp(source, url, detail_api)
             return self._fetch_detail_api(source, url, detail_api)
 
         self._checker.check(source, self._abs_url(source, url))
@@ -353,6 +366,29 @@ class Content:
 
         # 章节列表（按类型取 content 配置，传书名用于标题清理）
         detail.chapters = self._fetch_chapters(source, doc, book_title=detail.title)
+        return detail
+
+    def _fetch_detail_ytdlp(self, source: SourceConfig, url: str, cfg: dict) -> Detail:
+        """yt-dlp 引擎：详情元数据 + 章节列表。"""
+        yt = self._get_ytdlp()
+        try:
+            d = yt.fetch_detail(url)
+        except Exception as exc:
+            raise ContentMissingError(
+                f"yt-dlp 详情失败（{url}）：{exc}", source_id=source.source_id
+            ) from exc
+        detail = Detail(
+            source_id=source.source_id,
+            content_type=source.content_type,
+            url=url,
+            title=d.get("title") or "",
+            author=d.get("author") or "",
+            cover=d.get("cover") or "",
+            status=d.get("status") or "",
+            summary=d.get("summary") or "",
+        )
+        chapters = d.get("chapters") or []
+        detail.chapters = [Chapter(title=c.get("title") or "", url=c.get("url") or url) for c in chapters]
         return detail
 
     # ------------------------------------------------------------------ #
@@ -860,16 +896,23 @@ class Content:
         # 以原始 chapter_url 为 key 返回（调用方用 ch.url 直接查）
         return {u: raw.get(a) for u, a in zip(chapter_urls, abs_urls)}
 
-    def fetch_video_streams(self, source: SourceConfig, episode_url: str) -> tuple:
-        """视频：抓取单集 dash 音视频双流（播放用）。
+    def fetch_video_streams(self, source: SourceConfig, episode_url: str, quality: str = "") -> tuple:
+        """视频：抓取单集 dash 音视频双流（播放/下载用）。
 
         返回 (video_url, audio_url)；非 dash/无音频时 audio_url 为 ""。
+        quality: 画质名（"best"/"1080p"/...），空=源配置默认。经
+        api_endpoints.episode 的 quality 映射为请求参数（如 B 站 qn）。
         mpv 播放 dash 需要同时喂视频轨+音频轨（B 站音视频分离）。
         """
         api = source.raw.get("api_endpoints") or {}
         episode_api = api.get("episode") or {}
         if episode_api:
-            streams = self._fetch_episode_api(source, episode_url, episode_api, want_streams=True)
+            # yt-dlp 引擎（YouTube 高清双流，需签名）
+            if episode_api.get("engine") == "ytdlp":
+                return self._fetch_streams_ytdlp(source, episode_url, episode_api, quality)
+            streams = self._fetch_episode_api(
+                source, episode_url, episode_api, want_streams=True, quality=quality
+            )
             if isinstance(streams, dict):
                 return streams.get("video", ""), streams.get("audio", "")
             if streams:
@@ -887,6 +930,10 @@ class Content:
         api = source.raw.get("api_endpoints") or {}
         episode_api = api.get("episode") or {}
         if episode_api:
+            # yt-dlp 引擎：单流播放地址（拿视频轨）
+            if episode_api.get("engine") == "ytdlp":
+                v, _ = self._fetch_streams_ytdlp(source, episode_url, episode_api)
+                return v
             play = self._fetch_episode_api(source, episode_url, episode_api)
             if play:
                 return play
@@ -914,18 +961,72 @@ class Content:
             return self._decrypter.decrypt(source, play, "video_url")
         return play
 
-    def _fetch_episode_api(self, source: SourceConfig, episode_url: str, cfg: dict, want_streams: bool = False) -> str | dict:
+    def _fetch_streams_ytdlp(self, source: SourceConfig, episode_url: str, cfg: dict, quality: str = "") -> tuple:
+        """yt-dlp 引擎：拿高清双流（YouTube 需签名，委托 yt-dlp）。
+
+        缓存：yt-dlp 取流 ~10s（签名+网络），同视频短时间复用，避免重复等待。
+        """
+        yt = self._get_ytdlp()
+
+        key = (episode_url, quality)
+        cached = self._ytdlp_stream_cache.get(key)
+        if cached is not None:
+            return cached
+
+        fmt = self._ytdlp_format(cfg, quality)
+        try:
+            streams = yt.fetch_streams(episode_url, fmt=fmt)
+        except Exception as exc:
+            # 高清失败回退单流
+            try:
+                streams = (yt.fetch_streams(episode_url, fmt="best")[0], "")
+            except Exception:
+                raise ContentMissingError(
+                    f"yt-dlp 取流失败（{episode_url}）：{exc}", source_id=source.source_id
+                ) from exc
+        self._ytdlp_stream_cache[key] = streams
+        return streams
+
+    def _get_ytdlp(self):
+        """懒加载单例 Ytdlp（复用，避免每次子进程重复探测）。"""
+        if self._ytdlp is None:
+            from .ytdlp import Ytdlp
+
+            self._ytdlp = Ytdlp()
+        return self._ytdlp
+
+    @staticmethod
+    def _ytdlp_format(cfg: dict, quality: str = "") -> str:
+        """quality → yt-dlp 格式串。默认 bestvideo+bestaudio。"""
+        fmt = str(cfg.get("format") or "bestvideo+bestaudio/best")
+        if not quality or quality == "best":
+            return fmt
+        # 精确画质：bestvideo[height<=X]+bestaudio
+        m = __import__("re").match(r"^(\d{3,4})p$", quality or "")
+        if m:
+            h = m.group(1)
+            return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+        return fmt
+
+    def _fetch_episode_api(self, source: SourceConfig, episode_url: str, cfg: dict, want_streams: bool = False, quality: str = "") -> str | dict:
         """api_endpoints.episode：JSON API 取播放地址（支持 sign 签名）。
 
         want_streams=True 时返回 {"video": ..., "audio": ...}（dash 音视频分离）。
+        quality: 画质名（"best"/"1080p"/...），经 cfg["quality"]["map"] 映射为
+        请求参数值（如 B 站 qn）；缺省用 quality.map 的默认值。
         """
         import copy
         from urllib.parse import urlencode, urljoin, quote
 
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
+        # 画质映射：{quality} 占位 → 具体请求参数值（如 B 站 qn）
+        quality_map = (cfg.get("quality") or {}).get("map") or {}
+        q_param = (cfg.get("quality") or {}).get("param") or "quality"
+        q_default = (cfg.get("quality") or {}).get("default") or "best"
+        q_value = quality_map.get(quality, quality_map.get(q_default, quality or q_default))
         filled = {}
-        # 占位符：{bvid}/{cid}/{id} 从 episode_url 提取；{keyword} 不适用
+        # 占位符：{bvid}/{cid}/{id} 从 episode_url 提取；{quality} 从画质映射；{keyword} 不适用
         for k, v in params.items():
             val = str(v)
             val = val.replace("{id}", episode_url.split("/")[-1])
@@ -936,6 +1037,7 @@ class Content:
             m_cid = _re.search(r"(?:cid|p)=(\d+)", episode_url)
             if m_cid:
                 val = val.replace("{cid}", m_cid.group(1))
+            val = val.replace("{" + q_param + "}", str(q_value))
             filled[k] = val
         sign_cfg = cfg.get("sign") or {}
         strategy = sign_cfg.get("strategy")
