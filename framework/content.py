@@ -905,26 +905,48 @@ class Content:
         return urls
 
     def _decrypt_image_urls(self, source: SourceConfig, urls: List[str]) -> List[str]:
-        """把加密图片 URL 逐张下载并 AES 解密成 data URI（供阅读器/下载器直接用）。
+        """把加密图片 URL 并发下载并 AES 解密成 data URI（供阅读器/下载器直接用）。
 
-        单张失败 → 保留原 URL（可能有封面等非加密图混入，靠 reader 容错）。
+        一话常几十张图，串行下载+解密要 15-30s 卡半天；改为 8 并发，
+        并发把耗时压到 2-4s。单张失败 → 保留原 URL（可能封面等非加密图混入）。
+
+        注意：HttpClient 非线程安全，每 worker 各建独立实例（复用默认值）。
         """
-        out: List[str] = []
-        for u in urls:
-            try:
-                raw = self._http.get_bytes(self._abs_url(source, u),
-                                           headers=self._headers(source))
-                plain = self._decrypter.decrypt_bytes(source, raw, target="image")
-                if plain and plain is not raw:
-                    import base64 as _b64
+        if len(urls) <= 1:
+            # 单张直接走原逻辑（无并发开销）
+            return [self._decrypt_one_image(source, u) for u in urls]
 
-                    mime = self._guess_image_mime(plain)
-                    out.append(f"data:{mime};base64,{_b64.b64encode(plain).decode()}")
-                else:
-                    out.append(u)
-            except Exception:  # noqa: BLE001
-                out.append(u)  # 解密失败保底原 URL
-        return out
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _worker(u: str) -> str:
+            return self._decrypt_one_image(source, u)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(_worker, urls))
+
+    def _decrypt_one_image(self, source: SourceConfig, u: str) -> str:
+        """下载单张并 AES 解密 → data URI；失败保留原 URL。
+
+        并发下载用 urllib 独立连接（复用 HttpClient 的 Session 线程不安全），
+        headers 带 Referer/UA 防图床防盗链。
+        """
+        try:
+            import urllib.request
+
+            abs_url = self._abs_url(source, u)
+            req = urllib.request.Request(abs_url, headers=self._headers(source))
+            timeout = self._timeout(source)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+            plain = self._decrypter.decrypt_bytes(source, raw, target="image")
+            if plain and plain is not raw:
+                import base64 as _b64
+
+                mime = self._guess_image_mime(plain)
+                return f"data:{mime};base64,{_b64.b64encode(plain).decode()}"
+            return u
+        except Exception:  # noqa: BLE001
+            return u  # 解密失败保底原 URL
 
     @staticmethod
     def _guess_image_mime(data: bytes) -> str:

@@ -63,6 +63,9 @@ class _SwitchSourceTask(QRunnable):
 
 
 class ReaderPage(BasePage):
+    # 收藏/取消收藏 → App 层写书架收藏库（ui-reader.md #2 通用外壳「收藏」）
+    favorite_requested = Signal(object)
+
     def __init__(
         self,
         source_manager: SourceManager,
@@ -78,6 +81,8 @@ class ReaderPage(BasePage):
         self._font_scale = float(font_scale or 1.0)
         self._current_source_id = None
         self._current_book_url = None
+        self._current_content_type = ""  # 当前作品类型（收藏时记录）
+        self._favorite_checker = None  # 可选回调: url -> bool（App 注入判断是否已收藏）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -92,6 +97,11 @@ class ReaderPage(BasePage):
         self.source_label.setStyleSheet("color: palette(dark);")
         info.addWidget(self.source_label)
         info.addStretch(1)
+        self.fav_btn = QPushButton("☆ 收藏")
+        self.fav_btn.setCheckable(True)
+        self.fav_btn.setFixedWidth(86)
+        self.fav_btn.clicked.connect(self._on_favorite_clicked)
+        info.addWidget(self.fav_btn)
         self.open_btn = QPushButton("打开源详情")
         self.open_btn.clicked.connect(self._open_source_page)
         info.addWidget(self.open_btn)
@@ -190,8 +200,10 @@ class ReaderPage(BasePage):
         self._current_source_id = source_id
         self._current_source = source
         self._current_book_url = book_url
+        self._current_content_type = content_type
         self.title_label.setText(f"加载中...")
         self.source_label.setText(source.source_name)
+        self.refresh_favorite_state()  # 打开新作品即刷新收藏按钮
 
         # 后台拉详情（信号跨线程安全）
         from PySide6.QtCore import QThreadPool
@@ -208,6 +220,7 @@ class ReaderPage(BasePage):
             self.title_label.setText(f"加载失败：{err}")
             return
         self.title_label.setText(detail.title or "无标题")
+        self.refresh_favorite_state()  # 按当前书 URL 刷新收藏按钮
         # 按类型切视图
         if content_type == "novel":
             self.stack.setCurrentWidget(self.novel_view)
@@ -218,6 +231,45 @@ class ReaderPage(BasePage):
         else:
             self.stack.setCurrentWidget(self.video_view)
             self.video_view.load(self._manager.get(self._current_source_id), detail, start_chapter_url)
+
+    # ------------------------------------------------------------------ #
+    def set_favorite_checker(self, cb) -> None:
+        """注入收藏判断回调：cb(url) -> bool。App 层接 LibraryStore.has。"""
+        self._favorite_checker = cb
+        self.refresh_favorite_state()
+
+    def _on_favorite_clicked(self) -> None:
+        """点收藏/取消收藏 → 转发给 App 层写收藏库。"""
+        if self._current_book_url:
+            # 构造最小 Detail（App 层 _on_favorite 只需 url/title 等）
+            from framework.content import Detail
+
+            detail = Detail(
+                source_id=self._current_source_id or "",
+                content_type=self._current_content_type or "",
+                url=self._current_book_url,
+                title=self.title_label.text() or self._current_book_url,
+            )
+            self.favorite_requested.emit(detail)
+
+    def refresh_favorite_state(self) -> None:
+        """按当前书 URL 刷新收藏按钮状态（☆收藏 / ★已收藏）。"""
+        if not self._current_book_url:
+            self.fav_btn.setChecked(False)
+            self.fav_btn.setText("☆ 收藏")
+            self.fav_btn.setEnabled(False)
+            return
+        self.fav_btn.setEnabled(True)
+        is_fav = False
+        if self._favorite_checker is not None:
+            try:
+                is_fav = bool(self._favorite_checker(self._current_book_url))
+            except Exception:  # noqa: BLE001
+                is_fav = False
+        self.fav_btn.blockSignals(True)
+        self.fav_btn.setChecked(is_fav)
+        self.fav_btn.setText("★ 已收藏" if is_fav else "☆ 收藏")
+        self.fav_btn.blockSignals(False)
 
     def _open_source_page(self) -> None:
         import webbrowser
@@ -241,6 +293,8 @@ class ReaderPage(BasePage):
         self._current_book_url = ""
         self.title_label.setText("epub 阅读")
         self.source_label.setText(path)
+        self.fav_btn.setEnabled(False)  # epub 本地书不收藏
+        self.fav_btn.setText("☆ 收藏")
         self.stack.setCurrentWidget(self.epub_view)
         if self.epub_view.open(path, start_idx=0):
             # 续读：按上次章节标题定位
@@ -266,6 +320,11 @@ class ReaderPage(BasePage):
             self.novel_view.set_font_scale(self._font_scale)
         if hasattr(self, "epub_view"):
             self.epub_view.set_font_scale(self._font_scale)
+
+    def apply_reading_style(self, bg: str = "", font_size: int = 0) -> None:
+        """设置阅读区独立背景/字号（ui-reader #12）：转发给小说视图。"""
+        if hasattr(self, "novel_view"):
+            self.novel_view.set_reading_style(bg, font_size)
 
 
 class _DetailSignals(QObject):

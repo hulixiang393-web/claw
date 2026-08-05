@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QGridLayout,
     QHBoxLayout,
@@ -32,27 +33,27 @@ GRID_COLUMNS = 5
 
 
 class _SearchSignals(QObject):
-    finished = Signal(object, object)  # (results, err)
+    finished = Signal(object, object, object)  # (source, results, err)
 
 
 class _SearchTask(QRunnable):
-    """后台跨源搜索。"""
+    """后台单源搜索（每源一个任务，驱动源状态条）。"""
 
-    def __init__(self, search_obj, sources, keyword):
+    def __init__(self, search_obj, source, keyword):
         super().__init__()
         self.signals = _SearchSignals()
         self._search = search_obj
-        self._sources = sources
+        self._source = source
         self._keyword = keyword
 
     def run(self) -> None:
         results, err = [], None
         try:
-            results = self._search.search_type(self._sources, self._keyword)
+            results = self._search.search_one(self._source, self._keyword)
         except Exception as exc:
             err = str(exc)
         try:
-            self.signals.finished.emit(results, err)
+            self.signals.finished.emit(self._source, results, err)
         except RuntimeError:
             pass
 
@@ -60,6 +61,9 @@ class _SearchTask(QRunnable):
 class SearchPage(BasePage):
     search_clicked = Signal(str)  # 搜索触发（首页接）
     open_requested = Signal(str, str, str)  # (source_id, url, content_type) 打开作品
+    # 批量操作（ui-search.md #8）：加入书架 / 加入下载
+    add_to_shelf_requested = Signal(object)   # list[SearchResult]
+    batch_download_requested = Signal(object)  # list[SearchResult]
 
     def __init__(self, source_manager: SourceManager, search: Search, parent=None):
         super().__init__(parent)
@@ -67,6 +71,13 @@ class SearchPage(BasePage):
         self._search = search
         self._results = []
         self._filter_source = ""
+        self._status_chips: dict = {}  # source_id → (QLabel, QLabel状态) 或组合控件
+        self._pending_count = 0  # 未完成搜索的源数
+        self._work_count = 0  # 当前网格卡片计数（追加/重建共用）
+        self._shown_count = 0  # 已渲染到 _results 的条数（分批懒加载用）
+        self._page_size = 20  # 每批渲染条数（搜索结果分批，防一次几百张卡片卡顿）
+        self._selected: dict = {}  # 勾选批量：url → SearchResult
+        self._select_mode = False  # 是否进入勾选模式
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -85,13 +96,26 @@ class SearchPage(BasePage):
         self.src_combo.addItem("全部源", "")
         for s in source_manager.all():
             self.src_combo.addItem(s.source_name, s)
+        self.merge_check = QCheckBox("合并相似")
+        self.merge_check.setToolTip("按书名+作者模糊匹配，合并同书多源版本（默认关）")
+        self.merge_check.setChecked(False)
+        self.merge_check.toggled.connect(self._on_merge_toggled)
         self.search_btn = QPushButton("搜索")
         self.search_btn.clicked.connect(self._on_search)
         top.addWidget(self.keyword_input, stretch=1)
         top.addWidget(self.type_combo)
         top.addWidget(self.src_combo)
+        top.addWidget(self.merge_check)
         top.addWidget(self.search_btn)
         layout.addLayout(top)
+
+        # ---- 每源状态条（跨源并发进度，ui-search.md #4）----
+        self.status_bar = QWidget()
+        self.status_bar_layout = QHBoxLayout(self.status_bar)
+        self.status_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.status_bar_layout.setSpacing(8)
+        self.status_bar.setVisible(False)
+        layout.addWidget(self.status_bar)
 
         # ---- 来源过滤 chip ----
         self.filter_bar = QHBoxLayout()
@@ -129,6 +153,33 @@ class SearchPage(BasePage):
         # 懒加载滚动
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
+        # ---- 批量操作栏（勾选 ≥1 条后显示，ui-search.md #8）----
+        self.batch_bar = QWidget()
+        self.batch_bar.setVisible(False)
+        bb = QHBoxLayout(self.batch_bar)
+        bb.setContentsMargins(0, 6, 0, 0)
+        bb.setSpacing(8)
+        self.select_all_check = QCheckBox("全选")
+        self.select_all_check.toggled.connect(self._on_select_all)
+        bb.addWidget(self.select_all_check)
+        self.batch_count = QLabel("已选 0 项")
+        self.batch_count.setStyleSheet("color: palette(dark); font-size: 12px;")
+        bb.addWidget(self.batch_count)
+        bb.addStretch(1)
+        self.batch_shelf_btn = QPushButton("加入书架")
+        self.batch_shelf_btn.setFixedHeight(26)
+        self.batch_shelf_btn.clicked.connect(self._on_batch_add_shelf)
+        bb.addWidget(self.batch_shelf_btn)
+        self.batch_dl_btn = QPushButton("加入下载")
+        self.batch_dl_btn.setFixedHeight(26)
+        self.batch_dl_btn.clicked.connect(self._on_batch_download)
+        bb.addWidget(self.batch_dl_btn)
+        self.batch_clear_btn = QPushButton("取消选择")
+        self.batch_clear_btn.setFixedHeight(26)
+        self.batch_clear_btn.clicked.connect(self._clear_selection)
+        bb.addWidget(self.batch_clear_btn)
+        layout.addWidget(self.batch_bar)
+
     def fill_keyword(self, keyword: str) -> None:
         """外部预填关键词并搜索。"""
         self.keyword_input.setText(keyword)
@@ -142,9 +193,13 @@ class SearchPage(BasePage):
         self.filter_bar_widget.setVisible(False)
         self.status_label.setText("搜索中...")
         self._clear_grid()
+        self._results = []
+        self._shown_count = 0
+        self._selected = {}
+        self.batch_bar.setVisible(False)
+        self.select_all_check.setChecked(False)
 
         # 选择目标源
-        sources = []
         selected_type = self.type_combo.currentData()
         selected_src = self.src_combo.currentData()
         if selected_src:
@@ -154,21 +209,193 @@ class SearchPage(BasePage):
             if selected_type:
                 sources = [s for s in sources if s.content_type == selected_type]
 
-        # 后台搜索
-        task = _SearchTask(self._search, sources, keyword)
-        task.signals.finished.connect(self._on_results_loaded)
-        QThreadPool.globalInstance().start(task)
-
-    def _on_results_loaded(self, results, err) -> None:
-        if err:
-            self.status_label.setText(f"搜索失败：{err}")
+        if not sources:
+            self.status_label.setText("没有可搜索的源")
             return
-        self._results = results
-        self._show_results()
-        if not results:
+
+        # 每源一个状态 chip + 一个后台任务（并发由 ThreadPool 调度）
+        self._build_status_bar(sources)
+        self.status_bar.setVisible(True)
+        self._pending_count = len(sources)
+        self._search_tasks = []
+        for source in sources:
+            task = _SearchTask(self._search, source, keyword)
+            task.signals.finished.connect(self._on_source_done)
+            self._search_tasks.append(task)  # 持引用防 GC
+            QThreadPool.globalInstance().start(task)
+
+    # ------------------------------------------------------------------ #
+    # 每源状态条
+    # ------------------------------------------------------------------ #
+    def _build_status_bar(self, sources) -> None:
+        """清空并重建每源状态 chip 行。"""
+        while self.status_bar_layout.count():
+            item = self.status_bar_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._status_chips = {}
+        for source in sources:
+            chip = QLabel(f"🔄 {source.source_name}")
+            chip.setStyleSheet(
+                "font-size: 11px; padding: 3px 10px; border-radius: 10px;"
+                "background: palette(midlight); color: palette(text);"
+            )
+            chip.setToolTip(f"{source.source_name}：搜索中")
+            self.status_bar_layout.addWidget(chip)
+            self._status_chips[source.source_id] = chip
+        self.status_bar_layout.addStretch(1)
+
+    def _set_source_status(self, source, state: str, err: str = "") -> None:
+        """更新单源状态 chip：🔄进行中 ✅完成 ❌失败。"""
+        chip = self._status_chips.get(source.source_id)
+        if chip is None:
+            return
+        if state == "running":
+            chip.setText(f"🔄 {source.source_name}")
+            chip.setStyleSheet(
+                "font-size: 11px; padding: 3px 10px; border-radius: 10px;"
+                "background: palette(midlight); color: palette(text);"
+            )
+            chip.setToolTip(f"{source.source_name}：搜索中")
+        elif state == "done":
+            chip.setText(f"✅ {source.source_name}")
+            chip.setStyleSheet(
+                "font-size: 11px; padding: 3px 10px; border-radius: 10px;"
+                "background: palette(base); color: palette(text);"
+            )
+            chip.setToolTip(f"{source.source_name}：完成")
+        else:
+            chip.setText(f"❌ {source.source_name}")
+            chip.setStyleSheet(
+                "font-size: 11px; padding: 3px 10px; border-radius: 10px;"
+                "background: rgba(255,107,107,0.15); color: #D32F2F;"
+            )
+            chip.setToolTip(f"{source.source_name}：失败\n{err or '未知错误'}")
+
+    def _on_source_done(self, source, results, err) -> None:
+        """单源搜索完成：更新状态 chip + 追加结果。"""
+        if err:
+            self._set_source_status(source, "failed", str(err))
+        else:
+            self._set_source_status(source, "done")
+            self._results.extend(results or [])
+            if self.merge_check.isChecked():
+                # 合并模式：只累积结果，全部完成后再统一合并渲染
+                pass
+            else:
+                self._append_results(results or [])
+        self._pending_count -= 1
+        if self._pending_count <= 0:
+            self._on_all_done()
+
+    def _on_merge_toggled(self, checked: bool) -> None:
+        """合并相似开关切换：对当前结果重新合并渲染（结果已加载时）。"""
+        if self._results:
+            self._rebuild_results_with_merge()
+
+    def _rebuild_results_with_merge(self) -> None:
+        """按当前合并开关状态重建结果网格。"""
+        if self._search is None:
+            return
+        if self.merge_check.isChecked():
+            # 合并相似：合并后只显示代表卡片（variants 挂在卡片详情）
+            from framework.search import Search
+
+            merged = Search.merge_similar(self._results)
+            self._results_display = merged
+        else:
+            self._results_display = list(self._results)
+        self._shown_count = 0
+        self._clear_grid()
+        # 分批渲染：先渲染第一批
+        self._append_displayed_batch()
+
+    def _append_displayed_batch(self) -> None:
+        """按 _results_display 渲染下一批（合并后走此路径）。"""
+        display = getattr(self, "_results_display", None)
+        if display is None:
+            return
+        cols = self._columns()
+        new_shown = min(len(display), self._shown_count + self._page_size)
+        while self._shown_count < new_shown:
+            r = display[self._shown_count]
+            row, col = divmod(self._work_count, cols)
+            card = self._make_card(r)
+            self.grid_layout.addWidget(card, row, col)
+            self._work_count += 1
+            self._shown_count += 1
+        self._apply_column_stretch(cols)
+        self._update_batch_status()
+
+    def _on_all_done(self) -> None:
+        """全部源搜索结束。"""
+        if not self._results:
             self.status_label.setText("搜不到这个哦，换个词试试？")
         else:
-            self.status_label.setText(f"共 {len(results)} 条结果")
+            self._rebuild_results_with_merge()
+            self._update_batch_status()
+
+    def _update_batch_status(self) -> None:
+        """更新状态文本：已显示 X / 共 Y 条。"""
+        total = len(self._results)
+        if self._filter_source:
+            # 筛选时显示筛选后总数（_results 未过滤，需单独算）
+            filtered = sum(1 for r in self._results if r.source_id == self._filter_source)
+            self.status_label.setText(f"共 {filtered} 条结果（仅看此源）")
+        elif self._shown_count >= total:
+            self.status_label.setText(f"共 {total} 条结果")
+        else:
+            self.status_label.setText(f"已显示 {self._shown_count} / {total} 条，滚动加载更多...")
+
+    def _append_results(self, items) -> None:
+        """把一批结果卡片追加到网格尾部（按当前列数排），分批懒加载。
+
+        每次追加只渲染到 _page_size 的整数倍边界，其余留待滚动到底
+        （_load_more_results）再渲染，防止一次几百条结果全量建卡卡顿。
+        """
+        if not items:
+            return
+        # 渲染源：合并时 _results_display 在 _on_all_done 统一生成；
+        # 非合并时 _results_display 由 _rebuild_results_with_merge 首次触发
+        display = self._current_display()
+        cols = self._columns()
+        new_shown = min(len(display), self._shown_count + self._page_size)
+        while self._shown_count < new_shown:
+            r = display[self._shown_count]
+            row, col = divmod(self._work_count, cols)
+            card = self._make_card(r)
+            self.grid_layout.addWidget(card, row, col)
+            self._work_count += 1
+            self._shown_count += 1
+        self._apply_column_stretch(cols)
+        # 若视口未填满（结果少），自动补足
+        if self._shown_count < len(display):
+            if self.scroll.verticalScrollBar().maximum() < self.scroll.height():
+                self._load_more_results()
+
+    def _current_display(self):
+        """当前渲染源：合并后为 _results_display，否则 _results。"""
+        display = getattr(self, "_results_display", None)
+        if display is None:
+            display = self._results
+        return display
+
+    def _load_more_results(self) -> None:
+        """滚动加载下一批结果。"""
+        display = self._current_display()
+        if self._shown_count >= len(display):
+            return
+        cols = self._columns()
+        new_shown = min(len(display), self._shown_count + self._page_size)
+        while self._shown_count < new_shown:
+            r = display[self._shown_count]
+            row, col = divmod(self._work_count, cols)
+            card = self._make_card(r)
+            self.grid_layout.addWidget(card, row, col)
+            self._work_count += 1
+            self._shown_count += 1
+        self._apply_column_stretch(cols)
+        self._update_batch_status()
 
     def _columns(self) -> int:
         """按可视宽度计算结果列数（与发现页一致，自适应不溢出）。"""
@@ -184,18 +411,22 @@ class SearchPage(BasePage):
             self.grid_layout.setColumnStretch(i, 1)
 
     def _show_results(self) -> None:
+        """按当前筛选重建结果网格（来源角标筛选用）。"""
         self._clear_grid()
-        items = self._results
+        display = self._current_display()
+        items = display
         if self._filter_source:
             items = [r for r in items if r.source_id == self._filter_source]
         cols = self._columns()
-        for idx, r in enumerate(items):
-            row, col = divmod(idx, cols)
-            card = WorkCard(r)
-            # 点卡片 → 打开详情/阅读器
-            card.clicked.connect(lambda _, rr=r: self._emit_open(rr))
+        # 筛选时全量渲染（结果通常较少）；无筛选时只渲染已加载批
+        shown = items if self._filter_source else display[:self._shown_count]
+        for r in shown:
+            row, col = divmod(self._work_count, cols)
+            card = self._make_card(r)
             self.grid_layout.addWidget(card, row, col)
+            self._work_count += 1
         self._apply_column_stretch(cols)
+        self._update_batch_status()
 
     def _emit_open(self, result) -> None:
         """点搜索结果卡片 → 打开 reader 播放/阅读。"""
@@ -207,11 +438,90 @@ class SearchPage(BasePage):
             return
         self.open_requested.emit(result.source_id, result.url, src.content_type)
 
+    # ------------------------------------------------------------------ #
+    # 勾选批量（ui-search.md #8）
+    # ------------------------------------------------------------------ #
+    def _make_card(self, r):
+        """创建勾选模式卡片并连接信号。"""
+        card = WorkCard(r, selectable=True)
+        card.clicked.connect(lambda _, rr=r: self._emit_open(rr))
+        card.checked.connect(self._on_card_checked)
+        if r.url in self._selected:
+            card.set_checked(True)
+        return card
+
+    def _on_card_checked(self, work, checked: bool) -> None:
+        """单卡勾选状态变化：更新选中集合 + 批量栏。"""
+        url = getattr(work, "url", "")
+        if not url:
+            return
+        if checked:
+            self._selected[url] = work
+        else:
+            self._selected.pop(url, None)
+        self._refresh_batch_bar()
+
+    def _refresh_batch_bar(self) -> None:
+        """更新批量栏：勾选数 + 显隐。"""
+        n = len(self._selected)
+        self.batch_count.setText(f"已选 {n} 项")
+        # 全选 checkbox 同步（避免信号循环）
+        self.select_all_check.blockSignals(True)
+        display = self._current_display()
+        total = len(display)
+        self.select_all_check.setChecked(total > 0 and n == total)
+        self.select_all_check.blockSignals(False)
+        self.batch_bar.setVisible(n > 0)
+
+    def _on_select_all(self, checked: bool) -> None:
+        """全选/取消全选当前已显示的结果。"""
+        if checked:
+            display = self._current_display()
+            for r in display:
+                if r.url:
+                    self._selected[r.url] = r
+            # 同步所有卡片勾选态
+            for card in self.grid_container.findChildren(WorkCard):
+                if getattr(card.work, "url", "") in self._selected:
+                    card.blockSignals(True)
+                    card.set_checked(True)
+                    card.blockSignals(False)
+        else:
+            self._clear_selection()
+            return
+        self._refresh_batch_bar()
+
+    def _clear_selection(self) -> None:
+        """清空全部勾选。"""
+        self._selected = {}
+        for card in self.grid_container.findChildren(WorkCard):
+            card.blockSignals(True)
+            card.set_checked(False)
+            card.blockSignals(False)
+        self._refresh_batch_bar()
+
+    def _on_batch_add_shelf(self) -> None:
+        """批量加入书架。"""
+        items = list(self._selected.values())
+        if not items:
+            return
+        self.add_to_shelf_requested.emit(items)
+        self._clear_selection()
+
+    def _on_batch_download(self) -> None:
+        """批量加入下载。"""
+        items = list(self._selected.values())
+        if not items:
+            return
+        self.batch_download_requested.emit(items)
+        self._clear_selection()
+
     def _clear_grid(self) -> None:
         while self.grid_layout.count():
             child = self.grid_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
+        self._work_count = 0
 
     def _set_filter(self, source_id: str) -> None:
         """来源角标筛选。"""
@@ -229,9 +539,10 @@ class SearchPage(BasePage):
         self._show_results()
 
     def _on_scroll(self, value: int) -> None:
+        """滚动接近底部 → 渲染下一批结果（懒加载）。"""
         vbar = self.scroll.verticalScrollBar()
         if value >= vbar.maximum() - 200:
-            pass  # 搜索结果不分懒加载（一次返回全部）
+            self._load_more_results()
 
     def refresh(self) -> None:
         pass

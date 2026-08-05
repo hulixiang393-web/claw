@@ -57,6 +57,32 @@ def _infer_referer(url: str) -> Optional[str]:
     return None
 
 
+def fade_in(widget: "QWidget") -> None:
+    """封面淡入动画：从透明到不透明，让异步加载过程可见。
+
+    加载完成后图片从 0 透明度淡入到 255，视觉上明确"刚加载出来"。
+    动画对象绑定在 widget 属性上防 GC；失败静默（不影响显示）。
+    """
+    try:
+        from PySide6.QtCore import QPropertyAnimation, QEasingCurve
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+        widget.setProperty("_fade_effect", effect)  # 持引用防 GC
+        anim = QPropertyAnimation(effect, b"opacity", widget)
+        anim.setDuration(260)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        widget.setProperty("_fade_anim", anim)
+        anim.finished.connect(lambda: widget.setGraphicsEffect(None))
+        anim.start()
+    except Exception:  # noqa: BLE001
+        pass  # 动画失败不影响封面显示
+
+
 class _CoverLoader(QObject):
     """单例封面加载器。"""
 

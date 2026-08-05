@@ -135,6 +135,55 @@ class BulkFetch:
             return []
 
     # ------------------------------------------------------------------ #
+    def check_updates(self, source: SourceConfig, pages: int = 2) -> dict:
+        """批量更新检测：对比本地索引，找各源「最近更新」里的新作品。
+
+        只抓 discovery 列表前 pages 页（软上限），与本地索引 URL 集合对比，
+        返回索引里没有的新作品列表。需先跑过 fetch_all 生成索引，
+        否则返回 {error: "未建立索引"}。
+
+        返回：
+            {"source_id", "source_name", "new_works": [Work...], "checked": N}
+        """
+        known = self.load_index(source)
+        if not known:
+            return {
+                "source_id": source.source_id,
+                "source_name": source.source_name,
+                "new_works": [],
+                "error": "未建立索引，请先「抓取全部」",
+            }
+        known_urls = {w.url for w in known}
+
+        # 抓最近更新列表（发现入口第 1~pages 页）
+        entry = self._works_entry(source)
+        fresh: List[Work] = []
+        for page in range(1, pages + 1):
+            try:
+                page_works = self._discovery.list_works(source, entry, page)
+            except SourceError:
+                continue
+            if not page_works:
+                break
+            fresh.extend(page_works)
+
+        new_works = [w for w in fresh if w.url and w.url not in known_urls]
+        # 去重（按 url）
+        seen: set = set()
+        deduped = []
+        for w in new_works:
+            if w.url in seen:
+                continue
+            seen.add(w.url)
+            deduped.append(w)
+        return {
+            "source_id": source.source_id,
+            "source_name": source.source_name,
+            "new_works": deduped,
+            "checked": len(fresh),
+        }
+
+    # ------------------------------------------------------------------ #
     def _emit_progress(self, source: SourceConfig, done: int, total: int, works: int) -> None:
         if self._bus:
             self._bus.emit(

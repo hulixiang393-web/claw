@@ -115,10 +115,12 @@ class TopBar(QWidget):
 
 
 class BatchUpdateCard(QWidget):
-    """批量更新检测（占位）。依赖 bulk_fetch，功能待完善。"""
+    """批量更新检测：对每个有索引的源，对比「最近更新」找新作品。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, bulk_fetch, source_manager, parent=None):
         super().__init__(parent)
+        self._bulk_fetch = bulk_fetch
+        self._manager = source_manager
         layout = QHBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(12)
@@ -127,23 +129,91 @@ class BatchUpdateCard(QWidget):
         title.setStyleSheet("font-weight: bold;")
         layout.addWidget(title)
 
-        hint = QLabel("检查所有源是否有新章节 / 新剧集")
-        hint.setObjectName("statsLabel")
-        layout.addWidget(hint, stretch=1)
+        self.hint = QLabel("检查各源是否有新作品（需先「抓取全部」建索引）")
+        self.hint.setObjectName("statsLabel")
+        layout.addWidget(self.hint, stretch=1)
 
-        # 按钮显示但标注"开发中"，点击提示待完善
-        self.btn = QPushButton("检查更新 · 开发中")
+        self.btn = QPushButton("检查更新")
         self.btn.setFixedWidth(130)
-        self.btn.clicked.connect(self._on_click)
+        self.btn.clicked.connect(self._on_check)
         layout.addWidget(self.btn)
 
-    def _on_click(self) -> None:
-        """功能未实现，弹出提示。"""
-        from PySide6.QtWidgets import QMessageBox
+    def _on_check(self) -> None:
+        """后台对全部源跑 check_updates，完成后汇总。"""
+        from PySide6.QtCore import QThreadPool, QRunnable, QObject, Signal
 
-        QMessageBox.information(
-            self, "功能开发中", "批量更新检测功能正在开发中，后续版本完善。"
-        )
+        class _CheckSignals(QObject):
+            finished = Signal(object)  # 全部结果 list[dict]
+
+        class _CheckTask(QRunnable):
+            def __init__(self, bulk_fetch, source):
+                super().__init__()
+                self.signals = _CheckSignals()
+                self._bf = bulk_fetch
+                self._src = source
+
+            def run(self) -> None:
+                results = []
+                sources = [self._src]
+                for s in sources:
+                    try:
+                        results.append(self._bf.check_updates(s))
+                    except Exception as exc:  # noqa: BLE001
+                        results.append({
+                            "source_id": s.source_id,
+                            "source_name": s.source_name,
+                            "new_works": [],
+                            "error": str(exc),
+                        })
+                try:
+                    self.signals.finished.emit(results)
+                except RuntimeError:
+                    pass
+
+        # 每个源一个任务（并发由 ThreadPool 调度）
+        self.btn.setEnabled(False)
+        self.hint.setText("检查中...")
+        sources = [s for s in self._manager.all() if s.enabled]
+        if not sources:
+            self.hint.setText("没有启用的源")
+            self.btn.setEnabled(True)
+            return
+
+        self._tasks = []
+        self._batch_results = []
+        self._batch_pending = len(sources)
+        for s in sources:
+            task = _CheckTask(self._bulk_fetch, s)
+            task.signals.finished.connect(self._on_source_checked)
+            self._tasks.append(task)
+            QThreadPool.globalInstance().start(task)
+
+    def _on_source_checked(self, results) -> None:
+        """单源完成：累计，全部完成汇总展示。"""
+        self._batch_results.extend(results)
+        self._batch_pending -= 1
+        if self._batch_pending > 0:
+            return
+        self.btn.setEnabled(True)
+        total_new = 0
+        parts = []
+        for r in self._batch_results:
+            new = r.get("new_works") or []
+            total_new += len(new)
+            if r.get("error") and not new:
+                parts.append(f"{r.get('source_name')}: {r['error']}")
+            elif new:
+                parts.append(f"{r.get('source_name')}: {len(new)}部新")
+        if total_new:
+            self.hint.setText(
+                f"发现 {total_new} 部新作品：{'，'.join(p for p in parts if '部新' in p)}"
+            )
+            self.hint.setStyleSheet(
+                "color: palette(success); font-weight: bold;"
+            )
+        else:
+            self.hint.setText("各源暂无新作品")
+            self.hint.setStyleSheet("")
 
 
 class HomePage(BasePage):
@@ -161,6 +231,7 @@ class HomePage(BasePage):
         theme_manager: ThemeManager,
         settings: SettingsManager,
         history: SearchHistory,
+        bulk_fetch=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -197,8 +268,8 @@ class HomePage(BasePage):
         self.mini_progress = MiniProgress(event_bus)
         layout.addWidget(self.mini_progress)
 
-        # 批量更新检测（占位）
-        self.batch_update = BatchUpdateCard()
+        # 批量更新检测（对比索引找新作品）
+        self.batch_update = BatchUpdateCard(bulk_fetch, source_manager)
         layout.addWidget(self.batch_update)
 
         # 空状态（覆盖层，默认隐藏）

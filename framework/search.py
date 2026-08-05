@@ -35,6 +35,8 @@ class SearchResult:
     cover: str = ""
     author: str = ""
     update: str = ""
+    # 合并相似结果时：该结果的其它源版本（ui-search.md #7）
+    variants: "list[SearchResult]" = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -293,6 +295,50 @@ class Search:
                     )
                 )
         return results
+
+    @staticmethod
+    def merge_similar(results: "List[SearchResult]") -> "List[SearchResult]":
+        """合并相似搜索结果（ui-search.md #7）。
+
+        按「书名规范化 + 作者」模糊匹配：书名去标点/空格/括号内容，作者一致则视为同书。
+        合并后保留第一个结果作为代表，其余各源版本挂到 `variants` 属性。
+        返回新列表（不修改原列表）。
+        """
+        import re as _re
+
+        def _norm_title(t: str) -> str:
+            """书名规范化：去括号内容/标点/常见状态后缀，转小写。"""
+            t = _re.sub(r"[（(].*?[)）]", "", t or "")  # 去括号内容（含副标题）
+            t = _re.sub(r"[\s:：,，.。、!！?？\-—_/\\|··'\"“”]+", "", t)
+            # 去常见状态/连载后缀（连载中/更新中/已完结/全本/全文/TXT 等）
+            t = _re.sub(r"(连载中|更新中|已完结|完结|全本|全文|正版|无删减|TXT|txt)$", "", t)
+            return t.lower().strip()
+
+        groups: "dict[str, list]" = {}
+        order: "list[str]" = []  # 保持首次出现顺序
+        for r in results:
+            key = (_norm_title(r.title), (r.author or "").strip().lower())
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(r)
+
+        merged = []
+        for key in order:
+            items = groups[key]
+            if len(items) == 1:
+                merged.append(items[0])
+                continue
+            # 多条合并：首条为代表，其余挂 variants
+            head = items[0]
+            # 用 dataclasses.replace 克隆，避免污染原对象
+            from dataclasses import replace
+
+            rep = replace(head)
+            rep.variants = items[1:]  # type: ignore[attr-defined]
+            rep.title = f"{head.title}（{len(items)} 个源）"
+            merged.append(rep)
+        return merged
 
     @staticmethod
     def _clean_title(title: str) -> str:

@@ -9,19 +9,22 @@
     "max_bytes_per_image": 5242880
   },
   "ui": {
-    "theme": "mint",
+    "theme": "sakura",
     "font_scale": 1.5,
     "cover_cache_size_mb": 256,
     "default_page_size": 20,
-    "background_image": "",
-    "background_opacity": 0.6
+    "background_image": "D:/code/claw/薇尔莉特.jpg",
+    "background_opacity": 0.6,
+    "reading_bg": "",
+    "reading_font_size": 0
   },
   "download": {
     "output_dir": "downloads",
     "naming_template": "{title}_{chapter_no}_{chapter_title}",
     "merge_chapters_into_one_file": true,
     "skip_existing": true,
-    "max_concurrent_downloads": 6
+    "max_concurrent_downloads": 6,
+    "show_notification": true
   },
   "library": {
     "shelf_export_dir": "library",

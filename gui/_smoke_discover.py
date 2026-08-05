@@ -6,6 +6,10 @@ import pathlib
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+# Windows 控制台默认 GBK：源选择器含健康灯 emoji，强制 UTF-8 输出避免编码崩
+if os.name == "nt":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from PySide6.QtWidgets import QApplication
 
 from framework.config import SourceConfig

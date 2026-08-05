@@ -240,13 +240,6 @@ class Discovery:
 
         items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         works: List[Work] = []
-        # 封面加密站（如 18mh）：cover 直接用 URL 下载是加密字节，无法显示。
-        # 在 list_works 阶段并发解密成 data URI（逐张同步下载 48 张要 30s+，
-        # 并发把耗时压到几秒，避免发现页加载卡死）。
-        need_cover_decrypt = bool(
-            source.raw.get("decryption", {}).get("targets", {}).get("image")
-        )
-        pending_covers: dict = {}  # work index → cover url（待并发解密）
         for it in items:
             if not it.get("title") or not it.get("url"):
                 continue
@@ -262,31 +255,16 @@ class Discovery:
                     source_name=source.source_name,
                 )
             )
-        if need_cover_decrypt:
-            # 并发下载+解密所有 http 封面 → data URI
-            targets = [
-                (i, w.cover)
-                for i, w in enumerate(works)
-                if w.cover and w.cover.startswith(("http://", "https://"))
-            ]
-            if targets:
-                from concurrent.futures import ThreadPoolExecutor
-
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    futs = {
-                        pool.submit(self._decrypt_cover, source, url): i
-                        for i, url in targets
-                    }
-                    for fut in futs:
-                        try:
-                            works[futs[fut]].cover = fut.result()
-                        except Exception:  # noqa: BLE001
-                            pass
-        # 封面走加密渲染（works_list_item.cover_render == "playwright"）：
-        # 标记源需要封面恢复，但不在这里同步执行（太慢会阻塞 QRunnable），
-        # 由 GUI 层调 discover_page 起异步任务恢复封面后刷新卡片。
+        # 封面加密站（18mh 类 AES 解密）或需 Playwright 渲染的源：
+        # 不再同步解密封面（阻塞列表返回），改为标记，由 GUI 层异步恢复
+        # （discover_page._start_cover_recovery），列表秒开、封面后补。
+        need_cover_decrypt = bool(
+            source.raw.get("decryption", {}).get("targets", {}).get("image")
+        )
+        if works and need_cover_decrypt:
+            works[0]._needs_cover_decrypt = True  # 标记：GUI 起 AES 异步恢复
         if works and works_list_item.get("cover_render") == "playwright":
-            works[0]._needs_cover_recovery = True  # 标记即可
+            works[0]._needs_cover_recovery = True  # 标记：GUI 起 Playwright 恢复
         return works
 
     def _recover_covers(self, source: SourceConfig, booklist_url: str, works: List[Work]) -> dict:
@@ -299,6 +277,37 @@ class Discovery:
             book_urls,
             proxy=source.transports().get("proxy"),
         )
+
+    # ------------------------------------------------------------------ #
+    def decrypt_covers(self, source: SourceConfig, works: List[Work]) -> dict:
+        """批量下载+AES 解密封面 → {work_url: data_uri}（18mh 类加密站）。
+
+        与 list_works 内联同步解密分离：列表先返回（不阻塞），GUI 异步调本方法
+        恢复封面后刷新卡片。单张失败跳过（保留原 URL 兜底）。
+        """
+        targets = [
+            (w.url, w.cover)
+            for w in works
+            if w.url and w.cover and w.cover.startswith(("http://", "https://"))
+        ]
+        if not targets:
+            return {}
+        from concurrent.futures import ThreadPoolExecutor
+
+        result: dict = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {
+                pool.submit(self._decrypt_cover, source, url): wurl
+                for wurl, url in targets
+            }
+            for fut in futs:
+                try:
+                    data_uri = fut.result()
+                    if data_uri and data_uri.startswith("data:"):
+                        result[futs[fut]] = data_uri
+                except Exception:  # noqa: BLE001
+                    pass
+        return result
 
     def _decrypt_cover(self, source: SourceConfig, cover_url: str) -> str:
         """下载并解密带加密的封面 → data URI。解密失败保留原 URL（封面留空不阻塞）。

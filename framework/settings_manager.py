@@ -40,6 +40,9 @@ DEFAULTS: dict = {
         "default_page_size": 20,
         "background_image": "",
         "background_opacity": 0.6,
+        # 阅读区独立设置（ui-reader #12）：留空 = 跟随全局主题
+        "reading_bg": "",
+        "reading_font_size": 0,
     },
     "download": {
         "output_dir": "downloads",
@@ -47,6 +50,7 @@ DEFAULTS: dict = {
         "merge_chapters_into_one_file": False,
         "skip_existing": True,
         "max_concurrent_downloads": 6,
+        "show_notification": True,
     },
     "library": {
         "shelf_export_dir": "library",

@@ -46,6 +46,8 @@ class VideoView(QWidget):
         self._source_list = []       # [{sid, name, from_, ps, parse}]
         self._current_sid = ""       # 当前选中播放源 sid
         self._switching = False      # 换源进行中锁（防止重复触发）
+        self._play_cache: dict = {}  # 播放地址缓存 {episode_url: play}（预加载/命中秒开）
+        self._prefetch_idx = -2      # 正在预拉下一集的索引（<0 空闲）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -93,6 +95,8 @@ class VideoView(QWidget):
         self._source = source
         self._detail = detail
         self._episodes = detail.chapters
+        self._play_cache.clear()  # 打开新作品 → 清空旧播放地址缓存
+        self._prefetch_idx = -2
         self._populate_source_combo(detail)
         self.ep_list.clear()
         for i, ep in enumerate(detail.chapters):
@@ -107,13 +111,17 @@ class VideoView(QWidget):
                     break
         self.ep_list.setCurrentRow(idx)
         if not detail.chapters:
-            # 无分集列表（如 B站番剧 season 页）→ 直接播放详情页
-            self.play_label.setText("正在加载播放页...")
-            self._open_embed(detail.url)
+            # 无分集列表（如 B站番剧 season 页）→ 直接取详情页播放地址，不自动弹播放器
+            self.play_label.setText("正在获取播放地址...")
+            self._current_idx = -1
+            from PySide6.QtCore import QThreadPool
+
+            task = _LoadVideoTask(self._content, self._source, None, detail_url=detail.url)
+            task.signals.finished.connect(self._on_play_loaded)
+            self._video_task = task
+            QThreadPool.globalInstance().start(task)
             return
         self._load_episode(idx)
-        # 进入即自动播放当前集（mpv 独立窗口）
-        self._open_embed(self._episodes[idx].url)
 
     def _populate_source_combo(self, detail: Detail) -> None:
         """填充播放源下拉框；无换源配置则隐藏。"""
@@ -172,6 +180,14 @@ class VideoView(QWidget):
             return
         self._current_idx = idx
         ep = self._episodes[idx]
+        # 已预加载播放地址 → 直接显示，秒开不白屏
+        cached = self._play_cache.get(ep.url)
+        if cached:
+            self._current_play = cached
+            self.play_label.setText(f"播放地址（已解密）：\n{cached}")
+            self.episode_changed.emit((self._detail, ep.title, ep.url))
+            self._prefetch_next(idx)
+            return
         self.play_label.setText(f"正在获取播放地址：{ep.title}...")
         self._current_play = ""
         # 后台获取播放地址
@@ -182,8 +198,7 @@ class VideoView(QWidget):
         self._video_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
         self.episode_changed.emit((self._detail, ep.title, ep.url))
-        # 切剧情自动播放（mpv 独立窗口）
-        self._open_embed(ep.url)
+        # 不自动弹 mpv：用户点「在应用内观看」才拉起播放器
 
     def _on_ep_clicked(self, item) -> None:
         idx = item.data(Qt.UserRole)
@@ -200,7 +215,47 @@ class VideoView(QWidget):
             self.play_label.setText(f"获取失败：{err}")
             return
         self._current_play = play
+        if ep is not None and getattr(ep, "url", ""):
+            self._play_cache[ep.url] = play  # 写缓存，切集命中秒开
         self.play_label.setText(f"播放地址（已解密）：\n{play}")
+        # 预加载下一集播放地址（切集不白屏）
+        self._prefetch_next(self._current_idx)
+
+    # ------------------------------------------------------------------ #
+    def _prefetch_next(self, idx: int = -1) -> None:
+        """后台预拉下一集播放地址（fetch_video_episode 轻量，串行）。
+
+        当前集加载完成后触发；命中缓存/无下一集/正在预拉 → 跳过。
+        预拉结果写 _play_cache，_load_episode 命中秒开，切换不白屏。
+        """
+        if self._source is None:
+            return
+        if idx < 0:
+            idx = self._current_idx
+        nxt = idx + 1
+        if not (0 <= nxt < len(self._episodes)):
+            return
+        nxt_ep = self._episodes[nxt]
+        if nxt_ep.url in self._play_cache:
+            return  # 已缓存
+        if self._prefetch_idx == nxt:
+            return  # 正在预拉该集
+        if self._prefetch_idx >= 0 and self._prefetch_idx != nxt:
+            return  # 已有其他集在预拉（串行）
+        self._prefetch_idx = nxt
+        from PySide6.QtCore import QThreadPool
+
+        task = _LoadVideoTask(self._content, self._source, nxt_ep)
+        task.signals.finished.connect(self._on_prefetch_done)
+        self._prefetch_task = task  # 持引用防 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_prefetch_done(self, ep, play, err) -> None:
+        """预拉完成：写缓存，允许下一个预拉。"""
+        self._prefetch_idx = -2  # 清锁，允许下一个
+        if err or not play:
+            return
+        self._play_cache[ep.url] = play
 
     def _next_available_sid(self) -> str:
         """返回当前源之后的第一个可用源 sid（无则空）。"""
@@ -219,6 +274,8 @@ class VideoView(QWidget):
         """ReaderPage 换源重载分集后调用：刷新分集列表 + 播放第一集。"""
         self._detail = new_detail
         self._episodes = new_detail.chapters
+        self._play_cache.clear()  # 换源 → 旧源播放地址缓存作废
+        self._prefetch_idx = -2
         self.ep_list.clear()
         for i, ep in enumerate(new_detail.chapters):
             item = QListWidgetItem(ep.title or f"第{i+1}集")
@@ -227,8 +284,7 @@ class VideoView(QWidget):
         self.ep_list.setCurrentRow(0)
         self._switching = False
         if new_detail.chapters:
-            self._load_episode(0)
-            self._open_embed(new_detail.chapters[0].url)
+            self._load_episode(0)  # 只显示地址，不自动弹 mpv
 
     # ------------------------------------------------------------------ #
     def _copy(self) -> None:
@@ -292,19 +348,21 @@ class _VideoSignals(QObject):
 
 
 class _LoadVideoTask(QRunnable):
-    """后台获取视频播放地址。"""
+    """后台获取视频播放地址。episode 可为 None（无分集时用 detail_url）。"""
 
-    def __init__(self, content, source, episode):
+    def __init__(self, content, source, episode, detail_url: str = ""):
         super().__init__()
         self.signals = _VideoSignals()
         self._content = content
         self._source = source
         self._episode = episode
+        self._detail_url = detail_url or ""
 
     def run(self) -> None:
         play, err = "", None
         try:
-            play = self._content.fetch_video_episode(self._source, self._episode.url)
+            url = self._episode.url if self._episode is not None else self._detail_url
+            play = self._content.fetch_video_episode(self._source, url)
         except Exception as exc:
             err = str(exc)
         try:

@@ -42,6 +42,7 @@ class NovelView(QWidget):
         self._current_idx = -1
         self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
+        self._reading_bg = ""  # 阅读区独立背景色（ui-reader #12，空=透明跟随主题）
         self._auto_loading = False  # 防止自动翻章重复触发
         self._auto_prev_loading = False  # 防止向上自动翻章重复触发
         self._last_auto_nav_ts = 0.0  # 上次自动翻章时间戳（防循环：新章滚到顶部又触发翻章）
@@ -97,6 +98,7 @@ class NovelView(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.text = QLabel()
+        self.text.setObjectName("readerBody")
         self.text.setWordWrap(True)
         self.text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -112,6 +114,7 @@ class NovelView(QWidget):
         self.paged_scroll.setWidgetResizable(True)
         self.paged_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.paged_label = QLabel()
+        self.paged_label.setObjectName("readerBody")
         self.paged_label.setWordWrap(True)
         self.paged_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.paged_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -322,14 +325,27 @@ class NovelView(QWidget):
 
     def _apply_font(self) -> None:
         size = self._clamp_font(self._base_font + self._font_delta)
+        bg = self._reading_bg  # 阅读区独立背景（空 = 透明跟随主题）
+        bg_css = f" background-color: {bg};" if bg else " background: transparent;"
         self.text.setStyleSheet(
-            f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;"
+            f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;{bg_css}"
         )
         self.paged_label.setStyleSheet(
-            f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;"
+            f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;{bg_css}"
         )
         self._repaginate()
         self._pager_show_page(self._current_page)
+
+    def set_reading_style(self, bg: str = "", font_size: int = 0) -> None:
+        """设置阅读区独立背景色/字号（ui-reader #12）。
+
+        bg：颜色字符串（#RRGGBB），空 = 透明跟随主题；
+        font_size：>0 时覆盖全局字号，0 = 跟随全局 font_scale。
+        """
+        self._reading_bg = bg or ""
+        if font_size > 0:
+            self._base_font = self._clamp_font(font_size)
+        self._apply_font()
 
     # ------------------------------------------------------------------ #
     def _toggle_mode(self) -> None:

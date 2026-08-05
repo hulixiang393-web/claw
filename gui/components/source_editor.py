@@ -219,16 +219,17 @@ class SourceEditor(QDialog):
 
     source_saved = Signal(str)  # 保存成功后发射 source_id
 
-    def __init__(self, source_config=None, sources_dir=None, parent=None):
+    def __init__(self, source_config=None, sources_dir=None, parent=None, preview=None):
         super().__init__(parent)
         self._src = source_config
         self._sources_dir = Path(sources_dir) if sources_dir else None
         # self._raw：完整 JSON dict（含未暴露字段），保存时只覆盖已暴露字段
         self._raw = dict(source_config.raw) if source_config else self._default_template("novel")
         self._mode = "EDIT" if source_config else "NEW"
+        self._preview = preview  # framework.preview.Preview（实时验证/测试搜索/测试详情）
 
         self.setWindowTitle("编辑源" if self._mode == "EDIT" else "添加源")
-        self.resize(720, 640)
+        self.resize(760, 680)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -253,6 +254,10 @@ class SourceEditor(QDialog):
         self._build_adblock()
         self.tabs.currentChanged.connect(self._update_stepbar)
         layout.addWidget(self.tabs, stretch=1)
+
+        # 预览面板（实时验证选择器 / 测试搜索 / 测试详情）
+        self._build_preview_panel()
+        layout.addWidget(self._preview_panel)
 
         # 底部按钮
         btns = QHBoxLayout()
@@ -304,6 +309,196 @@ class SourceEditor(QDialog):
             self.example_btn.setToolTip("用同类型的现有源填充各 Tab 空白字段，便于参考")
             self.example_btn.clicked.connect(self._fill_example)
             self._topbar.addWidget(self.example_btn)
+
+    # ================================================================== #
+    # 预览面板（ui-editor #2/#3/#4）
+    # ================================================================== #
+    def _build_preview_panel(self) -> None:
+        """底部预览面板：选择器实时验证 + 测试搜索 + 测试详情。
+
+        无 preview 注入时整个面板隐藏（内核未接线的降级）。
+        """
+        panel = QFrame()
+        panel.setObjectName("editorPreview")
+        panel.setStyleSheet(
+            "QFrame#editorPreview { background: palette(base); border: 1px solid palette(mid);"
+            " border-radius: 8px; }"
+        )
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(6)
+
+        # 标题行：说明 + 折叠
+        head = QHBoxLayout()
+        title = QLabel("🔍 实时预览")
+        title.setStyleSheet("font-weight: bold; font-size: 12px;")
+        head.addWidget(title)
+        head.addStretch(1)
+        self.preview_toggle = QPushButton("收起")
+        self.preview_toggle.setFixedWidth(60)
+        self.preview_toggle.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+        self.preview_toggle.clicked.connect(self._toggle_preview)
+        head.addWidget(self.preview_toggle)
+        lay.addLayout(head)
+
+        # 折叠容器
+        self.preview_body = QWidget()
+        body = QVBoxLayout(self.preview_body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(6)
+
+        # 行1：选择器验证（选择器输入 + 验证按钮）
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("选择器:"))
+        self.preview_sel = QLineEdit()
+        self.preview_sel.setPlaceholderText("CSS/XPath，如 a.title 或 //div[@class='item']")
+        self.preview_sel.returnPressed.connect(self._do_validate_selector)
+        # 自动防抖 500ms 触发（ui-editor #2）：停止输入 500ms 后自动验证
+        from PySide6.QtCore import QTimer
+
+        self._sel_debounce = QTimer(self)
+        self._sel_debounce.setSingleShot(True)
+        self._sel_debounce.setInterval(500)
+        self._sel_debounce.timeout.connect(self._do_validate_selector)
+        self.preview_sel.textChanged.connect(
+            lambda _: self._sel_debounce.start() if self.preview_sel.text().strip() else None
+        )
+        sel_row.addWidget(self.preview_sel, stretch=1)
+        self.preview_sel_url = QLineEdit()
+        self.preview_sel_url.setPlaceholderText("验证 URL（留空=源 base_url）")
+        self.preview_sel_url.setFixedWidth(220)
+        sel_row.addWidget(self.preview_sel_url)
+        self.preview_sel_btn = QPushButton("验证")
+        self.preview_sel_btn.setFixedWidth(60)
+        self.preview_sel_btn.clicked.connect(self._do_validate_selector)
+        sel_row.addWidget(self.preview_sel_btn)
+        body.addLayout(sel_row)
+
+        # 行2：测试搜索 / 测试详情（关键词/URL 输入 + 按钮）
+        test_row = QHBoxLayout()
+        self.preview_kw = QLineEdit()
+        self.preview_kw.setPlaceholderText("测试搜索关键词")
+        self.preview_kw.returnPressed.connect(self._do_preview_search)
+        test_row.addWidget(self.preview_kw, stretch=1)
+        self.preview_search_btn = QPushButton("测试搜索")
+        self.preview_search_btn.setFixedWidth(80)
+        self.preview_search_btn.clicked.connect(self._do_preview_search)
+        test_row.addWidget(self.preview_search_btn)
+        test_row.addSpacing(8)
+        self.preview_detail_url = QLineEdit()
+        self.preview_detail_url.setPlaceholderText("测试详情 URL")
+        self.preview_detail_url.returnPressed.connect(self._do_preview_detail)
+        test_row.addWidget(self.preview_detail_url, stretch=1)
+        self.preview_detail_btn = QPushButton("测试详情")
+        self.preview_detail_btn.setFixedWidth(80)
+        self.preview_detail_btn.clicked.connect(self._do_preview_detail)
+        test_row.addWidget(self.preview_detail_btn)
+        body.addLayout(test_row)
+
+        # 结果区
+        self.preview_result = QLabel("")
+        self.preview_result.setWordWrap(True)
+        self.preview_result.setStyleSheet(
+            "color: palette(text2); font-size: 11px; font-family: Consolas, monospace;"
+            " max-height: 90px;"
+        )
+        self.preview_result.setAlignment(Qt.AlignTop)
+        self.preview_result.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.addWidget(self.preview_result)
+
+        lay.addWidget(self.preview_body)
+
+        # 无 preview 注入 → 隐藏整个面板
+        if self._preview is None:
+            panel.setVisible(False)
+        self._preview_panel = panel
+        self._preview_visible = True
+
+    def _toggle_preview(self) -> None:
+        """折叠/展开预览面板。"""
+        self._preview_visible = not self._preview_visible
+        self.preview_body.setVisible(self._preview_visible)
+        self.preview_toggle.setText("展开" if not self._preview_visible else "收起")
+
+    def _current_source_config(self):
+        """从表单构造当前 SourceConfig（供预览请求使用）。"""
+        try:
+            raw = self._build_dict()
+            return SourceConfig.from_dict(raw)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _do_validate_selector(self) -> None:
+        """实时验证选择器：抓页面，显示命中项。"""
+        if self._preview is None:
+            self.preview_result.setText("预览内核未注入")
+            return
+        sel = self.preview_sel.text().strip()
+        if not sel:
+            return
+        source = self._current_source_config()
+        if source is None:
+            self.preview_result.setText("⚠ 表单配置不完整，无法构造源")
+            return
+        url = self.preview_sel_url.text().strip() or source.base_url
+        css = sel if not sel.startswith("//") else ""
+        xpath = sel if sel.startswith("//") else ""
+        hits = self._preview.validate_selector(source, url, css=css, xpath=xpath)
+        if hits:
+            self.preview_result.setText(
+                f"✓ 命中 {len(hits)} 项：\n" + "\n".join(f"  · {h}" for h in hits[:8])
+            )
+        else:
+            self.preview_result.setText("✗ 未命中任何元素，检查选择器或站点结构")
+
+    def _do_preview_search(self) -> None:
+        """一键测试搜索。"""
+        if self._preview is None:
+            self.preview_result.setText("预览内核未注入")
+            return
+        kw = self.preview_kw.text().strip()
+        if not kw:
+            return
+        source = self._current_source_config()
+        if source is None:
+            self.preview_result.setText("⚠ 表单配置不完整，无法构造源")
+            return
+        self.preview_result.setText("搜索中...")
+        results = self._preview.preview_search(source, kw)
+        if results:
+            lines = [f"· {r.title}（{r.source_name or r.source_id}）" for r in results[:8]]
+            self.preview_result.setText(f"✓ 命中 {len(results)} 条：\n" + "\n".join(lines))
+        else:
+            self.preview_result.setText("✗ 未搜索到结果，检查搜索配置")
+
+    def _do_preview_detail(self) -> None:
+        """一键测试详情。"""
+        if self._preview is None:
+            self.preview_result.setText("预览内核未注入")
+            return
+        url = self.preview_detail_url.text().strip()
+        if not url:
+            return
+        source = self._current_source_config()
+        if source is None:
+            self.preview_result.setText("⚠ 表单配置不完整，无法构造源")
+            return
+        self.preview_result.setText("抓取详情中...")
+        detail = self._preview.preview_detail(source, url)
+        if not detail:
+            self.preview_result.setText("✗ 详情解析失败")
+            return
+        if detail.get("error"):
+            self.preview_result.setText(f"✗ 详情失败：{detail['error']}")
+            return
+        lines = [
+            f"标题: {detail.get('title')}",
+            f"作者: {detail.get('author') or '无'}",
+            f"状态: {detail.get('status') or '无'}",
+            f"章节数: {detail.get('chapters') or 0}",
+            f"简介: {detail.get('summary') or '无'}",
+        ]
+        self.preview_result.setText("\n".join(lines))
 
     # ================================================================== #
     # 制作引导步骤条

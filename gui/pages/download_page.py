@@ -264,6 +264,13 @@ class DownloadPage(BasePage):
         self._bus = event_bus
         self._queue = queue
         self._tray = None
+        # 下载完成通知开关（ui-download.md #10，设置页 download.show_notification）
+        try:
+            self._notify_enabled = bool(
+                settings.get("download", "show_notification", True)
+            )
+        except Exception:  # noqa: BLE001
+            self._notify_enabled = True
 
         self._evt_to_ui.connect(self._handle_event)
 
@@ -594,7 +601,10 @@ class DownloadPage(BasePage):
         QTimer.singleShot(3000, toast.deleteLater)
 
     def _init_tray(self) -> None:
-        """初始化系统托盘图标（用于下载完成通知）。"""
+        """初始化系统托盘图标（用于下载完成通知）。开关关闭则跳过。"""
+        if not self._notify_enabled:
+            self._tray = None
+            return
         try:
             from PySide6.QtGui import QColor, QIcon, QPixmap
 

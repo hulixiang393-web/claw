@@ -200,18 +200,41 @@ class DiscoverPage(BasePage):
         viewport.mouseReleaseEvent = on_release
 
     def _reload_sources(self) -> None:
-        """只列配置了 discovery 的源（避免多次触发切换）。"""
+        """只列配置了 discovery 的源（避免多次触发切换）。加健康灯前缀。"""
         self.source_combo.blockSignals(True)
         self.source_combo.clear()
         sources = self._manager.discoverable_sources()
         for s in sources:
-            label = f"{s.source_name} ({s.content_type})"
+            label = f"{self._health_icon(s.source_id)} {s.source_name} ({s.content_type})"
             self.source_combo.addItem(label, s)
+            # 下拉项 ToolTip：健康灯 + 错误详情（若失效）
+            health = self._manager.get_health(s.source_id)
+            tip = self._health_tip(s, health)
+            idx = self.source_combo.count() - 1
+            self.source_combo.setItemData(idx, tip, Qt.ToolTipRole)
         if sources:
             self.source_combo.setCurrentIndex(0)
         self.source_combo.blockSignals(False)
         # 手动触发一次源切换
         self._on_source_changed(self.source_combo.currentIndex())
+
+    def _health_icon(self, source_id: str) -> str:
+        """源健康灯图标：🟢正常 🟠软失败 🔴失效。"""
+        from framework.source_manager import HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN
+
+        state = self._manager.get_health(source_id).state
+        return {HEALTH_OK: "🟢", HEALTH_WARN: "🟠", HEALTH_BROKEN: "🔴"}.get(state, "⚪")
+
+    def _health_tip(self, source, health) -> str:
+        """健康 ToolTip：状态 + 错误详情。"""
+        from framework.source_manager import HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN
+
+        state = health.state
+        label = {HEALTH_OK: "正常", HEALTH_WARN: "自检软失败", HEALTH_BROKEN: "失效"}.get(state, state)
+        tip = f"{source.source_name}\n健康状态：{label}"
+        if health.last_error:
+            tip += f"\n{health.last_error}"
+        return tip
 
     def _on_source_changed(self, index: int) -> None:
         if index < 0:
@@ -443,18 +466,25 @@ class DiscoverPage(BasePage):
         else:
             self._append_works(works)
             self.status_label.setText(f"已加载 {self._current_page} 页 · 共 {self._work_count} 部")
-            # 漫画封面需 Playwright 恢复：后台恢复，完成后刷新卡片
+            # 封面需异步恢复（AES 解密 或 Playwright 渲染）：后台恢复，完成后刷新卡片
             if self._needs_cover_recovery(works):
                 self._start_cover_recovery(epoch, page_works=works)
         # 自动继续加载下一页直到填满视口（预加载）
         self._maybe_preload()
 
     def _needs_cover_recovery(self, works) -> bool:
-        """检查这批作品是否需要封面恢复（漫画分片加密站）。"""
-        return any(getattr(w, "_needs_cover_recovery", False) for w in works)
+        """检查这批作品是否需要封面恢复（AES 加密 或 Playwright 渲染站）。"""
+        return any(
+            getattr(w, "_needs_cover_recovery", False)
+            or getattr(w, "_needs_cover_decrypt", False)
+            for w in works
+        )
 
     def _start_cover_recovery(self, epoch: int, page_works=None) -> None:
-        """后台恢复当前页漫画封面，完成后刷新卡片封面图。
+        """后台恢复当前页封面，完成后刷新卡片封面图。
+
+        - AES 加密站（18mh 类）：_needs_cover_decrypt → 下载字节+AES 解密成 data URI
+        - Playwright 渲染站（分片加密）：_needs_cover_recovery → 整页渲染恢复
 
         page_works: 本次加载的那一批作品（page 粒度），避免传全量导致
         恢复页与实际作品不对齐（翻页后新页作品不在恢复页里）。
@@ -465,16 +495,20 @@ class DiscoverPage(BasePage):
             or source.get_discovery_config().get("list_url")
             or source.base_url
         )
-        # 构造当前页 URL（含 ?page=N），使 Playwright 渲染的页面与作品批次一致
-        from urllib.parse import urlencode
-
-        sep = "&" if "?" in base_url else "?"
-        works_url = f"{base_url}{sep}{urlencode({'page': self._current_page})}"
         targets = page_works if page_works is not None else self._works
-        book_urls = [w.url for w in targets if w.url]
-        if not book_urls:
-            return
-        task = _CoverRecoveryTask(source, works_url, book_urls, epoch)
+        use_decrypt = any(getattr(w, "_needs_cover_decrypt", False) for w in targets)
+        if use_decrypt:
+            task = _CoverDecryptTask(self._discovery, source, targets, epoch)
+        else:
+            # 构造当前页 URL（含 ?page=N），使 Playwright 渲染的页面与作品批次一致
+            from urllib.parse import urlencode
+
+            sep = "&" if "?" in base_url else "?"
+            works_url = f"{base_url}{sep}{urlencode({'page': self._current_page})}"
+            book_urls = [w.url for w in targets if w.url]
+            if not book_urls:
+                return
+            task = _CoverRecoveryTask(source, works_url, book_urls, epoch)
         task.signals.finished.connect(
             lambda covers, e=epoch: self._on_covers_recovered(covers, e)
         )
@@ -800,6 +834,29 @@ class _CoverRecoveryTask(QRunnable):
                 proxy=self._source.transports().get("proxy"),
             )
         except Exception:
+            covers = {}
+        try:
+            self.signals.finished.emit(covers)
+        except RuntimeError:
+            pass
+
+
+class _CoverDecryptTask(QRunnable):
+    """后台下载+AES 解密封面（18mh 类加密站）→ {work_url: data_uri}。"""
+
+    def __init__(self, discovery, source, works, epoch):
+        super().__init__()
+        self.signals = _CoverRecoverySignals()  # finished(covers: dict{work_url: data_uri})
+        self._discovery = discovery
+        self._source = source
+        self._works = works
+        self._epoch = epoch
+
+    def run(self) -> None:
+        covers = {}
+        try:
+            covers = self._discovery.decrypt_covers(self._source, self._works)
+        except Exception:  # noqa: BLE001
             covers = {}
         try:
             self.signals.finished.emit(covers)

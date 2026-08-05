@@ -192,6 +192,13 @@ class SettingsPage(BasePage):
             filter_="图片 (*.png *.jpg *.jpeg *.bmp *.webp)",
         )
         self._ui_bg_opacity = sec._double("背景透明度", "background_opacity", 0.0, 1.0, "仅背景图时生效")
+        self._ui_reading_bg = sec._line(
+            "阅读背景色", "reading_bg",
+            "留空 = 跟随主题（如 #FDF6EC 或 #FFFFFF）",
+        )
+        self._ui_reading_font = sec._spin(
+            "阅读字号", "reading_font_size", 0, 36, " px", "0 = 跟随全局"
+        )
         # 缓存清除行
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -281,6 +288,8 @@ class SettingsPage(BasePage):
         self._ui_page_size.setValue(int(g("ui", "default_page_size", 20)))
         self._ui_bg_image.setText(g("ui", "background_image", "") or "")
         self._ui_bg_opacity.setValue(float(g("ui", "background_opacity", 0.6)))
+        self._ui_reading_bg.setText(g("ui", "reading_bg", "") or "")
+        self._ui_reading_font.setValue(int(g("ui", "reading_font_size", 0)))
 
         self._dl_dir.setText(g("download", "output_dir", "downloads"))
         self._dl_tpl.setText(g("download", "naming_template", ""))
@@ -315,6 +324,8 @@ class SettingsPage(BasePage):
         s.set("ui", "default_page_size", self._ui_page_size.value())
         s.set("ui", "background_image", self._ui_bg_image.text().strip())
         s.set("ui", "background_opacity", self._ui_bg_opacity.value())
+        s.set("ui", "reading_bg", self._ui_reading_bg.text().strip())
+        s.set("ui", "reading_font_size", self._ui_reading_font.value())
 
         s.set("download", "output_dir", self._dl_dir.text().strip() or "downloads")
         s.set("download", "naming_template", self._dl_tpl.text().strip())

@@ -9,7 +9,13 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QVBoxLayout,
+)
 
 from .cover_loader import CoverLoader
 
@@ -18,8 +24,9 @@ class WorkCard(QFrame):
     """单张作品卡片。"""
 
     clicked = Signal(object)  # 发射 Work 对象
+    checked = Signal(object, bool)  # (work, checked) 勾选状态变化（批量模式）
 
-    def __init__(self, work, parent=None):
+    def __init__(self, work, selectable: bool = False, parent=None):
         super().__init__(parent)
         self.work = work
         self.setObjectName("workCard")
@@ -33,13 +40,27 @@ class WorkCard(QFrame):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
 
+        # 封面行：封面 + 可选勾选框（右上角）
+        cover_row = QHBoxLayout()
+        cover_row.setSpacing(4)
+
+        self._checkbox = None
+        if selectable:
+            self._checkbox = QCheckBox()
+            self._checkbox.setCursor(Qt.PointingHandCursor)
+            self._checkbox.toggled.connect(self._on_check_toggled)
+            # 放在封面右上角，避免挡住封面
+            cover_row.addStretch(1)
+            cover_row.addWidget(self._checkbox, alignment=Qt.AlignTop)
+
         # 封面（CoverLoader 全局限流加载）
         cover = QLabel("🖼")
         cover.setAlignment(Qt.AlignCenter)
         cover.setFixedSize(140, 180)
         cover.setStyleSheet("background: palette(midlight); border-radius: 8px; font-size: 36px;")
-        layout.addWidget(cover)
+        cover_row.addWidget(cover)
         self._cover = cover
+        layout.addLayout(cover_row)
 
         title = QLabel(work.title or "无标题")
         title.setWordWrap(True)
@@ -62,6 +83,7 @@ class WorkCard(QFrame):
             else:
                 self._load_cover(work.cover)
 
+    # ------------------------------------------------------------------ #
     def _load_data_cover(self, data_uri: str) -> None:
         """直接解码 data URI 封面（加密站解密结果）。"""
         try:
@@ -78,6 +100,23 @@ class WorkCard(QFrame):
     def _load_cover(self, url: str) -> None:
         """通过 CoverLoader 加载封面（全局最多 4 个并发）。"""
         CoverLoader.instance().load(url, self._on_cover_ready)
+
+    def _on_check_toggled(self, checked: bool) -> None:
+        self.checked.emit(self.work, checked)
+
+    def is_checked(self) -> bool:
+        return bool(self._checkbox and self._checkbox.isChecked())
+
+    def set_checked(self, checked: bool) -> None:
+        if self._checkbox is not None:
+            self._checkbox.setChecked(checked)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        # 点勾选框不触发卡片点击（checkbox 自己处理）
+        if self._checkbox is not None and self._checkbox.underMouse():
+            return
+        self.clicked.emit(self.work)
+        super().mouseReleaseEvent(event)
 
     def _on_cover_ready(self, pixmap) -> None:
         """CoverLoader 回调：更新封面。
@@ -104,6 +143,9 @@ class WorkCard(QFrame):
         sy = max(0, (scaled.height() - 180) // 2)
         cropped = scaled.copy(sx, sy, min(140, scaled.width()), min(180, scaled.height()))
         self._cover.setPixmap(cropped)
+        from gui.components.cover_loader import fade_in
+
+        fade_in(self._cover)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         self.clicked.emit(self.work)

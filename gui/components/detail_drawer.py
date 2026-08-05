@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -126,9 +127,48 @@ class DetailDrawer(QFrame):
         self.status.setText(detail.status or "")
         self.chapters_label.setText(f"共 {len(detail.chapters)} 章节" if detail.chapters else "无章节信息")
         self.summary.setText(detail.summary or "（无简介）")
-        if detail.cover:
-            self.cover.setText("🖼")
+        self._load_cover(detail.cover)
         self.setVisible(True)
+
+    def _load_cover(self, url: str) -> None:
+        """异步加载封面（CoverLoader 全局限流），失败/为空保留占位符。"""
+        if not url:
+            self.cover.setText("🖼")
+            return
+        from gui.components.cover_loader import CoverLoader
+
+        def _on_ready(pixmap) -> None:
+            import shiboken6
+
+            if pixmap is None or not shiboken6.isValid(self.cover):
+                return  # 加载失败或控件已销毁，保留占位
+            scaled = pixmap.scaled(
+                320, 180, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+            )
+            sx = max(0, (scaled.width() - 320) // 2)
+            sy = max(0, (scaled.height() - 180) // 2)
+            cropped = scaled.copy(sx, sy, min(320, scaled.width()), min(180, scaled.height()))
+            self.cover.setPixmap(cropped)
+            from gui.components.cover_loader import fade_in
+
+            fade_in(self.cover)
+
+        if url.startswith("data:"):
+            # data URI（解密后封面）→ 直接解码
+            try:
+                _, b64 = url.split(",", 1)
+                import base64
+
+                data = base64.b64decode(b64)
+                pix = QPixmap()
+                if pix.loadFromData(data) and not pix.isNull():
+                    _on_ready(pix)
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            self.cover.setText("🖼")
+            return
+        CoverLoader.instance().load(url, _on_ready)
 
     def hide_detail(self) -> None:
         self.setVisible(False)
