@@ -17,7 +17,8 @@ def main():
 
     labels = [win.tabs.tabText(i) for i in range(win.tabs.count())]
     print("导航栏:", labels)
-    expected = ["首页", "发现", "搜索", "阅读", "下载", "书架·开发中", "源管理·开发中", "设置·开发中"]
+    # 全部 8 个 Tab 均已实现（首页/发现/搜索/阅读/下载/书架/源管理/设置）
+    expected = ["首页", "发现", "搜索", "阅读", "下载", "书架", "源管理", "设置"]
     assert labels == expected, labels
 
     # 首页、下载已实现，其余占位

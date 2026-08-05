@@ -1,0 +1,38 @@
+{
+  "$schema_version": 2,
+  "$id": "rumble",
+  "$type": "video",
+  "$name": "Rumble",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://rumble.com",
+    "description": "Rumble 视频（yt-dlp 引擎，URL 解析）",
+    "lang": "en",
+    "region": "en",
+    "tags": ["视频", "免费", "yt-dlp"]
+  },
+  "transports": {
+    "base_url": "https://rumble.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0"
+    },
+    "timeout": 60,
+    "retries": 1,
+    "interval_ms": 50
+  },
+  "api_endpoints": {
+    "detail": { "engine": "ytdlp" },
+    "episode": { "engine": "ytdlp", "format": "bestvideo+bestaudio/best" }
+  },
+  "media": {
+    "format": "dash",
+    "select": { "video": { "quality": "best" } },
+    "merge": { "tool": "ffmpeg", "output_format": "mp4" }
+  },
+  "constraints": {
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 1, "max_items": 1 }
+  },
+  "diagnostics": { "selfcheck": { "strategy": "off" } }
+}

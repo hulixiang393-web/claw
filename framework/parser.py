@@ -97,6 +97,12 @@ class Parser:
                 results.append(inner)
             elif attr:
                 v = node.get(attr)
+                # 懒加载兜底：URL 类属性（src/href）未取到时回退 data-src/data-original
+                if not v and attr in ("src", "href"):
+                    for lazy_attr in ("data-src", "data-original", "data-lazy-src"):
+                        v = node.get(lazy_attr)
+                        if v:
+                            break
                 if v:
                     results.append(v)
             else:
@@ -136,6 +142,22 @@ class Parser:
             css = root_selector.get("css")
             xpath = root_selector.get("xpath")
             roots = self._query(doc, css, xpath)
+            # exclude: source-schema §3.4 list.root_selector.exclude
+            # 从 roots 中移除匹配 exclude 选择器的节点
+            exclude_sels = root_selector.get("exclude")
+            if exclude_sels and roots and self._lxml:
+                exclude_nodes: set = set()
+                for es in exclude_sels:
+                    es = _normalize_selector(es)
+                    if es is None:
+                        continue
+                    ecss = es.get("css")
+                    exml = es.get("xpath")
+                    if ecss or exml:
+                        for n in self._query(doc, ecss, exml):
+                            exclude_nodes.add(n)
+                if exclude_nodes:
+                    roots = [r for r in roots if r not in exclude_nodes]
         items = []
         for root in roots:
             item = self._parse_fields_on_doc(root, fields, base_url)
@@ -160,6 +182,11 @@ class Parser:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _abs(base_url: str, url: str) -> str:
-        if url.startswith(("http://", "https://", "data:", "javascript:")):
+        from urllib.parse import urlsplit
+
+        if url.startswith(("http://", "https://", "data:", "javascript:", "//")):
+            return url
+        # 大写协议也识别（HTTP:// 等）
+        if (urlsplit(url).scheme or "").lower() in ("http", "https"):
             return url
         return urljoin(base_url, url)

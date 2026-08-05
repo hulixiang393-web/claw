@@ -1,0 +1,101 @@
+{
+  "$schema_version": 2,
+  "$id": "18j",
+  "$type": "video",
+  "$name": "18J.TV",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://18j.tv",
+    "description": "18J.TV - 成人视频站（HLS m3u8 直连）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "成人", "免费", "hls"]
+  },
+  "transports": {
+    "base_url": "https://18j.tv",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://18j.tv/"
+    },
+    "timeout": 20,
+    "retries": 3,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/vod/",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          { "title": "全部", "url": "/vod/" },
+          { "title": "国产", "url": "/t/1/" },
+          { "title": "日韩", "url": "/t/2/" },
+          { "title": "欧美", "url": "/t/3/" },
+          { "title": "伦理", "url": "/t/4/" },
+          { "title": "成人AI", "url": "/t/41/" },
+          { "title": "动漫", "url": "/t/5/" },
+          { "title": "另类", "url": "/t/6/" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "div.box" },
+        "fields": {
+          "title": { "css": "a[href*='/v/']", "attr": "title" },
+          "url": { "css": "a[href*='/v/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "data-original" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/vod/",
+      "method": "GET",
+      "keyword_param": "wd",
+      "item": {
+        "root_selector": { "css": "div.box" },
+        "fields": {
+          "title": { "css": "a[href*='/v/']", "attr": "title" },
+          "url": { "css": "a[href*='/v/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "data-original" }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": { "css": "h1" },
+        "summary": { "css": "meta[name='description']", "attr": "content" }
+      }
+    },
+    "content": {
+      "episode": {
+        "list": {
+          "root_selector": { "css": "h1" },
+          "fields": {
+            "title": { "css": "h1" },
+            "url": { "css": "link[rel='canonical']", "attr": "href" }
+          }
+        },
+        "play_url": {
+          "regex": "(https?://[^\"'\\s]*m3u8[^\"'\\s]*)"
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 48 },
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 1, "max_items": 1 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

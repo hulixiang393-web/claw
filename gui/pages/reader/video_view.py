@@ -14,6 +14,7 @@ import webbrowser
 from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -27,9 +28,10 @@ from framework.content import Content, Detail
 
 
 class VideoView(QWidget):
-    """视频分集 + 播放地址视图。"""
+    """视频分集 + 播放地址视图（支持多播放源换源）。"""
 
     episode_changed = Signal(object)
+    source_changed = Signal(object)  # (detail, new_sid) → ReaderPage 重载分集
 
     def __init__(self, content: Content, parent=None):
         super().__init__(parent)
@@ -40,9 +42,26 @@ class VideoView(QWidget):
         self._current_idx = -1
         self._current_play = ""
         self._player = None
+        self._stream_seq = 0  # 播放流请求序号（防并发任务回调乱序）
+        self._source_list = []       # [{sid, name, from_, ps, parse}]
+        self._current_sid = ""       # 当前选中播放源 sid
+        self._switching = False      # 换源进行中锁（防止重复触发）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        # ---- 播放源选择（换源站显示，普通源隐藏）----
+        source_row = QHBoxLayout()
+        source_row.setSpacing(8)
+        self.source_label = QLabel("播放源：")
+        source_row.addWidget(self.source_label)
+        self.source_combo = QComboBox()
+        self.source_combo.currentIndexChanged.connect(self._on_source_switch)
+        source_row.addWidget(self.source_combo, stretch=1)
+        layout.addLayout(source_row)
+        # 默认隐藏，load() 时按 source_list 决定
+        self.source_label.setVisible(False)
+        self.source_combo.setVisible(False)
 
         # ---- 分集列表 ----
         self.ep_list = QListWidget()
@@ -74,6 +93,7 @@ class VideoView(QWidget):
         self._source = source
         self._detail = detail
         self._episodes = detail.chapters
+        self._populate_source_combo(detail)
         self.ep_list.clear()
         for i, ep in enumerate(detail.chapters):
             item = QListWidgetItem(ep.title or f"第{i+1}集")
@@ -95,6 +115,58 @@ class VideoView(QWidget):
         # 进入即自动播放当前集（mpv 独立窗口）
         self._open_embed(self._episodes[idx].url)
 
+    def _populate_source_combo(self, detail: Detail) -> None:
+        """填充播放源下拉框；无换源配置则隐藏。"""
+        self._source_list = detail.source_list or []
+        self._switching = False
+        # 断开信号防止填充时误触发
+        try:
+            self.source_combo.currentIndexChanged.disconnect(self._on_source_switch)
+        except (RuntimeError, TypeError):
+            pass
+        self.source_combo.clear()
+        for s in self._source_list:
+            name = s.get("name") or f"源{s.get('sid')}"
+            self.source_combo.addItem(name, s.get("sid"))
+        has = bool(self._source_list)
+        self.source_label.setVisible(has)
+        self.source_combo.setVisible(has)
+        if has:
+            # 默认选第一个源（或当前详情 URL 里 sid 对应的）
+            cur_sid = self._current_sid
+            idx = 0
+            for i, s in enumerate(self._source_list):
+                if s.get("sid") == cur_sid:
+                    idx = i
+                    break
+            self.source_combo.setCurrentIndex(idx)
+        self.source_combo.currentIndexChanged.connect(self._on_source_switch)
+
+    def _on_source_switch(self, idx: int) -> None:
+        """下拉框切换播放源 → 通知 ReaderPage 重新抓分集。"""
+        if self._switching or idx < 0 or not self._source_list:
+            return
+        sid = self.source_combo.itemData(idx)
+        if not sid or sid == self._current_sid:
+            return
+        self._current_sid = str(sid)
+        self._switching = True
+        self.source_changed.emit((self._detail, str(sid)))
+
+    def set_source_sid(self, sid: str) -> None:
+        """外部设置当前播放源（ReaderPage 重载分集后回填）。"""
+        self._current_sid = str(sid)
+        self._switching = False
+        for i in range(self.source_combo.count()):
+            if self.source_combo.itemData(i) == str(sid):
+                try:
+                    self.source_combo.currentIndexChanged.disconnect(self._on_source_switch)
+                except (RuntimeError, TypeError):
+                    pass
+                self.source_combo.setCurrentIndex(i)
+                self.source_combo.currentIndexChanged.connect(self._on_source_switch)
+                break
+
     def _load_episode(self, idx: int) -> None:
         if self._source is None or not (0 <= idx < len(self._episodes)):
             return
@@ -110,6 +182,8 @@ class VideoView(QWidget):
         self._video_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
         self.episode_changed.emit((self._detail, ep.title, ep.url))
+        # 切剧情自动播放（mpv 独立窗口）
+        self._open_embed(ep.url)
 
     def _on_ep_clicked(self, item) -> None:
         idx = item.data(Qt.UserRole)
@@ -117,10 +191,44 @@ class VideoView(QWidget):
 
     def _on_play_loaded(self, ep, play, err) -> None:
         if err:
+            # 自动降级：当前源失败 → 尝试下一个可用源（仅在多源时）
+            nxt = self._next_available_sid()
+            if nxt:
+                self.play_label.setText(f"当前源不可用，尝试切换到源 {nxt}...")
+                self.source_changed.emit((self._detail, nxt))
+                return
             self.play_label.setText(f"获取失败：{err}")
             return
         self._current_play = play
         self.play_label.setText(f"播放地址（已解密）：\n{play}")
+
+    def _next_available_sid(self) -> str:
+        """返回当前源之后的第一个可用源 sid（无则空）。"""
+        if not self._source_list or not self._current_sid:
+            return ""
+        found = False
+        for s in self._source_list:
+            if s.get("sid") == self._current_sid:
+                found = True
+                continue
+            if found:
+                return str(s.get("sid"))
+        return ""
+
+    def reload_detail(self, new_detail: Detail) -> None:
+        """ReaderPage 换源重载分集后调用：刷新分集列表 + 播放第一集。"""
+        self._detail = new_detail
+        self._episodes = new_detail.chapters
+        self.ep_list.clear()
+        for i, ep in enumerate(new_detail.chapters):
+            item = QListWidgetItem(ep.title or f"第{i+1}集")
+            item.setData(Qt.UserRole, i)
+            self.ep_list.addItem(item)
+        self.ep_list.setCurrentRow(0)
+        self._switching = False
+        if new_detail.chapters:
+            self._load_episode(0)
+            self._open_embed(new_detail.chapters[0].url)
 
     # ------------------------------------------------------------------ #
     def _copy(self) -> None:
@@ -147,23 +255,34 @@ class VideoView(QWidget):
             return
 
         self.play_label.setText("正在获取播放流...")
+        self._stream_seq += 1  # 递增序号，确保只接受最新请求结果
+        seq = self._stream_seq
         # 后台取 dash 双流，再拉起 mpv（避免网络阻塞 UI）
         task = _LoadStreamTask(self._content, self._source, target)
-        task.signals.finished.connect(self._on_stream_loaded)
+        task.signals.finished.connect(
+            lambda v, a, t, e, s=seq: self._on_stream_loaded(v, a, t, e, s)
+        )
         self._stream_task = task  # 持有引用防 GC
         QThreadPool.globalInstance().start(task)
 
-    def _on_stream_loaded(self, video, audio, title, err) -> None:
+    def _on_stream_loaded(self, video, audio, title, err, seq) -> None:
+        # 只处理最新一次请求（旧请求结果丢弃，避免 mpv 被乱序覆盖）
+        if seq != self._stream_seq:
+            return
         if err or not video:
             self.play_label.setText(f"获取播放流失败：{err or '无播放地址'}")
             return
         self._current_play = video
         self.play_label.setText(f"正在打开 mpv 播放：{title}")
-        # 拉起 mpv（懒创建，复用实例）
+        # 拉起 mpv（懒创建，复用实例）；referer 从源配置请求头取
         if self._player is None:
             from framework.mpv_player import MpvPlayer
 
-            self._player = MpvPlayer()
+            referer = ""
+            _rh = getattr(self._source, "request_headers", None)
+            if callable(_rh):
+                referer = (_rh() or {}).get("Referer", "") or ""
+            self._player = MpvPlayer(referer=referer)
         self._player.play(video, audio, title=title)
 
 

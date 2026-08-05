@@ -10,6 +10,7 @@ from .mini_progress import MiniProgress
 from .empty_state import EmptyState
 from .work_card import WorkCard
 from .detail_drawer import DetailDrawer
+from .source_editor import SourceEditor
 
 __all__ = [
     "MascotWidget",
@@ -19,4 +20,5 @@ __all__ = [
     "EmptyState",
     "WorkCard",
     "DetailDrawer",
+    "SourceEditor",
 ]

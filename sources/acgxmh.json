@@ -1,0 +1,109 @@
+{
+  "$schema_version": 2,
+  "$id": "acgxmh",
+  "$type": "comic",
+  "$name": "ACG漫画网",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.acgxmh.com",
+    "description": "ACG漫画网 - 里番/全彩工口漫画源（分页阅读）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["漫画", "成人", "分页"]
+  },
+  "transports": {
+    "base_url": "https://www.acgxmh.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "page_placeholder": "\\d+(?=\\.html)"
+      },
+      "list_item": {
+        "categories": [
+          { "title": "最新", "url": "/" },
+          { "title": "漫画", "url": "/h/" },
+          { "title": "图集", "url": "/hentai/" },
+          { "title": "动画", "url": "/animation/" },
+          { "title": "全彩", "url": "/tags/full-color.html" },
+          { "title": "网漫", "url": "/webtoon/" },
+          { "title": "西漫", "url": "/western/" },
+          { "title": "写真", "url": "/cos/" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "ul#list li" },
+        "fields": {
+          "title": { "css": "a.thumb", "attr": "title" },
+          "url": { "css": "a.thumb", "attr": "href" },
+          "cover": { "css": "a.thumb img", "attr": "src" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/",
+      "method": "GET",
+      "keyword_param": "q",
+      "item": {
+        "root_selector": { "css": "ul#list li" },
+        "fields": {
+          "title": { "css": "a.thumb", "attr": "title" },
+          "url": { "css": "a.thumb", "attr": "href" },
+          "cover": { "css": "a.thumb img", "attr": "src" }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": { "css": "h1.title" },
+        "summary": { "css": "meta[name='description']", "attr": "content" },
+        "status": { "css": ".info" }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": { "css": ".page.bigpage" },
+          "fields": {
+            "title": { "css": "h1.title" },
+            "url": { "css": "a.a1:first-child", "attr": "href" }
+          }
+        },
+        "body": {
+          "root_selector": { "css": "p.manga-picture img" },
+          "fields": {
+            "url": { "css": "img", "attr": "src" }
+          },
+          "paginator": {
+            "next_link": {
+              "selector": { "css": "a.a1 + a.a1", "attr": "href" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 50 },
+    "detail": { "max_pages": 1 },
+    "page": { "max_pages": 30 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

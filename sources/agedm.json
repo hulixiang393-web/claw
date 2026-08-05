@@ -1,0 +1,109 @@
+{
+  "$schema_version": 2,
+  "$id": "agedm",
+  "$type": "video",
+  "$name": "AGE动漫",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.agedm.io",
+    "description": "AGE动漫 - 动漫视频源（Playwright 渲染 iframe 解析站拿源）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "动漫", "免费"]
+  },
+  "transports": {
+    "base_url": "https://www.agedm.io",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://www.agedm.io/"
+    },
+    "timeout": 20,
+    "retries": 2,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/catalog/all-all-all-all-all-time-1",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "page_placeholder": "-\\d+$"
+      },
+      "list_item": {
+        "categories": [
+          { "title": "全部", "url": "/catalog/all-all-all-all-all-time-1" },
+          { "title": "番剧", "url": "/catalog/1-all-all-all-all-time-1" },
+          { "title": "剧场版", "url": "/catalog/2-all-all-all-all-time-1" },
+          { "title": "国漫", "url": "/catalog/3-all-all-all-all-time-1" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "a[href*='/detail/']" },
+        "fields": {
+          "title": { "css": "a[href*='/detail/']", "attr": "title" },
+          "url": { "css": "a[href*='/detail/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "data-original" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search",
+      "method": "GET",
+      "keyword_param": "key",
+      "item": {
+        "root_selector": { "css": "a[href*='/detail/']" },
+        "fields": {
+          "title": { "css": "a[href*='/detail/']", "attr": "title" },
+          "url": { "css": "a[href*='/detail/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "data-original" }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": { "css": "meta[property='og:title']", "attr": "content" },
+        "summary": { "css": "meta[name='description']", "attr": "content" }
+      }
+    },
+    "content": {
+      "episode": {
+        "list": {
+          "root_selector": { "css": "a[href*='/play/']" },
+          "fields": {
+            "title": { "css": "a[href*='/play/']", "attr": "title" },
+            "url": { "css": "a[href*='/play/']", "attr": "href" }
+          }
+        },
+        "play_url": {
+          "render": "playwright"
+        },
+        "render_config": {
+          "wait_until": "networkidle",
+          "timeout_ms": 45000,
+          "extra_delay_ms": 8000
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "mp4",
+    "select": {
+      "video": { "quality": "best" }
+    },
+    "merge": { "tool": "ffmpeg", "output_format": "mp4" }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 40 },
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 1, "max_items": 1 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

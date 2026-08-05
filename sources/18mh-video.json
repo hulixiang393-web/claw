@@ -1,0 +1,110 @@
+{
+  "$schema_version": 2,
+  "$id": "18mh-video",
+  "$type": "video",
+  "$name": "禁漫视频(18mh)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://18mh.net",
+    "description": "禁漫天堂 - 视频源（HLS m3u8，AES 加密流）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "成人", "免费", "hls"]
+  },
+  "transports": {
+    "base_url": "https://18mh.net",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://18mh.net/"
+    },
+    "timeout": 20,
+    "retries": 3,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/mv/all",
+      "list_item": {
+        "categories": [
+          { "title": "全部视频", "url": "/mv/all" },
+          { "title": "国产视频", "url": "/mv/all/gcsp" },
+          { "title": "日本AV", "url": "/mv/all/rbav" },
+          { "title": "H动漫", "url": "/mv/all/hdm" },
+          { "title": "偷拍摄像", "url": "/mv/all/tp" },
+          { "title": "次元萝莉", "url": "/mv/all/cyll" },
+          { "title": "国产传媒", "url": "/mv/all/gccm" },
+          { "title": "主播福利", "url": "/mv/all/zbfl" },
+          { "title": "吃瓜爆料", "url": "/mv/all/cgbl" },
+          { "title": "无码流出", "url": "/mv/all/wmlc" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "ul.dx-video-list li" },
+        "fields": {
+          "title": { "css": "h2" },
+          "url": { "css": "a[href*='/mv/detail/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "data-src" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/mv/all",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "item": {
+        "root_selector": { "css": "ul.dx-video-list li" },
+        "fields": {
+          "title": { "css": "h2" },
+          "url": { "css": "a[href*='/mv/detail/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "data-src" }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": { "css": "h1" },
+        "summary": { "css": "meta[name='description']", "attr": "content" },
+        "status": { "css": ".detail-page__meta-item" }
+      }
+    },
+    "content": {
+      "episode": {
+        "list": {
+          "root_selector": { "css": "a[href*='/mv/detail/']" },
+          "fields": {
+            "title": { "css": "h1" },
+            "url": { "css": "a[href*='/mv/detail/']", "attr": "href" }
+          }
+        },
+        "play_url": {
+          "regex": "\"url\"\\s*:\\s*\"([^\"]*m3u8[^\"]*)\""
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 96 },
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 1, "max_items": 1 }
+  },
+  "decryption": {
+    "targets": {
+      "image": {
+        "strategy": "aes_cbc",
+        "key": "f5d965df75336270",
+        "iv": "97b60394abc2fbe1",
+        "padding": "none",
+        "input": "bytes",
+        "output": "bytes"
+      }
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

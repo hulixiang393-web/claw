@@ -36,6 +36,44 @@ from gui.components import (
 from .base_page import BasePage
 
 
+class _BrokenSourcesCard(QWidget):
+    """不可用源列表卡片：列出不可用的源及其原因（无不可用时隐藏）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("brokenCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        self.title = QLabel("⚠ 不可用源")
+        self.title.setStyleSheet("font-size: 14px; font-weight: bold; color: palette(text);")
+        header.addWidget(self.title)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        self.list_label = QLabel("")
+        self.list_label.setWordWrap(True)
+        self.list_label.setStyleSheet(
+            "color: palette(text2); font-size: 12px; line-height: 1.6;"
+        )
+        layout.addWidget(self.list_label)
+
+    def update_sources(self, broken: list) -> None:
+        """刷新不可用源列表。empty → 隐藏卡片。"""
+        if not broken:
+            self.setVisible(False)
+            return
+        lines = []
+        for b in broken:
+            name = b.get("name") or b.get("source_id", "")
+            err = b.get("error", "")
+            lines.append(f"• {name}：{err}")
+        self.list_label.setText("\n".join(lines))
+        self.setVisible(True)
+
+
 class TopBar(QWidget):
     """顶部栏：logo + 吉祥物 + 主题切换 + 设置入口。"""
 
@@ -146,6 +184,10 @@ class HomePage(BasePage):
         self.stats_row = StatsRow(source_manager)
         layout.addWidget(self.stats_row)
 
+        # 不可用源列表（无不可用时隐藏）
+        self.broken_card = _BrokenSourcesCard()
+        layout.addWidget(self.broken_card)
+
         # 最近搜索
         self.recent = RecentSearches(history)
         layout.addWidget(self.recent)
@@ -175,6 +217,7 @@ class HomePage(BasePage):
     def refresh(self) -> None:
         """从数据源刷新本页。"""
         self.stats_row.reload()
+        self.broken_card.update_sources(self._manager.list_broken())
         self.recent.reload()
         self._update_empty_state()
 
@@ -182,6 +225,7 @@ class HomePage(BasePage):
         has_sources = len(self._manager.all()) > 0
         self.empty_state.setVisible(not has_sources)
         self.stats_row.setVisible(has_sources)
+        self.broken_card.setVisible(has_sources and bool(self._manager.list_broken()))
         self.recent.setVisible(has_sources)
         self.mini_progress.setVisible(has_sources)
         self.batch_update.setVisible(has_sources)

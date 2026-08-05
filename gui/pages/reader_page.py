@@ -29,18 +29,53 @@ from .reader.epub_view import EpubView
 from .base_page import BasePage
 
 
+class _SwitchSourceSignals(QObject):
+    """换源后台任务信号。"""
+    done = Signal(object)  # new_detail
+    error = Signal(str)
+
+
+class _SwitchSourceTask(QRunnable):
+    """后台切换播放源：重新抓详情（换 sid）。"""
+
+    def __init__(self, content, source, detail_url, sid):
+        super().__init__()
+        self.signals = _SwitchSourceSignals()
+        self._content = content
+        self._source = source
+        self._url = detail_url
+        self._sid = sid
+
+    def run(self) -> None:
+        try:
+            new_detail, chapters = self._content.switch_source(
+                self._source, self._url, self._sid
+            )
+            try:
+                self.signals.done.emit(new_detail)
+            except RuntimeError:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.signals.error.emit(str(exc))
+            except RuntimeError:
+                pass
+
+
 class ReaderPage(BasePage):
     def __init__(
         self,
         source_manager: SourceManager,
         content: Content,
         reading_progress=None,
+        font_scale: float = 1.0,
         parent=None,
     ):
         super().__init__(parent)
         self._manager = source_manager
         self._content = content
         self._reading_progress = reading_progress
+        self._font_scale = float(font_scale or 1.0)
         self._current_source_id = None
         self._current_book_url = None
 
@@ -67,10 +102,10 @@ class ReaderPage(BasePage):
 
         # ---- 四视图切换 ----
         self.stack = QStackedWidget()
-        self.novel_view = NovelView(content)
+        self.novel_view = NovelView(content, font_scale=self._font_scale)
         self.comic_view = ComicView(content)
         self.video_view = VideoView(content)
-        self.epub_view = EpubView()
+        self.epub_view = EpubView(font_scale=self._font_scale)
         self.stack.addWidget(self.novel_view)
         self.stack.addWidget(self.comic_view)
         self.stack.addWidget(self.video_view)
@@ -84,6 +119,37 @@ class ReaderPage(BasePage):
             self.video_view.episode_changed.connect(self._on_progress_signal)
             # epub 本地阅读：用文件路径作 key 续读
             self.epub_view.chapter_changed.connect(self._on_progress_signal)
+
+        # ---- 换源：VideoView 切源 → 重载分集 ----
+        self.video_view.source_changed.connect(self._on_source_changed)
+
+    def _on_source_changed(self, payload) -> None:
+        """换源：重新抓取该源详情 + 刷新 VideoView 分集。"""
+        if self._content is None or not isinstance(payload, (tuple, list)):
+            return
+        detail, new_sid = payload[0], payload[1]
+        if detail is None or not new_sid:
+            return
+        # 后台切源（网络请求，不阻塞 UI）
+        task = _SwitchSourceTask(
+            self._content, self._current_source, detail.url, new_sid
+        )
+        task.signals.done.connect(self._on_source_switched)
+        task.signals.error.connect(self._on_source_switch_failed)
+        self._switch_task = task  # 持有引用，防止被 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_source_switched(self, new_detail) -> None:
+        """换源成功：刷新 VideoView 分集列表。"""
+        if new_detail is None:
+            return
+        self.video_view.reload_detail(new_detail)
+        # 进度记忆用原 URL（含 sid 变化，保留同一部剧 key）
+        self._on_progress_signal((new_detail, new_detail.title, ""))
+
+    def _on_source_switch_failed(self, err: str) -> None:
+        self.video_view.play_label.setText(f"换源失败：{err}")
+        self.video_view.set_source_sid(self.video_view._current_sid)
 
     def _on_progress_signal(self, payload) -> None:
         """记录阅读进度（换章/换集触发）。payload=(detail, title, url)。
@@ -122,6 +188,7 @@ class ReaderPage(BasePage):
             self.title_label.setText(f"源不存在：{source_id}")
             return
         self._current_source_id = source_id
+        self._current_source = source
         self._current_book_url = book_url
         self.title_label.setText(f"加载中...")
         self.source_label.setText(source.source_name)
@@ -175,13 +242,30 @@ class ReaderPage(BasePage):
         self.title_label.setText("epub 阅读")
         self.source_label.setText(path)
         self.stack.setCurrentWidget(self.epub_view)
-        if self.epub_view.open(path):
+        if self.epub_view.open(path, start_idx=0):
+            # 续读：按上次章节标题定位
+            if self._reading_progress is not None:
+                rec = self._reading_progress.resume(path)
+                last_title = (rec or {}).get("chapter_title", "")
+                if last_title:
+                    for i, ch in enumerate(self.epub_view._chapters):
+                        if ch.title == last_title:
+                            self.epub_view._load_chapter(i)
+                            break
             self.title_label.setText(self.epub_view._chapters[0].title if self.epub_view._chapters else "epub")
         else:
             self.title_label.setText("epub 打开失败")
 
     def refresh(self) -> None:
         pass
+
+    def apply_font_scale(self, scale: float) -> None:
+        """设置页字体缩放实时生效：转发给小说/epub 视图。"""
+        self._font_scale = float(scale or 1.0)
+        if hasattr(self, "novel_view"):
+            self.novel_view.set_font_scale(self._font_scale)
+        if hasattr(self, "epub_view"):
+            self.epub_view.set_font_scale(self._font_scale)
 
 
 class _DetailSignals(QObject):

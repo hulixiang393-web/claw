@@ -432,17 +432,17 @@ async def _render_one_url(
             for cid, uri in items:
                 drawn[cid] = uri
 
-        step = 1000
+        step = 1500
         no_new = 0
-        for _ in range(120):
+        for _ in range(80):
             await page.evaluate(f"window.scrollBy(0, {step})")
-            await page.wait_for_timeout(80)
+            await page.wait_for_timeout(50)
             prev = len(drawn)
             await _collect_drawn()
             no_new = 0 if len(drawn) > prev else no_new + 1
-            if no_new >= 10:
+            if no_new >= 6:
                 break
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(1000)
         await _collect_drawn()
 
     await page.wait_for_timeout(extra_delay_ms)
@@ -553,3 +553,96 @@ def fetch_rendered_pages_batch_sync(
     """
     per_url_cfg = per_url_cfg or {}
     return asyncio.run(_fetch_pages_batch(urls, render_cfg, per_url_cfg))
+
+
+# ------------------------------------------------------------------ #
+# 渲染后提取正文文本（SPA 小说站用）
+# ------------------------------------------------------------------ #
+def fetch_rendered_text_sync(
+    url: str,
+    selector: str,
+    wait_for: str = "",
+    wait_until: str = "domcontentloaded",
+    timeout_ms: int = 30000,
+    extra_delay_ms: int = 2000,
+    proxy: Optional[str] = None,
+) -> str:
+    """用 Playwright 同步 API 渲染页面后，按 CSS selector 提取全部段落文本。
+
+    供 SPA 小说站（如 18mh）正文在 JS 渲染的页面用。
+    使用同步 API（部分站对 async headless 有反爬，sync API 指纹不同）。
+    返回 selector 命中节点的合并文本（\\n 分隔），无命中返回 ""。
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        launch_args = ["--no-sandbox"]
+        if proxy:
+            launch_args.append(f"--proxy-server={proxy}")
+        browser = p.chromium.launch(headless=True, args=launch_args)
+        try:
+            context = browser.new_context(user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ), viewport={"width": 1366, "height": 768})
+            page = context.new_page()
+            page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+            if wait_for:
+                try:
+                    page.wait_for_selector(wait_for, timeout=12000)
+                except Exception:
+                    pass
+            page.wait_for_timeout(extra_delay_ms)
+            nodes = page.query_selector_all(selector)
+            texts = []
+            for n in nodes:
+                t = (n.inner_text() or "").strip()
+                if t:
+                    texts.append(t)
+            return "\n".join(texts)
+        finally:
+            browser.close()
+
+
+def fetch_rendered_video_sync(
+    url: str,
+    wait_until: str = "networkidle",
+    timeout_ms: int = 45000,
+    extra_delay_ms: int = 8000,
+    proxy: Optional[str] = None,
+) -> str:
+    """渲染播放页，等 iframe 解析站执行后，提取真实视频源（video src）。
+
+    适用：播放页用 iframe 嵌套第三方解析站（如 agedm），解析站 JS
+    解密后填充真实视频 URL 到 iframe 的 <video>。返回 video src；失败 ""。
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        launch_args = ["--no-sandbox"]
+        if proxy:
+            launch_args.append(f"--proxy-server={proxy}")
+        browser = p.chromium.launch(headless=True, args=launch_args)
+        try:
+            context = browser.new_context(user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ), viewport={"width": 1366, "height": 768})
+            page = context.new_page()
+            page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+            page.wait_for_timeout(extra_delay_ms)
+            # 遍历全部 frame（含 iframe 解析站）找 video src
+            for _ in range(3):  # 多轮重试等解析站渲染
+                for f in page.frames:
+                    try:
+                        vids = f.query_selector_all("video")
+                        for v in vids:
+                            src = v.get_attribute("src") or ""
+                            if src and src.startswith("http"):
+                                return src
+                    except Exception:
+                        continue
+                page.wait_for_timeout(4000)
+            return ""
+        finally:
+            browser.close()

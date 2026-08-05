@@ -52,7 +52,6 @@ class ComicView(QWidget):
         self._auto_loading = False  # 自动翻话锁，防重复触发
         self._auto_prev_loading = False  # 向上自动翻话锁，防重复触发
         self._last_auto_nav_ts = 0.0  # 上次自动翻话时间戳（防循环）
-        self._edge_armed = False  # 边沿触发武装：离开边界区才允许再次触发翻话
         self._prefetched = {}  # {url: {"images":[...], "count":N}} 预渲染的后续话
         self._prefetch_queue = []  # 串行预渲染队列（同一时间只渲染 1 话）
         self._prefetch_busy = False  # 是否正在预渲染
@@ -81,6 +80,12 @@ class ComicView(QWidget):
         toolbar.addStretch(1)
         self.progress_label = QLabel("")
         toolbar.addWidget(self.progress_label)
+        # 缩放指示器（跟随 Ctrl+滚轮实时更新）
+        from PySide6.QtWidgets import QSpinBox
+
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        toolbar.addWidget(self.zoom_label)
         layout.addLayout(toolbar)
 
         # ---- 目录 + 图片区 ----
@@ -94,7 +99,8 @@ class ComicView(QWidget):
         body.addWidget(self.toc_list)
 
         self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidgetResizable(False)  # False：让 gallery.setFixedWidth(缩放) 真正生效
+        self.scroll.setAlignment(Qt.AlignHCenter)  # gallery 比视口窄时水平居中（默认是左上角）
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.gallery = QWidget()
         self.gallery_layout = QVBoxLayout(self.gallery)
@@ -105,10 +111,15 @@ class ComicView(QWidget):
         body.addWidget(self.scroll, stretch=1)
         layout.addLayout(body, stretch=1)
 
-        # 自动下一话：读到当前话底部（最后一张图）→ 无缝加载下一话
-        self.scroll.verticalScrollBar().valueChanged.connect(self._maybe_auto_next)
+        # 自动下一话：滚动到话底不再自动加载 —— 用户须手动点「下一话/下一章」按钮。
+        # （_maybe_auto_next 保留但不连接，避免滚动到底意外跳话）
 
         self._apply_mode()
+        # Ctrl+滚轮缩放：用事件过滤器抢在 scroll area / 图片子控件之前捕获
+        self.scroll.viewport().installEventFilter(self)
+        self.scroll.installEventFilter(self)
+        # 键盘焦点（支持←→↑↓翻话/翻图）
+        self.setFocusPolicy(Qt.StrongFocus)
 
     # ------------------------------------------------------------------ #
     def load(self, source, detail: Detail, start_chapter_url: str = "") -> None:
@@ -190,9 +201,6 @@ class ComicView(QWidget):
         """加载完成后统一收尾：清翻话锁 + 定位（顶部/话尾）+ 续读信号。"""
         self._auto_loading = False
         self._auto_prev_loading = False
-        # 程序化定位后解除边沿武装：停在边界（顶部/话尾）时不触发自动跳话，
-        # 用户滚回中段（_edge_armed=True）再回边界才重新触发
-        self._edge_armed = False
         self.chapter_changed.emit((self._detail, ch.title, ch.url))
         if self._scroll_on_load == 1:
             # 定位到上一话末尾（等 layout 完成后再滚，blockSignals 防自动翻话循环）
@@ -292,8 +300,24 @@ class ComicView(QWidget):
             self.gallery_layout.addWidget(header)
         for url in self._images:
             lbl = _ComicImageLabel(url)
+            lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
+        # 刷新 gallery 尺寸（widgetResizable=False 需手动定宽+按内容定高）
+        self._apply_zoom()
+        self._relayout_gallery()
+
+    def _relayout_gallery_queued(self) -> None:
+        """图片异步加载完/重绘后，排队重算 gallery 高度（避免频繁触发）。"""
+        QTimer.singleShot(0, self._relayout_gallery)
+
+    def _relayout_gallery(self) -> None:
+        """按内容重算 gallery 高度（widgetResizable=False 不会自动跟随）。"""
+        if self.gallery.layout() is not None:
+            self.gallery.adjustSize()
+        # 刷新滚动范围（高度变化后滚动条最大值跟着更新）
+        vbar = self.scroll.verticalScrollBar()
+        vbar.setValue(min(vbar.value(), vbar.maximum()))
 
     def _clear_images(self) -> None:
         while self.gallery_layout.count():
@@ -321,77 +345,125 @@ class ComicView(QWidget):
             self._load_episode(nxt)
 
     def _maybe_auto_next(self, value: int) -> None:
-        """滚动到底 → 自动下一话；滚到顶 → 自动上一话（双向自然衔接）。
+        """滚动到底 → 自动下一话；滚到顶 → 自动上一话。
 
-        边沿触发：翻话后解除武装（_edge_armed=False），必须离开边界区
-        （滚回中段）再回到边界才再次触发，避免停在边界时被反复触发而"瞎跳"。
+        用时间冷却（_last_auto_nav_ts）防快速重触发，比边沿触发更自然。
         """
         if self._current_idx < 0:
             return
-        if not self._images:  # 本话图片还没加载完，不触发
+        if not self._images:
             return
         vbar = self.scroll.verticalScrollBar()
         if vbar.maximum() == 0:
             return
         if self._mode != "gallery":
             return  # 横向翻页模式走独立的翻页边界逻辑
+        # 时间冷却：翻话后 2s 内不重复触发
+        if time.time() - self._last_auto_nav_ts < 2.0:
+            return
         max_v = vbar.maximum()
         total = len(self._chapters)
-        at_top = value <= 2
-        at_bottom = value >= max_v - 40
-        # 离开边界区（回到中段）→ 重新武装
-        if not at_top and not at_bottom:
-            self._edge_armed = True
-            return
-        if not self._edge_armed:
-            return  # 未武装（刚翻完话停在边界）→ 忽略
         # 向下：近底部 → 下一话
-        if at_bottom:
+        if value >= max_v - 40:
             if self._auto_loading or self._current_idx >= total - 1:
                 return
             self._auto_loading = True
-            self._edge_armed = False
             self._last_auto_nav_ts = time.time()
             self._load_episode(self._current_idx + 1, scroll_to_end=False)
-        # 向上：滚回顶部 → 上一话，并定位到上一话末尾
-        elif at_top:
+        # 向上：滚回顶部 → 上一话末尾
+        elif value <= 2:
             if self._auto_prev_loading or self._current_idx <= 0:
                 return
             self._auto_prev_loading = True
-            self._edge_armed = False
             self._last_auto_nav_ts = time.time()
             self._load_episode(self._current_idx - 1, scroll_to_end=True)
 
+    # ------------------------------------------------------------------ #
+    # Ctrl+滚轮缩放（事件过滤器，抢在子控件 wheelEvent 之前）
+    # ------------------------------------------------------------------ #
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if event.type() == event.Type.Wheel:
+            if event.modifiers() & Qt.ControlModifier:
+                delta = 1.1 if event.angleDelta().y() > 0 else 0.9
+                self._zoom *= delta
+                self._zoom = max(0.25, min(4.0, self._zoom))
+                self._apply_zoom()
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
+
     def wheelEvent(self, event) -> None:  # noqa: N802
-        # Ctrl+滚轮缩放
+        # Ctrl+滚轮缩放（焦点在 ComicView 本身时走这里）
         if event.modifiers() & Qt.ControlModifier:
             delta = 1.1 if event.angleDelta().y() > 0 else 0.9
             self._zoom *= delta
-            self._zoom = max(0.3, min(3.0, self._zoom))
+            self._zoom = max(0.25, min(4.0, self._zoom))
             self._apply_zoom()
             event.accept()
         else:
             super().wheelEvent(event)
 
     def _apply_zoom(self) -> None:
-        self.gallery.setFixedWidth(int(self._current_base_width() * self._zoom))
+        """按 _zoom 调整 gallery 宽度，图片宽度随动。"""
+        base = self._current_base_width()
+        target = max(200, int(base * self._zoom))
+        self.gallery.setFixedWidth(target)
+        # 通知每张图片按新宽度重新缩放
+        self._update_zoom_indicator()
+        QTimer.singleShot(0, self._relayout_gallery)
 
     def _current_base_width(self) -> int:
-        return max(300, self.width() - 40)
+        return max(300, self.scroll.viewport().width())
+
+    def _update_zoom_indicator(self) -> None:
+        """工具栏缩放百分比提示。"""
+        if hasattr(self, "zoom_label"):
+            self.zoom_label.setText(f"{int(self._zoom * 100)}%")
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._apply_zoom()
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """键盘导航：上下键滚动，左右键切话（画廊模式）。"""
+        key = event.key()
+        if self._mode == "gallery":
+            vbar = self.scroll.verticalScrollBar()
+            if key in (Qt.Key_Down, Qt.Key_PageDown):
+                vbar.setValue(vbar.value() + self.scroll.height() * 2 // 3)
+            elif key in (Qt.Key_Up, Qt.Key_PageUp):
+                vbar.setValue(vbar.value() - self.scroll.height() * 2 // 3)
+            elif key == Qt.Key_Right:
+                self._jump_relative(1)
+            elif key == Qt.Key_Left:
+                self._jump_relative(-1)
+        else:
+            # flip模式：左右键翻图/翻话
+            if key == Qt.Key_Right:
+                self._jump_relative(1)
+            elif key == Qt.Key_Left:
+                self._jump_relative(-1)
+            elif key in (Qt.Key_Down, Qt.Key_Up):
+                vbar = self.scroll.horizontalScrollBar()
+                step = self.scroll.width() * 3 // 4
+                vbar.setValue(vbar.value() + (step if key == Qt.Key_Down else -step))
+        super().keyPressEvent(event)
+
 
 class _ComicImageLabel(QLabel):
-    """漫画单页图片（异步加载自适应）。"""
+    """漫画单页图片（异步加载 + 跟随容器宽度自适应缩放）。
+
+    loaded = Signal()：图片加载/重绘完成，通知宿主重排 gallery 高度。
+    """
+
+    loaded = Signal()
 
     def __init__(self, url, parent=None):
         super().__init__(parent)
         self.url = url
         self.setAlignment(Qt.AlignCenter)
         self._loading = True
+        self._orig: QPixmap | None = None  # 原始像素图（缩放基准）
         self.setText("加载中...")
         self.setMinimumWidth(200)
         self.setStyleSheet("border: 1px solid palette(mid); border-radius: 4px; padding: 4px;")
@@ -414,7 +486,7 @@ class _ComicImageLabel(QLabel):
                 pass
             self._on_image(None)
             return
-        # Playwright 返回的本地文件路径 → 直接读
+        # Playwright 返回的本地文件路径 → 直接读（同步）
         if self.url and (self.url.startswith(("file://", "/", "\\")) or "\\" in self.url or self.url.startswith(".")):
             path = self.url.replace("file://", "")
             pix = QPixmap(path)
@@ -427,14 +499,30 @@ class _ComicImageLabel(QLabel):
     def _on_image(self, pixmap) -> None:
         if pixmap is None:
             self.setText("图片加载失败\n（可能需登录或已失效）")
+            self.loaded.emit()
             return
-        # 缩放适应宽度（widget 未显示时 width() 可能是 -1，需兜底）
+        self._orig = pixmap
+        self._fit()
+        self.loaded.emit()  # 通知宿主：图片就绪，重排 gallery
+
+    def _fit(self) -> None:
+        """按当前容器宽度重绘（缩放/窗口变化时调用）。"""
+        if self._orig is None:
+            return
+        # 容器未布局时宽度可能是 -1，兜底 600
         avail = self.width() if self.width() > 100 else 600
-        scaled = pixmap.scaledToWidth(
-            avail, Qt.SmoothTransformation
-        ) if pixmap.width() > avail else pixmap
-        self.setPixmap(scaled)
-        self.setMinimumHeight(min(scaled.height() + 8, 4096))
+        pix = self._orig
+        if pix.width() > avail or pix.width() < avail:
+            pix = pix.scaledToWidth(avail, Qt.SmoothTransformation)
+        self.setPixmap(pix)
+        self.setMinimumHeight(min(pix.height() + 8, 4096))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        """容器宽度变化（窗口缩放 / Ctrl+滚轮）→ 重绘图片。"""
+        super().resizeEvent(event)
+        if self._orig is not None:
+            self._fit()
+            self.loaded.emit()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:

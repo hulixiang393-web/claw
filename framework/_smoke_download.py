@@ -104,7 +104,9 @@ class _FakeHttp:
 
 class _FakeManager:
     def get(self, source_id):
-        return {"obj": ("novel", "comic", "video")}  # 任一 truthy 对象即可
+        # 返回带 .raw 的伪 SourceConfig（非 playwright 源，走串行下载）
+        raw = {"endpoints": {"content": {"page": {"render": "html"}}}}
+        return type("FakeSource", (), {"raw": raw, "source_id": source_id})()
 
 
 class _FakeBus:

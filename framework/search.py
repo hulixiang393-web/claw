@@ -54,38 +54,80 @@ class Search:
         http: HttpClient,
         parser: Parser,
         discovery: Optional[Discovery] = None,
+        concurrent: int = 1,
     ):
         self._http = http
         self._parser = parser
         self._discovery = discovery
+        self._concurrent = max(1, int(concurrent or 1))
         self._ytdlp = None  # 懒加载单例
 
     # ------------------------------------------------------------------ #
-    def search_one(self, source: SourceConfig, keyword: str) -> List[SearchResult]:
-        """单源搜索。优先 yt-dlp 引擎，其次 api_endpoints.search，否则 endpoints.search。"""
+    def search_one(
+        self, source: SourceConfig, keyword: str, http: Optional[HttpClient] = None
+    ) -> List[SearchResult]:
+        """单源搜索。优先 yt-dlp 引擎，其次 api_endpoints.search，否则 endpoints.search。
+
+        http：可指定独立 HttpClient（并发搜索时每 worker 各用一个，requests.Session
+        非线程安全）。None 用 self._http。
+        """
+        http = http or self._http
         api = source.raw.get("api_endpoints") or {}
         search_cfg = api.get("search") or {}
         if search_cfg.get("engine") == "ytdlp":
-            return self._search_ytdlp(source, keyword, search_cfg)
+            return self._search_ytdlp(source, keyword, search_cfg, http=http)
         if search_cfg:
-            return self._search_api(source, keyword)
-        return self._search_html(source, keyword)
+            return self._search_api(source, keyword, http=http)
+        return self._search_html(source, keyword, http=http)
 
     def search_type(
         self, sources: List[SourceConfig], keyword: str
     ) -> List[SearchResult]:
-        """跨源搜索（串行），合并结果。单源失败不影响其他。"""
+        """跨源搜索（并发数 = concurrent），合并结果。单源失败不影响其他。
+
+        concurrent>1 时用 ThreadPoolExecutor 并行；每 worker 独立 HttpClient
+        （复用同一 NetworkDefaults），避免 requests.Session 非线程安全。
+        """
         results: List[SearchResult] = []
-        for source in sources:
+        if self._concurrent <= 1 or len(sources) <= 1:
+            for source in sources:
+                try:
+                    results.extend(self.search_one(source, keyword))
+                except Exception as exc:
+                    log.warning("[%s] 搜索失败: %s", source.source_id, exc)
+            return results
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _worker(source: SourceConfig) -> List[SearchResult]:
+            # 每 worker 一个独立 HttpClient（共享默认值）
+            worker_http = self._http.__class__(
+                sleeper=getattr(self._http, "_sleeper", None),
+                defaults=self._http.defaults,
+            )
             try:
-                results.extend(self.search_one(source, keyword))
+                return self.search_one(source, keyword, http=worker_http)
             except Exception as exc:
                 log.warning("[%s] 搜索失败: %s", source.source_id, exc)
+                return []
+            finally:
+                try:
+                    worker_http.close()
+                except Exception:
+                    pass
+
+        workers = min(self._concurrent, max(1, len(sources)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for part in pool.map(_worker, sources):
+                results.extend(part or [])
         return results
 
     # ------------------------------------------------------------------ #
-    def _search_html(self, source: SourceConfig, keyword: str) -> List[SearchResult]:
+    def _search_html(
+        self, source: SourceConfig, keyword: str, http: Optional[HttpClient] = None
+    ) -> List[SearchResult]:
         """HTML 站搜索（endpoints.search）。"""
+        http = http or self._http
         search_cfg = source.get_search_config()
         if not search_cfg.get("item") or not search_cfg.get("item", {}).get("fields"):
             return []
@@ -97,12 +139,17 @@ class Search:
         if method == "POST":
             abs_url = urljoin(source.base_url, base_url)
             body = {kw_param: keyword}
+            # 固定附加参数（source-schema §3.2 extra_params）并入 POST body
+            extra = search_cfg.get("extra_params") or {}
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    body.setdefault(k, v)
             # 需要 http 支持 post_form
-            text = self._http_post_form(source, abs_url, body)
+            text = self._http_post_form(source, abs_url, body, http=http)
         else:
             sep = "&" if "?" in base_url else "?"
             abs_url = urljoin(source.base_url, f"{base_url}{sep}{kw_param}={quote(keyword)}")
-            text = self._http_get(source, abs_url)
+            text = self._http_get(source, abs_url, http=http)
 
         doc = self._parser.parse(text)
         item_cfg = search_cfg.get("item") or {}
@@ -112,11 +159,15 @@ class Search:
             return []
         items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         results = []
+        seen_urls = set()
         for it in items:
             title = it.get("title", "")
             url = it.get("url", "")
             if not title or not url:
                 continue
+            if url in seen_urls:
+                continue  # URL 去重（trtag 等站搜索页 DOM 有重复节点）
+            seen_urls.add(url)
             results.append(
                 SearchResult(
                     title=title,
@@ -131,7 +182,9 @@ class Search:
         return results
 
     # ------------------------------------------------------------------ #
-    def _search_ytdlp(self, source: SourceConfig, keyword: str, cfg: dict) -> List[SearchResult]:
+    def _search_ytdlp(
+        self, source: SourceConfig, keyword: str, cfg: dict, http: Optional[HttpClient] = None
+    ) -> List[SearchResult]:
         """yt-dlp 引擎搜索。搜索前缀/URL 模板从源配置读（通用化）。"""
         constraints = source.raw.get("constraints") or {}
         cs = constraints.get("search") or {}
@@ -159,13 +212,16 @@ class Search:
             )
         return results
 
-    def _search_api(self, source: SourceConfig, keyword: str) -> List[SearchResult]:
+    def _search_api(
+        self, source: SourceConfig, keyword: str, http: Optional[HttpClient] = None
+    ) -> List[SearchResult]:
         """API 站搜索（api_endpoints.search）。
 
         支持两种 URL 构造：
         - params 对象：结构化参数，自动 URL encode，支持 sign 策略签名。
         - url 模板：URL 含 {keyword} 占位，手动拼接。
         """
+        http = http or self._http
         api = source.raw.get("api_endpoints") or {}
         cfg = api.get("search") or {}
         if not cfg:
@@ -190,7 +246,7 @@ class Search:
                 if strategy:
                     from .signers import get_signer
 
-                    signer = get_signer(strategy, self._http)
+                    signer = get_signer(strategy, http)
                     filled = signer.sign(filled)
                 qs = urlencode(filled)
                 abs_url = urljoin(source.base_url, api_url)
@@ -199,12 +255,12 @@ class Search:
                 else:
                     abs_url = f"{abs_url}?{qs}"
             else:
-                api_url2 = api_url.replace("{keyword}", quote(keyword))
+                api_url2 = api_url.replace("{keyword}", quote(keyword)).replace("{page}", str(page))
                 abs_url = urljoin(source.base_url, api_url2)
-            resp = self._http.get_json(
+            resp = http.get_json(
                 abs_url,
                 headers=source.request_headers(),
-                timeout=float(source.transports().get("timeout") or 10),
+                timeout=float(source.transports().get("timeout") or http.defaults.timeout),
             )
             items = resp
             rpath = cfg.get("response_path")
@@ -254,22 +310,30 @@ class Search:
         return cover
 
     # ------------------------------------------------------------------ #
-    def _http_get(self, source: SourceConfig, url: str) -> str:
-        return self._http.get_text(
+    def _http_get(
+        self, source: SourceConfig, url: str, http: Optional[HttpClient] = None
+    ) -> str:
+        http = http or self._http
+        return http.get_text(
             url,
             headers=source.request_headers(),
-            timeout=float(source.transports().get("timeout") or 10),
-            retries=int(source.transports().get("retries") or 3),
+            timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+            retries=int(source.transports().get("retries") or http.defaults.retries),
+            encoding=source.transports().get("charset"),
         )
 
-    def _http_post_form(self, source: SourceConfig, url: str, data: dict) -> str:
+    def _http_post_form(
+        self, source: SourceConfig, url: str, data: dict, http: Optional[HttpClient] = None
+    ) -> str:
         from urllib.parse import urlencode
 
-        return self._http.post_form(
+        http = http or self._http
+        return http.post_form(
             url,
             form_data=data,
             headers=source.request_headers(),
-            timeout=float(source.transports().get("timeout") or 10),
+            timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+            encoding=source.transports().get("charset"),
         )
 
     @staticmethod

@@ -13,8 +13,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 DEFAULTS: dict = {
     "network": {
@@ -34,6 +38,8 @@ DEFAULTS: dict = {
         "font_scale": 1.0,
         "cover_cache_size_mb": 256,
         "default_page_size": 20,
+        "background_image": "",
+        "background_opacity": 0.6,
     },
     "download": {
         "output_dir": "downloads",
@@ -51,6 +57,9 @@ DEFAULTS: dict = {
         "log_dir": "logs",
         "log_file_pattern": "framework-{date}.jsonl",
     },
+    "adblock": {
+        "extra_rule_dir": "",
+    },
     "sources_runtime": {
         "broken_source_warn_interval_hours": 24,
         "auto_disable_after_failures": 3,
@@ -62,6 +71,7 @@ DEFAULTS: dict = {
 class SettingsManager:
     def __init__(self, path: str | Path = "app_config.json"):
         self.path = Path(path)
+        self._lock = threading.RLock()  # set/save 并发保护（下载线程 + UI 线程）
         self._data: dict = self._load()
 
     def _load(self) -> dict:
@@ -100,11 +110,16 @@ class SettingsManager:
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except OSError:
-            pass  # 保存失败不崩溃
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            with self._lock:
+                tmp.write_text(
+                    json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            tmp.replace(self.path)  # 原子替换：避免中途崩溃截断配置文件
+        except OSError as exc:
+            log.warning("保存配置失败：%s", exc)
 
     def reset_to_defaults(self) -> None:
-        self._data = json.loads(json.dumps(DEFAULTS))
+        with self._lock:
+            self._data = json.loads(json.dumps(DEFAULTS))
+        self.save()

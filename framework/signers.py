@@ -50,9 +50,14 @@ def _get_wbi_keys(http) -> tuple:
 
 
 def _mixin_key(edk: str) -> str:
-    """按混排索引表重组密钥（yt-dlp 同款）。"""
+    """按混排索引表重组密钥（yt-dlp 同款）。
+
+    索引表基于 64 字符 key；edk 变短时截断（防 IndexError），变长时取前 64。
+    """
     chars = list(edk)
-    return "".join(chars[i] for i in MIXIN_KEY_ENC_TAB)
+    return "".join(
+        chars[i] for i in MIXIN_KEY_ENC_TAB if i < len(chars)
+    )
 
 
 class Signer:
@@ -71,16 +76,18 @@ class BilibiliWbiSigner(Signer):
 
     def __init__(self, http=None, key_cache: Optional[dict] = None):
         self._http = http
-        self._cache = key_cache if key_cache is not None else {"mk": None}
+        self._cache = key_cache if key_cache is not None else {"mk": None, "mk_ts": 0.0}
 
     def _mixin(self) -> str:
-        if self._cache.get("mixin"):
+        # wbi key 每天轮换；缓存 30 分钟（TTL）后重新拉取，避免次日用过期 key 签名失败
+        if self._cache.get("mixin") and time.time() - self._cache.get("mk_ts", 0.0) < 1800:
             return self._cache["mixin"]
         if self._http is None:
             raise DecryptError("wbi 签名需要 HttpClient，且当前未注入")
         img_key, sub_key = _get_wbi_keys(self._http)
         mk = _mixin_key(img_key + sub_key)
         self._cache["mixin"] = mk
+        self._cache["mk_ts"] = time.time()
         return mk
 
     def sign(self, params: Dict[str, object]) -> Dict[str, object]:

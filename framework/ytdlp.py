@@ -45,24 +45,49 @@ class Ytdlp:
 
     # ------------------------------------------------------------------ #
     def _run(self, args: List[str]) -> str:
-        """跑 yt-dlp，返回 stdout（utf-8）。失败抛 YtdlpError。"""
+        """跑 yt-dlp，返回 stdout（utf-8）。失败抛 YtdlpError。
+
+        用临时文件重定向 stdout/stderr 而非 capture_output：
+        Windows 管道缓冲满（~64KB）会让子进程写 stderr 时阻塞 → 死锁，
+        视频/长列表输出大时尤其明显。文件重定向彻底规避。
+        """
         cmd = [self._bin] + args
+        import tempfile
+        import os
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w+", suffix=".log", delete=False, encoding="utf-8"
+        )
+        log_path = tmp.name
+        tmp.close()
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=self._timeout,
-            )
+            with open(log_path, "w", encoding="utf-8", errors="replace") as f:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    timeout=self._timeout,
+                )
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    out = f.read()
+            except OSError:
+                out = ""
         except subprocess.TimeoutExpired:
             raise YtdlpError("yt-dlp 超时")
         except FileNotFoundError:
             raise YtdlpError(f"未找到 yt-dlp：{self._bin}")
+        finally:
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
         if proc.returncode != 0:
-            err = (proc.stderr or "")[-300:].strip()
+            err = (out or "")[-300:].strip()
             raise YtdlpError(f"yt-dlp 错误({proc.returncode})：{err}")
-        return proc.stdout
+        return out
 
     # ------------------------------------------------------------------ #
     def search(self, keyword: str, limit: int = 20, prefix: str = "ytsearch",
@@ -125,8 +150,7 @@ class Ytdlp:
     # ------------------------------------------------------------------ #
     def extractor_of(self, url: str) -> str:
         """探测 URL 属于哪个站点 extractor（如 youtube/bilibili）。"""
-        out = self._run(["--list-extractors"])
-        # 简单方式：用 -J 看返回的 extractor_key
+        # 用 -J 看返回的 extractor_key（不白跑 --list-extractors 浪费子进程调用）
         try:
             d = json.loads(self._run(["--dump-single-json", "--no-warnings",
                                       "--skip-download", url]))

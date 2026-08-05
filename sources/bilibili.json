@@ -145,6 +145,9 @@
     },
     "merge": { "tool": "ffmpeg", "output_format": "mp4" }
   },
+  "ad_block": {
+    "enabled": true
+  },
   "constraints": {
     "search": { "max_pages": 3, "max_results": 60 },
     "detail": { "max_pages": 1 },

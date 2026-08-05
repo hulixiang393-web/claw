@@ -122,7 +122,23 @@ class ThemeManager:
     def generate_qss(self, theme_key: str | None = None) -> str:
         key = theme_key or self._current_key
         t = THEMES.get(key, THEMES["sakura"])
-        return BASE_QSS.format_map(t)
+        qss = BASE_QSS.format_map(t)
+        # 全局字体缩放：scale font-size: Npx → round(N*scale)px（BASE_QSS 内 4 处）
+        scale = 1.0
+        if self._settings is not None:
+            try:
+                scale = float(self._settings.get("ui", "font_scale", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                scale = 1.0
+        if scale != 1.0:
+            import re as _re
+
+            def _scale_font(match):
+                val = round(int(match.group(1)) * scale)
+                return f"font-size: {val}px"
+
+            qss = _re.sub(r"font-size:\s*(\d+)px", _scale_font, qss)
+        return qss
 
     def apply_theme(self) -> str:
         """读取当前主题 key，返回 QSS 字符串。GUI 层 qApp.setStyleSheet(qss)。"""
@@ -163,10 +179,8 @@ QMainWindow, QDialog {{
     color: {text};
     border-radius: {radius_md};
 }}
-QWidget {{
-    background-color: transparent;
-    color: {text};
-}}
+/* 注意：不要给 QWidget 全局设 background-color: transparent ——
+   那会让每个 widget 单独走样式引擎，重绘性能极差（按钮卡顿根源）。 */
 
 /* ---------- 按钮 ---------- */
 QPushButton {{
@@ -178,8 +192,7 @@ QPushButton {{
     font-weight: bold;
 }}
 QPushButton:hover {{
-    background-color: {accent};
-    transform: scale(1.03);
+    background-color: {accent2};
 }}
 QPushButton:pressed {{
     background-color: {accent2};

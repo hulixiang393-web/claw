@@ -1,0 +1,98 @@
+{
+  "$schema_version": 2,
+  "$id": "trtag",
+  "$type": "video",
+  "$name": "提线影院(trtag)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://trtag.com",
+    "description": "提线影院 - 电影/电视剧/动漫视频源（maccms）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "免费", "影视"]
+  },
+  "transports": {
+    "base_url": "https://trtag.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://trtag.com/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 200,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/tv/index.html",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "page_placeholder": "(?=\\.html)"
+      },
+      "list_item": {
+        "root_selector": { "css": "li.p1" },
+        "fields": {
+          "title": { "css": "a.link-hover", "attr": "title" },
+          "url": { "css": "a.link-hover", "attr": "href" },
+          "cover": { "css": "img.lazy", "attr": "data-original" },
+          "update": { "css": "span.list-score" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search.php",
+      "method": "POST",
+      "keyword_param": "searchword",
+      "body_format": "form",
+      "item": {
+        "root_selector": { "css": "li.p1" },
+        "fields": {
+          "title": { "css": "a.link-hover", "attr": "title" },
+          "url": { "css": "a.link-hover", "attr": "href" },
+          "cover": { "css": "img.lazy", "attr": "data-original" },
+          "update": { "css": "span.list-score" }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": { "css": "dt.name" },
+        "author": { "css": "meta[name='keywords']", "attr": "content" },
+        "summary": { "css": "meta[name='description']", "attr": "content" },
+        "cover": { "css": "meta[property='og:image']", "attr": "content" }
+      }
+    },
+    "content": {
+      "episode": {
+        "list": {
+          "root_selector": { "css": "div#vlink_1 ul li a" },
+          "chapter_order": "asc",
+          "title_clean": true,
+          "fields": {
+            "title": { "css": "a" },
+            "url": { "css": "a", "attr": "href" }
+          }
+        },
+        "play_url": {
+          "regex": "var\\s+now\\s*=\\s*[\"']([^\"']+)[\"']"
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 60 },
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 300, "max_items": 500 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": "li.p1" }
+    }
+  }
+}

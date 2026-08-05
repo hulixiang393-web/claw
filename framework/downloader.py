@@ -118,7 +118,24 @@ class Downloader:
     def _download_comic(self, source, task, chapter, index: int) -> int:
         # 只产出 epub：抓图片字节累积，全书写完统一合成
         images = self._content.fetch_comic_pages(source, chapter.url)
-        img_bytes = [self._image_bytes(img) for img in images]
+        # 并发下载图片（CDN 慢的站提速），逐张回调更新进度。
+        # 用 index→bytes 字典占位，保持图片顺序（as_completed 完成序会打乱页序）。
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        img_map = {i: b"" for i in range(len(images))}
+        progress_cb = getattr(task, "image_progress_cb", None)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {pool.submit(self._image_bytes, img): i for i, img in enumerate(images)}
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                try:
+                    b = fut.result()
+                except Exception:
+                    b = b""
+                img_map[idx] = b
+                if progress_cb is not None:
+                    progress_cb(len(b))
+        img_bytes = [img_map[i] for i in range(len(images))]
         task.epub_chapters.append((chapter.title or f"第{index+1}话", img_bytes))
         return sum(len(b) for b in img_bytes)
 
@@ -136,9 +153,54 @@ class Downloader:
             raise RuntimeError(f"未获取到播放流：{chapter.title or chapter.url}")
         from .ffmpeg_merger import FFmpegMerger
 
-        merger = FFmpegMerger()
-        finalized = merger.merge(video, audio, path)
+        # referer 从源配置的请求头取（如 B站 CDN 需要它）；源无此接口则空
+        referer = ""
+        _rh = getattr(source, "request_headers", None)
+        if callable(_rh):
+            referer = (_rh() or {}).get("Referer", "") or ""
+        merger = FFmpegMerger(referer=referer)
+        # m3u8 广告段过滤：视频是 HLS 时下载播放列表 → 剔除广告段 → 本地重写，
+        # 用无广告的本地 m3u8 合并（下载不落广告片段）。
+        # 【鉴权保护】源带 Referer 时本地 m3u8 无法传给内部 https 段请求（ffmpeg 白名单/
+        # headers 不传播），CDN 会拒绝 → 跳过本地过滤，直接用原始 URL 下载（保证能下）。
+        if video.startswith(("http://", "https://")) and (
+            ".m3u8" in video.lower() or "m3u8" in video.lower()
+        ) and not referer:
+            filtered = self._filter_m3u8_for_download(source, video, book_dir)
+            if filtered:
+                video = str(filtered)
+        # 合并期间实时上报输出文件大小 → 下载页进度条动起来；
+        # cancel_evt：用户点「取消」→ 立即终止 ffmpeg（而非等整集下完）
+        progress_cb = getattr(task, "image_progress_cb", None)
+        finalized = merger.merge(
+            video, audio, path,
+            progress_cb=progress_cb,
+            cancel_evt=getattr(task, "cancel_evt", None),
+            pause_evt=getattr(task, "pause_evt", None),
+        )
         return finalized.stat().st_size if finalized.exists() else 0
+
+    def _filter_m3u8_for_download(self, source, video_url: str, book_dir) -> Optional[Path]:
+        """下载 m3u8 → adblock 剔除广告段 → 写本地临时文件。失败返回 None（用原 URL）。"""
+        from .adblock import adblock_for
+
+        ad = adblock_for(source)
+        try:
+            text = self._http.get_text(video_url, headers=source.request_headers(), timeout=20, retries=2)
+        except Exception:  # noqa: BLE001
+            return None
+        if not text or not ad.enabled:
+            return None
+        cleaned = ad.filter_m3u8(text, video_url)
+        if cleaned == text:
+            return None  # 无广告，用原 URL
+        # 写本地无广告 m3u8（相对段 URL 需基于原 m3u8 目录解析，ffmpeg 处理相对路径）
+        tmp = book_dir / "_clean.m3u8"
+        try:
+            tmp.write_text(cleaned, encoding="utf-8")
+            return tmp
+        except OSError:
+            return None
 
     # ------------------------------------------------------------------ #
     # 批量漫画下载（复用同一个 Chromium 实例，大幅提速）
@@ -197,11 +259,23 @@ class Downloader:
         return len(raw)
 
     def _image_bytes(self, img: str) -> bytes:
-        """单张图字节：data URI 解码 / http URL 下载。不落盘（供 epub 累积）。"""
+        """单张图字节：data URI 解码 / http URL 下载。不落盘（供 epub 累积）。
+
+        受 network.max_bytes_per_image 上限约束：超过则跳过该图并告警（不中断整本）。
+        """
         if img.startswith("data:"):
             _, b64 = img.split(",", 1)
             return base64.b64decode(b64)
-        return self._http.get_bytes(img)
+        raw = self._http.get_bytes(img)
+        limit = int(self._settings.get("network", "max_bytes_per_image", 0) or 0)
+        if limit > 0 and len(raw) > limit:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "图片超过大小上限 %dB，跳过：%s", limit, img[:120]
+            )
+            return b""
+        return raw
 
     # ------------------------------------------------------------------ #
     def finalize_epub(self, task) -> Path:
@@ -222,8 +296,9 @@ class Downloader:
             return out  # 已存在（续传）
         ctype = task.content_type
         title = task.title or "untitled"
+        merge = bool(self._settings.get("download", "merge_chapters_into_one_file", False))
         if ctype == "comic":
-            build_comic_epub(title, out, task.epub_chapters)
+            build_comic_epub(title, out, task.epub_chapters, merge=merge)
         else:
-            build_novel_epub(title, out, task.epub_chapters)
+            build_novel_epub(title, out, task.epub_chapters, merge=merge)
         return out

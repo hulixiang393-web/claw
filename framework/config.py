@@ -19,6 +19,19 @@ from .errors import ConfigError
 CONTENT_TYPES = ("novel", "comic", "video")
 
 
+def _safe_weight(val) -> float:
+    """安全解析 weight：拒绝 NaN/Inf/非数字，回退 1.0。"""
+    import math
+
+    try:
+        w = float(val)
+        if not math.isfinite(w):
+            return 1.0
+        return w
+    except (TypeError, ValueError):
+        return 1.0
+
+
 @dataclass
 class SourceConfig:
     """一个数据源（对应一份 sources/*.json）。"""
@@ -36,6 +49,7 @@ class SourceConfig:
     raw: dict = field(default_factory=dict)  # 原始 JSON，供后续完整解析
     source_path: str = ""
     _buvid3: str = field(default="", init=False, repr=False)  # 缓存，复用连接
+    cookie_provider: object = field(default=None, init=False, repr=False)  # 可选: load(source_id)->str
 
     @classmethod
     def from_dict(cls, data: Any, path: str = "<memory>") -> "SourceConfig":
@@ -61,7 +75,7 @@ class SourceConfig:
             source_name=source_name,
             content_type=content_type,
             enabled=bool(data.get("$enabled", True)),
-            weight=float(data.get("$weight", 1.0)),
+            weight=_safe_weight(data.get("$weight", 1.0)),
             base_url=str(base_url),
             homepage=str(meta.get("homepage") or ""),
             icon=str(meta.get("icon") or ""),
@@ -73,12 +87,14 @@ class SourceConfig:
 
     def to_dict(self) -> dict:
         """导出回 JSON dict（供编辑器/落盘）。"""
-        meta = {
+        # 保留 raw 里原有的自定义 metadata / transports 键，再覆盖固定键（往返不丢字段）
+        meta = dict(self.raw.get("$metadata") or {})
+        meta.update({
             "homepage": self.homepage,
             "icon": self.icon,
             "description": self.description,
             "tags": self.tags,
-        }
+        })
         transports = dict(self.raw.get("transports") or {})
         transports["base_url"] = self.base_url
         out = dict(self.raw)
@@ -133,6 +149,7 @@ class SourceConfig:
         """
         headers = dict(self.transports().get("headers") or {})
         cookie = self.transports().get("cookie")
+        cookie_parts = []
         if cookie:
             if "{buvid3}" in cookie:
                 if not self._buvid3:
@@ -140,8 +157,20 @@ class SourceConfig:
 
                     self._buvid3 = f"{uuid.uuid4()}infoc"
                 cookie = cookie.replace("{buvid3}", self._buvid3)
-            if not headers.get("Cookie"):
-                headers["Cookie"] = cookie
+            cookie_parts.append(cookie)
+        # 登录保存的 cookie（CookieManager）追加合并
+        if self.cookie_provider is not None:
+            try:
+                saved = self.cookie_provider(self.source_id)
+                if saved:
+                    cookie_parts.append(saved)
+            except Exception:
+                pass
+        if cookie_parts:
+            # 大小写不敏感：headers 里可能已有 "cookie"/"Cookie" 键
+            has_cookie = any(k.lower() == "cookie" for k in headers)
+            if not has_cookie:
+                headers["Cookie"] = "; ".join(p for p in cookie_parts if p)
         return headers
 
 

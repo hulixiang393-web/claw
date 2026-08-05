@@ -28,7 +28,7 @@ class StructureChecker:
         self._http = http
         self._parser = parser
         self._default_strategy = default_strategy
-        self._last_check: dict[str, tuple[float, bool]] = {}
+        self._last_check: dict[tuple[str, str], tuple[float, bool]] = {}
 
     # ------------------------------------------------------------------ #
     def _get_config(self, source: SourceConfig):
@@ -48,11 +48,20 @@ class StructureChecker:
         if strategy == "off" or selector is None:
             return True
 
-        # interval 缓存：间隔内不重复自检；0 也加最小 60s 缓存
+        # interval 缓存：间隔内不重复自检；0 也加最小 60s 缓存。
+        # key 用 (source_id, url)：同一源不同页面各自缓存，避免跨页面重复整页请求。
         now = time.time()
         min_interval = max(interval_hours * 3600, 60)  # 至少 60s 缓存
-        last = self._last_check.get(source.source_id)
+        cache_key = (source.source_id, url)
+        last = self._last_check.get(cache_key)
         if last and now - last[0] < min_interval:
+            # strict 失败结果被缓存时，仍抛异常（保持 strict「失败即抛」语义，
+            # 否则 60s 窗口内 strict 被降级为返回 False）
+            if not last[1] and strategy == "strict":
+                raise StructureChangedError(
+                    f"站点结构已变更，请更新源配置（校验标签未命中 {url}）",
+                    source_id=source.source_id,
+                )
             return last[1]
 
         try:
@@ -61,6 +70,7 @@ class StructureChecker:
                 headers=source.request_headers(),
                 timeout=float(source.raw.get("transports", {}).get("timeout") or 10),
                 retries=int(source.raw.get("transports", {}).get("retries") or 3),
+                encoding=source.transports().get("charset"),
             )
         except Exception:
             ok = False
@@ -68,7 +78,7 @@ class StructureChecker:
             doc = self._parser.parse(html)
             ok = bool(self._parser.extract(doc, selector))
 
-        self._last_check[source.source_id] = (now, ok)
+        self._last_check[cache_key] = (now, ok)
         if not ok and strategy == "strict":
             raise StructureChangedError(
                 f"站点结构已变更，请更新源配置（校验标签未命中 {url}）",

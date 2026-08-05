@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout
 
 from .cover_loader import CoverLoader
@@ -55,7 +56,24 @@ class WorkCard(QFrame):
         # 异步加载封面（全局限流，不会并发爆炸）
         self._pix = None
         if work.cover:
-            self._load_cover(work.cover)
+            if work.cover.startswith("data:"):
+                # data URI（解密后的封面）直接解码显示，无需网络
+                self._load_data_cover(work.cover)
+            else:
+                self._load_cover(work.cover)
+
+    def _load_data_cover(self, data_uri: str) -> None:
+        """直接解码 data URI 封面（加密站解密结果）。"""
+        try:
+            _, b64 = data_uri.split(",", 1)
+            import base64
+
+            data = base64.b64decode(b64)
+            pix = QPixmap()
+            if pix.loadFromData(data) and not pix.isNull():
+                self._on_cover_ready(pix)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _load_cover(self, url: str) -> None:
         """通过 CoverLoader 加载封面（全局最多 4 个并发）。"""

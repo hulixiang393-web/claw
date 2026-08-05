@@ -91,7 +91,6 @@ class DownloadTask:
     chapters: List = field(default_factory=list)      # List[Chapter]
     selected: List[bool] = field(default_factory=list)  # 与 chapters 等长的勾选
     quality: str = ""                                    # 视频画质（best/1080p/...），非视频为空
-    epub_chapters: list = field(default_factory=list)    # epub 累积：[(标题, 文本)或(标题,[图字节])]
     epub_chapters: List = field(default_factory=list)    # epub 累积材料（novel:文本 / comic:图字节）
     epub_ok: bool = False                                # epub 是否已成功合成
     status: str = TaskStatus.WAITING
@@ -100,6 +99,7 @@ class DownloadTask:
     failed: List[str] = field(default_factory=list)   # 失败章节标题
     error: str = ""                                    # 最近一次错误信息
     bytes_written: int = 0
+    merge_progress: int = 0        # 视频合并已输出字节（UI 显示用）
     start_time: float = 0.0
     end_time: float = 0.0
     out_dir: str = ""
@@ -214,9 +214,14 @@ class DownloadQueue:
             if t.status == TaskStatus.WAITING:
                 t.status = TaskStatus.PAUSED  # 未启动即暂停
             elif t.status in (TaskStatus.DOWNLOADING, TaskStatus.PAUSED):
-                t.pause_evt.set()  # worker 会在章节边界阻塞
+                # 同步置 PAUSED：resume_task 据此判断，避免"暂停→立即继续"竞态
+                # （否则 worker 到章节边界才置 PAUSED，期间点继续会被 status!=PAUSED 挡掉）
+                t.pause_evt.set()
+                t.status = TaskStatus.PAUSED
             else:
                 return
+        # 通知 UI：暂停后按钮变「继续」（下载页据此刷新卡片）
+        self._emit_refresh(t)
 
     def resume_task(self, task_id: str) -> None:
         with self._lock:
@@ -229,6 +234,7 @@ class DownloadQueue:
             else:
                 t.status = TaskStatus.WAITING  # 从未启动，重新入队
         self._maybe_dispatch()
+        self._emit_refresh(t)
 
     def cancel_task(self, task_id: str) -> None:
         with self._lock:
@@ -241,6 +247,20 @@ class DownloadQueue:
                 # 无运行中 worker，直接标记；运行中由 worker 在章节边界退出
                 t.status = TaskStatus.CANCELED
                 t.end_time = time.time()
+        # 通知 UI：立即反映取消（下载页刷新卡片）
+        self._emit_refresh(t)
+
+    def _emit_refresh(self, task: DownloadTask) -> None:
+        """发一个进度事件驱动下载页刷新（暂停/继续/取消后按钮状态变化）。"""
+        with self._lock:
+            done = task.done
+            total = task.total
+        self._emit(
+            EVENT_DOWNLOAD_PROGRESS,
+            {"task_id": task.task_id, "done": done, "total": total,
+             "speed_mbs": task.speed_mbs, "title": task.title},
+            task,
+        )
 
     def retry_task(self, task_id: str) -> None:
         """失败任务清零计数重新入队。"""
@@ -371,7 +391,10 @@ class DownloadQueue:
             self._download_all(task)
             # 小说/漫画：全部章节下载完后合成为单本 epub（只产出 epub）
             if task.content_type in ("novel", "comic"):
-                self._downloader.finalize_epub(task)
+                epub_path = self._downloader.finalize_epub(task)
+                with self._lock:
+                    task.epub_ok = True
+                    task.out_dir = str(epub_path)  # 记录 epub 落盘位置
         except Exception as exc:  # noqa: BLE001 —— 兜底，整任务失败
             with self._lock:
                 task.error = str(exc)
@@ -390,6 +413,9 @@ class DownloadQueue:
         if source is None:
             raise SourceError(f"源不存在：{task.source_id}")
         if task.total <= 0:
+            # 空选集/全跳过：无下载内容，直接置 DONE（避免卡在 DOWNLOADING 无终态）
+            with self._lock:
+                task.status = TaskStatus.DONE
             return
 
         # ── 漫画批量路径：所有待下载话一次性 Playwright 渲染，避免 N 次启动浏览器 ──
@@ -417,8 +443,23 @@ class DownloadQueue:
             # 单章下载（失败自动重试 MAX_ATTEMPTS 次）
             last_err = ""
             for attempt in range(MAX_ATTEMPTS):
+                # 重试前检查取消/暂停：避免退避 sleep 后仍浪费一整章/批下载
+                if task.cancel_evt.is_set():
+                    break
+                while task.pause_evt.is_set():
+                    with self._lock:
+                        task.status = TaskStatus.PAUSED
+                    if task.cancel_evt.wait(0.3):
+                        break
+                if task.cancel_evt.is_set():
+                    break
                 try:
+                    # 视频：ffmpeg 合并期间经 image_progress_cb 实时上报输出字节
+                    task.image_progress_cb = (
+                        lambda nb, _t=task: self._on_video_bytes(_t, nb)
+                    )
                     nbytes = self._downloader.download_chapter(source, task, ch, i)
+                    task.image_progress_cb = None
                     with self._lock:
                         task.done += 1
                         task.bytes_written += max(0, nbytes)
@@ -426,6 +467,13 @@ class DownloadQueue:
                 except Exception as exc:  # noqa: BLE001
                     last_err = str(exc)
                     if task.cancel_evt.is_set():
+                        break  # 用户取消：停止下载，走取消终态
+                    if task.pause_evt.is_set():
+                        # 用户暂停：中断当前合并，任务进入暂停（恢复后重下当前集）
+                        with self._lock:
+                            task.status = TaskStatus.PAUSED
+                            task.bytes_written = 0  # 当前集未完整落盘
+                        self._emit_refresh(task)
                         break
                     if attempt < MAX_ATTEMPTS - 1:
                         time.sleep(min(0.5 * (2 ** attempt), 2.0))  # 退避
@@ -453,10 +501,12 @@ class DownloadQueue:
                 task,
             )
 
-        # 终态判定
+        # 终态判定（novel / video 串行循环）
         with self._lock:
             task.end_time = time.time()
-            if task.cancel_evt.is_set():
+            if task.status == TaskStatus.PAUSED:
+                pass  # 暂停：保持 PAUSED（不覆盖）
+            elif task.cancel_evt.is_set():
                 task.status = TaskStatus.CANCELED
             elif task.failed:
                 task.status = TaskStatus.FAILED
@@ -464,17 +514,23 @@ class DownloadQueue:
                 task.status = TaskStatus.DONE
 
     def _download_comic_batch(self, task: DownloadTask, source) -> None:
-        """漫画专用批量下载：一次 Playwright 渲染全部待下载话。
+        """漫画批量下载：Playwright 源走批量渲染，HTML 源回退串行下载。"""
 
-        与 _download_comic_batch（Downloader 侧）区别：
-        - 本函数由 DownloadQueue 调度，含暂停/取消/进度/重试/终态判定；
-        - Downloader.download_comic_batch 只负责渲染+落盘字节数。
-        每 5~10 话为一批（避免单次 Chromium 渲染话太多内存涨），
-        批内失败自动重试，取消/暂停在批边界检查。
-        """
+        # 检测源是否使用 Playwright 渲染（content.page.render 配置）
+        content_cfg = source.raw.get("endpoints", {}).get("content", {}).get("page", {})
+        body_cfg = content_cfg.get("body") or {}
+        render_mode = content_cfg.get("render") or body_cfg.get("render")
+        use_playwright = render_mode == "playwright"
+
+        # 非 Playwright 源：回退到普通串行下载路径
+        if not use_playwright:
+            self._download_comic_serial(task, source)
+            return
+
+        # Playwright 源：批量渲染（一次浏览器启动，多话图片）
         import math
 
-        BATCH_SIZE = 8  # 每批渲染话数（控制 Chromium 峰值内存）
+        BATCH_SIZE = 12  # 每批渲染话数（控制 Chromium 峰值内存）
 
         # 收集待下载的章节索引
         pending = [i for i in range(len(task.chapters)) if task.selected[i]]
@@ -557,6 +613,116 @@ class DownloadQueue:
             else:
                 task.status = TaskStatus.DONE
 
+    def _download_comic_serial(self, task: DownloadTask, source) -> None:
+        """非 Playwright 漫画：逐章串行下载图片，复用 fetch_comic_pages。"""
+
+        for i, ch in enumerate(task.chapters):
+            if not task.selected[i]:
+                continue
+            if task.cancel_evt.is_set():
+                break
+            while task.pause_evt.is_set():
+                with self._lock:
+                    task.status = TaskStatus.PAUSED
+                if task.cancel_evt.wait(0.3):
+                    break
+            if task.cancel_evt.is_set():
+                break
+            with self._lock:
+                task.status = TaskStatus.DOWNLOADING
+
+            last_err = ""
+            for attempt in range(MAX_ATTEMPTS):
+                try:
+                    # 设置图片进度回调：每张图下载后实时更新 bytes_written
+                    task.image_progress_cb = lambda nb: self._on_image_bytes(task, nb)
+                    nbytes = self._downloader.download_chapter(source, task, ch, i)
+                    task.image_progress_cb = None
+                    with self._lock:
+                        task.done += 1
+                        task.bytes_written += max(0, nbytes)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_err = str(exc)
+                    if task.cancel_evt.is_set():
+                        break
+                    if attempt < MAX_ATTEMPTS - 1:
+                        time.sleep(min(0.5 * (2 ** attempt), 2.0))
+            else:
+                with self._lock:
+                    task.failed.append(ch.title or f"第{i + 1}话")
+                    task.error = last_err
+
+            with self._lock:
+                task.end_time = time.time()
+            self._emit(
+                EVENT_DOWNLOAD_PROGRESS,
+                {
+                    "task_id": task.task_id,
+                    "done": task.done,
+                    "total": task.total,
+                    "speed_mbs": task.speed_mbs,
+                    "title": task.title,
+                },
+                task,
+            )
+
+        # 终态判定（与 _download_comic_batch 一致）
+        with self._lock:
+            task.end_time = time.time()
+            if task.cancel_evt.is_set():
+                task.status = TaskStatus.CANCELED
+            elif task.failed:
+                task.status = TaskStatus.FAILED
+            else:
+                task.status = TaskStatus.DONE
+
+    def _on_image_bytes(self, task: DownloadTask, nbytes: int) -> None:
+        """图片下载进度回调：实时更新 bytes_written + 节流发进度。"""
+        with self._lock:
+            task.bytes_written += max(0, nbytes)
+        # 节流：~1 秒最多发一次进度，避免 UI 刷屏
+        now = time.time()
+        if not hasattr(self, "_last_img_emit"):
+            self._last_img_emit = {}
+        if now - self._last_img_emit.get(task.task_id, 0) < 1.0:
+            return
+        self._last_img_emit[task.task_id] = now
+        with self._lock:
+            done = task.done
+            total = task.total
+        self._emit(
+            EVENT_DOWNLOAD_PROGRESS,
+            {"task_id": task.task_id, "done": done, "total": total,
+             "speed_mbs": task.speed_mbs, "title": task.title},
+            task,
+        )
+
+    def _on_video_bytes(self, task: DownloadTask, nbytes: int) -> None:
+        """视频合并进度回调：ffmpeg 输出字节实时上报。
+
+        更新 task.merge_progress（UI 显示"已合并 X MB"），发进度事件驱动滚动。
+        bytes_written 由 _download_all 在章节结束时一次性加。
+        """
+        with self._lock:
+            task.merge_progress = max(0, nbytes)
+        now = time.time()
+        if not hasattr(self, "_last_img_emit"):
+            self._last_img_emit = {}
+        if now - self._last_img_emit.get(task.task_id, 0) < 1.0:
+            return
+        self._last_img_emit[task.task_id] = now
+        with self._lock:
+            done = task.done
+            total = task.total
+        self._emit(
+            EVENT_DOWNLOAD_PROGRESS,
+            {"task_id": task.task_id, "done": done, "total": total,
+             "speed_mbs": 0, "title": task.title,
+             "merge_bytes": nbytes},
+            task,
+        )
+
     def _emit_final(self, task: DownloadTask) -> None:
         if task.status == TaskStatus.DONE:
             self._emit(
@@ -596,6 +762,15 @@ if QRunnable is not None:
             self.setAutoDelete(True)
             self._queue = queue
             self._task = task
+            self._running = threading.Event()
+
+        def is_alive(self) -> bool:
+            """是否正在 run()（兼容 threading.Thread.is_alive，供 resume_* 判断）。"""
+            return self._running.is_set()
 
         def run(self) -> None:
-            self._queue._run_task(self._task)
+            self._running.set()
+            try:
+                self._queue._run_task(self._task)
+            finally:
+                self._running.clear()

@@ -70,7 +70,7 @@ SOURCE_RAW = {
 class MockHttp(HttpClient):
     """mock：按 URL 返回固定 HTML。"""
 
-    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0):
+    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None):
         if "/category" in url:
             return CATEGORY_HTML
         if "/search" in url or "/book" in url:

@@ -1,0 +1,214 @@
+{
+  "$schema_version": 2,
+  "$id": "23qb",
+  "$type": "novel",
+  "$name": "铅笔小说",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.23qb.net/",
+    "description": "铅笔小说 - 小说阅读网（UTF-8，MacCMS，完整目录页，无加密）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "小说",
+      "免费"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.23qb.net",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/book/lastupdate_0_1_0_0_0_0_0_{page}_0.html",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "言情小说",
+            "url": "/book/lastupdate_0_1_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "都市小说",
+            "url": "/book/lastupdate_0_2_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "耽美百合",
+            "url": "/book/lastupdate_0_3_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "穿越时空",
+            "url": "/book/lastupdate_0_4_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "青春校园",
+            "url": "/book/lastupdate_0_5_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "玄幻魔法",
+            "url": "/book/lastupdate_0_6_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "修真武侠",
+            "url": "/book/lastupdate_0_7_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "历史军事",
+            "url": "/book/lastupdate_0_8_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "游戏竞技",
+            "url": "/book/lastupdate_0_9_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "科幻空间",
+            "url": "/book/lastupdate_0_10_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "悬疑惊悚",
+            "url": "/book/lastupdate_0_11_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "同人小说",
+            "url": "/book/lastupdate_0_12_0_0_0_0_0_{page}_0.html"
+          },
+          {
+            "title": "官场职场",
+            "url": "/book/lastupdate_0_13_0_0_0_0_0_{page}_0.html"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.module-item"
+        },
+        "fields": {
+          "title": {
+            "css": "div.module-item-titlebox a.module-item-title",
+            "attr": "title"
+          },
+          "url": {
+            "css": "div.module-item-titlebox a.module-item-title",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.module-item-pic img",
+            "attr": "data-src"
+          },
+          "author": {
+            "css": "div.module-item-text"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search.html",
+      "method": "GET",
+      "keyword_param": "searchkey",
+      "item": {
+        "root_selector": {
+          "css": "div.novel-info"
+        },
+        "fields": {
+          "title": {
+            "css": "h3 a",
+            "attr": "title"
+          },
+          "url": {
+            "css": "h3 a",
+            "attr": "href"
+          },
+          "author": {
+            "css": "span.novel-tag-icon"
+          },
+          "status": {
+            "css": "div.novel-info-status"
+          },
+          "tags": {
+            "css": "div.tag-link span"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/book/(\\d+)",
+      "fields": {
+        "title": {
+          "css": "meta[property='og:novel:book_name']"
+        },
+        "author": {
+          "css": "meta[property='og:novel:author']"
+        },
+        "cover": {
+          "css": "div.novel-cover img"
+        },
+        "summary": {
+          "css": "div.novel-info-main div.novel-info-content"
+        },
+        "status": {
+          "css": "meta[property='og:novel:status']",
+          "attr": "content"
+        },
+        "tags": {
+          "css": "span.novel-tag-icon"
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "list": {
+          "chapters_url": "/book/{id}/catalog",
+          "root_selector": {
+            "css": "a.module-row-text"
+          },
+          "fields": {
+            "title": {
+              "css": "div.module-row-title span"
+            },
+            "url": {
+              "css": "a.module-row-text"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": "div.article-content"
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 30
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 500,
+      "max_items": 5000
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "body"
+      }
+    }
+  }
+}

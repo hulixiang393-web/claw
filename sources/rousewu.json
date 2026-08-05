@@ -1,0 +1,120 @@
+{
+  "$schema_version": 2,
+  "$id": "rousewu",
+  "$type": "novel",
+  "$name": "肉色屋(m)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.rousewu.uk/",
+    "description": "肉色屋 - 成人小说源（移动端 m.rousewu.uk，UTF-8，章节目录完整）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["小说", "成人", "免费"]
+  },
+  "transports": {
+    "base_url": "https://m.rousewu.uk",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+    },
+    "charset": "utf-8",
+    "timeout": 30,
+    "retries": 4,
+    "interval_ms": 400
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/wapsort/1_{page}.html",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          { "title": "玄幻", "url": "/wapsort/1_{page}.html" },
+          { "title": "修真", "url": "/wapsort/2_{page}.html" },
+          { "title": "言情", "url": "/wapsort/3_{page}.html" },
+          { "title": "武侠", "url": "/wapsort/4_{page}.html" },
+          { "title": "都市", "url": "/wapsort/5_{page}.html" },
+          { "title": "科幻", "url": "/wapsort/6_{page}.html" },
+          { "title": "网游", "url": "/wapsort/7_{page}.html" },
+          { "title": "恐怖", "url": "/wapsort/8_{page}.html" },
+          { "title": "耽美", "url": "/wapsort/9_{page}.html" },
+          { "title": "历史", "url": "/wapsort/10_{page}.html" },
+          { "title": "高辣文", "url": "/wapsort/11_{page}.html" },
+          { "title": "种田", "url": "/wapsort/14_{page}.html" },
+          { "title": "高干", "url": "/wapsort/15_{page}.html" },
+          { "title": "其他", "url": "/wapsort/16_{page}.html" },
+          { "title": "百合", "url": "/wapsort/17_{page}.html" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "div.common-bookele" },
+        "fields": {
+          "title": { "css": "h3 a" },
+          "url": { "css": "h3 a", "attr": "href" },
+          "author": { "css": "p strong" },
+          "update": { "css": "p.lastupdate time" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/s.php",
+      "method": "POST",
+      "keyword_param": "s",
+      "extra_params": {
+        "type": "articlename"
+      },
+      "item": {
+        "root_selector": { "css": "div.common-bookele" },
+        "fields": {
+          "title": { "css": "a.articlename" },
+          "url": { "css": "a.articlename", "attr": "href" },
+          "author": { "css": "p strong" }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/novel/(\\d+)",
+      "fields": {
+        "title": { "css": "nav.yzwHead ul li:last-child" },
+        "author": { "css": "div.lb_fm td.article_info_td div h2" },
+        "status": { "css": "div.lb_fm td.article_info_td div" },
+        "summary": { "css": "div.lb_jj pre" },
+        "meta": {
+          "category": { "css": "div.lb_fm a[href*='/wapsort/']", "attr": "text" }
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "list": {
+          "chapters_url": "/novel/list/{id}/1.html",
+          "root_selector": { "xpath": "//ul/li/a[contains(substring-after(substring-before(@href, '.html'), '/novel/'), '/')]" },
+          "fields": {
+            "title": { "css": "a" },
+            "url": { "css": "a", "attr": "href" }
+          }
+        },
+        "body": {
+          "selector": { "css": "div.nr_nr div#nr1" },
+          "attr": "text"
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 50 },
+    "detail": { "max_pages": 1 },
+    "chapter": { "max_pages": 2000, "max_items": 5000 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": "body" }
+    }
+  }
+}

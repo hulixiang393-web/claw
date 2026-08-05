@@ -18,6 +18,7 @@ from .errors import ContentMissingError
 from .http import HttpClient
 from .parser import Parser
 from .selfcheck import StructureChecker
+from .source_manager import HEALTH_OK
 
 
 @dataclass
@@ -52,29 +53,48 @@ class Work:
 
 
 class Discovery:
-    def __init__(self, http: HttpClient, parser: Parser, checker: StructureChecker):
+    def __init__(
+        self,
+        http: HttpClient,
+        parser: Parser,
+        checker: StructureChecker,
+        health_reporter=None,
+    ):
         self._http = http
         self._parser = parser
         self._checker = checker
+        self._health_reporter = health_reporter  # 可选：update_health(source_id, state, error)
         self._ytdlp = None  # 懒加载单例
+
+    # ------------------------------------------------------------------ #
+    def _report_health(self, source: SourceConfig, state: str, error: str = "") -> None:
+        """上报源健康状态（若注入 health_reporter）。"""
+        if self._health_reporter is not None:
+            try:
+                self._health_reporter.update_health(source.source_id, state, error)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
         return source.request_headers()
 
     def _timeout(self, source: SourceConfig) -> float:
-        return float(source.transports().get("timeout") or 10)
+        return float(source.transports().get("timeout") or self._http.defaults.timeout)
 
     def _retries(self, source: SourceConfig) -> int:
-        return int(source.transports().get("retries") or 3)
+        return int(source.transports().get("retries") or self._http.defaults.retries)
 
     def _interval_ms(self, source: SourceConfig) -> int:
-        return int(source.transports().get("interval_ms") or 0)
+        return int(source.transports().get("interval_ms") or self._http.defaults.interval_ms)
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
-        from urllib.parse import urljoin
+        from urllib.parse import urljoin, urlsplit
 
-        return urljoin(source.base_url, url) if not url.startswith("http") else url
+        scheme = (urlsplit(url).scheme or "").lower()
+        if scheme in ("http", "https") or url.startswith("//"):
+            return url
+        return urljoin(source.base_url, url)
 
     def _get(self, source: SourceConfig, url: str) -> str:
         from urllib.parse import quote
@@ -88,6 +108,7 @@ class Discovery:
             timeout=self._timeout(source),
             retries=self._retries(source),
             interval_ms=self._interval_ms(source),
+            encoding=source.transports().get("charset"),
         )
 
     # ------------------------------------------------------------------ #
@@ -133,7 +154,8 @@ class Discovery:
             or disc.get("list_url")
             or source.base_url
         )
-        self._checker.check(source, self._abs_url(source, list_url))
+        ok = self._checker.check(source, self._abs_url(source, list_url))
+        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
         html = self._get(source, list_url)
         doc = self._parser.parse(html)
 
@@ -186,7 +208,8 @@ class Discovery:
             return self._list_works_api(source, url, page)
 
         fetch_url = self._build_page_url(source, url, page)
-        self._checker.check(source, self._abs_url(source, fetch_url))
+        ok = self._checker.check(source, self._abs_url(source, fetch_url))
+        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
         html = self._get(source, fetch_url)
         doc = self._parser.parse(html)
 
@@ -217,20 +240,48 @@ class Discovery:
 
         items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         works: List[Work] = []
+        # 封面加密站（如 18mh）：cover 直接用 URL 下载是加密字节，无法显示。
+        # 在 list_works 阶段并发解密成 data URI（逐张同步下载 48 张要 30s+，
+        # 并发把耗时压到几秒，避免发现页加载卡死）。
+        need_cover_decrypt = bool(
+            source.raw.get("decryption", {}).get("targets", {}).get("image")
+        )
+        pending_covers: dict = {}  # work index → cover url（待并发解密）
         for it in items:
             if not it.get("title") or not it.get("url"):
                 continue
+            cover = it.get("cover", "")
             works.append(
                 Work(
                     title=it.get("title", ""),
                     url=it.get("url", ""),
-                    cover=it.get("cover", ""),
+                    cover=cover,
                     author=it.get("author", ""),
                     update=it.get("update", ""),
                     source_id=source.source_id,
                     source_name=source.source_name,
                 )
             )
+        if need_cover_decrypt:
+            # 并发下载+解密所有 http 封面 → data URI
+            targets = [
+                (i, w.cover)
+                for i, w in enumerate(works)
+                if w.cover and w.cover.startswith(("http://", "https://"))
+            ]
+            if targets:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futs = {
+                        pool.submit(self._decrypt_cover, source, url): i
+                        for i, url in targets
+                    }
+                    for fut in futs:
+                        try:
+                            works[futs[fut]].cover = fut.result()
+                        except Exception:  # noqa: BLE001
+                            pass
         # 封面走加密渲染（works_list_item.cover_render == "playwright"）：
         # 标记源需要封面恢复，但不在这里同步执行（太慢会阻塞 QRunnable），
         # 由 GUI 层调 discover_page 起异步任务恢复封面后刷新卡片。
@@ -248,6 +299,38 @@ class Discovery:
             book_urls,
             proxy=source.transports().get("proxy"),
         )
+
+    def _decrypt_cover(self, source: SourceConfig, cover_url: str) -> str:
+        """下载并解密带加密的封面 → data URI。解密失败保留原 URL（封面留空不阻塞）。
+
+        复用 Decrypter.decrypt_bytes；与正文图片同密钥（decryption.image）。
+        """
+        try:
+            from .decrypter import Decrypter
+
+            raw = self._http.get_bytes(
+                self._abs_url(source, cover_url),
+                headers=self._headers(source),
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+            )
+            decrypter = Decrypter(self._http)
+            plain = decrypter.decrypt_bytes(source, raw, target="image")
+            if plain and plain is not raw:
+                import base64 as _b64
+
+                # 按魔数猜 mime，默认 jpeg
+                mime = "image/jpeg"
+                if plain[:4] == b"\x89PNG":
+                    mime = "image/png"
+                elif plain[:6] in (b"GIF89a", b"GIF87a"):
+                    mime = "image/gif"
+                elif plain[:4] == b"RIFF" and plain[8:12] == b"WEBP":
+                    mime = "image/webp"
+                return f"data:{mime};base64,{_b64.b64encode(plain).decode()}"
+        except Exception:  # noqa: BLE001
+            pass
+        return cover_url
 
     def _list_works_api(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
         """API 站（api_endpoints）JSON 解析作品列表。
@@ -452,9 +535,12 @@ class Discovery:
             # 1) {page} 占位替换
             if "{page}" in url:
                 return url.replace("{page}", str(page))
-            # 2) page_placeholder 正则：替换 URL 中页码位
+            # 2) page_placeholder 正则：替换 URL 中页码位。
+            #    第 1 页不插页码（多数站第 1 页即 base URL，页码从第 2 页起）。
             placeholder = paginator.get("page_placeholder")
             if placeholder:
+                if page <= 1:
+                    return url
                 return _re.sub(placeholder, str(page), url, count=1)
             # 3) 默认：?param=N
             param = paginator.get("param") or "page"

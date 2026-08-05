@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Callable, List, Optional
 from urllib.parse import urlsplit
 
@@ -63,13 +64,66 @@ class _CoverLoader(QObject):
         super().__init__()
         self._manager = QNetworkAccessManager(self)
         self._manager.finished.connect(self._on_reply)
+        self._manager_direct = QNetworkAccessManager(self)  # 无代理 fallback manager
+        self._manager_direct.finished.connect(self._on_direct_reply)
         self._queue: List[tuple] = []
-        self._pending: dict = {}  # reply → callback
+        self._pending: dict = {}  # reply → (callback, url, used_proxy)
+        self._direct_pending: dict = {}  # direct reply → callback
         self._active = 0
         self._proxy_set = False
+        self._proxy_url: Optional[str] = None
+        # 内存封面缓存（LRU，字节预算来自设置 cover_cache_size_mb）
+        self._cache: "OrderedDict[str, QPixmap]" = OrderedDict()
+        self._cache_bytes = 0
+        self._cache_budget = 0  # 0 = 关闭缓存
+
+    def configure(self, cache_mb: float | int = 0) -> None:
+        """设置缓存字节预算（MB）。0 关闭缓存。启动时调用一次。"""
+        self._cache_budget = max(0, int(cache_mb or 0)) * 1024 * 1024
+        self._trim_cache()
+
+    def clear_cache(self) -> None:
+        """清空内存封面缓存。"""
+        self._cache.clear()
+        self._cache_bytes = 0
+
+    def _cache_get(self, url: str) -> Optional[QPixmap]:
+        """LRU 命中：移到尾部（最新）。"""
+        pm = self._cache.get(url)
+        if pm is not None:
+            self._cache.move_to_end(url)
+            return pm
+        return None
+
+    def _cache_put(self, url: str, pixmap: QPixmap) -> None:
+        if self._cache_budget <= 0 or not url or pixmap.isNull():
+            return
+        old = self._cache.get(url)
+        if old is not None:
+            self._cache_bytes -= self._pixmap_bytes(old)
+        self._cache[url] = pixmap
+        self._cache_bytes += self._pixmap_bytes(pixmap)
+        self._trim_cache()
+
+    @staticmethod
+    def _pixmap_bytes(pm: QPixmap) -> int:
+        try:
+            img = pm.toImage()
+            return img.byteCount() if not img.isNull() else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _trim_cache(self) -> None:
+        """按字节预算 LRU 淘汰（删最久未用）。"""
+        while self._cache_bytes > self._cache_budget > 0 and self._cache:
+            _, pm = self._cache.popitem(last=False)
+            self._cache_bytes -= self._pixmap_bytes(pm)
 
     def _ensure_proxy(self) -> None:
-        """QNetwork 走系统代理（与 Playwright 一致），避免 Clash 下直连超时。"""
+        """QNetwork 走系统代理（与 Playwright 一致），避免 Clash 下直连超时。
+
+        记录 _proxy_url 供失败回退直连判断。
+        """
         if self._proxy_set:
             return
         proxy_url = _system_proxy()
@@ -82,6 +136,7 @@ class _CoverLoader(QObject):
                     parts.port or 7890,
                 )
                 self._manager.setProxy(proxy)
+                self._proxy_url = proxy_url
                 log.info("[cover] 走代理 %s", proxy_url)
         self._proxy_set = True
 
@@ -89,6 +144,10 @@ class _CoverLoader(QObject):
     def load(self, url: str, callback: Callable[[Optional[QPixmap]], None]) -> None:
         if not url:
             callback(None)
+            return
+        cached = self._cache_get(url)
+        if cached is not None:
+            callback(cached)
             return
         self._queue.append((url, callback))
         self._pump()
@@ -104,12 +163,13 @@ class _CoverLoader(QObject):
             if referer:
                 request.setRawHeader(b"Referer", referer.encode("utf-8"))
             self._active += 1
-            # 用属性存回调，reply 完成后取出
+            # 用属性存回调 + 代理标记，reply 完成后取出
             reply = self._manager.get(request)
-            self._pending[reply] = callback
+            used_proxy = self._proxy_url is not None
+            self._pending[reply] = (callback, url, used_proxy)
 
     def _on_reply(self, reply: QNetworkReply) -> None:
-        callback = self._pending.pop(reply, None)
+        callback, url, used_proxy = self._pending.pop(reply, (None, "", False))
         self._active -= 1
         pixmap = None
         try:
@@ -121,6 +181,42 @@ class _CoverLoader(QObject):
         except Exception:
             pixmap = None
         reply.deleteLater()
+        # 代理请求失败 → 用无代理 manager 异步重试（不阻塞 UI；直接改代理会丢 fallback）
+        if pixmap is None and used_proxy and url:
+            if callback is not None:
+                req2 = QNetworkRequest(QUrl(url))
+                req2.setHeader(QNetworkRequest.UserAgentHeader, _BROWSER_UA)
+                req2.setTransferTimeout(REQUEST_TIMEOUT_MS)
+                referer = _infer_referer(url)
+                if referer:
+                    req2.setRawHeader(b"Referer", referer.encode("utf-8"))
+                r2 = self._manager_direct.get(req2)
+                self._direct_pending[r2] = callback
+            self._pump()
+            return
+        if pixmap is not None and url:
+            self._cache_put(url, pixmap)
+        if callback:
+            callback(pixmap)
+        self._pump()
+
+    def _on_direct_reply(self, reply: QNetworkReply) -> None:
+        """无代理 fallback 完成。"""
+        callback = self._direct_pending.pop(reply, None)
+        pixmap = None
+        try:
+            if reply.error() == QNetworkReply.NoError:
+                data = reply.readAll()
+                p = QPixmap()
+                if p.loadFromData(data) and not p.isNull():
+                    pixmap = p
+        except Exception:
+            pixmap = None
+        reply.deleteLater()
+        if pixmap is not None:
+            # 用回调闭包里的 URL 无法取得，若需要缓存 direct 结果 -> url 需改结构；
+            # 保守不缓存 direct fallback（低频且无 url key）。仅调回。
+            pass
         if callback:
             callback(pixmap)
         self._pump()

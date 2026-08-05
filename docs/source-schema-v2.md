@@ -272,6 +272,32 @@
 | `list.paginator` | `paginator` | 分��列表翻页器 |
 | `play_url.attr` | `string` | 取 src（默认） |
 | `list.root_selector.exclude` | `array<selector>` | 排除广告集 |
+| `source_switch` | `object` | 多播放源换源（见下） |
+
+</details>
+
+#### source_switch（换源，video 多播放源站）
+
+> MacCMS 等"同剧多源"（如 `?sid=N`）站的换源配置。配置后：
+> - `fetch_detail` 提取所有可用播放源 → `Detail.source_list`（GUI 显示源下拉框）
+> - 分集按当前 `sid` 从 `ep_list_selector` 提取（各源分集独立）
+> - 播放地址从 `player_aaaa` JS 配置解析，按 `ps` 决定直接用 / 走 `parse` 转码
+> - `switch_source(source, detail_url, new_sid)` 切源重抓
+
+| 键 | 类型 | 用途 |
+|---|---|---|
+| `param` | `string` | 换源 URL 参数名（如 `sid`） |
+| `list_selector` | `string` | 播放源 tab 根选择器（含源 ID 属性，如 `.player_name[data-sid]`） |
+| `list_attr` | `string` | 源 ID 属性名（如 `data-sid`） |
+| `name_selector` | `string` | 源名选择器（缺省用根节点文本） |
+| `ep_list_selector` | `string` | 分集列表选择器，`{sid}` 占位换成当前源 ID（如 `#playlist{sid} a[href*='/tv/']`） |
+| `play_regex` | `string` | 播放配置 JS 提取正则（如 `var player_aaaa=(\{.*?\})\s*</script>`） |
+| `play_url_path` | `string` | player_aaaa 里播放地址字段（默认 `url`） |
+| `playerconfig_url` | `string` | 可选：加载 playerconfig.js 补全各源 `ps`/`parse` |
+
+**ps/parse 机制**（参考 MacCMS playerconfig）：
+- `ps=0`：`url` 直接用（m3u8 直链 / iframe embed 页）
+- `ps=1`：`url` 需经 `parse` 接口转码 → `{parse}?url={url}`
 
 </details>
 

@@ -52,7 +52,7 @@ SRC = {
 
 
 class MockHttp(HttpClient):
-    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0):
+    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None):
         if "1.html" in url or "2.html" in url:
             return CHAPTER_HTML
         return DETAIL_HTML
@@ -155,23 +155,24 @@ def main():
     comic._load_episode(1)  # 第2话
     assert comic._current_idx == 1
     comic._current_idx = 1
-    # 边沿触发状态机：未武装停在边界不触发；离开边界才武装；武装后回边界触发
-    comic._edge_armed = False
+    # 冷却机制：离开边界(滚到中段)武装；滚回顶部触发向上跳话；触发后解除+冷却期内不重复
+    comic._last_auto_nav_ts = 0.0
     comic._auto_prev_loading = False
-    comic._maybe_auto_next(0)  # 顶部未武装 → 不触发
-    assert not comic._auto_prev_loading, "未武装滚回顶部不应触发向上跳话"
-    comic._maybe_auto_next(500)  # 滚回中段 → 武装
-    assert comic._edge_armed, "离开边界应重新武装"
+    comic._maybe_auto_next(500)  # 滚回中段 → 不触发（非边界）
+    assert not comic._auto_prev_loading, "中段不应触发向上跳话"
+    comic._maybe_auto_next(0)  # 滚到顶部 → 触发向上跳话锁
+    assert comic._auto_prev_loading, "滚回顶部应触发向上跳话锁"
+    # 冷却期内再滚顶 → 不重复触发（时间冷却）
     comic._auto_prev_loading = False
-    comic._maybe_auto_next(0)  # 武装后滚回顶部 → 触发上一话
-    # mock 无 fetch_comic_pages → 锁设过即验证触发逻辑成立
-    assert comic._auto_prev_loading, "武装后滚回顶部应触发向上跳话锁"
-    assert not comic._edge_armed, "触发后应解除武装"
-    # 停在顶部（边界）不再触发（未武装）
-    comic._auto_prev_loading = False
+    comic._last_auto_nav_ts = 9999999999  # 模拟冷却期内
     comic._maybe_auto_next(0)
-    assert not comic._auto_prev_loading, "触发后停在顶部不应再次跳话"
-    print(f"  [ok] 漫画向上边沿触发（未武装不跳 + 离开武装 + 回边界触发 + 触发后解除）")
+    assert not comic._auto_prev_loading, "冷却期内不应重复触发"
+    # 冷却结束再触发
+    import time
+    comic._last_auto_nav_ts = 0.0
+    comic._maybe_auto_next(0)
+    assert comic._auto_prev_loading, "冷却结束后应重新触发"
+    print(f"  [ok] 漫画向上触发（中段不跳 + 到顶触发 + 冷却抑制重复 + 冷却后恢复）")
 
     # ---- 小说滚动模式：向上滑到顶 → 上一章末尾（不重回开头） ----
     from gui.pages.reader.novel_view import NovelView
@@ -203,12 +204,13 @@ def main():
     _lp4.exec()
     app.processEvents()
     assert nv._current_idx == 1, f"应在第二章，idx={nv._current_idx}"
-    # 真实用户行为：向上滑 → 先离开顶部（进中段，边沿武装），再滑回顶部（触发）
+    # 真实用户行为：向上滑 → 滚回中段（不触发），再滚回顶部 → 触发向上翻章
     vbar = nv.scroll.verticalScrollBar()
     mid = vbar.maximum() // 2
-    nv._maybe_auto_next(mid)  # 离开边界区 → _edge_armed=True
-    assert nv._edge_armed, "滚回中段应重新武装"
+    nv._maybe_auto_next(mid)  # 中段不触发翻章
+    assert nv._current_idx == 1, f"中段不应触发翻章"
     nv._auto_prev_loading = False
+    nv._last_auto_nav_ts = 0.0  # 清零冷却，允许触发
     nv._maybe_auto_next(0)  # 滚回顶部 → 触发向上翻章
     _lp5 = _EL()
     _T.singleShot(1200, _lp5.quit)
@@ -218,10 +220,11 @@ def main():
     vbar = nv.scroll.verticalScrollBar()
     assert vbar.value() >= vbar.maximum() - 5, \
         f"应定位到第一章末尾，value={vbar.value()}/max={vbar.maximum()}"
-    # 停在上一章末尾（边界）不应再触发向下（未武装）
+    # 冷却期内（2s）不重复触发向下跳
+    ts = nv._last_auto_nav_ts
     nv._maybe_auto_next(vbar.maximum())
-    assert nv._current_idx == 0, f"停在末尾不应触发向下跳，idx={nv._current_idx}"
-    print(f"  [ok] 小说滚动模式向上翻章定位上一章末尾且不反弹（value={vbar.value()}/{vbar.maximum()}）")
+    assert nv._current_idx == 0, f"冷却期不应触发翻章，idx={nv._current_idx}"
+    print(f"  [ok] 小说滚动模式向上翻章定位上一章末尾且时间冷却防反弹（value={vbar.value()}/{vbar.maximum()}）")
 
     print("\n=== 阅读器小说视图离屏测试通过 ===")
 

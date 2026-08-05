@@ -1,0 +1,114 @@
+{
+  "$schema_version": 2,
+  "$id": "hanime1",
+  "$type": "video",
+  "$name": "Hanime1",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://hanime1.me/",
+    "description": "Hanime1 - 成人動漫/裏番/線上看（繁体站，HTML 直链 mp4，无登录）",
+    "lang": "zh-Hant",
+    "region": "tw",
+    "tags": ["视频", "成人", "裏番", "動畫"]
+  },
+  "transports": {
+    "base_url": "https://hanime1.me",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+      "Referer": "https://hanime1.me/"
+    },
+    "timeout": 20,
+    "retries": 3,
+    "interval_ms": 500,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/search?genre={cat}&page={page}",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          { "title": "最新動畫", "url": "/search?page={page}" },
+          { "title": "無碼", "url": "/playlist?list=1744&page={page}" },
+          { "title": "裏番", "url": "/search?genre=裏番&page={page}" },
+          { "title": "2D動畫", "url": "/search?genre=2D動畫&page={page}" },
+          { "title": "2.5D", "url": "/search?genre=2.5D&page={page}" },
+          { "title": "3DCG", "url": "/search?genre=3DCG&page={page}" },
+          { "title": "泡麵番", "url": "/search?genre=泡麵番&page={page}" },
+          { "title": "Motion Anime", "url": "/search?genre=Motion Anime&page={page}" },
+          { "title": "AI生成", "url": "/search?genre=AI生成&page={page}" },
+          { "title": "MMD", "url": "/search?genre=MMD&page={page}" },
+          { "title": "Cosplay", "url": "/search?genre=Cosplay&page={page}" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "div.video-item-container" },
+        "fields": {
+          "title": { "css": ".video-title, .title" },
+          "url": { "css": "a[href*='watch?v=']", "attr": "href" },
+          "cover": { "css": "img.main-thumb", "attr": "src" },
+          "author": { "css": ".subtitle a[href*='query=']" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search",
+      "method": "GET",
+      "keyword_param": "query",
+      "item": {
+        "root_selector": { "css": "div.video-item-container" },
+        "fields": {
+          "title": { "css": ".video-title, .title" },
+          "url": { "css": "a[href*='watch?v=']", "attr": "href" },
+          "cover": { "css": "img.main-thumb", "attr": "src" },
+          "author": { "css": ".subtitle a[href*='query=']" }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/watch\\?v=\\d+",
+      "fields": {
+        "title": { "css": "meta[property='og:title']", "attr": "content" },
+        "cover": { "css": "meta[property='og:image']", "attr": "content" },
+        "summary": { "css": "meta[property='og:description']", "attr": "content" },
+        "status": { "css": "meta[property='og:video:duration']", "attr": "content" }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "play_url": {
+          "selector": { "css": "video#player source[src*='1080p']", "attr": "src" }
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "mp4",
+    "select": {
+      "video": { "quality": "best" }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 3, "max_results": 60 },
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 1, "max_items": 20 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": "div.video-item-container" }
+    }
+  }
+}

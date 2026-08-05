@@ -33,18 +33,18 @@ class NovelView(QWidget):
 
     chapter_changed = Signal(object)  # 发出 (detail, chapter_title) 供续读
 
-    def __init__(self, content: Content, parent=None):
+    def __init__(self, content: Content, font_scale: float = 1.0, parent=None):
         super().__init__(parent)
         self._content = content
         self._source = None
         self._detail: Detail | None = None
         self._chapters = []
         self._current_idx = -1
-        self._font_size = 17
+        self._font_delta = 0
+        self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
         self._auto_loading = False  # 防止自动翻章重复触发
         self._auto_prev_loading = False  # 防止向上自动翻章重复触发
         self._last_auto_nav_ts = 0.0  # 上次自动翻章时间戳（防循环：新章滚到顶部又触发翻章）
-        self._edge_armed = False  # 边沿触发武装：离开边界区才允许再次触发翻章
         self._prefetch_idx = -2  # 正在后台预加载的章节 idx（<0 表示空闲）
 
         layout = QVBoxLayout(self)
@@ -135,8 +135,8 @@ class NovelView(QWidget):
         body.addWidget(self.body_stack, stretch=1)
         layout.addLayout(body, stretch=1)
 
-        # 自动加载下一章：读到当前章底部时无缝衔接
-        self.scroll.verticalScrollBar().valueChanged.connect(self._maybe_auto_next)
+        # 自动加载下一章：滚动模式在章尾不再自动翻章 —— 用户须点「下一章」按钮。
+        # （_maybe_auto_next 保留但不连接，避免滚动到底意外跳章）
 
         # ---- 底部导航 ----
         nav = QHBoxLayout()
@@ -154,6 +154,9 @@ class NovelView(QWidget):
         self._current_page = 0
         self._paged_full_text = ""
         self._apply_font()
+
+        # ---- 键盘导航 ----
+        self.setFocusPolicy(Qt.StrongFocus)
 
     # ------------------------------------------------------------------ #
     def load(self, source, detail: Detail, start_chapter_url: str = "") -> None:
@@ -218,7 +221,7 @@ class NovelView(QWidget):
         label = chapter_label(ch.title) or f"第{self._current_idx + 1}章"
         full = f"【{label}】\n\n{text}"
         self.text.setText(full)
-        # 翻页视图同步
+        # 翻页视图同步（分页结果按章缓存，避免反复全量切分长文）
         self._paged_full_text = full
         self._repaginate()
         if scroll_to_end:
@@ -273,11 +276,9 @@ class NovelView(QWidget):
             self._load_chapter(nxt)
 
     def _maybe_auto_next(self, value: int) -> None:
-        """滚动近底部 → 自动下一章；滚动回顶部 → 自动上一章（双向自然衔接）。
+        """滚动近底部 → 自动下一章；滚动回顶部 → 自动上一章。
 
-        边沿触发：翻章后解除武装（_edge_armed=False），必须离开边界区
-        （滚回中段）再回到边界才再次触发。避免翻到上一章末尾/下一章开头
-        后停在边界上被 re-layout 或微小滚动反复触发而"瞎跳"。
+        用时间冷却（_last_auto_nav_ts）防快速重触发，比边沿触发更自然。
         """
         if self._current_idx < 0:
             return
@@ -286,48 +287,46 @@ class NovelView(QWidget):
             return
         if self._mode != "scroll":
             return  # 翻页模式走 _pager_turn 的章边界跳转
-        max_v = vbar.maximum()
-        # 是否在边界区
-        at_top = value <= 2
-        at_bottom = value >= max_v - 40
-        # 离开边界区（回到中段）→ 重新武装，允许下次边界触发
-        if not at_top and not at_bottom:
-            self._edge_armed = True
+        # 时间冷却：翻章后 2s 内不重复触发
+        if time.time() - self._last_auto_nav_ts < 2.0:
             return
-        if not self._edge_armed:
-            return  # 未武装（刚翻完章停在边界）→ 忽略
-        last = len(self._chapters) - 1
+        max_v = vbar.maximum()
         # 向下：近底部且非末章 → 下一章
-        if at_bottom:
-            if self._auto_loading or self._current_idx >= last:
+        if value >= max_v - 40:
+            if self._auto_loading or self._current_idx >= len(self._chapters) - 1:
                 return
             self._auto_loading = True
-            self._edge_armed = False  # 触发后解除武装
             self._last_auto_nav_ts = time.time()
             self._load_chapter(self._current_idx + 1)
-            # 加载完成后 _on_chapter_loaded 会清锁
-        # 向上：滚回顶部（值=0）且非首章 → 上一章，并跳到上一章末尾
-        elif at_top:
+        # 向上：滚回顶部且非首章 → 上一章末尾
+        elif value <= 2:
             if self._auto_prev_loading or self._current_idx <= 0:
                 return
             self._auto_prev_loading = True
-            self._edge_armed = False  # 触发后解除武装
             self._last_auto_nav_ts = time.time()
-            # 定位到上一章末尾（scroll_to_end → _display_chapter 滚到底/最后一页）
             self._load_chapter(self._current_idx - 1, scroll_to_end=True)
             # 跳到上一章末尾在 _on_chapter_loaded 里处理（need_scroll_bottom）
 
+    @staticmethod
+    def _clamp_font(size: int) -> int:
+        return max(12, min(28, size))
+
+    def set_font_scale(self, scale: float) -> None:
+        """外部设置字体缩放（设置页实时生效）。保留用户 A+/A- 微调量。"""
+        self._base_font = self._clamp_font(round(17 * float(scale or 1.0)))
+        self._apply_font()
+
     def _adjust_font(self, delta: int) -> None:
-        self._font_size += delta
-        self._font_size = max(12, min(28, self._font_size))
+        self._font_delta += delta
         self._apply_font()
 
     def _apply_font(self) -> None:
+        size = self._clamp_font(self._base_font + self._font_delta)
         self.text.setStyleSheet(
-            f"font-size: {self._font_size}px; line-height: 1.8; padding: 8px 12px;"
+            f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;"
         )
         self.paged_label.setStyleSheet(
-            f"font-size: {self._font_size}px; line-height: 1.8; padding: 12px 20px;"
+            f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;"
         )
         self._repaginate()
         self._pager_show_page(self._current_page)
@@ -348,12 +347,24 @@ class NovelView(QWidget):
             self.scroll.verticalScrollBar().setValue(0)
 
     def _repaginate(self):
-        """按字数把正文拆成多页（每页约 CHARS_PER_PAGE 字）。"""
+        """按字数把正文拆成多页（每页约 CHARS_PER_PAGE 字）。
+
+        分页结果按当前章缓存到 ch._cached_pages，换章才重切；
+        章内翻页/字号调整复用缓存，避免长文反复全量切分导致卡顿。
+        """
         text = getattr(self, "_paged_full_text", "") or ""
         if not text:
             self._pages = [""]
             self._page_count = 1
             self._current_page = 0
+            return
+        # 当前章缓存命中 → 直接复用
+        cur_ch = self._chapters[self._current_idx] if 0 <= self._current_idx < len(self._chapters) else None
+        if cur_ch is not None and getattr(cur_ch, "_cached_pages", None) == text:
+            self._pages = cur_ch._cached_pages["pages"]
+            self._page_count = len(self._pages)
+            if self._current_page >= self._page_count:
+                self._current_page = 0
             return
         # 每页按字数切（字号/宽度动态变化时字数固定，行为确定）
         chars_per = 900
@@ -363,6 +374,9 @@ class NovelView(QWidget):
         self._page_count = len(self._pages)
         if self._current_page >= self._page_count:
             self._current_page = 0
+        # 写缓存
+        if cur_ch is not None:
+            cur_ch._cached_pages = {"pages": self._pages}
 
     def _pager_show_page(self, page: int) -> None:
         """跳到第 page 页（0 基）。"""
@@ -404,6 +418,30 @@ class NovelView(QWidget):
         self.progress_label.setText(f"第{self._current_idx + 1}/{total}章")
 
     # ------------------------------------------------------------------ #
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """键盘导航：翻页模式←翻页/→翻页，上下滚动/翻章节。"""
+        key = event.key()
+        if self._mode == "pager":
+            if key == Qt.Key_Left:
+                self._pager_turn(-1)
+            elif key == Qt.Key_Right:
+                self._pager_turn(1)
+            elif key == Qt.Key_PageDown:
+                self._pager_turn(1)
+            elif key == Qt.Key_PageUp:
+                self._pager_turn(-1)
+            elif key == Qt.Key_Down:
+                self._pager_turn(1)
+            elif key == Qt.Key_Up:
+                self._pager_turn(-1)
+        else:
+            vbar = self.scroll.verticalScrollBar()
+            if key in (Qt.Key_Down, Qt.Key_PageDown):
+                vbar.setValue(vbar.value() + self.scroll.height() * 2 // 3)
+            elif key in (Qt.Key_Up, Qt.Key_PageUp):
+                vbar.setValue(vbar.value() - self.scroll.height() * 2 // 3)
+        super().keyPressEvent(event)
+
     def _prefetch_next(self, idx: int) -> None:
         """后台预加载下一章（idx+1），翻章时命中缓存秒开。
 

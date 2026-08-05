@@ -48,6 +48,8 @@ class DiscoverPage(BasePage):
     read_requested = Signal(object)
     # 对外信号：下载 → App 层弹章节范围对话框并入队
     download_requested = Signal(object)
+    # 对外信号：收藏/取消收藏 → App 层写书架收藏库
+    favorite_requested = Signal(object)
 
     def __init__(
         self,
@@ -150,6 +152,7 @@ class DiscoverPage(BasePage):
         self.detail_drawer.read_requested.connect(self._on_read)
         self.detail_drawer.open_url_requested.connect(self._on_open_url)
         self.detail_drawer.download_requested.connect(self._on_download)
+        self.detail_drawer.favorite_requested.connect(self._on_favorite)
         body.addWidget(self.detail_drawer)
 
         # 点作品区空白处 → 关闭详情抽屉
@@ -600,7 +603,7 @@ class DiscoverPage(BasePage):
         self.status_label.setText("")
 
     def _on_bulk_fetch(self) -> None:
-        """全量抓取：确认弹窗 → 后台执行 → 进度。"""
+        """全量抓取：确认弹窗 → 后台执行 → 进度（不阻塞 UI）。"""
         from PySide6.QtWidgets import QMessageBox
 
         if self._current_source is None:
@@ -618,15 +621,23 @@ class DiscoverPage(BasePage):
 
         self.status_label.setText("全量抓取中...")
         self.bulk_btn.setEnabled(False)
-        try:
-            stats = self._bulk_fetch.fetch_all(source)
-            self.status_label.setText(
-                f"全量抓取完成：{stats['categories']} 个分类，{stats['works']} 部作品"
-            )
-        except Exception as exc:
-            self.status_label.setText(f"全量抓取失败：{exc}")
-        finally:
+
+        def _done(stats):
             self.bulk_btn.setEnabled(True)
+            if isinstance(stats, dict) and stats.get("error"):
+                self.status_label.setText(f"全量抓取失败：{stats['error']}")
+            elif isinstance(stats, dict):
+                self.status_label.setText(
+                    f"全量抓取完成：{stats.get('categories', 0)} 个分类，{stats.get('works', 0)} 部作品"
+                )
+
+        from PySide6.QtCore import QThreadPool
+
+        # 后台线程执行，完成回主线程更新 UI
+        task = _BulkFetchTask(self._bulk_fetch, source)
+        task.signals.finished.connect(_done)
+        self._bulk_task = task  # 持引用防 GC
+        QThreadPool.globalInstance().start(task)
 
     def _on_read(self, detail) -> None:
         """开始阅读 → 跳阅读器 Tab（占位）。"""
@@ -641,6 +652,10 @@ class DiscoverPage(BasePage):
     def _on_download(self, detail) -> None:
         """下载 → 转发给 App 层（弹章节范围对话框并入队）。"""
         self.download_requested.emit(detail)
+
+    def _on_favorite(self, detail) -> None:
+        """收藏/取消收藏 → 转发给 App 层（写书架收藏库）。"""
+        self.favorite_requested.emit(detail)
 
     def _on_scroll(self, value: int) -> None:
         """滚动接近底部（阈值 200px）触发加载下一页。"""
@@ -788,5 +803,30 @@ class _CoverRecoveryTask(QRunnable):
             covers = {}
         try:
             self.signals.finished.emit(covers)
+        except RuntimeError:
+            pass
+
+
+class _BulkFetchSignals(QObject):
+    """全量抓取信号。"""
+    finished = Signal(object)  # (stats dict 或 {"error": str})
+
+
+class _BulkFetchTask(QRunnable):
+    """后台执行全量抓取（不阻塞 UI）。"""
+
+    def __init__(self, bulk_fetch, source):
+        super().__init__()
+        self.signals = _BulkFetchSignals()
+        self._bulk_fetch = bulk_fetch
+        self._source = source
+
+    def run(self) -> None:
+        try:
+            stats = self._bulk_fetch.fetch_all(self._source)
+        except Exception as exc:  # noqa: BLE001
+            stats = {"error": str(exc)}
+        try:
+            self.signals.finished.emit(stats)
         except RuntimeError:
             pass

@@ -18,15 +18,20 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re as _re
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+log = logging.getLogger(__name__)
 
 from .config import SourceConfig
 from .errors import ContentMissingError
 from .http import HttpClient
 from .parser import Parser
 from .selfcheck import StructureChecker
+from .source_manager import HEALTH_OK
 from .decrypter import Decrypter  # noqa: F401  (类型提示用)
 
 # ---- 章节标题数字解析 ------------------------------------------------- #
@@ -162,6 +167,10 @@ def _extract_chapter_number(title: str) -> tuple | None:
             return (0, v)
     # 退化：标题结尾带数字（如「书名 2」「名3」），常见于短篇集/番外连载，
     # 数字是章节序号（无「第X话」前缀）。仅在标题非纯数字开头时兜底提取。
+    # 收紧：排除「楔/序/番外/完结/篇/卷」等特殊词，避免「完结篇2」「第0话 序章」
+    # 误判为章号；数字可紧贴标题（如「名3」）或带分隔符（如「书名 2」）。
+    if _re.search(r"楔|序章|番外|完结|篇|前言|后记|尾声|卷首", title):
+        return None
     m = _re.match(r".+[ \t#・\-—\.]?([０-９\d]{1,5})\s*$", title)
     if m and not _re.match(r"\s*[０-９\d]", title):
         v = _to_int_full(m.group(1))
@@ -259,6 +268,7 @@ def _sort_chapters(chapters: List["Chapter"]) -> List["Chapter"]:
 class Chapter:
     title: str
     url: str
+    source_id: str = ""  # 该集所属播放源标识（换源站：sid 值）；普通源空
 
 
 @dataclass
@@ -275,6 +285,8 @@ class Detail:
     summary: str = ""
     tags: List[str] = field(default_factory=list)
     chapters: List[Chapter] = field(default_factory=list)
+    # 播放源列表（换源站）：[{sid, name, from_, ps, parse}]；无换源配置时为空
+    source_list: List[dict] = field(default_factory=list)
 
 
 class Content:
@@ -284,32 +296,46 @@ class Content:
         parser: Parser,
         checker: StructureChecker,
         decrypter: Optional["Decrypter"] = None,
+        health_reporter=None,
     ):
         self._http = http
         self._parser = parser
         self._checker = checker
         self._decrypter = decrypter
+        self._health_reporter = health_reporter  # 可选：update_health(source_id, state, error)
         # yt-dlp 流 URL 缓存（同视频短时复用，避免重复签名等待）
         self._ytdlp_stream_cache: dict = {}
         self._ytdlp = None  # 懒加载单例，复用 yt-dlp 子进程
+
+    def _report_health(self, source: SourceConfig, state: str, error: str = "") -> None:
+        """上报源健康状态（若注入 health_reporter）。"""
+        if self._health_reporter is not None:
+            try:
+                self._health_reporter.update_health(source.source_id, state, error)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
         return source.request_headers()
 
     def _timeout(self, source: SourceConfig) -> float:
-        return float(source.transports().get("timeout") or 10)
+        return float(source.transports().get("timeout") or self._http.defaults.timeout)
 
     def _retries(self, source: SourceConfig) -> int:
-        return int(source.transports().get("retries") or 3)
+        return int(source.transports().get("retries") or self._http.defaults.retries)
 
     def _interval_ms(self, source: SourceConfig) -> int:
-        return int(source.transports().get("interval_ms") or 0)
+        return int(source.transports().get("interval_ms") or self._http.defaults.interval_ms)
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
-        from urllib.parse import urljoin
+        from urllib.parse import urljoin, urlsplit
 
-        return urljoin(source.base_url, url) if not url.startswith("http") else url
+        # 协议判断（大小写不敏感 + 协议相对 //），避免 "HTTP://" 被误当相对路径
+        scheme = (urlsplit(url).scheme or "").lower()
+        if scheme in ("http", "https") or url.startswith("//"):
+            return url
+        return urljoin(source.base_url, url)
 
     def _get(self, source: SourceConfig, url: str) -> str:
         abs_url = self._abs_url(source, url)
@@ -319,6 +345,7 @@ class Content:
             timeout=self._timeout(source),
             retries=self._retries(source),
             interval_ms=self._interval_ms(source),
+            encoding=source.transports().get("charset"),
         )
 
     # ------------------------------------------------------------------ #
@@ -335,7 +362,8 @@ class Content:
                 return self._fetch_detail_ytdlp(source, url, detail_api)
             return self._fetch_detail_api(source, url, detail_api)
 
-        self._checker.check(source, self._abs_url(source, url))
+        ok = self._checker.check(source, self._abs_url(source, url))
+        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
         html = self._get(source, url)
         doc = self._parser.parse(html)
 
@@ -365,7 +393,13 @@ class Content:
         detail.tags = tags
 
         # 章节列表（按类型取 content 配置，传书名用于标题清理）
-        detail.chapters = self._fetch_chapters(source, doc, book_title=detail.title)
+        detail.chapters = self._fetch_chapters(
+            source, doc, book_title=detail.title, detail_url=url
+        )
+
+        # 播放源列表（换源站）：解析 source_switch 配置的可用源
+        detail.source_list = self._parse_source_list(source, html)
+
         return detail
 
     def _fetch_detail_ytdlp(self, source: SourceConfig, url: str, cfg: dict) -> Detail:
@@ -490,12 +524,20 @@ class Content:
         return cur
 
     # ------------------------------------------------------------------ #
-    def _fetch_chapters(self, source: SourceConfig, doc, book_title: str = "") -> List[Chapter]:
+    def _fetch_chapters(
+        self,
+        source: SourceConfig,
+        doc,
+        book_title: str = "",
+        detail_url: str = "",
+    ) -> List[Chapter]:
         """从详情页提取章节列表。按 content_type 读 content 配置。
 
         支持源配置：
         - list.chapter_order: "desc" → HTML 倒序，反转成正序（asc）
         - list.title_clean: true    → 从章节标题移除书名
+        - content.<type>.single_chapter: true → 详情页即单章图集（无章节列表），
+          直接以详情 URL 作为唯一章节（如 wnacg 每 aid 一图集）。
         """
         content_cfg = source.raw.get("endpoints", {}).get("content") or {}
         if source.content_type == "novel":
@@ -504,11 +546,42 @@ class Content:
             block = content_cfg.get("page") or {}
         else:
             block = content_cfg.get("episode") or {}
+        # 换源站：分集从 source_switch.ep_list_selector 提取（按当前 sid）
+        switch_cfg = block.get("source_switch") or {}
+        if switch_cfg.get("ep_list_selector") and detail_url:
+            # 当前 sid 从详情 URL 提取；URL 无 sid 时默认用第一个播放源（sid=1）
+            m_sid = _re.search(r"sid=(\d+)", detail_url)
+            sid = m_sid.group(1) if m_sid else switch_cfg.get("default_sid", "1")
+            return self._fetch_chapters_for_source(
+                source, doc, detail_url, sid
+            )
+        # 单章图集：详情页即唯一章节，无需解析章节列表
+        if block.get("single_chapter"):
+            return [
+                Chapter(
+                    title=book_title or "全本",
+                    url=detail_url or self._abs_url(source, source.base_url),
+                )
+            ]
         list_cfg = block.get("list") or {}
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
         if not root_sel:
             return []
+
+        # 独立目录页：content.chapter.list.chapters_url 为模板（如 /other/chapters/id/{id}.html），
+        # 从详情 URL 提取 book id 并二次抓取，在该页提取完整章节列表
+        chapters_url_tpl = list_cfg.get("chapters_url") or ""
+        if chapters_url_tpl and detail_url:
+            m_id = _re.search(r"/(?:novel|book|comic|detail)/(\w+)", detail_url)
+            if m_id:
+                try:
+                    cat_url = chapters_url_tpl.replace("{id}", m_id.group(1))
+                    cat_html = self._get(source, cat_url)
+                    cat_doc = self._parser.parse(cat_html)
+                    doc = cat_doc  # 用目录页 doc 提取章节
+                except Exception:
+                    pass  # 目录页抓取失败回退详情页
 
         items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         chapters: List[Chapter] = []
@@ -625,7 +698,8 @@ class Content:
         3. 再兜底从页面找 _<数字>.html 的分页链接。
         返回的 nxt 是否同章续页由调用方 _chapter_base 判定。
         """
-        self._checker.check(source, self._abs_url(source, url))
+        ok = self._checker.check(source, self._abs_url(source, url))
+        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
         html = self._get(source, url)
         doc = self._parser.parse(html)
 
@@ -651,6 +725,27 @@ class Content:
                 nxt = self._detect_next_page(doc, source, url)
             if nxt:
                 nxt = self._abs_url(source, nxt)
+
+        # Playwright 渲染正文（SPA 小说站，如 18mh）
+        if body.get("render") == "playwright":
+            rc = body.get("render_config") or {}
+            sel_css = (selector or {}).get("css") if isinstance(selector, dict) else selector
+            from .playwright_helper import fetch_rendered_text_sync
+
+            text = fetch_rendered_text_sync(
+                self._abs_url(source, url),
+                sel_css or "",
+                wait_for=rc.get("wait_for") or "",
+                wait_until=rc.get("wait_until") or "domcontentloaded",
+                timeout_ms=int(rc.get("timeout_ms") or 30000),
+                extra_delay_ms=int(rc.get("extra_delay_ms") or 2000),
+                proxy=source.transports().get("proxy"),
+            )
+            if not text:
+                raise ContentMissingError(
+                    f"渲染正文为空（{url}）", source_id=source.source_id
+                )
+            return text, nxt
 
         if not selector:
             raise ContentMissingError("源未配置正文选择器", source_id=source.source_id)
@@ -704,13 +799,14 @@ class Content:
 
     @staticmethod
     def _chapter_base(url: str) -> str:
-        """去 URL 的 _<数字>.html 分页后缀，返回基路径。
+        """去 URL 的 _<数字> 分页后缀，返回基路径（兼容 .html/.htm/.shtml/.php/无后缀）。
 
         https://x/1/73976498_1.html → https://x/1/73976498.html
+        https://x/1/73976498_2.htm  → https://x/1/73976498.htm
         https://x/1/73976498.html   → https://x/1/73976498.html
         """
         import re as _re2
-        return _re2.sub(r"_(\d+)\.html$", ".html", url)
+        return _re2.sub(r"_(\d+)(?=\.\w+$|$)", "", url)
 
     def _decrypt_chapter(self, source: SourceConfig, html: str, url: str) -> str:
         """正文被混淆时的解密路径（源配置 decryption 驱动）。"""
@@ -782,8 +878,8 @@ class Content:
                     abs_url,
                     wait_for=rc.get("wait_for", "canvas"),
                     wait_until=rc.get("wait_until", "domcontentloaded"),
-                    timeout_ms=rc.get("timeout_ms", 30000),
-                    extra_delay_ms=rc.get("extra_delay_ms", 2500),
+                    timeout_ms=int(rc.get("timeout_ms") or 30000),
+                    extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
                     click_selector=rc.get("click_selector"),
                     scroll_to_bottom=rc.get("scroll_to_bottom", False),
                     extract_mode=rc.get("extract_mode", "canvas"),
@@ -793,16 +889,70 @@ class Content:
                     scroll_stale_rounds=int(rc.get("scroll_stale_rounds", 6)),
                 )
             except Exception as exc:
-                raise ContentMissingError(
-                    f"Playwright 渲染图片失败（{chapter_url}）：{exc}",
-                    source_id=source.source_id,
-                ) from exc
+                # Playwright 渲染失败 → 降级到普通 HTML 提取（站点改版/选择器不匹配时
+                # 不整话失败，尝试 HTML 兜底；若 HTML 也提取不到，下方会抛 ContentMissingError）
+                log.warning("[%s] Playwright 渲染失败，降级 HTML 提取：%s", source.source_id, exc)
 
-        self._checker.check(source, abs_url)
-        html = self._get(source, chapter_url)
-        doc = self._parser.parse(html)
+        ok = self._checker.check(source, abs_url)
+        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
         # 图片列表优先 body，兼容旧 list
         list_cfg = body_cfg or block.get("list") or {}
+        urls = self._fetch_comic_page_imgs(source, list_cfg, chapter_url)
+        # 图片解密源（如 18mh AES-CBC 加密图）：下载并把每张解密成 data URI，
+        # 使阅读器/下载器无需改动即可显示/保存解密图。
+        if urls and source.raw.get("decryption", {}).get("targets", {}).get("image"):
+            return self._decrypt_image_urls(source, urls)
+        return urls
+
+    def _decrypt_image_urls(self, source: SourceConfig, urls: List[str]) -> List[str]:
+        """把加密图片 URL 逐张下载并 AES 解密成 data URI（供阅读器/下载器直接用）。
+
+        单张失败 → 保留原 URL（可能有封面等非加密图混入，靠 reader 容错）。
+        """
+        out: List[str] = []
+        for u in urls:
+            try:
+                raw = self._http.get_bytes(self._abs_url(source, u),
+                                           headers=self._headers(source))
+                plain = self._decrypter.decrypt_bytes(source, raw, target="image")
+                if plain and plain is not raw:
+                    import base64 as _b64
+
+                    mime = self._guess_image_mime(plain)
+                    out.append(f"data:{mime};base64,{_b64.b64encode(plain).decode()}")
+                else:
+                    out.append(u)
+            except Exception:  # noqa: BLE001
+                out.append(u)  # 解密失败保底原 URL
+        return out
+
+    @staticmethod
+    def _guess_image_mime(data: bytes) -> str:
+        """按魔数猜图片 mime（JPEG/PNG/GIF/WEBP/BMP），默认 octet-stream。"""
+        if data[:3] == b"\xff\xd8\xff":
+            return "image/jpeg"
+        if data[:4] == b"\x89PNG":
+            return "image/png"
+        if data[:6] in (b"GIF89a", b"GIF87a"):
+            return "image/gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        if data[:2] == b"BM":
+            return "image/bmp"
+        return "image/jpeg"
+
+    def _fetch_comic_page_imgs(
+        self, source: SourceConfig, list_cfg: dict, chapter_url: str
+    ) -> List[str]:
+        """从单话 HTML 提取全部图片 URL，支持图片列表翻页。
+
+        对应 endpoints.content.page：
+        - list.root_selector / list.fields.url   单图项与图片 URL 提取
+        - list.paginator.next_link.selector     （可选）「下一页」链接，跨页拼全
+          多页图片站（如每页固定 N 张、30P 需翻 3 页）。循环抓取直到：
+            下一页链接缺失 / 已访问过（URL 去重防死循环）/ 达 max_pages 上限。
+        - 图片 URL 用 data-src / data-original 懒加载属性时框架自动兜底
+        """
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
         if not root_sel or not fields.get("url"):
@@ -810,22 +960,43 @@ class Content:
                 "源未配置漫画图片规则（content.page）",
                 source_id=source.source_id,
             )
+        paginator = list_cfg.get("paginator") or {}
+        max_pages = int(paginator.get("max_pages") or 0)
+        next_sel = (paginator.get("next_link") or {}).get("selector")
 
-        # 图片字段可能用 data-src / data-original 懒加载属性
         url_sel = fields.get("url")
-        if url_sel and isinstance(url_sel, dict):
-            attr = url_sel.get("attr")
-            if attr in (None, "src"):
-                # 尝试 data-src / data-original 兜底
-                for lazy_attr in ("data-src", "data-original", "src"):
-                    sel = dict(url_sel)
-                    sel["attr"] = lazy_attr
-                    imgs = self._parser.extract(doc, sel, source.base_url)
-                    if imgs:
-                        return self._filter_ad_images(imgs, source)
-        # 常规提取
-        imgs = self._parser.extract(doc, url_sel, source.base_url)
-        return self._filter_ad_images(imgs, source)
+        urls: List[str] = []
+        seen_url: set = set()   # 已访问的页面 URL（防死循环）
+        seen_img: set = set()   # 已收集的图片 URL（跨页去重）
+        page_url = chapter_url
+
+        for _ in range(max_pages if max_pages else 1000):
+            if page_url in seen_url:
+                break
+            seen_url.add(page_url)
+            html = self._get(source, page_url)
+            doc = self._parser.parse(html)
+            # 在 root_selector 限定范围内提取图片 URL（复用 parse_items：
+            # 每个 root 项内按 fields.url 取属性，自动 data-src 懒加载兜底）。
+            # 无 root_selector 时回退整页提取。
+            items = self._parser.parse_items(
+                doc, root_sel, fields, source.base_url
+            )
+            page_imgs = [it.get("url") or "" for it in items]
+            page_imgs = [u for u in page_imgs if u]
+            for u in self._filter_ad_images(page_imgs, source):
+                if u not in seen_img:
+                    seen_img.add(u)
+                    urls.append(u)
+            # 无下一页配置 → 单页即止
+            if not next_sel:
+                break
+            nxt = self._parser.extract_first(doc, next_sel, source.base_url)
+            if not nxt:
+                break
+            page_url = nxt
+
+        return urls
 
     def comic_page_urls(self, source: SourceConfig, chapter_url: str) -> List[str]:
         """纯 HTTP 提取一话的图片 URL 列表（不渲染，供预加载计数）。
@@ -838,26 +1009,14 @@ class Content:
         block = content_cfg.get("page") or {}
         body_cfg = block.get("body") or {}
         abs_url = self._abs_url(source, chapter_url)
-        self._checker.check(source, abs_url)
-        html = self._get(source, chapter_url)
-        doc = self._parser.parse(html)
+        ok = self._checker.check(source, abs_url)
+        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
         list_cfg = body_cfg or block.get("list") or {}
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
         if not root_sel or not fields.get("url"):
             return []
-        url_sel = fields.get("url")
-        if url_sel and isinstance(url_sel, dict):
-            attr = url_sel.get("attr")
-            if attr in (None, "src"):
-                for lazy_attr in ("data-src", "data-original", "src"):
-                    sel = dict(url_sel)
-                    sel["attr"] = lazy_attr
-                    imgs = self._parser.extract(doc, sel, source.base_url)
-                    if imgs:
-                        return self._filter_ad_images(imgs, source)
-        imgs = self._parser.extract(doc, url_sel, source.base_url)
-        return self._filter_ad_images(imgs, source)
+        return self._fetch_comic_page_imgs(source, list_cfg, chapter_url)
 
     def fetch_comic_pages_batch(
         self,
@@ -903,22 +1062,39 @@ class Content:
         quality: 画质名（"best"/"1080p"/...），空=源配置默认。经
         api_endpoints.episode 的 quality 映射为请求参数（如 B 站 qn）。
         mpv 播放 dash 需要同时喂视频轨+音频轨（B 站音视频分离）。
+
+        返回前经 adblock 广告过滤：URL 命中广告特征 → 置空（下载/播放均跳过）。
         """
+        from .adblock import adblock_for
+
+        ad = adblock_for(source)
         api = source.raw.get("api_endpoints") or {}
         episode_api = api.get("episode") or {}
+        video, audio = "", ""
         if episode_api:
             # yt-dlp 引擎（YouTube 高清双流，需签名）
             if episode_api.get("engine") == "ytdlp":
-                return self._fetch_streams_ytdlp(source, episode_url, episode_api, quality)
-            streams = self._fetch_episode_api(
-                source, episode_url, episode_api, want_streams=True, quality=quality
-            )
-            if isinstance(streams, dict):
-                return streams.get("video", ""), streams.get("audio", "")
-            if streams:
-                return streams, ""
-        # HTML 兜底：单 URL
-        return self.fetch_video_episode(source, episode_url), ""
+                video, audio = self._fetch_streams_ytdlp(
+                    source, episode_url, episode_api, quality
+                )
+            else:
+                streams = self._fetch_episode_api(
+                    source, episode_url, episode_api, want_streams=True, quality=quality
+                )
+                if isinstance(streams, dict):
+                    video, audio = streams.get("video", ""), streams.get("audio", "")
+                elif streams:
+                    video, audio = streams, ""
+        else:
+            # HTML 兜底：单 URL
+            video, audio = self.fetch_video_episode(source, episode_url), ""
+        # 广告过滤（URL 命中 → 置空）
+        if ad.enabled:
+            if video and ad.is_ad_url(video):
+                video = ""
+            if audio and ad.is_ad_url(audio):
+                audio = ""
+        return video, audio
 
     def fetch_video_episode(self, source: SourceConfig, episode_url: str) -> str:
         """视频：抓取单集播放地址（解密后返回真实地址）。
@@ -938,13 +1114,53 @@ class Content:
             if play:
                 return play
 
-        self._checker.check(source, self._abs_url(source, episode_url))
+        ok = self._checker.check(source, self._abs_url(source, episode_url))
+        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
         html = self._get(source, episode_url)
         doc = self._parser.parse(html)
 
         content_cfg = source.raw.get("endpoints", {}).get("content") or {}
         block = content_cfg.get("episode") or {}
         play_cfg = block.get("play_url") or {}
+        switch_cfg = block.get("source_switch") or {}
+
+        # Playwright 渲染播放页 → iframe 解析站 → video src（agedm 类嵌套 iframe 站）
+        if play_cfg.get("render") == "playwright":
+            rc = block.get("render_config") or {}
+            from .playwright_helper import fetch_rendered_video_sync
+
+            vurl = fetch_rendered_video_sync(
+                self._abs_url(source, episode_url),
+                wait_until=rc.get("wait_until") or "networkidle",
+                timeout_ms=int(rc.get("timeout_ms") or 45000),
+                extra_delay_ms=int(rc.get("extra_delay_ms") or 8000),
+                proxy=source.transports().get("proxy"),
+            )
+            if not vurl:
+                raise ContentMissingError(
+                    f"渲染未获取到视频源（{episode_url}）", source_id=source.source_id
+                )
+            return vurl
+
+        # 换源站：从 player_aaaa JS 配置提取真实播放地址（ps=0 直接用 / ps=1 走 parse 转码）
+        if switch_cfg:
+            return self._fetch_play_url_from_player(
+                html, switch_cfg, episode_url, source=source
+            )
+
+        # 正则提取（JS 里的转义 URL，如 _detail_.url m3u8）
+        play_regex = play_cfg.get("regex")
+        if play_regex:
+            m = _re.search(play_regex, html)
+            if m:
+                play = m.group(1) if m.groups() else m.group(0)
+                # unescape JS 转义（\/ → /）
+                play = play.replace("\\/", "/")
+                return play
+            raise ContentMissingError(
+                f"未匹配到播放地址（{episode_url}）", source_id=source.source_id
+            )
+
         play_sel = play_cfg.get("selector")
         if not play_sel:
             raise ContentMissingError(
@@ -995,6 +1211,197 @@ class Content:
             self._ytdlp = Ytdlp()
         return self._ytdlp
 
+    # ------------------------------------------------------------------ #
+    # 换源支持（source_switch）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _get_source_switch_cfg(source: SourceConfig) -> dict:
+        """取源配置 content.episode.source_switch（换源配置），无则 {}。"""
+        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        block = content_cfg.get("episode") or {}
+        return block.get("source_switch") or {}
+
+    def _parse_source_list(self, source: SourceConfig, html: str) -> List[dict]:
+        """从详情页 HTML 提取所有可用播放源。
+
+        source_switch 配置：
+            list_selector  提取源 tab 的根选择器（如 .player_name[data-sid]）
+            list_attr      源 ID 属性名（data-sid）
+            name_selector  源名选择器（缺省用根节点的文本）
+            playerconfig_url  可选：加载 playerconfig.js 拿各源 ps/parse
+        返回 [{sid, name, from_, ps, parse}]；无配置返回 []。
+        """
+        switch = self._get_source_switch_cfg(source)
+        if not switch:
+            return []
+        doc = self._parser.parse(html)
+        list_sel = switch.get("list_selector")
+        attr = switch.get("list_attr", "data-sid")
+        name_sel = switch.get("name_selector") or list_sel
+        if not list_sel:
+            return []
+        roots = self._parser._query(doc, list_sel, None)
+        name_nodes = self._parser._query(doc, name_sel, None) if name_sel else roots
+        out: List[dict] = []
+        seen: set = set()
+        for i, node in enumerate(roots):
+            sid = node.get(attr) if hasattr(node, "get") else None
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            name = ""
+            if i < len(name_nodes) and hasattr(name_nodes[i], "text_content"):
+                name = (name_nodes[i].text_content() or "").strip()
+            if not name:
+                name = node.text_content().strip() if hasattr(node, "text_content") else ""
+            # data-from 可能在节点或其子元素上（如 span[data-from]）
+            from_ = ""
+            if hasattr(node, "get"):
+                from_ = node.get("data-from") or ""
+            if not from_ and hasattr(node, "iter"):
+                for sub in node.iter():
+                    if hasattr(sub, "get") and sub.get("data-from"):
+                        from_ = sub.get("data-from")
+                        break
+            out.append({
+                "sid": sid,
+                "name": name,
+                "from_": from_,
+                "ps": "0",
+                "parse": "",
+            })
+        # 加载 playerconfig.js 补全各源 ps/parse（可选；失败用默认 ps=0 直接用 url）
+        pc_url = switch.get("playerconfig_url")
+        if pc_url and out:
+            try:
+                pc_html = self._get(source, self._abs_url(source, pc_url))
+                self._merge_parse_config(out, pc_html)
+            except Exception:
+                pass  # playerconfig 加载失败 → 所有源 ps=0 直接用 url
+        return out
+
+    @staticmethod
+    def _merge_parse_config(source_list: List[dict], pc_html: str) -> None:
+        """解析 playerconfig.js 的 player_list，把各 from 的 ps/parse 合入源列表。"""
+        import json as _json
+
+        m = _re.search(
+            r'MacPlayerConfig\.player_list=(\{.*?\}),MacPlayerConfig', pc_html, _re.S
+        )
+        if not m:
+            return
+        try:
+            raw = m.group(1)
+            # JS 对象 → 尽量解析（字符串键无引号也能被 json 容错处理）
+            raw = _re.sub(r"([{\s,])(\w+)\s*:", r'\1"\2":', raw)
+            players = _json.loads(raw)
+        except Exception:
+            return
+        for item in source_list:
+            cfg = players.get(item.get("from_")) or {}
+            item["ps"] = str(cfg.get("ps", "0") or "0")
+            item["parse"] = (cfg.get("parse") or "").replace("\\/", "/")
+            if not item["name"] and cfg.get("show"):
+                item["name"] = cfg["show"]
+
+    def _fetch_play_url_from_player(
+        self, html: str, switch_cfg: dict, episode_url: str, source: SourceConfig = None
+    ) -> str:
+        """从 player_aaaa JS 配置提取真实播放地址。
+
+        player_aaaa 结构：
+            {url: 播放地址, from: 源类型, sid: 源ID, nid: 集数, ps: 0/1}
+        ps=0：url 直接用；ps=1：url 需经 parse 接口转码（{parse}?url={url}）
+        """
+        regex = switch_cfg.get("play_regex", r'var player_aaaa=(\{.*?\})\s*</script>')
+        url_field = switch_cfg.get("play_url_path", "url")
+        m = _re.search(regex, html)
+        if not m:
+            raise ContentMissingError(
+                f"未匹配到播放配置（{episode_url}）", source_id=(source.source_id if source else "")
+            )
+        try:
+            obj = json.loads(m.group(1))
+        except Exception as exc:
+            raise ContentMissingError(
+                f"播放配置解析失败（{episode_url}）：{exc}",
+                source_id=(source.source_id if source else ""),
+            ) from exc
+        raw_url = obj.get(url_field) or ""
+        if not raw_url:
+            raise ContentMissingError(
+                f"播放配置无 {url_field}（{episode_url}）",
+                source_id=(source.source_id if source else ""),
+            )
+        raw_url = raw_url.replace("\\/", "/")
+        # ps=1 → 走 parse 接口转码（iframe 外链源 → m3u8）
+        ps = str(obj.get("ps", "0") or "0")
+        parse_url = (obj.get("parse") or switch_cfg.get("default_parse") or "")
+        parse_url = parse_url.replace("\\/", "/")
+        if ps == "1" and parse_url:
+            sep = "&" if "?" in parse_url else "?"
+            return f"{parse_url}{sep}url={raw_url}"
+        return raw_url
+
+    def _fetch_chapters_for_source(
+        self, source: SourceConfig, doc, detail_url: str, sid: str
+    ) -> List[Chapter]:
+        """按指定播放源 sid 从详情页 doc 提取分集列表。
+
+        source_switch.ep_list_selector 含 {sid} 占位 → 替换为当前 sid。
+        返回 Chapter 列表，每条带 source_id=sid。
+        """
+        switch = self._get_source_switch_cfg(source)
+        ep_sel_tpl = switch.get("ep_list_selector")
+        if not ep_sel_tpl:
+            return []
+        # 分集列表选择器：{sid} → 当前源
+        ep_sel = ep_sel_tpl.replace("{sid}", str(sid))
+        nodes = self._parser._query(doc, ep_sel, None)
+        chapters: List[Chapter] = []
+        seen: set = set()
+        for node in nodes:
+            href = node.get("href") if hasattr(node, "get") else None
+            if not href or "/tv/" not in href:
+                continue
+            if href in seen:
+                continue
+            seen.add(href)
+            title = node.text_content().strip() if hasattr(node, "text_content") else ""
+            # 确保 URL 带 sid（无则补）
+            if f"sid={sid}" not in href:
+                sep = "&" if "?" in href else "?"
+                href = f"{href}{sep}sid={sid}"
+            abs_url = self._abs_url(source, href)
+            chapters.append(Chapter(title=title or f"第{len(chapters)+1}集", url=abs_url, source_id=str(sid)))
+        # 去重标题（同标题不同 URL 的只留第一个）
+        seen_t = set()
+        deduped = []
+        for ch in chapters:
+            t = ch.title or ""
+            if t in seen_t:
+                continue
+            seen_t.add(t)
+            deduped.append(ch)
+        return deduped
+
+    def switch_source(
+        self, source: SourceConfig, detail_url: str, new_sid: str
+    ) -> tuple:
+        """切换播放源：重新抓取该源详情页，返回 (更新后的 Detail, 新分集列表)。
+
+        detail_url：当前详情 URL（含当前 sid）；new_sid：目标播放源 sid。
+        返回的 Detail 保留元数据，chapters 换成新源分集，source_list 保留。
+        """
+        # 构造新 URL（换 sid 参数）
+        new_url = _re.sub(r"sid=\d+", f"sid={new_sid}", detail_url)
+        if f"sid={new_sid}" not in new_url:
+            sep = "&" if "?" in new_url else "?"
+            new_url = f"{new_url}{sep}sid={new_sid}"
+        # 重新抓详情（fetch_detail 内部会按新 sid 用 _fetch_chapters 提取新分集）
+        detail = self.fetch_detail(source, new_url)
+        return detail, detail.chapters
+
     @staticmethod
     def _ytdlp_format(cfg: dict, quality: str = "") -> str:
         """quality → yt-dlp 格式串。默认 bestvideo+bestaudio。"""
@@ -1038,6 +1445,8 @@ class Content:
             if m_cid:
                 val = val.replace("{cid}", m_cid.group(1))
             val = val.replace("{" + q_param + "}", str(q_value))
+            # 兼容通用占位符 {quality}（不论 param 名是什么都替换）
+            val = val.replace("{quality}", str(q_value))
             filled[k] = val
         sign_cfg = cfg.get("sign") or {}
         strategy = sign_cfg.get("strategy")
@@ -1096,12 +1505,27 @@ class Content:
 
     @staticmethod
     def _filter_ad_images(images: List[str], source: SourceConfig) -> List[str]:
-        """剔除广告图（URL 含 ad/banner/promo 等标记）。"""
-        ad_markers = ("/ad", "ad_", "banner", "promo", "advert", ".gif")
+        """剔除广告图（URL 路径含广告标记）。
+
+        仅检查 URL 路径部分（? 前），且用路径段边界匹配，避免
+        auth_key/upload_01 等正常参数被 ad_ 子串误伤。
+        """
+        import re as _re
+        from urllib.parse import urlparse
+
+        # 精确广告特征：路径段或明确广告词（不用宽泛的 ad_，防误杀正常 URL）
+        ad_re = _re.compile(
+            r"(?:/ads?/|/ad-|_ad\.|/advert|/banner|/promo|/ad\.|/ad/|\.ads\.)"
+        )
+        gif_marker = ".gif"
         filtered = []
         for url in images:
             low = url.lower()
-            if any(m in low for m in ad_markers):
+            path = urlparse(low).path
+            # gif 仍按路径判断（gif 常是广告动图）
+            if gif_marker in path:
+                continue
+            if ad_re.search(path):
                 continue
             filtered.append(url)
         return filtered

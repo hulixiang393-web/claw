@@ -63,13 +63,14 @@ class EpubView(QWidget):
 
     chapter_changed = Signal(object)  # 发 (epub_path, chapter_title) 供续读
 
-    def __init__(self, parent=None):
+    def __init__(self, font_scale: float = 1.0, parent=None):
         super().__init__(parent)
         self._path = ""
         self._chapters: list[_Chapter] = []
         self._current_idx = -1
         self._is_comic = False
-        self._font_size = 17
+        self._font_delta = 0
+        self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -122,16 +123,14 @@ class EpubView(QWidget):
         self.text.setWordWrap(True)
         self.text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.text.setStyleSheet(
-            f"font-size: {self._font_size}px; line-height: 1.8; padding: 8px 12px;"
-        )
+        self._apply_font()
         self.scroll.setWidget(self.text)
         body.addWidget(self.scroll, stretch=1)
         layout.addLayout(body, stretch=1)
 
     # ------------------------------------------------------------------ #
-    def open(self, path: str) -> bool:
-        """打开本地 epub，返回是否成功。"""
+    def open(self, path: str, start_idx: int = 0) -> bool:
+        """打开本地 epub，返回是否成功。start_idx 指定起始章节（续读定位）。"""
         if not HAS_EBOOKLIB:
             self.text.setText("未安装 EbookLib，无法阅读 epub")
             return False
@@ -150,7 +149,8 @@ class EpubView(QWidget):
         if self._is_comic:
             self._switch_gallery()
         self._populate_toc()
-        self._load_chapter(0)
+        start_idx = max(0, min(start_idx, len(self._chapters) - 1))
+        self._load_chapter(start_idx)
         return True
 
     def _extract_chapters(self, book) -> list[_Chapter]:
@@ -259,14 +259,30 @@ class EpubView(QWidget):
                 lbl.setText("图片解码失败")
             self._gallery_layout.addWidget(lbl)
 
+    @staticmethod
+    def _clamp_font(size: int) -> int:
+        return max(12, min(28, size))
+
+    def set_font_scale(self, scale: float) -> None:
+        """外部设置字体缩放（设置页实时生效）。保留用户 A+/A- 微调量。"""
+        if self._is_comic:
+            return
+        self._base_font = self._clamp_font(round(17 * float(scale or 1.0)))
+        self._apply_font()
+
+    def _apply_font(self) -> None:
+        if self._is_comic:
+            return
+        size = self._clamp_font(self._base_font + self._font_delta)
+        self.text.setStyleSheet(
+            f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;"
+        )
+
     def _adjust_font(self, delta: int) -> None:
         if self._is_comic:
             return
-        self._font_size += delta
-        self._font_size = max(12, min(28, self._font_size))
-        self.text.setStyleSheet(
-            f"font-size: {self._font_size}px; line-height: 1.8; padding: 8px 12px;"
-        )
+        self._font_delta += delta
+        self._apply_font()
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:

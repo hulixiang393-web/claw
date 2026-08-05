@@ -109,6 +109,18 @@
     "detail": { "max_pages": 1 },
     "page": { "max_pages": 300, "max_items": 300 }
   },
+  "decryption": {
+    "targets": {
+      "image": {
+        "strategy": "aes_cbc",
+        "key": "f5d965df75336270",
+        "iv": "97b60394abc2fbe1",
+        "padding": "none",
+        "input": "bytes",
+        "output": "bytes"
+      }
+    }
+  },
   "diagnostics": {
     "selfcheck": {
       "strategy": "soft",

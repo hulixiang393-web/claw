@@ -74,13 +74,21 @@ class BulkFetch:
         return disc.get("works_list_url") or disc.get("list_url") or source.base_url
 
     def _fetch_category(self, source: SourceConfig, url: str) -> List[Work]:
-        """抓取一个分类的所有页（软上限 max_pages）。"""
+        """抓取一个分类的所有页（软上限 max_pages）。
+
+        单页网络失败不中断整个分类：跳过该页继续；连续失败 N 页才停（防死循环）。
+        """
         works: List[Work] = []
+        consecutive_fail = 0
         for page in range(1, self._max_pages + 1):
             try:
                 page_works = self._discovery.list_works(source, url, page)
             except SourceError:
-                break
+                consecutive_fail += 1
+                if consecutive_fail >= 3:
+                    break  # 连续 3 页失败，网络/反爬问题，停止该分类
+                continue  # 跳过单页失败，继续下一页
+            consecutive_fail = 0
             if not page_works:
                 break  # 无更多页
             works.extend(page_works)

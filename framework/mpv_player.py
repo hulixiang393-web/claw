@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from typing import List, Optional
 
 
@@ -48,7 +49,7 @@ class MpvPlayer:
 
     def __init__(self, mpv_path: str | None = None, referer: str = ""):
         self._mpv = mpv_path or _find_mpv()
-        self._referer = referer or "https://www.bilibili.com/"
+        self._referer = referer or ""
         self._proc: Optional[subprocess.Popen] = None
 
     # ------------------------------------------------------------------ #
@@ -72,8 +73,9 @@ class MpvPlayer:
 
     def _build_cmd(self, video_url: str, audio_url: str, title: str) -> List[str]:
         cmd = [self._mpv, "--no-config", "--keep-open=yes", "--force-window=yes"]
-        # B 站 CDN 要求 Referer + UA
-        cmd.append(f"--http-header-fields=Referer: {self._referer}")
+        # Referer 头：源配置传入时附带（如 B 站 CDN 需要）
+        if self._referer:
+            cmd.append(f"--http-header-fields=Referer: {self._referer}")
         cmd.append(f"--user-agent={self.UA}")
         if title:
             cmd.append(f"--title={title}")
@@ -85,14 +87,30 @@ class MpvPlayer:
 
     # ------------------------------------------------------------------ #
     def stop(self) -> None:
-        """停止当前 mpv 进程（若无则无操作）。"""
-        if self._proc is not None:
-            try:
-                if self._proc.poll() is None:  # 仍在运行
-                    self._proc.terminate()
-            except Exception:
-                pass
-            self._proc = None
+        """停止当前 mpv 进程（若无则无操作）。
+
+        terminate 后等待短暂时间，若 mpv 未退出（--keep-open 窗口可能忽略
+        SIGTERM），再 kill 强制结束。避免旧 mpv 残留导致下次 play 失败。
+        """
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:  # 仍在运行
+                proc.terminate()
+                # 等最多 ~1.5s，未退则强杀
+                for _ in range(15):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def is_playing(self) -> bool:
         return self._proc is not None and self._proc.poll() is None

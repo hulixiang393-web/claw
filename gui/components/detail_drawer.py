@@ -26,11 +26,18 @@ class DetailDrawer(QFrame):
     read_requested = Signal(object)      # Detail
     open_url_requested = Signal(str)     # url
     download_requested = Signal(object)  # Detail
+    favorite_requested = Signal(object)  # Detail（收藏/取消收藏）
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("detailDrawer")
         self.setFixedWidth(320)
+        # 隐藏时仍保留布局占位，防止抽屉显示/隐藏时网格列数跳变/闪屏
+        from PySide6.QtWidgets import QSizePolicy
+
+        sp = QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        sp.setRetainSizeWhenHidden(True)
+        self.setSizePolicy(sp)
         self.setVisible(False)
 
         layout = QVBoxLayout(self)
@@ -94,6 +101,11 @@ class DetailDrawer(QFrame):
         self.download_btn = QPushButton("下载")
         self.download_btn.clicked.connect(lambda: self.download_requested.emit(self._detail))
         btn_row.addWidget(self.download_btn)
+
+        self.fav_btn = QPushButton("☆ 收藏")
+        self.fav_btn.setCheckable(True)
+        self.fav_btn.clicked.connect(lambda: self.favorite_requested.emit(self._detail))
+        btn_row.addWidget(self.fav_btn)
         layout.addLayout(btn_row)
 
         self.open_btn = QPushButton("打开源详情页")

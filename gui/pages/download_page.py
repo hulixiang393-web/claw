@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 from framework.events import (
     EVENT_DOWNLOAD_COMPLETED,
     EVENT_DOWNLOAD_FAILED,
@@ -135,6 +134,10 @@ class _TaskCard(QFrame):
             TaskStatus.DONE: "已完成",
             TaskStatus.FAILED: "失败",
         }.get(t.status, t.status)
+        # 视频下载中：合并 ffmpeg 期间显示已合并字节（否则全程 0/1 无变化）
+        if t.status == TaskStatus.DOWNLOADING and t.content_type == "video" and t.merge_progress > 0:
+            mb = t.merge_progress / 1048576.0
+            return f"{t.done}/{t.total} 章节  正在合并 {mb:.1f} MB"
         return f"{t.done}/{t.total} 章节  {status_text}"
 
     def _build_buttons(self) -> None:
@@ -206,7 +209,11 @@ class _TaskCard(QFrame):
 
     # ------------------------------------------------------------------ #
     def refresh(self, task) -> None:
-        """轻量刷新：更新进度条/文本/按钮（不重建）。"""
+        """轻量刷新：更新进度条/文本/按钮（不重建）。
+
+        状态变化时（暂停→继续→完成）重建按钮行，保证按钮跟随状态。
+        """
+        prev_status = getattr(self, "_last_status", None)
         self.task = task
         t = task
         self.progress_bar.setRange(0, max(1, t.total))
@@ -221,6 +228,18 @@ class _TaskCard(QFrame):
         else:
             self.time_label.setText("")
         self._apply_status_style()
+        # 状态变化 → 重建按钮行（暂停/继续/取消/重试随状态切换）
+        if prev_status is not None and prev_status != t.status:
+            self._rebuild_buttons()
+        self._last_status = t.status
+
+    def _rebuild_buttons(self) -> None:
+        """清空并重建按钮行（按最新状态）。"""
+        while self.btn_row.count():
+            item = self.btn_row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._build_buttons()
 
 
 # ====================================================================== #
@@ -228,6 +247,9 @@ class DownloadPage(BasePage):
     """下载管理页：任务队列列表 + 并发控制 + 全局操作 + 筛选。"""
 
     open_epub_requested = Signal(object)  # 请求打开某任务的 epub（发 epub 路径）
+    # 内部信号：事件 → 主线程处理（EventBus 回调在后台线程，QTimer.singleShot
+    # 从后台线程调度不可靠，改用 Qt 信号自动 Queued 回主线程）
+    _evt_to_ui = Signal(object)
 
     def __init__(
         self,
@@ -237,10 +259,13 @@ class DownloadPage(BasePage):
         parent=None,
     ):
         super().__init__(parent)
+        self._q = queue
         self._settings = settings
         self._bus = event_bus
         self._queue = queue
         self._tray = None
+
+        self._evt_to_ui.connect(self._handle_event)
 
         self._build_ui()
         self._bus.subscribe(self._on_event)
@@ -499,7 +524,13 @@ class DownloadPage(BasePage):
     # EventBus 事件处理（子线程 emit → QTimer 回主线程）
     # ------------------------------------------------------------------ #
     def on_event(self, event) -> None:
-        """EventBus 事件回调（subscribe 注册此方法）。"""
+        """EventBus 事件回调（subscribe 注册此方法）。
+
+        EventBus.emit 同步调用本方法 —— 可能在后台 worker 线程执行。
+        QTimer.singleShot 从非主线程调度不可靠（事件丢失，UI 不刷新），
+        改用 Qt 信号 self._evt_to_ui（auto 连接 → Queued 回主线程）触发
+        _handle_event，保证任何下载事件都可靠地驱动 UI 更新。
+        """
         t = event.type
         if t not in (
             EVENT_DOWNLOAD_STARTED,
@@ -508,8 +539,7 @@ class DownloadPage(BasePage):
             EVENT_DOWNLOAD_FAILED,
         ):
             return
-        # 回主线程处理
-        QTimer.singleShot(0, lambda e=event: self._handle_event(e))
+        self._evt_to_ui.emit(event)
 
     def _on_event(self, event) -> None:
         """订阅包装（subscribe 需要显式回调约定），实际走 on_event。"""

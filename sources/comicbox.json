@@ -92,7 +92,7 @@
           "render_config": {
             "wait_for": "canvas",
             "wait_until": "domcontentloaded",
-            "extra_delay_ms": 3000,
+            "extra_delay_ms": 800,
             "scroll_to_bottom": true,
             "extract_mode": "canvas",
             "page_container_selector": "div.cropped"

@@ -3,21 +3,23 @@
     "default_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 SpiderFramework/1.0",
     "default_timeout": 10,
     "default_retries": 3,
-    "default_request_interval": 0.0,
+    "default_request_interval": 0,
     "proxy": null,
     "concurrent_search_sources": 4,
     "max_bytes_per_image": 5242880
   },
   "ui": {
-    "theme": "midnight",
-    "font_scale": 1.0,
+    "theme": "mint",
+    "font_scale": 1.5,
     "cover_cache_size_mb": 256,
-    "default_page_size": 20
+    "default_page_size": 20,
+    "background_image": "",
+    "background_opacity": 0.6
   },
   "download": {
     "output_dir": "downloads",
     "naming_template": "{title}_{chapter_no}_{chapter_title}",
-    "merge_chapters_into_one_file": false,
+    "merge_chapters_into_one_file": true,
     "skip_existing": true,
     "max_concurrent_downloads": 6
   },
@@ -29,6 +31,9 @@
     "verbose_logging": false,
     "log_dir": "logs",
     "log_file_pattern": "framework-{date}.jsonl"
+  },
+  "adblock": {
+    "extra_rule_dir": ""
   },
   "sources_runtime": {
     "broken_source_warn_interval_hours": 24,
