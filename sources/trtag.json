@@ -10,7 +10,11 @@
     "description": "提线影院 - 电影/电视剧/动漫视频源（maccms，原 trtag.com 已迁移）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["视频", "免费", "影视"]
+    "tags": [
+      "视频",
+      "免费",
+      "影视"
+    ]
   },
   "transports": {
     "base_url": "https://jyoyuy.com",
@@ -36,11 +40,26 @@
       },
       "list_item": {
         "categories": [
-          { "title": "全部", "url": "/tv/index.html" },
-          { "title": "大陆剧", "url": "/tv/dalu" },
-          { "title": "港台剧", "url": "/tv/tangtai" },
-          { "title": "日韩剧", "url": "/tv/rihan" },
-          { "title": "欧美剧", "url": "/tv/oumei" }
+          {
+            "title": "全部",
+            "url": "/tv/index.html"
+          },
+          {
+            "title": "大陆剧",
+            "url": "/tv/dalu"
+          },
+          {
+            "title": "港台剧",
+            "url": "/tv/tangtai"
+          },
+          {
+            "title": "日韩剧",
+            "url": "/tv/rihan"
+          },
+          {
+            "title": "欧美剧",
+            "url": "/tv/oumei"
+          }
         ]
       }
     },
@@ -50,32 +69,63 @@
       "keyword_param": "searchword",
       "body_format": "form",
       "item": {
-        "root_selector": { "css": "li.p1" },
+        "root_selector": {
+          "css": "li.p1"
+        },
         "fields": {
-          "title": { "css": "a.link-hover", "attr": "title" },
-          "url": { "css": "a.link-hover", "attr": "href" },
-          "cover": { "css": "img.lazy", "attr": "data-original" },
-          "update": { "css": "span.list-score" }
+          "title": {
+            "css": "a.link-hover",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a.link-hover",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.lazy",
+            "attr": "data-original"
+          },
+          "update": {
+            "css": "span.list-score"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "dt.name" },
-        "author": { "css": "meta[name='keywords']", "attr": "content" },
-        "summary": { "css": "meta[name='description']", "attr": "content" },
-        "cover": { "css": "meta[property='og:image']", "attr": "content" }
+        "title": {
+          "css": "dt.name"
+        },
+        "author": {
+          "css": "meta[name='keywords']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        }
       }
     },
     "content": {
       "episode": {
         "list": {
-          "root_selector": { "css": "div#vlink_1 ul li a" },
+          "root_selector": {
+            "css": "div#vlink_1 ul li a"
+          },
           "chapter_order": "asc",
           "title_clean": true,
           "fields": {
-            "title": { "css": "a" },
-            "url": { "css": "a", "attr": "href" }
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
           }
         },
         "play_url": {
@@ -85,14 +135,24 @@
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 60 },
-    "detail": { "max_pages": 1 },
-    "episode": { "max_pages": 300, "max_items": 500 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 60
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 300,
+      "max_items": 500
+    }
   },
   "diagnostics": {
     "selfcheck": {
       "strategy": "soft",
-      "selector": { "css": "li.p1" }
+      "selector": {
+        "css": "li.p1"
+      }
     }
   }
 }

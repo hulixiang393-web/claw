@@ -10,7 +10,10 @@
     "description": "笔趣阁魔镜 - 小说源（测试用）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["小说", "免费"]
+    "tags": [
+      "小说",
+      "免费"
+    ]
   },
   "transports": {
     "base_url": "https://www.biqumo.com",
@@ -32,11 +35,18 @@
         "page_placeholder": "\\d+(?=/$)"
       },
       "list_item": {
-        "root_selector": { "css": ".main-nav li a" },
+        "root_selector": {
+          "css": ".main-nav li a"
+        },
         "url_pattern": "/sort/\\d+/1/",
         "fields": {
-          "title": { "css": "a" },
-          "url": { "css": "a", "attr": "href" }
+          "title": {
+            "css": "a"
+          },
+          "url": {
+            "css": "a",
+            "attr": "href"
+          }
         }
       }
     },
@@ -46,46 +56,87 @@
       "keyword_param": "s",
       "body_format": "form",
       "item": {
-        "root_selector": { "css": ".book-grid li" },
+        "root_selector": {
+          "css": ".book-grid li"
+        },
         "fields": {
-          "title": { "css": ".bmeta h3 a" },
-          "url": { "css": ".bmeta h3 a", "attr": "href" },
-          "cover": { "css": ".bcover img", "attr": "src" },
-          "author": { "css": ".bmeta p a" },
-          "update": { "css": ".bmeta p" }
+          "title": {
+            "css": ".bmeta h3 a"
+          },
+          "url": {
+            "css": ".bmeta h3 a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": ".bcover img",
+            "attr": "src"
+          },
+          "author": {
+            "css": ".bmeta p a"
+          },
+          "update": {
+            "css": ".bmeta p"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "h1" },
-        "book_name": { "css": "meta[property='og:novel:book_name']", "attr": "content" },
-        "author": { "css": "meta[property='og:novel:author']", "attr": "content" },
-        "status": { "css": ".info .status" }
+        "title": {
+          "css": "h1"
+        },
+        "book_name": {
+          "css": "meta[property='og:novel:book_name']",
+          "attr": "content"
+        },
+        "author": {
+          "css": "meta[property='og:novel:author']",
+          "attr": "content"
+        },
+        "status": {
+          "css": ".info .status"
+        }
       }
     },
     "content": {
       "chapter": {
         "list": {
-          "root_selector": { "css": ".cataloglist ul li a" },
+          "root_selector": {
+            "css": ".cataloglist ul li a"
+          },
           "chapter_order": "desc",
           "title_clean": true,
           "fields": {
-            "title": { "css": "a" },
-            "url": { "css": "a", "attr": "href" }
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
           }
         },
         "body": {
-          "selector": { "css": "#chaptercontent p" },
+          "selector": {
+            "css": "#chaptercontent p"
+          },
           "attr": "text"
         }
       }
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 20 },
-    "detail": { "max_pages": 1 },
-    "chapter": { "max_pages": 100, "max_items": 200 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 20
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 100,
+      "max_items": 200
+    }
   },
   "decryption": {
     "targets": {
@@ -98,7 +149,9 @@
   "diagnostics": {
     "selfcheck": {
       "strategy": "soft",
-      "selector": { "css": ".brand h1" }
+      "selector": {
+        "css": ".brand h1"
+      }
     }
   }
 }

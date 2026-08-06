@@ -10,7 +10,12 @@
     "description": "饭搭子影视 - 免费电影/电视/综艺/动漫（MacCMS，多播放源换源）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["视频", "免费", "影视", "换源"]
+    "tags": [
+      "视频",
+      "免费",
+      "影视",
+      "换源"
+    ]
   },
   "transports": {
     "base_url": "https://fdzys.com",
@@ -35,19 +40,45 @@
       },
       "list_item": {
         "categories": [
-          { "title": "全部", "url": "/tv/all" },
-          { "title": "国产剧", "url": "/tv/guochan" },
-          { "title": "欧美剧", "url": "/tv/oumei" },
-          { "title": "日本剧", "url": "/tv/riben" },
-          { "title": "韩国剧", "url": "/tv/hanguo" }
+          {
+            "title": "全部",
+            "url": "/tv/all"
+          },
+          {
+            "title": "国产剧",
+            "url": "/tv/guochan"
+          },
+          {
+            "title": "欧美剧",
+            "url": "/tv/oumei"
+          },
+          {
+            "title": "日本剧",
+            "url": "/tv/riben"
+          },
+          {
+            "title": "韩国剧",
+            "url": "/tv/hanguo"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": ".myui-vodbox-content" },
+        "root_selector": {
+          "css": ".myui-vodbox-content"
+        },
         "fields": {
-          "title": { "css": "img", "attr": "alt" },
-          "url": { "css": "a[href*='/tv/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-src" }
+          "title": {
+            "css": "img",
+            "attr": "alt"
+          },
+          "url": {
+            "css": "a[href*='/tv/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-src"
+          }
         }
       }
     },
@@ -57,7 +88,9 @@
       "keyword_param": "wd",
       "render": "playwright",
       "item": {
-        "root_selector": { "css": "a[href*='/yu-']" },
+        "root_selector": {
+          "css": "a[href*='/yu-']"
+        },
         "render_config": {
           "interact": true,
           "home_url": "https://fdzys.com/",
@@ -71,10 +104,22 @@
     "detail": {
       "url_pattern": "/tv/[\\w-]+",
       "fields": {
-        "title": { "css": "meta[property='og:title']", "attr": "content" },
-        "cover": { "css": "meta[property='og:image']", "attr": "content" },
-        "summary": { "css": "meta[property='og:description']", "attr": "content" },
-        "author": { "css": "meta[property='og:video:actor']", "attr": "content" }
+        "title": {
+          "css": "meta[property='og:title']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[property='og:description']",
+          "attr": "content"
+        },
+        "author": {
+          "css": "meta[property='og:video:actor']",
+          "attr": "content"
+        }
       }
     },
     "content": {
@@ -91,7 +136,10 @@
           "playerconfig_url": "/static/js/playerconfig.js"
         },
         "play_url": {
-          "selector": { "css": "video#player source", "attr": "src" }
+          "selector": {
+            "css": "video#player source",
+            "attr": "src"
+          }
         }
       }
     }
@@ -99,7 +147,9 @@
   "media": {
     "format": "hls",
     "select": {
-      "video": { "quality": "best" }
+      "video": {
+        "quality": "best"
+      }
     },
     "merge": {
       "tool": "ffmpeg",
@@ -107,14 +157,24 @@
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 30 },
-    "detail": { "max_pages": 1 },
-    "episode": { "max_pages": 1, "max_items": 200 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 30
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 200
+    }
   },
   "diagnostics": {
     "selfcheck": {
       "strategy": "off",
-      "selector": { "css": ".player_name[data-sid]" }
+      "selector": {
+        "css": ".player_name[data-sid]"
+      }
     }
   }
 }

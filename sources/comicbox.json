@@ -10,7 +10,10 @@
     "description": "漫画盒 - 漫画源（分类在专属分类页）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["漫画", "免费"]
+    "tags": [
+      "漫画",
+      "免费"
+    ]
   },
   "transports": {
     "base_url": "https://www.comicbox.xyz",
@@ -35,22 +38,43 @@
         "param": "page"
       },
       "list_item": {
-        "root_selector": { "xpath": "//dd[contains(@class,'sp-filter-item') and contains(@onclick,\"'tag'\")]" },
+        "root_selector": {
+          "xpath": "//dd[contains(@class,'sp-filter-item') and contains(@onclick,\"'tag'\")]"
+        },
         "tag_url_template": "/booklist?tag={tag}",
         "fields": {
-          "title": { "css": "dd.sp-filter-item" },
-          "data_val": { "css": "dd.sp-filter-item", "attr": "data-val" }
+          "title": {
+            "css": "dd.sp-filter-item"
+          },
+          "data_val": {
+            "css": "dd.sp-filter-item",
+            "attr": "data-val"
+          }
         }
       },
       "works_list_item": {
-        "root_selector": { "css": ".sp-booklist-grid a.sp-booklist-card" },
+        "root_selector": {
+          "css": ".sp-booklist-grid a.sp-booklist-card"
+        },
         "cover_render": "playwright",
         "fields": {
-          "title": { "css": ".sp-booklist-title" },
-          "url": { "css": "a.sp-booklist-card", "attr": "href" },
-          "cover": { "css": ".cropped", "attr": "data-src" },
-          "author": { "css": ".sp-booklist-meta" },
-          "update": { "css": ".sp-book-end-badge" }
+          "title": {
+            "css": ".sp-booklist-title"
+          },
+          "url": {
+            "css": "a.sp-booklist-card",
+            "attr": "href"
+          },
+          "cover": {
+            "css": ".cropped",
+            "attr": "data-src"
+          },
+          "author": {
+            "css": ".sp-booklist-meta"
+          },
+          "update": {
+            "css": ".sp-book-end-badge"
+          }
         }
       }
     },
@@ -59,32 +83,65 @@
       "method": "GET",
       "keyword_param": "keyword",
       "item": {
-        "root_selector": { "css": ".sp-search-grid a.sp-search-card" },
+        "root_selector": {
+          "css": ".sp-search-grid a.sp-search-card"
+        },
         "fields": {
-          "title": { "css": ".sp-search-card-title" },
-          "url": { "css": "a.sp-search-card", "attr": "href" },
-          "cover": { "css": ".cropped", "attr": "data-src" },
-          "author": { "css": ".sp-search-card-desc" }
+          "title": {
+            "css": ".sp-search-card-title"
+          },
+          "url": {
+            "css": "a.sp-search-card",
+            "attr": "href"
+          },
+          "cover": {
+            "css": ".cropped",
+            "attr": "data-src"
+          },
+          "author": {
+            "css": ".sp-search-card-desc"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "h1" },
-        "author": { "css": ".sp-book-author" },
-        "status": { "css": ".sp-book-meta-item span" },
-        "summary": { "css": ".sp-book-summary" },
-        "cover": { "css": ".sp-book-cover .cropped", "attr": "data-src" },
-        "tags": { "css": ".sp-book-tag" }
+        "title": {
+          "css": "h1"
+        },
+        "author": {
+          "css": ".sp-book-author"
+        },
+        "status": {
+          "css": ".sp-book-meta-item span"
+        },
+        "summary": {
+          "css": ".sp-book-summary"
+        },
+        "cover": {
+          "css": ".sp-book-cover .cropped",
+          "attr": "data-src"
+        },
+        "tags": {
+          "css": ".sp-book-tag"
+        }
       }
     },
     "content": {
       "page": {
         "list": {
-          "root_selector": { "css": ".sp-chapter-grid .sp-chapter-item" },
+          "root_selector": {
+            "css": ".sp-chapter-grid .sp-chapter-item"
+          },
           "fields": {
-            "title": { "css": "a.sp-chapter-item", "attr": "title" },
-            "url": { "css": "a.sp-chapter-item", "attr": "href" }
+            "title": {
+              "css": "a.sp-chapter-item",
+              "attr": "title"
+            },
+            "url": {
+              "css": "a.sp-chapter-item",
+              "attr": "href"
+            }
           }
         },
         "body": {
@@ -97,23 +154,38 @@
             "extract_mode": "canvas",
             "page_container_selector": "div.cropped"
           },
-          "root_selector": { "css": ".comicpage .cropped" },
+          "root_selector": {
+            "css": ".comicpage .cropped"
+          },
           "fields": {
-            "url": { "css": "div.cropped", "attr": "data-src" }
+            "url": {
+              "css": "div.cropped",
+              "attr": "data-src"
+            }
           }
         }
       }
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 48 },
-    "detail": { "max_pages": 1 },
-    "chapter": { "max_pages": 50, "max_items": 300 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 48
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 50,
+      "max_items": 300
+    }
   },
   "diagnostics": {
     "selfcheck": {
       "strategy": "soft",
-      "selector": { "css": ".sp-booklist-grid" }
+      "selector": {
+        "css": ".sp-booklist-grid"
+      }
     }
   }
 }

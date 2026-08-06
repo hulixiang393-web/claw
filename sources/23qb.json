@@ -192,7 +192,7 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 1,
+      "max_pages": 3,
       "max_results": 30
     },
     "detail": {

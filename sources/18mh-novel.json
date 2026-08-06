@@ -10,7 +10,12 @@
     "description": "禁漫天堂 - 小说源（SPA 渲染正文）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["小说", "成人", "免费", "render"]
+    "tags": [
+      "小说",
+      "成人",
+      "免费",
+      "render"
+    ]
   },
   "transports": {
     "base_url": "https://18mh.net",
@@ -29,25 +34,68 @@
       "list_url": "/novel/all",
       "list_item": {
         "categories": [
-          { "title": "全部小说", "url": "/novel/all" },
-          { "title": "都市激情", "url": "/novel/all/dsjq" },
-          { "title": "校园春色", "url": "/novel/all/xycs" },
-          { "title": "乡村爱情", "url": "/novel/all/xcaq" },
-          { "title": "系统异能", "url": "/novel/all/xtyn" },
-          { "title": "家庭乱伦", "url": "/novel/all/jtll" },
-          { "title": "穿越重生", "url": "/novel/all/cycs" },
-          { "title": "经典武侠", "url": "/novel/all/jdwx" },
-          { "title": "同人改编", "url": "/novel/all/trgb" },
-          { "title": "科学幻想", "url": "/novel/all/kxhx" },
-          { "title": "东方玄幻", "url": "/novel/all/dfxh" }
+          {
+            "title": "全部小说",
+            "url": "/novel/all"
+          },
+          {
+            "title": "都市激情",
+            "url": "/novel/all/dsjq"
+          },
+          {
+            "title": "校园春色",
+            "url": "/novel/all/xycs"
+          },
+          {
+            "title": "乡村爱情",
+            "url": "/novel/all/xcaq"
+          },
+          {
+            "title": "系统异能",
+            "url": "/novel/all/xtyn"
+          },
+          {
+            "title": "家庭乱伦",
+            "url": "/novel/all/jtll"
+          },
+          {
+            "title": "穿越重生",
+            "url": "/novel/all/cycs"
+          },
+          {
+            "title": "经典武侠",
+            "url": "/novel/all/jdwx"
+          },
+          {
+            "title": "同人改编",
+            "url": "/novel/all/trgb"
+          },
+          {
+            "title": "科学幻想",
+            "url": "/novel/all/kxhx"
+          },
+          {
+            "title": "东方玄幻",
+            "url": "/novel/all/dfxh"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "ul.dx-novel-list li" },
+        "root_selector": {
+          "css": "ul.dx-novel-list li"
+        },
         "fields": {
-          "title": { "css": "h2" },
-          "url": { "css": "a[href*='/novel/detail/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-src" }
+          "title": {
+            "css": "h2"
+          },
+          "url": {
+            "css": "a[href*='/novel/detail/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-src"
+          }
         }
       }
     },
@@ -56,29 +104,55 @@
       "method": "GET",
       "keyword_param": "keyword",
       "item": {
-        "root_selector": { "css": "ul.dx-novel-list li" },
+        "root_selector": {
+          "css": "ul.dx-novel-list li"
+        },
         "fields": {
-          "title": { "css": "h2" },
-          "url": { "css": "a[href*='/novel/detail/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-src" }
+          "title": {
+            "css": "h2"
+          },
+          "url": {
+            "css": "a[href*='/novel/detail/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-src"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "h1" },
-        "author": { "css": ".detail-page__meta-item--author" },
-        "summary": { "css": "meta[name='description']", "attr": "content" },
-        "status": { "css": ".detail-page__meta-item" }
+        "title": {
+          "css": "h1"
+        },
+        "author": {
+          "css": ".detail-page__meta-item--author"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "status": {
+          "css": ".detail-page__meta-item"
+        }
       }
     },
     "content": {
       "chapter": {
         "list": {
-          "root_selector": { "css": "a.detail-page__catalog-item" },
+          "root_selector": {
+            "css": "a.detail-page__catalog-item"
+          },
           "fields": {
-            "title": { "css": ".detail-page__chapter-title" },
-            "url": { "css": "a.detail-page__catalog-item", "attr": "href" }
+            "title": {
+              "css": ".detail-page__chapter-title"
+            },
+            "url": {
+              "css": "a.detail-page__catalog-item",
+              "attr": "href"
+            }
           }
         },
         "body": {
@@ -89,15 +163,25 @@
             "extra_delay_ms": 2000,
             "timeout_ms": 30000
           },
-          "selector": { "css": ".dx-container.app-content" }
+          "selector": {
+            "css": ".dx-container.app-content"
+          }
         }
       }
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 48 },
-    "detail": { "max_pages": 1 },
-    "chapter": { "max_pages": 500, "max_items": 500 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 48
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 500,
+      "max_items": 500
+    }
   },
   "decryption": {
     "targets": {

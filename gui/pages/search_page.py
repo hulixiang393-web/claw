@@ -311,7 +311,12 @@ class SearchPage(BasePage):
         self._append_displayed_batch()
 
     def _append_displayed_batch(self) -> None:
-        """按 _results_display 渲染下一批（合并后走此路径）。"""
+        """按 _results_display 渲染下一批（合并后走此路径）。
+
+        渲染一批后若视口未填满（结果不足以撑满一屏），自动补足下一批，
+        直到填满或全部渲染完——保证搜索完第一屏就能看到尽可能多的结果，
+        无需手动滚动才触发加载。
+        """
         display = getattr(self, "_results_display", None)
         if display is None:
             return
@@ -326,6 +331,10 @@ class SearchPage(BasePage):
             self._shown_count += 1
         self._apply_column_stretch(cols)
         self._update_batch_status()
+        # 视口未填满 → 自动补足下一批（滚动懒加载由 _on_scroll 继续）
+        if self._shown_count < len(display):
+            if self.scroll.verticalScrollBar().maximum() < self.scroll.height():
+                self._append_displayed_batch()
 
     def _on_all_done(self) -> None:
         """全部源搜索结束。"""

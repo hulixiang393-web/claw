@@ -10,7 +10,12 @@
     "description": "绅士漫画 - 汉化本子/成人漫画源（MeiuPic CMS）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["漫画", "成人", "汉化", "本子"]
+    "tags": [
+      "漫画",
+      "成人",
+      "汉化",
+      "本子"
+    ]
   },
   "transports": {
     "base_url": "https://www.wnacg.com",
@@ -36,29 +41,85 @@
       },
       "list_item": {
         "categories": [
-          { "title": "最新更新", "url": "/albums.html" },
-          { "title": "同人誌-漢化", "url": "/albums-index-cate-1.html" },
-          { "title": "同人誌-日語", "url": "/albums-index-cate-12.html" },
-          { "title": "同人誌-English", "url": "/albums-index-cate-16.html" },
-          { "title": "CG畫集", "url": "/albums-index-cate-2.html" },
-          { "title": "AI圖集", "url": "/albums-index-cate-37.html" },
-          { "title": "3D漫畫", "url": "/albums-index-cate-22.html" },
-          { "title": "Cosplay", "url": "/albums-index-cate-3.html" },
-          { "title": "單行本-漢化", "url": "/albums-index-cate-9.html" },
-          { "title": "單行本-日語", "url": "/albums-index-cate-13.html" },
-          { "title": "雜誌&短篇-漢化", "url": "/albums-index-cate-10.html" },
-          { "title": "雜誌&短篇-日語", "url": "/albums-index-cate-14.html" },
-          { "title": "韓漫-漢化", "url": "/albums-index-cate-20.html" },
-          { "title": "韓漫-其他", "url": "/albums-index-cate-21.html" },
-          { "title": "排行", "url": "/albums-favorite_ranking.html" }
+          {
+            "title": "最新更新",
+            "url": "/albums.html"
+          },
+          {
+            "title": "同人誌-漢化",
+            "url": "/albums-index-cate-1.html"
+          },
+          {
+            "title": "同人誌-日語",
+            "url": "/albums-index-cate-12.html"
+          },
+          {
+            "title": "同人誌-English",
+            "url": "/albums-index-cate-16.html"
+          },
+          {
+            "title": "CG畫集",
+            "url": "/albums-index-cate-2.html"
+          },
+          {
+            "title": "AI圖集",
+            "url": "/albums-index-cate-37.html"
+          },
+          {
+            "title": "3D漫畫",
+            "url": "/albums-index-cate-22.html"
+          },
+          {
+            "title": "Cosplay",
+            "url": "/albums-index-cate-3.html"
+          },
+          {
+            "title": "單行本-漢化",
+            "url": "/albums-index-cate-9.html"
+          },
+          {
+            "title": "單行本-日語",
+            "url": "/albums-index-cate-13.html"
+          },
+          {
+            "title": "雜誌&短篇-漢化",
+            "url": "/albums-index-cate-10.html"
+          },
+          {
+            "title": "雜誌&短篇-日語",
+            "url": "/albums-index-cate-14.html"
+          },
+          {
+            "title": "韓漫-漢化",
+            "url": "/albums-index-cate-20.html"
+          },
+          {
+            "title": "韓漫-其他",
+            "url": "/albums-index-cate-21.html"
+          },
+          {
+            "title": "排行",
+            "url": "/albums-favorite_ranking.html"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "li.gallary_item" },
+        "root_selector": {
+          "css": "li.gallary_item"
+        },
         "fields": {
-          "title": { "css": "div.title a", "attr": "title" },
-          "url": { "css": "div.pic_box a", "attr": "href" },
-          "cover": { "css": "div.pic_box img", "attr": "src" }
+          "title": {
+            "css": "div.title a",
+            "attr": "title"
+          },
+          "url": {
+            "css": "div.pic_box a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.pic_box img",
+            "attr": "src"
+          }
         }
       }
     },
@@ -72,34 +133,68 @@
         "syn": "yes"
       },
       "item": {
-        "root_selector": { "css": "li.gallary_item" },
+        "root_selector": {
+          "css": "li.gallary_item"
+        },
         "fields": {
-          "title": { "css": "div.title a", "attr": "title" },
-          "url": { "css": "div.pic_box a", "attr": "href" },
-          "cover": { "css": "div.pic_box img", "attr": "src" }
+          "title": {
+            "css": "div.title a",
+            "attr": "title"
+          },
+          "url": {
+            "css": "div.pic_box a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.pic_box img",
+            "attr": "src"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "#bodywrap h2" },
-        "cover": { "css": ".asTBcell.uwthumb img", "attr": "src" },
-        "summary": { "css": ".asTBcell.uwconn p" },
-        "status": { "css": ".asTBcell.uwconn label" },
-        "tags": { "css": "a.tagshow" },
-        "author": { "css": ".asTBcell.uwuinfo p:first-of-type" }
+        "title": {
+          "css": "#bodywrap h2"
+        },
+        "cover": {
+          "css": ".asTBcell.uwthumb img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": ".asTBcell.uwconn p"
+        },
+        "status": {
+          "css": ".asTBcell.uwconn label"
+        },
+        "tags": {
+          "css": "a.tagshow"
+        },
+        "author": {
+          "css": ".asTBcell.uwuinfo p:first-of-type"
+        }
       }
     },
     "content": {
       "page": {
         "single_chapter": true,
         "list": {
-          "root_selector": { "css": ".grid .gallary_item .pic_box" },
+          "root_selector": {
+            "css": ".grid .gallary_item .pic_box"
+          },
           "fields": {
-            "url": { "css": "img", "attr": "src" }
+            "url": {
+              "css": "img",
+              "attr": "src"
+            }
           },
           "paginator": {
-            "next_link": { "selector": { "css": "span.next a", "attr": "href" } },
+            "next_link": {
+              "selector": {
+                "css": "span.next a",
+                "attr": "href"
+              }
+            },
             "max_pages": 10
           }
         }
@@ -107,14 +202,24 @@
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 20 },
-    "detail": { "max_pages": 1 },
-    "page": { "max_pages": 50, "max_items": 500 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 20
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 50,
+      "max_items": 500
+    }
   },
   "diagnostics": {
     "selfcheck": {
       "strategy": "soft",
-      "selector": { "css": "li.gallary_item" }
+      "selector": {
+        "css": "li.gallary_item"
+      }
     }
   }
 }

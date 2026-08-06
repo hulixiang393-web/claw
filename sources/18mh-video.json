@@ -10,7 +10,12 @@
     "description": "禁漫天堂 - 视频源（HLS m3u8，AES 加密流）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["视频", "成人", "免费", "hls"]
+    "tags": [
+      "视频",
+      "成人",
+      "免费",
+      "hls"
+    ]
   },
   "transports": {
     "base_url": "https://18mh.net",
@@ -29,24 +34,64 @@
       "list_url": "/mv/all",
       "list_item": {
         "categories": [
-          { "title": "全部视频", "url": "/mv/all" },
-          { "title": "国产视频", "url": "/mv/all/gcsp" },
-          { "title": "日本AV", "url": "/mv/all/rbav" },
-          { "title": "H动漫", "url": "/mv/all/hdm" },
-          { "title": "偷拍摄像", "url": "/mv/all/tp" },
-          { "title": "次元萝莉", "url": "/mv/all/cyll" },
-          { "title": "国产传媒", "url": "/mv/all/gccm" },
-          { "title": "主播福利", "url": "/mv/all/zbfl" },
-          { "title": "吃瓜爆料", "url": "/mv/all/cgbl" },
-          { "title": "无码流出", "url": "/mv/all/wmlc" }
+          {
+            "title": "全部视频",
+            "url": "/mv/all"
+          },
+          {
+            "title": "国产视频",
+            "url": "/mv/all/gcsp"
+          },
+          {
+            "title": "日本AV",
+            "url": "/mv/all/rbav"
+          },
+          {
+            "title": "H动漫",
+            "url": "/mv/all/hdm"
+          },
+          {
+            "title": "偷拍摄像",
+            "url": "/mv/all/tp"
+          },
+          {
+            "title": "次元萝莉",
+            "url": "/mv/all/cyll"
+          },
+          {
+            "title": "国产传媒",
+            "url": "/mv/all/gccm"
+          },
+          {
+            "title": "主播福利",
+            "url": "/mv/all/zbfl"
+          },
+          {
+            "title": "吃瓜爆料",
+            "url": "/mv/all/cgbl"
+          },
+          {
+            "title": "无码流出",
+            "url": "/mv/all/wmlc"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "ul.dx-video-list li" },
+        "root_selector": {
+          "css": "ul.dx-video-list li"
+        },
         "fields": {
-          "title": { "css": "h2" },
-          "url": { "css": "a[href*='/mv/detail/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-src" }
+          "title": {
+            "css": "h2"
+          },
+          "url": {
+            "css": "a[href*='/mv/detail/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-src"
+          }
         }
       }
     },
@@ -55,28 +100,52 @@
       "method": "GET",
       "keyword_param": "keyword",
       "item": {
-        "root_selector": { "css": "ul.dx-video-list li" },
+        "root_selector": {
+          "css": "ul.dx-video-list li"
+        },
         "fields": {
-          "title": { "css": "h2" },
-          "url": { "css": "a[href*='/mv/detail/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-src" }
+          "title": {
+            "css": "h2"
+          },
+          "url": {
+            "css": "a[href*='/mv/detail/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-src"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "h1" },
-        "summary": { "css": "meta[name='description']", "attr": "content" },
-        "status": { "css": ".detail-page__meta-item" }
+        "title": {
+          "css": "h1"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "status": {
+          "css": ".detail-page__meta-item"
+        }
       }
     },
     "content": {
       "episode": {
         "list": {
-          "root_selector": { "css": "a[href*='/mv/detail/']" },
+          "root_selector": {
+            "css": "a[href*='/mv/detail/']"
+          },
           "fields": {
-            "title": { "css": "h1" },
-            "url": { "css": "a[href*='/mv/detail/']", "attr": "href" }
+            "title": {
+              "css": "h1"
+            },
+            "url": {
+              "css": "a[href*='/mv/detail/']",
+              "attr": "href"
+            }
           }
         },
         "play_url": {
@@ -86,9 +155,17 @@
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 96 },
-    "detail": { "max_pages": 1 },
-    "episode": { "max_pages": 1, "max_items": 1 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 96
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
   },
   "decryption": {
     "targets": {

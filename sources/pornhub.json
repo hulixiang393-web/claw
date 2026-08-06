@@ -10,7 +10,11 @@
     "description": "PornHub 视频源（HTML 搜索/发现 + yt-dlp 高清流）",
     "lang": "en",
     "region": "en",
-    "tags": ["视频", "成人", "ytdlp"]
+    "tags": [
+      "视频",
+      "成人",
+      "ytdlp"
+    ]
   },
   "transports": {
     "base_url": "https://cn.pornhub.com",
@@ -36,22 +40,53 @@
       },
       "list_item": {
         "categories": [
-          { "title": "最新视频", "url": "/video?page=1" },
-          { "title": "最多观看", "url": "/video?o=mv&page=1" },
-          { "title": "最热评分", "url": "/video?o=tr&page=1" },
-          { "title": "高清视频", "url": "/hd?page=1" },
-          { "title": "女优", "url": "/pornstars?page=1" }
+          {
+            "title": "最新视频",
+            "url": "/video?page=1"
+          },
+          {
+            "title": "最多观看",
+            "url": "/video?o=mv&page=1"
+          },
+          {
+            "title": "最热评分",
+            "url": "/video?o=tr&page=1"
+          },
+          {
+            "title": "高清视频",
+            "url": "/hd?page=1"
+          },
+          {
+            "title": "女优",
+            "url": "/pornstars?page=1"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "li.pcVideoListItem" },
+        "root_selector": {
+          "css": "li.pcVideoListItem"
+        },
         "fields": {
-          "title": { "css": "span.title a" },
-          "url": { "css": "a[href*='/view_video.php?viewkey=']", "attr": "href" },
-          "cover": { "css": "img", "attr": "src" },
-          "author": { "css": ".videoUploaderBlock a" },
-          "duration": { "css": "var.duration" },
-          "views": { "css": ".views var" }
+          "title": {
+            "css": "span.title a"
+          },
+          "url": {
+            "css": "a[href*='/view_video.php?viewkey=']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          },
+          "author": {
+            "css": ".videoUploaderBlock a"
+          },
+          "duration": {
+            "css": "var.duration"
+          },
+          "views": {
+            "css": ".views var"
+          }
         }
       }
     },
@@ -60,13 +95,27 @@
       "method": "GET",
       "keyword_param": "search",
       "item": {
-        "root_selector": { "css": "li.pcVideoListItem" },
+        "root_selector": {
+          "css": "li.pcVideoListItem"
+        },
         "fields": {
-          "title": { "css": "span.title a" },
-          "url": { "css": "a[href*='/view_video.php?viewkey=']", "attr": "href" },
-          "cover": { "css": "img", "attr": "src" },
-          "author": { "css": ".videoUploaderBlock a" },
-          "update": { "css": "var.duration" }
+          "title": {
+            "css": "span.title a"
+          },
+          "url": {
+            "css": "a[href*='/view_video.php?viewkey=']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          },
+          "author": {
+            "css": ".videoUploaderBlock a"
+          },
+          "update": {
+            "css": "var.duration"
+          }
         }
       }
     }
@@ -84,7 +133,9 @@
   "media": {
     "format": "hls",
     "select": {
-      "video": { "quality": "best" }
+      "video": {
+        "quality": "best"
+      }
     },
     "merge": {
       "tool": "ffmpeg",
@@ -92,14 +143,24 @@
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 36 },
-    "detail": { "max_pages": 1 },
-    "episode": { "max_pages": 1, "max_items": 20 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 36
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 20
+    }
   },
   "diagnostics": {
     "selfcheck": {
       "strategy": "soft",
-      "selector": { "css": "li.pcVideoListItem" }
+      "selector": {
+        "css": "li.pcVideoListItem"
+      }
     }
   }
 }

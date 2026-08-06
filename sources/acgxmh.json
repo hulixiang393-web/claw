@@ -10,7 +10,11 @@
     "description": "ACG漫画网 - 里番/全彩工口漫画源（分页阅读）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["漫画", "成人", "分页"]
+    "tags": [
+      "漫画",
+      "成人",
+      "分页"
+    ]
   },
   "transports": {
     "base_url": "https://www.acgxmh.com",
@@ -34,22 +38,57 @@
       },
       "list_item": {
         "categories": [
-          { "title": "最新", "url": "/" },
-          { "title": "漫画", "url": "/h/" },
-          { "title": "图集", "url": "/hentai/" },
-          { "title": "动画", "url": "/animation/" },
-          { "title": "全彩", "url": "/tags/full-color.html" },
-          { "title": "网漫", "url": "/webtoon/" },
-          { "title": "西漫", "url": "/western/" },
-          { "title": "写真", "url": "/cos/" }
+          {
+            "title": "最新",
+            "url": "/"
+          },
+          {
+            "title": "漫画",
+            "url": "/h/"
+          },
+          {
+            "title": "图集",
+            "url": "/hentai/"
+          },
+          {
+            "title": "动画",
+            "url": "/animation/"
+          },
+          {
+            "title": "全彩",
+            "url": "/tags/full-color.html"
+          },
+          {
+            "title": "网漫",
+            "url": "/webtoon/"
+          },
+          {
+            "title": "西漫",
+            "url": "/western/"
+          },
+          {
+            "title": "写真",
+            "url": "/cos/"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "ul#list li" },
+        "root_selector": {
+          "css": "ul#list li"
+        },
         "fields": {
-          "title": { "css": "a.thumb", "attr": "title" },
-          "url": { "css": "a.thumb", "attr": "href" },
-          "cover": { "css": "a.thumb img", "attr": "src" }
+          "title": {
+            "css": "a.thumb",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a.thumb",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a.thumb img",
+            "attr": "src"
+          }
         }
       }
     },
@@ -58,38 +97,71 @@
       "method": "GET",
       "keyword_param": "q",
       "item": {
-        "root_selector": { "css": "ul#list li" },
+        "root_selector": {
+          "css": "ul#list li"
+        },
         "fields": {
-          "title": { "css": "a.thumb", "attr": "title" },
-          "url": { "css": "a.thumb", "attr": "href" },
-          "cover": { "css": "a.thumb img", "attr": "src" }
+          "title": {
+            "css": "a.thumb",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a.thumb",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a.thumb img",
+            "attr": "src"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "h1.title" },
-        "summary": { "css": "meta[name='description']", "attr": "content" },
-        "status": { "css": ".info" }
+        "title": {
+          "css": "h1.title"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "status": {
+          "css": ".info"
+        }
       }
     },
     "content": {
       "page": {
         "list": {
-          "root_selector": { "css": ".page.bigpage" },
+          "root_selector": {
+            "css": ".page.bigpage"
+          },
           "fields": {
-            "title": { "css": "h1.title" },
-            "url": { "css": "a.a1:first-child", "attr": "href" }
+            "title": {
+              "css": "h1.title"
+            },
+            "url": {
+              "css": "a.a1:first-child",
+              "attr": "href"
+            }
           }
         },
         "body": {
-          "root_selector": { "css": "p.manga-picture img" },
+          "root_selector": {
+            "css": "p.manga-picture img"
+          },
           "fields": {
-            "url": { "css": "img", "attr": "src" }
+            "url": {
+              "css": "img",
+              "attr": "src"
+            }
           },
           "paginator": {
             "next_link": {
-              "selector": { "css": "a.a1 + a.a1", "attr": "href" }
+              "selector": {
+                "css": "a.a1 + a.a1",
+                "attr": "href"
+              }
             }
           }
         }
@@ -97,9 +169,16 @@
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 50 },
-    "detail": { "max_pages": 1 },
-    "page": { "max_pages": 30 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 50
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 30
+    }
   },
   "diagnostics": {
     "selfcheck": {

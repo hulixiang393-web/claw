@@ -10,7 +10,11 @@
     "description": "禁漫天堂 - 成人漫画源",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["漫画", "成人", "免费"]
+    "tags": [
+      "漫画",
+      "成人",
+      "免费"
+    ]
   },
   "transports": {
     "base_url": "https://18mh.net",
@@ -35,28 +39,79 @@
       },
       "list_item": {
         "categories": [
-          { "title": "全部", "url": "/comic/all" },
-          { "title": "爱情", "url": "/comic/all/aq" },
-          { "title": "BL", "url": "/comic/all/bl" },
-          { "title": "单本", "url": "/comic/all/db" },
-          { "title": "短篇", "url": "/comic/all/dp" },
-          { "title": "韩国H漫", "url": "/comic/all/hg" },
-          { "title": "禁漫", "url": "/comic/all/jq" },
-          { "title": "连载", "url": "/comic/all/ll" },
-          { "title": "清末", "url": "/comic/all/qh" },
-          { "title": "日韩", "url": "/comic/all/rb" },
-          { "title": "同人", "url": "/comic/all/tj" },
-          { "title": "汉化", "url": "/comic/all/tr" },
-          { "title": "校园", "url": "/comic/all/xy" }
+          {
+            "title": "全部",
+            "url": "/comic/all"
+          },
+          {
+            "title": "爱情",
+            "url": "/comic/all/aq"
+          },
+          {
+            "title": "BL",
+            "url": "/comic/all/bl"
+          },
+          {
+            "title": "单本",
+            "url": "/comic/all/db"
+          },
+          {
+            "title": "短篇",
+            "url": "/comic/all/dp"
+          },
+          {
+            "title": "韩国H漫",
+            "url": "/comic/all/hg"
+          },
+          {
+            "title": "禁漫",
+            "url": "/comic/all/jq"
+          },
+          {
+            "title": "连载",
+            "url": "/comic/all/ll"
+          },
+          {
+            "title": "清末",
+            "url": "/comic/all/qh"
+          },
+          {
+            "title": "日韩",
+            "url": "/comic/all/rb"
+          },
+          {
+            "title": "同人",
+            "url": "/comic/all/tj"
+          },
+          {
+            "title": "汉化",
+            "url": "/comic/all/tr"
+          },
+          {
+            "title": "校园",
+            "url": "/comic/all/xy"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "ul.dx-novel-list li" },
+        "root_selector": {
+          "css": "ul.dx-novel-list li"
+        },
         "fields": {
-          "title": { "css": "h2, h3" },
-          "url": { "css": "a[href*='/comic/detail/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-src" },
-          "author": { "css": ".justify-between a" }
+          "title": {
+            "css": "h2, h3"
+          },
+          "url": {
+            "css": "a[href*='/comic/detail/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-src"
+          },
+          "author": {
+            "css": ".justify-between a"
+          }
         }
       }
     },
@@ -65,49 +120,95 @@
       "method": "GET",
       "keyword_param": "keyword",
       "item": {
-        "root_selector": { "css": "ul.dx-novel-list li" },
+        "root_selector": {
+          "css": "ul.dx-novel-list li"
+        },
         "fields": {
-          "title": { "css": "h2, h3" },
-          "url": { "css": "a[href*='/comic/detail/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-src" },
-          "author": { "css": ".justify-between a" }
+          "title": {
+            "css": "h2, h3"
+          },
+          "url": {
+            "css": "a[href*='/comic/detail/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-src"
+          },
+          "author": {
+            "css": ".justify-between a"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "h1" },
-        "author": { "css": "a[href*='/comic/all/author/']" },
-        "cover": { "css": "meta[property='og:image']", "attr": "content" },
-        "summary": { "css": "meta[property='og:description']", "attr": "content" },
-        "status": { "css": "span.detail-page__cover-corner-badge" },
-        "tags": { "css": "a.detail-page__tag" }
+        "title": {
+          "css": "h1"
+        },
+        "author": {
+          "css": "a[href*='/comic/all/author/']"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[property='og:description']",
+          "attr": "content"
+        },
+        "status": {
+          "css": "span.detail-page__cover-corner-badge"
+        },
+        "tags": {
+          "css": "a.detail-page__tag"
+        }
       }
     },
     "content": {
       "page": {
         "list": {
-          "root_selector": { "css": "a.detail-page__catalog-item" },
+          "root_selector": {
+            "css": "a.detail-page__catalog-item"
+          },
           "chapter_order": "asc",
           "title_clean": true,
           "fields": {
-            "title": { "css": "span.detail-page__chapter-title" },
-            "url": { "css": "a.detail-page__catalog-item", "attr": "href" }
+            "title": {
+              "css": "span.detail-page__chapter-title"
+            },
+            "url": {
+              "css": "a.detail-page__catalog-item",
+              "attr": "href"
+            }
           }
         },
         "body": {
-          "root_selector": { "css": "img[data-src]" },
+          "root_selector": {
+            "css": "img[data-src]"
+          },
           "fields": {
-            "url": { "css": "img[data-src]", "attr": "data-src" }
+            "url": {
+              "css": "img[data-src]",
+              "attr": "data-src"
+            }
           }
         }
       }
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 48 },
-    "detail": { "max_pages": 1 },
-    "page": { "max_pages": 300, "max_items": 300 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 48
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 300,
+      "max_items": 300
+    }
   },
   "decryption": {
     "targets": {
@@ -124,7 +225,9 @@
   "diagnostics": {
     "selfcheck": {
       "strategy": "soft",
-      "selector": { "css": "a[href*='/comic/detail/']" }
+      "selector": {
+        "css": "a[href*='/comic/detail/']"
+      }
     }
   }
 }

@@ -10,7 +10,13 @@
     "description": "包子漫画 - 免费在线漫画阅读",
     "lang": "zh-CN",
     "region": "tw",
-    "tags": ["漫画", "免费", "日本", "韩国", "中国"]
+    "tags": [
+      "漫画",
+      "免费",
+      "日本",
+      "韩国",
+      "中国"
+    ]
   },
   "transports": {
     "base_url": "https://www.baozimh.com",
@@ -35,39 +41,125 @@
       },
       "list_item": {
         "categories": [
-          { "title": "全部", "url": "/classify?type=all&region=all&state=all&filter=*" },
-          { "title": "热血", "url": "/classify?type=rexie&region=all&state=all&filter=*" },
-          { "title": "恋爱", "url": "/classify?type=lianai&region=all&state=all&filter=*" },
-          { "title": "冒险", "url": "/classify?type=mouxian&region=all&state=all&filter=*" },
-          { "title": "搞笑", "url": "/classify?type=gaoxiao&region=all&state=all&filter=*" },
-          { "title": "奇幻", "url": "/classify?type=qihuan&region=all&state=all&filter=*" },
-          { "title": "后宫", "url": "/classify?type=hougong&region=all&state=all&filter=*" },
-          { "title": "治愈", "url": "/classify?type=chunai&region=all&state=all&filter=*" },
-          { "title": "异世界", "url": "/classify?type=kehuan&region=all&state=all&filter=*" },
-          { "title": "日常", "url": "/classify?type=richang&region=all&state=all&filter=*" },
-          { "title": "剧情", "url": "/classify?type=juqing&region=all&state=all&filter=*" },
-          { "title": "推理", "url": "/classify?type=tuili&region=all&state=all&filter=*" },
-          { "title": "格斗", "url": "/classify?type=gedou&region=all&state=all&filter=*" },
-          { "title": "少年", "url": "/classify?type=shaonian&region=all&state=all&filter=*" },
-          { "title": "穿越", "url": "/classify?type=chuanyue&region=all&state=all&filter=*" },
-          { "title": "都市", "url": "/classify?type=dushi&region=all&state=all&filter=*" },
-          { "title": "汉化", "url": "/classify?type=hanman&region=all&state=all&filter=*" },
-          { "title": "单做", "url": "/classify?type=danuzhu&region=all&state=all&filter=*" },
-          { "title": "古风", "url": "/classify?type=gufeng&region=all&state=all&filter=*" },
-          { "title": "其他", "url": "/classify?type=qita&region=all&state=all&filter=*" },
-          { "title": "连载中", "url": "/classify?type=all&region=all&state=serial&filter=*" },
-          { "title": "完结", "url": "/classify?type=all&region=all&state=pub&filter=*" },
-          { "title": "日本", "url": "/classify?type=all&region=jp&state=all&filter=*" },
-          { "title": "韩国", "url": "/classify?type=all&region=kr&state=all&filter=*" },
-          { "title": "中国", "url": "/classify?type=all&region=cn&state=all&filter=*" }
+          {
+            "title": "全部",
+            "url": "/classify?type=all&region=all&state=all&filter=*"
+          },
+          {
+            "title": "热血",
+            "url": "/classify?type=rexie&region=all&state=all&filter=*"
+          },
+          {
+            "title": "恋爱",
+            "url": "/classify?type=lianai&region=all&state=all&filter=*"
+          },
+          {
+            "title": "冒险",
+            "url": "/classify?type=mouxian&region=all&state=all&filter=*"
+          },
+          {
+            "title": "搞笑",
+            "url": "/classify?type=gaoxiao&region=all&state=all&filter=*"
+          },
+          {
+            "title": "奇幻",
+            "url": "/classify?type=qihuan&region=all&state=all&filter=*"
+          },
+          {
+            "title": "后宫",
+            "url": "/classify?type=hougong&region=all&state=all&filter=*"
+          },
+          {
+            "title": "治愈",
+            "url": "/classify?type=chunai&region=all&state=all&filter=*"
+          },
+          {
+            "title": "异世界",
+            "url": "/classify?type=kehuan&region=all&state=all&filter=*"
+          },
+          {
+            "title": "日常",
+            "url": "/classify?type=richang&region=all&state=all&filter=*"
+          },
+          {
+            "title": "剧情",
+            "url": "/classify?type=juqing&region=all&state=all&filter=*"
+          },
+          {
+            "title": "推理",
+            "url": "/classify?type=tuili&region=all&state=all&filter=*"
+          },
+          {
+            "title": "格斗",
+            "url": "/classify?type=gedou&region=all&state=all&filter=*"
+          },
+          {
+            "title": "少年",
+            "url": "/classify?type=shaonian&region=all&state=all&filter=*"
+          },
+          {
+            "title": "穿越",
+            "url": "/classify?type=chuanyue&region=all&state=all&filter=*"
+          },
+          {
+            "title": "都市",
+            "url": "/classify?type=dushi&region=all&state=all&filter=*"
+          },
+          {
+            "title": "汉化",
+            "url": "/classify?type=hanman&region=all&state=all&filter=*"
+          },
+          {
+            "title": "单做",
+            "url": "/classify?type=danuzhu&region=all&state=all&filter=*"
+          },
+          {
+            "title": "古风",
+            "url": "/classify?type=gufeng&region=all&state=all&filter=*"
+          },
+          {
+            "title": "其他",
+            "url": "/classify?type=qita&region=all&state=all&filter=*"
+          },
+          {
+            "title": "连载中",
+            "url": "/classify?type=all&region=all&state=serial&filter=*"
+          },
+          {
+            "title": "完结",
+            "url": "/classify?type=all&region=all&state=pub&filter=*"
+          },
+          {
+            "title": "日本",
+            "url": "/classify?type=all&region=jp&state=all&filter=*"
+          },
+          {
+            "title": "韩国",
+            "url": "/classify?type=all&region=kr&state=all&filter=*"
+          },
+          {
+            "title": "中国",
+            "url": "/classify?type=all&region=cn&state=all&filter=*"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "div.comics-card" },
+        "root_selector": {
+          "css": "div.comics-card"
+        },
         "fields": {
-          "title": { "css": "a.comics-card__poster", "attr": "title" },
-          "url": { "css": "a.comics-card__poster", "attr": "href" },
-          "cover": { "css": "amp-img", "attr": "src" }
+          "title": {
+            "css": "a.comics-card__poster",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a.comics-card__poster",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "amp-img",
+            "attr": "src"
+          }
         }
       }
     },
@@ -76,48 +168,96 @@
       "method": "GET",
       "keyword_param": "q",
       "item": {
-        "root_selector": { "css": "div.comics-card" },
+        "root_selector": {
+          "css": "div.comics-card"
+        },
         "fields": {
-          "title": { "css": "a.comics-card__poster", "attr": "title" },
-          "url": { "css": "a.comics-card__poster", "attr": "href" },
-          "cover": { "css": "amp-img", "attr": "src" }
+          "title": {
+            "css": "a.comics-card__poster",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a.comics-card__poster",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "amp-img",
+            "attr": "src"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "meta[name='og:novel:book_name']", "attr": "content" },
-        "author": { "css": "meta[name='og:novel:author']", "attr": "content" },
-        "cover": { "css": "amp-img[alt], .comics-card__poster amp-img", "attr": "src" },
-        "summary": { "css": "meta[name='description']", "attr": "content" },
-        "status": { "css": "meta[name='og:novel:status']", "attr": "content" },
-        "tags": { "css": "div.tag-list span" }
+        "title": {
+          "css": "meta[name='og:novel:book_name']",
+          "attr": "content"
+        },
+        "author": {
+          "css": "meta[name='og:novel:author']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "amp-img[alt], .comics-card__poster amp-img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "status": {
+          "css": "meta[name='og:novel:status']",
+          "attr": "content"
+        },
+        "tags": {
+          "css": "div.tag-list span"
+        }
       }
     },
     "content": {
       "page": {
         "list": {
-          "root_selector": { "css": "a.comics-chapters__item" },
+          "root_selector": {
+            "css": "a.comics-chapters__item"
+          },
           "chapter_order": "asc",
           "title_clean": true,
           "fields": {
-            "url": { "css": "a.comics-chapters__item", "attr": "href" },
-            "title": { "css": "span" }
+            "url": {
+              "css": "a.comics-chapters__item",
+              "attr": "href"
+            },
+            "title": {
+              "css": "span"
+            }
           }
         },
         "body": {
-          "root_selector": { "css": "amp-img.comic-contain__item" },
+          "root_selector": {
+            "css": "amp-img.comic-contain__item"
+          },
           "fields": {
-            "url": { "css": "amp-img", "attr": "data-src" }
+            "url": {
+              "css": "amp-img",
+              "attr": "data-src"
+            }
           }
         }
       }
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 37 },
-    "detail": { "max_pages": 1 },
-    "page": { "max_pages": 500, "max_items": 2000 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 37
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 500,
+      "max_items": 2000
+    }
   },
   "diagnostics": {
     "selfcheck": {

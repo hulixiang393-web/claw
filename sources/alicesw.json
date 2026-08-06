@@ -10,7 +10,11 @@
     "description": "爱丽丝书屋 - 全属性免费小说创作网站（成人）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["小说", "成人", "免费"]
+    "tags": [
+      "小说",
+      "成人",
+      "免费"
+    ]
   },
   "transports": {
     "base_url": "https://www.alicesw.com",
@@ -34,26 +38,72 @@
       },
       "list_item": {
         "categories": [
-          { "title": "最新", "url": "/original.html" },
-          { "title": "玄幻", "url": "/lists/62.html" },
-          { "title": "都市", "url": "/lists/64.html" },
-          { "title": "乱伦", "url": "/lists/65.html" },
-          { "title": "武侠", "url": "/lists/68.html" },
-          { "title": "系统", "url": "/lists/69.html" },
-          { "title": "科幻", "url": "/lists/71.html" },
-          { "title": "奇幻", "url": "/lists/75.html" },
-          { "title": "经典", "url": "/lists/79.html" },
-          { "title": "同人", "url": "/lists/73.html" },
-          { "title": "校园", "url": "/lists/61.html" },
-          { "title": "穿越", "url": "/lists/70.html" }
+          {
+            "title": "最新",
+            "url": "/original.html"
+          },
+          {
+            "title": "玄幻",
+            "url": "/lists/62.html"
+          },
+          {
+            "title": "都市",
+            "url": "/lists/64.html"
+          },
+          {
+            "title": "乱伦",
+            "url": "/lists/65.html"
+          },
+          {
+            "title": "武侠",
+            "url": "/lists/68.html"
+          },
+          {
+            "title": "系统",
+            "url": "/lists/69.html"
+          },
+          {
+            "title": "科幻",
+            "url": "/lists/71.html"
+          },
+          {
+            "title": "奇幻",
+            "url": "/lists/75.html"
+          },
+          {
+            "title": "经典",
+            "url": "/lists/79.html"
+          },
+          {
+            "title": "同人",
+            "url": "/lists/73.html"
+          },
+          {
+            "title": "校园",
+            "url": "/lists/61.html"
+          },
+          {
+            "title": "穿越",
+            "url": "/lists/70.html"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "li.two" },
+        "root_selector": {
+          "css": "li.two"
+        },
         "fields": {
-          "title": { "css": "a[href*='/novel/']" },
-          "url": { "css": "a[href*='/novel/']", "attr": "href" },
-          "cover": { "css": "a[href*='/novel/'] img", "attr": "src" }
+          "title": {
+            "css": "a[href*='/novel/']"
+          },
+          "url": {
+            "css": "a[href*='/novel/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a[href*='/novel/'] img",
+            "attr": "src"
+          }
         }
       }
     },
@@ -62,42 +112,77 @@
       "method": "GET",
       "keyword_param": "q",
       "item": {
-        "root_selector": { "css": "a[href*='/novel/']" },
+        "root_selector": {
+          "css": "a[href*='/novel/']"
+        },
         "fields": {
-          "title": { "css": "a[href*='/novel/']" },
-          "url": { "css": "a[href*='/novel/']", "attr": "href" },
-          "cover": { "css": "a[href*='/novel/'] img", "attr": "src" }
+          "title": {
+            "css": "a[href*='/novel/']"
+          },
+          "url": {
+            "css": "a[href*='/novel/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a[href*='/novel/'] img",
+            "attr": "src"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "div.novel_title" },
-        "cover": { "css": "img.lazyload_book_cover", "attr": "data-src" },
-        "summary": { "css": "meta[name='description']", "attr": "content" }
+        "title": {
+          "css": "div.novel_title"
+        },
+        "cover": {
+          "css": "img.lazyload_book_cover",
+          "attr": "data-src"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        }
       }
     },
     "content": {
       "chapter": {
         "list": {
           "chapters_url": "/other/chapters/id/{id}.html",
-          "root_selector": { "css": "a[href*='/book/']" },
+          "root_selector": {
+            "css": "a[href*='/book/']"
+          },
           "chapter_order": "asc",
           "fields": {
-            "title": { "css": "a[href*='/book/']" },
-            "url": { "css": "a[href*='/book/']", "attr": "href" }
+            "title": {
+              "css": "a[href*='/book/']"
+            },
+            "url": {
+              "css": "a[href*='/book/']",
+              "attr": "href"
+            }
           }
         },
         "body": {
-          "selector": { "css": "div.read-content.j_readContent p" }
+          "selector": {
+            "css": "div.read-content.j_readContent p"
+          }
         }
       }
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 50 },
-    "detail": { "max_pages": 1 },
-    "chapter": { "max_pages": 100, "max_items": 500 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 50
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 100,
+      "max_items": 500
+    }
   },
   "diagnostics": {
     "selfcheck": {

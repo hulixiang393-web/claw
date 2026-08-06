@@ -10,7 +10,11 @@
     "description": "AGE动漫 - 动漫视频源（Playwright 渲染 iframe 解析站拿源）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["视频", "动漫", "免费"]
+    "tags": [
+      "视频",
+      "动漫",
+      "免费"
+    ]
   },
   "transports": {
     "base_url": "https://www.agedm.io",
@@ -35,18 +39,41 @@
       },
       "list_item": {
         "categories": [
-          { "title": "全部", "url": "/catalog/all-all-all-all-all-time-1" },
-          { "title": "番剧", "url": "/catalog/1-all-all-all-all-time-1" },
-          { "title": "剧场版", "url": "/catalog/2-all-all-all-all-time-1" },
-          { "title": "国漫", "url": "/catalog/3-all-all-all-all-time-1" }
+          {
+            "title": "全部",
+            "url": "/catalog/all-all-all-all-all-time-1"
+          },
+          {
+            "title": "番剧",
+            "url": "/catalog/1-all-all-all-all-time-1"
+          },
+          {
+            "title": "剧场版",
+            "url": "/catalog/2-all-all-all-all-time-1"
+          },
+          {
+            "title": "国漫",
+            "url": "/catalog/3-all-all-all-all-time-1"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "a[href*='/detail/']" },
+        "root_selector": {
+          "css": "a[href*='/detail/']"
+        },
         "fields": {
-          "title": { "css": "a[href*='/detail/']", "attr": "title" },
-          "url": { "css": "a[href*='/detail/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-original" }
+          "title": {
+            "css": "a[href*='/detail/']",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a[href*='/detail/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-original"
+          }
         }
       }
     },
@@ -55,27 +82,52 @@
       "method": "GET",
       "keyword_param": "key",
       "item": {
-        "root_selector": { "css": "a[href*='/detail/']" },
+        "root_selector": {
+          "css": "a[href*='/detail/']"
+        },
         "fields": {
-          "title": { "css": "a[href*='/detail/']", "attr": "title" },
-          "url": { "css": "a[href*='/detail/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-original" }
+          "title": {
+            "css": "a[href*='/detail/']",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a[href*='/detail/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "data-original"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "meta[property='og:title']", "attr": "content" },
-        "summary": { "css": "meta[name='description']", "attr": "content" }
+        "title": {
+          "css": "meta[property='og:title']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        }
       }
     },
     "content": {
       "episode": {
         "list": {
-          "root_selector": { "css": "a[href*='/play/']" },
+          "root_selector": {
+            "css": "a[href*='/play/']"
+          },
           "fields": {
-            "title": { "css": "a[href*='/play/']", "attr": "title" },
-            "url": { "css": "a[href*='/play/']", "attr": "href" }
+            "title": {
+              "css": "a[href*='/play/']",
+              "attr": "title"
+            },
+            "url": {
+              "css": "a[href*='/play/']",
+              "attr": "href"
+            }
           }
         },
         "play_url": {
@@ -92,14 +144,27 @@
   "media": {
     "format": "mp4",
     "select": {
-      "video": { "quality": "best" }
+      "video": {
+        "quality": "best"
+      }
     },
-    "merge": { "tool": "ffmpeg", "output_format": "mp4" }
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 40 },
-    "detail": { "max_pages": 1 },
-    "episode": { "max_pages": 1, "max_items": 1 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 40
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
   },
   "diagnostics": {
     "selfcheck": {

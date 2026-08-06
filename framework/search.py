@@ -137,21 +137,16 @@ class Search:
         method = search_cfg.get("method") or "GET"
         kw_param = search_cfg.get("keyword_param") or "keyword"
 
-        # URL 构造（GET 拼 keyword，POST 放 body）
-        if method == "POST":
-            abs_url = urljoin(source.base_url, base_url)
-            body = {kw_param: keyword}
-            # 固定附加参数（source-schema §3.2 extra_params）并入 POST body
-            extra = search_cfg.get("extra_params") or {}
-            if isinstance(extra, dict):
-                for k, v in extra.items():
-                    body.setdefault(k, v)
-            # 需要 http 支持 post_form
-            text = self._http_post_form(source, abs_url, body, http=http)
-        else:
-            sep = "&" if "?" in base_url else "?"
-            abs_url = urljoin(source.base_url, f"{base_url}{sep}{kw_param}={quote(keyword)}")
-            text = self._http_get(source, abs_url, http=http)
+        # 翻页：读 constraints.search.max_pages（schema 默认 3），多页合并去重。
+        # URL 支持 {keyword}（自动 encode）与 {page} 占位；无 {page} 时 GET 加 ?page=N、
+        # POST body 加 page 参数。
+        constraints = source.raw.get("constraints") or {}
+        max_pages = int((constraints.get("search") or {}).get("max_pages") or 3)
+        max_results = int((constraints.get("search") or {}).get("max_results") or 0)
+        page_param = (search_cfg.get("paginator") or {}).get("param") or "page"
+        extra = search_cfg.get("extra_params") or {}
+        if not isinstance(extra, dict):
+            extra = {}
 
         item_cfg = search_cfg.get("item") or {}
         root_sel = item_cfg.get("root_selector")
@@ -159,34 +154,66 @@ class Search:
         if not root_sel:
             return []
 
-        # render: "playwright" → 反爬 SPA 站（搜索结果 JS 渲染 + 类名混淆），
-        # 用 Playwright 渲染页面提取各项（title/href/src）。
-        if search_cfg.get("render") == "playwright":
-            return self._search_html_rendered(source, abs_url, item_cfg, keyword)
-
-        doc = self._parser.parse(text)
-        items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         results = []
         seen_urls = set()
-        for it in items:
-            title = it.get("title", "")
-            url = it.get("url", "")
-            if not title or not url:
+
+        for page in range(1, max_pages + 1):
+            try:
+                if method == "POST":
+                    abs_url = urljoin(source.base_url, base_url)
+                    body = {kw_param: keyword, page_param: page}
+                    for k, v in extra.items():
+                        body.setdefault(k, v)
+                    text = self._http_post_form(source, abs_url, body, http=http)
+                else:
+                    # GET：URL 含 {page} 占位 → 替换；否则追加 ?page=N
+                    page_url = base_url
+                    if "{page}" in page_url:
+                        page_url = page_url.replace("{page}", str(page))
+                        url_kw = page_url.replace("{keyword}", quote(keyword))
+                        abs_url = urljoin(source.base_url, url_kw)
+                    else:
+                        sep = "&" if "?" in base_url else "?"
+                        abs_url = urljoin(
+                            source.base_url,
+                            f"{base_url}{sep}{kw_param}={quote(keyword)}&{page_param}={page}",
+                        )
+                    text = self._http_get(source, abs_url, http=http)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] 搜索第 %d 页失败：%s", source.source_id, page, exc)
+                continue  # 单页失败跳过，继续下一页
+
+            # render: "playwright" → 反爬 SPA 站（结果 JS 渲染），只搜第一页（交互式）
+            if search_cfg.get("render") == "playwright":
+                if page == 1:
+                    return self._search_html_rendered(source, abs_url, item_cfg, keyword)
                 continue
-            if url in seen_urls:
-                continue  # URL 去重（trtag 等站搜索页 DOM 有重复节点）
-            seen_urls.add(url)
-            results.append(
-                SearchResult(
-                    title=title,
-                    url=url,
-                    source_id=source.source_id,
-                    source_name=source.source_name,
-                    cover=it.get("cover", ""),
-                    author=it.get("author", ""),
-                    update=it.get("update", ""),
+
+            doc = self._parser.parse(text)
+            items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
+            if not items:
+                break  # 本页无结果 → 后续页大概率也无
+            for it in items:
+                title = it.get("title", "")
+                url = it.get("url", "")
+                if not title or not url:
+                    continue
+                if url in seen_urls:
+                    continue  # URL 去重（trtag 等站搜索页 DOM 有重复节点）
+                seen_urls.add(url)
+                results.append(
+                    SearchResult(
+                        title=title,
+                        url=url,
+                        source_id=source.source_id,
+                        source_name=source.source_name,
+                        cover=it.get("cover", ""),
+                        author=it.get("author", ""),
+                        update=it.get("update", ""),
+                    )
                 )
-            )
+                if max_results and len(results) >= max_results:
+                    return results
         return results
 
     def _search_html_rendered(
