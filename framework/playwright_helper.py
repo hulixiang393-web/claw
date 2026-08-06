@@ -77,6 +77,47 @@ def _page_sort_key(cid: str):
     return (1, cid or "")
 
 
+async def _eval_img_js_path(page, img_js_path: Optional[str]) -> List[str]:
+    """按 img_js_path 求值图片 URL 数组（长条图阅读器的 JS 全局变量）。
+
+    求值结果须为字符串数组（否则返回 []，调用方回退 DOM 提取）。
+    """
+    if not img_js_path:
+        return []
+    try:
+        val = await page.evaluate(f"() => {img_js_path}")
+        if isinstance(val, list):
+            out = [str(v) for v in val if isinstance(v, str) and v]
+            return out
+    except Exception:
+        pass
+    return []
+
+
+def _img_url_page_key(src: str) -> tuple | None:
+    """从图片 URL 提取页码排序键（数字元组）。
+
+    漫画站（如 manben）图片 URL 常内嵌页码：`.../2_4711.jpg` → (2,)，
+    长条图分片 `.../5_1041_1.jpg` → (5,1041,1)（页码+分片序号），
+    翻页式双页阅读器会交换 DOM 顺序，需按 URL 数字序列排序恢复阅读顺序。
+    返回 None 表示提取不到。
+    """
+    m = re.search(r"/(?:(\d+)_)+(\d+)?[^/]*(?:\.\w+)?(?:\?|$)", src or "")
+    if not m:
+        return None
+    nums = [int(x) for x in m.group(0).strip("/").replace(".", "_").split("_") if x.isdigit()]
+    return tuple(nums) if nums else None
+
+
+def _img_sort_key(url: str, fallback_idx: int) -> tuple:
+    """图片排序键：(0, 页码元组) 优先（恢复翻页式阅读器被交换的顺序），
+    (1, DOM 索引) 兜底（无内嵌页码的普通懒加载站）。"""
+    n = _img_url_page_key(url)
+    if n is not None:
+        return (0,) + n
+    return (1, fallback_idx)
+
+
 async def _wait_canvas_ready(page, selector: str, count: int, timeout_ms: int):
     """等待指定数量的 canvas 出现并绘制完成。
 
@@ -161,6 +202,7 @@ async def fetch_rendered_images(
     scroll_stale_rounds: int = 6,
     wheel_scroll: bool = False,
     img_selector: Optional[str] = None,
+    img_js_path: Optional[str] = None,
 ) -> List[str]:
     """用 Playwright 渲染页面，提取内容。
 
@@ -181,6 +223,10 @@ async def fetch_rendered_images(
                         img_selector 给出时只收集匹配元素（过滤 UI 图标等非正文图）
             "text"    → 收集页面 body 文本（JS 渲染出的正文）
         img_selector:      可选：extract_mode="img" 时限定收集的选择器（如 "img.indexImg"）
+        img_js_path:       可选：extract_mode="img" 时的 JS 表达式，求值为图片 URL 数组
+            （如 "window.newImgs"）。长条图阅读器把全部图片 URL 放在 JS 全局变量里，
+            window.onload 才构建 DOM，求值全局数组可立即拿到（无需等 onload）；
+            求值失败/非数组/空 → 回退 DOM 提取（img_selector）。
         proxy:             显式代理（如 http://127.0.0.1:7890）；None 时自动探测系统代理。
     """
     try:
@@ -210,9 +256,31 @@ async def fetch_rendered_images(
             try:
                 # 页面就绪策略由源配置 render_config.wait_until 控制
                 await page.goto(url, timeout=timeout_ms, wait_until=wait_until)
-                # 等渲染目标出现
+                # 快路径：img_js_path 全局数组（长条图阅读器）立即拿到全部图 URL，
+                # 无需等 window.onload 构建 DOM。domcontentloaded 后同步脚本已执行，
+                # 单次求值即可；非该类型章节该全局未定义 → 走常规 DOM 流程。
+                js_imgs_fast: List[str] = []
+                if img_js_path:
+                    js_imgs_fast = await _eval_img_js_path(page, img_js_path)
+                    if js_imgs_fast and output_dir:
+                        out = Path(output_dir)
+                        out.mkdir(parents=True, exist_ok=True)
+                        saved = []
+                        for i, u in enumerate(js_imgs_fast):
+                            if u.startswith("data:"):
+                                header, b64 = u.split(",", 1)
+                                p = out / f"page_{i+1:03d}.jpg"
+                                p.write_bytes(base64.b64decode(b64))
+                                saved.append(str(p))
+                            else:
+                                saved.append(u)
+                        return saved
+                    if js_imgs_fast:
+                        return js_imgs_fast
+                # 等渲染目标出现（state=attached：元素挂载即算，不等 visible——
+                # 翻页/懒加载阅读器的正文图初始常为隐藏/占位，等待挂载更可靠）
                 try:
-                    await page.wait_for_selector(wait_for, timeout=12000)
+                    await page.wait_for_selector(wait_for, timeout=12000, state="attached")
                 except Exception:
                     pass
 
@@ -227,9 +295,33 @@ async def fetch_rendered_images(
                 # 滚出视口即被 JS 移除回收。因此必须**边滚边收集**：
                 # 每一步滚动后立即提取当前已绘制 canvas，按 cropped id 去重累积；
                 # 滚到底后在底部深等（尾部 canvas 集中绘制），再补一轮收集。
-                drawn_pages: dict = {}  # {cropped_id: data_uri}
+                drawn_pages: dict = {}  # {cropped_id: data_uri} 或 {idx: img_src}
                 if scroll_to_bottom:
                     async def _collect_drawn() -> None:
+                        if extract_mode == "img":
+                            # img 模式（翻页式阅读器）：收集已加载正文图的 src。
+                            # 用于驱动 early-break（新图不再增长即到底），也累积最终结果。
+                            # 排序键：URL 内嵌页码优先（0_NNNNNN…，恢复被交换的顺序），
+                            # 否则 DOM 索引（1_NNNNNN）。
+                            sel = img_selector or "img"
+                            nodes = await page.query_selector_all(sel)
+                            for i, img in enumerate(nodes):
+                                try:
+                                    src = (
+                                        await img.get_attribute("data-src")
+                                        or await img.get_attribute("src")
+                                    )
+                                    if src:
+                                        nums = _img_url_page_key(src)
+                                        if nums:
+                                            key = "0_" + "_".join(
+                                                f"{x:06d}" for x in nums)
+                                        else:
+                                            key = f"1_{i:06d}"
+                                        drawn_pages[key] = src
+                                except Exception:
+                                    pass
+                            return
                         items = await page.evaluate(
                             """() => {
                                 const cs = Array.from(
@@ -289,21 +381,29 @@ async def fetch_rendered_images(
                     images = [t.strip() for t in (text or "").splitlines() if t.strip()] or []
                 elif extract_mode == "img":
                     # 普通图片 URL（懒加载 data-src / src）。
-                    # img_selector 给出时只收集匹配元素（如 "img.indexImg"，
-                    # 过滤翻页 UI 图标等非正文图）。
-                    sel = img_selector or "img"
-                    imgs = await page.query_selector_all(sel)
-                    images = []
-                    for img in imgs[:500]:
-                        try:
-                            src = (
-                                await img.get_attribute("data-src")
-                                or await img.get_attribute("src")
-                            )
-                            if src:
-                                images.append(src)
-                        except Exception:
-                            pass
+                    # 优先 JS 全局数组（长条图阅读器，如 window.newImgs，免等 onload）；
+                    # 其次 scroll_to_bottom 已边滚边收集（翻页式阅读器）→ 用累积结果，
+                    # 键 "0_NNNNNN"（URL 页码）/"1_NNNNNN"（DOM 索引）字典序即阅读顺序
+                    # （页码优先，恢复双页阅读器被交换的顺序）；否则直接查询当前 DOM。
+                    js_imgs = await _eval_img_js_path(page, img_js_path)
+                    if js_imgs:
+                        images = js_imgs
+                    elif drawn_pages:
+                        images = [src for _, src in sorted(drawn_pages.items())]
+                    else:
+                        sel = img_selector or "img"
+                        imgs = await page.query_selector_all(sel)
+                        images = []
+                        for img in imgs[:500]:
+                            try:
+                                src = (
+                                    await img.get_attribute("data-src")
+                                    or await img.get_attribute("src")
+                                )
+                                if src:
+                                    images.append(src)
+                            except Exception:
+                                pass
                 else:
                     # 默认 canvas：加密分片图合并后的完整页。
                     # 若已边滚边收集（scroll_to_bottom），直接用累积结果；
@@ -392,6 +492,7 @@ def fetch_rendered_images_sync(
     scroll_stale_rounds: int = 6,
     wheel_scroll: bool = False,
     img_selector: Optional[str] = None,
+    img_js_path: Optional[str] = None,
 ) -> List[str]:
     """同步版本的 fetch_rendered_images。"""
     return asyncio.run(
@@ -399,7 +500,7 @@ def fetch_rendered_images_sync(
             url, wait_for, wait_until, timeout_ms, extra_delay_ms,
             click_selector, scroll_to_bottom, extract_mode, output_dir, proxy,
             page_container_selector, scroll_step_px, scroll_stale_rounds,
-            wheel_scroll, img_selector,
+            wheel_scroll, img_selector, img_js_path,
         )
     )
 
@@ -415,6 +516,7 @@ async def _render_one_url(
     extract_mode: str,
     wheel_scroll: bool = False,
     img_selector: Optional[str] = None,
+    img_js_path: Optional[str] = None,
 ):
     """在给定 page（复用浏览器）上渲染单个 URL 并提取。
 
@@ -422,14 +524,39 @@ async def _render_one_url(
     base64 URI（canvas 合并结果）。滚到底边滚边收集，末段深等。
     """
     await page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+    # 快路径：img_js_path 全局数组立即拿到全部图 URL（长条图阅读器）
+    if img_js_path:
+        js_imgs = await _eval_img_js_path(page, img_js_path)
+        if js_imgs:
+            return js_imgs
     try:
-        await page.wait_for_selector(wait_for, timeout=12000)
+        await page.wait_for_selector(wait_for, timeout=12000, state="attached")
     except Exception:
         pass
 
-    drawn: dict = {}  # {cropped_id: data_uri}
+    drawn: dict = {}  # {cropped_id: data_uri} 或 {idx: img_src}
     if scroll_to_bottom:
         async def _collect_drawn() -> None:
+            if extract_mode == "img":
+                sel = img_selector or "img"
+                nodes = await page.query_selector_all(sel)
+                for i, img in enumerate(nodes):
+                    try:
+                        src = (
+                            await img.get_attribute("data-src")
+                            or await img.get_attribute("src")
+                        )
+                        if src:
+                            nums = _img_url_page_key(src)
+                            if nums:
+                                key = "0_" + "_".join(
+                                    f"{x:06d}" for x in nums)
+                            else:
+                                key = f"1_{i:06d}"
+                            drawn[key] = src
+                    except Exception:
+                        pass
+                return
             items = await page.evaluate(
                 """() => {
                     const cs = Array.from(document.querySelectorAll('canvas'))
@@ -476,15 +603,21 @@ async def _render_one_url(
         text = await page.evaluate("() => document.body.innerText")
         images = [t.strip() for t in (text or "").splitlines() if t.strip()] or []
     elif extract_mode == "img":
-        sel = img_selector or "img"
-        imgs = await page.query_selector_all(sel)
-        for img in imgs[:500]:
-            try:
-                src = await img.get_attribute("data-src") or await img.get_attribute("src")
-                if src:
-                    images.append(src)
-            except Exception:
-                pass
+        js_imgs = await _eval_img_js_path(page, img_js_path)
+        if js_imgs:
+            images = js_imgs
+        elif drawn:
+            images = [src for _, src in sorted(drawn.items())]
+        else:
+            sel = img_selector or "img"
+            imgs = await page.query_selector_all(sel)
+            for img in imgs[:500]:
+                try:
+                    src = await img.get_attribute("data-src") or await img.get_attribute("src")
+                    if src:
+                        images.append(src)
+                except Exception:
+                    pass
     elif drawn:
         images = [uri for _, uri in sorted(drawn.items(), key=lambda kv: _page_sort_key(kv[0]))]
     else:
@@ -550,6 +683,7 @@ async def _fetch_pages_batch(
                         "extract_mode": per.get("extract_mode", render_cfg.get("extract_mode", "canvas")),
                         "wheel_scroll": per.get("wheel_scroll", render_cfg.get("wheel_scroll", False)),
                         "img_selector": per.get("img_selector", render_cfg.get("img_selector")),
+                        "img_js_path": per.get("img_js_path", render_cfg.get("img_js_path")),
                     }
                     try:
                         imgs = await _render_one_url(page, url, **cfg)

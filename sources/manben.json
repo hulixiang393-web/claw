@@ -1,0 +1,252 @@
+{
+  "$schema_version": 2,
+  "$id": "manben",
+  "$type": "comic",
+  "$name": "满本网",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.manben.com/",
+    "description": "满本网 - 免费漫画在线阅读（国漫/日漫/港台，含作者与分类）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "漫画",
+      "免费",
+      "国漫",
+      "日漫"
+    ],
+    "last_verified": "2026-08-07T00:00:00+08:00"
+  },
+  "transports": {
+    "base_url": "https://www.manben.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.manben.com/"
+    },
+    "timeout": 10,
+    "retries": 2,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/mh-list-p{page}/",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "全部",
+            "url": "/mh-list-p{page}/"
+          },
+          {
+            "title": "更新",
+            "url": "/mh-updated-p{page}/"
+          },
+          {
+            "title": "排行榜",
+            "url": "/mh-ranklist-p{page}/"
+          },
+          {
+            "title": "搞笑",
+            "url": "/mh-gaoxiao-p{page}/"
+          },
+          {
+            "title": "奇幻",
+            "url": "/mh-qihuan-p{page}/"
+          },
+          {
+            "title": "热血",
+            "url": "/mh-rexue-p{page}/"
+          },
+          {
+            "title": "悬疑",
+            "url": "/mh-xuanyi-p{page}/"
+          },
+          {
+            "title": "格斗",
+            "url": "/mh-gedou1-p{page}/"
+          },
+          {
+            "title": "科幻",
+            "url": "/mh-kehuan-p{page}/"
+          },
+          {
+            "title": "励志",
+            "url": "/mh-lizhi-p{page}/"
+          },
+          {
+            "title": "校园",
+            "url": "/mh-xiaoyuan-p{page}/"
+          },
+          {
+            "title": "爱情",
+            "url": "/mh-aiqing-p{page}/"
+          },
+          {
+            "title": "日常",
+            "url": "/mh-meishi-p{page}/"
+          },
+          {
+            "title": "战争",
+            "url": "/mh-zhanzheng-p{page}/"
+          },
+          {
+            "title": "其他",
+            "url": "/mh-baihe-p{page}/"
+          },
+          {
+            "title": "港台",
+            "url": "/mh-hktw-p{page}/"
+          },
+          {
+            "title": "日韩",
+            "url": "/mh-jpkr-p{page}/"
+          },
+          {
+            "title": "大陆",
+            "url": "/mh-china-p{page}/"
+          },
+          {
+            "title": "欧美",
+            "url": "/mh-euus-p{page}/"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.list > a[href*='/mh-']"
+        },
+        "fields": {
+          "title": {
+            "css": "p.title a"
+          },
+          "url": {
+            "css": "p.title a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": ".ib.img img",
+            "attr": "src"
+          },
+          "author": {
+            "css": ".line a.avatar"
+          },
+          "update": {
+            "css": "a.op.ib.tip"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search?title={keyword}&language=1",
+      "method": "GET",
+      "keyword_param": "title",
+      "paginator": {
+        "url_template": "/search?title={keyword}&language=1"
+      },
+      "item": {
+        "root_selector": {
+          "css": ".mainSearch .bookList_2 .item.ib"
+        },
+        "fields": {
+          "title": {
+            "css": "p.title a"
+          },
+          "url": {
+            "css": "p.title a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": ".book .cover img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "xpath": "//div[contains(@class,'comicInfo')]//p[contains(@class,'title')]/text()[normalize-space()]"
+        },
+        "author": {
+          "css": "div.comicInfo .info a.avatar"
+        },
+        "cover": {
+          "css": "div.comicInfo .ib.cover .img img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": "div.comicInfo p.content"
+        },
+        "status": {
+          "xpath": "//div[contains(@class,'comicInfo')]//p[contains(@class,'gray')]//span[contains(@class,'s') and contains(text(),'状')]"
+        },
+        "tags": {
+          "css": "div.comicInfo p.gray span.ib.l"
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": {
+            "css": "#chapterlistload .list a.ib"
+          },
+          "chapter_order": "desc",
+          "fields": {
+            "title": {
+              "css": "a.ib"
+            },
+            "url": {
+              "css": "a.ib",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "render": "playwright",
+          "render_config": {
+            "wait_for": "img.loaded.lazy, img.indexImg",
+            "wait_until": "domcontentloaded",
+            "extra_delay_ms": 4000,
+            "scroll_to_bottom": true,
+            "wheel_scroll": true,
+            "extract_mode": "img",
+            "img_selector": "img.indexImg, img.loaded.lazy",
+            "img_js_path": "window.newImgs",
+            "scroll_step_px": 600,
+            "scroll_stale_rounds": 6
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 30
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 200,
+      "max_items": 500
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "a[href*='/mh-']"
+      }
+    }
+  }
+}

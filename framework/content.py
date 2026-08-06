@@ -936,6 +936,7 @@ class Content:
                     scroll_stale_rounds=int(rc.get("scroll_stale_rounds", 6)),
                     wheel_scroll=bool(rc.get("wheel_scroll", False)),
                     img_selector=rc.get("img_selector"),
+                    img_js_path=rc.get("img_js_path"),
                 )
             except Exception as exc:
                 # Playwright 渲染失败 → 降级到普通 HTML 提取（站点改版/选择器不匹配时
@@ -1119,6 +1120,7 @@ class Content:
                 "proxy": source.transports().get("proxy"),
                 "wheel_scroll": bool(rc.get("wheel_scroll", False)),
                 "img_selector": rc.get("img_selector"),
+                "img_js_path": rc.get("img_js_path"),
             }
         from .playwright_helper import fetch_rendered_pages_batch_sync
 
