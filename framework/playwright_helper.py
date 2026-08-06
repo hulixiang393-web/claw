@@ -604,6 +604,154 @@ def fetch_rendered_text_sync(
             browser.close()
 
 
+def fetch_rendered_items_sync(
+    url: str,
+    root_selector: str,
+    wait_for: str = "",
+    wait_until: str = "networkidle",
+    timeout_ms: int = 30000,
+    extra_delay_ms: int = 2500,
+    proxy: Optional[str] = None,
+) -> list:
+    """用 Playwright 渲染页面，按 root_selector 提取每项的 title/href/src。
+
+    供反爬 SPA 站搜索（如 fdzys 搜索结果由 JS 动态渲染、CSS 类名混淆）。
+    返回 [{title, href, src, text}]，每项取 root 元素内的：
+      - title: 首选 a[title]，否则 img[alt]，否则元素文本
+      - href : 首选 a[href]，否则任意 a[href] 链接
+      - src  : img 的 src / data-src / data-original
+    无命中返回 []。
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        launch_args = ["--no-sandbox"]
+        if proxy:
+            launch_args.append(f"--proxy-server={proxy}")
+        browser = p.chromium.launch(headless=True, args=launch_args)
+        try:
+            context = browser.new_context(user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ), viewport={"width": 1366, "height": 768})
+            page = context.new_page()
+            page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+            if wait_for:
+                try:
+                    page.wait_for_selector(wait_for, timeout=15000)
+                except Exception:
+                    pass
+            page.wait_for_timeout(extra_delay_ms)
+            roots = page.query_selector_all(root_selector)
+            items = []
+            for node in roots:
+                item = {"title": "", "href": "", "src": "", "text": ""}
+                try:
+                    title_el = node.query_selector("a[title]") or node.query_selector("img[alt]")
+                    if title_el:
+                        t = title_el.get_attribute("title") or title_el.get_attribute("alt") or ""
+                        item["title"] = (t or "").strip()
+                    if not item["title"]:
+                        a = node.query_selector("a")
+                        if a:
+                            item["title"] = (a.inner_text() or "").strip()
+                    a = node.query_selector("a[href]")
+                    if a:
+                        item["href"] = (a.get_attribute("href") or "").strip()
+                    img = node.query_selector("img")
+                    if img:
+                        for attr in ("src", "data-src", "data-original"):
+                            v = img.get_attribute(attr)
+                            if v:
+                                item["src"] = v.strip()
+                                break
+                    item["text"] = (node.inner_text() or "").strip()
+                except Exception:  # noqa: BLE001
+                    pass
+                if item["href"]:
+                    items.append(item)
+            return items
+        finally:
+            browser.close()
+
+
+def fetch_rendered_search_sync(
+    home_url: str,
+    keyword: str,
+    input_selector: str = "input[name='wd'], input[name='searchword']",
+    result_selector: str = "",
+    wait_until: str = "networkidle",
+    timeout_ms: int = 30000,
+    extra_delay_ms: int = 3000,
+    proxy: Optional[str] = None,
+) -> list:
+    """Playwright 交互式搜索：先访问首页，在搜索框输入关键词并提交，
+    等待 JS 渲染出真实结果后再提取。
+
+    适用：搜索框提交后由 JS 动态加载结果（如 fdzys），直接 GET /search?wd=
+    只会拿到热门榜。返回 fetch_rendered_items_sync 同构的 [{title,href,src,text}]。
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        launch_args = ["--no-sandbox"]
+        if proxy:
+            launch_args.append(f"--proxy-server={proxy}")
+        browser = p.chromium.launch(headless=True, args=launch_args)
+        try:
+            context = browser.new_context(user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ), viewport={"width": 1366, "height": 768})
+            page = context.new_page()
+            page.goto(home_url, timeout=timeout_ms, wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+            # 输入关键词并提交
+            try:
+                page.fill(input_selector, keyword)
+                page.press(input_selector, "Enter")
+            except Exception:
+                # fill 失败（输入框动态加载）→ 退化为直接访问搜索 URL
+                from urllib.parse import quote
+
+                page.goto(home_url.rstrip("/") + f"/search?wd={quote(keyword)}",
+                          timeout=timeout_ms, wait_until=wait_until)
+            page.wait_for_timeout(extra_delay_ms)
+            # 提取结果
+            roots = page.query_selector_all(result_selector) if result_selector else page.query_selector_all("a[href]")
+            items = []
+            seen_href = set()
+            for node in roots:
+                try:
+                    item = {"title": "", "href": "", "src": "", "text": ""}
+                    a = node if node.evaluate("e => e.tagName === 'A'") else node.query_selector("a[href]")
+                    if not a:
+                        continue
+                    href = a.get_attribute("href") or ""
+                    if not href or href in seen_href:
+                        continue
+                    title = a.get_attribute("title") or (a.inner_text() or "").strip()
+                    if not title:
+                        continue
+                    seen_href.add(href)
+                    item["href"] = href
+                    item["title"] = title.strip()
+                    img = node.query_selector("img")
+                    if img:
+                        for attr in ("src", "data-src", "data-original"):
+                            v = img.get_attribute(attr)
+                            if v:
+                                item["src"] = v.strip()
+                                break
+                    item["text"] = (node.inner_text() or "").strip()
+                    items.append(item)
+                except Exception:  # noqa: BLE001
+                    continue
+            return items
+        finally:
+            browser.close()
+
+
 def fetch_rendered_video_sync(
     url: str,
     wait_until: str = "networkidle",

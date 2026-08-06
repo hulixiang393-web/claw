@@ -153,12 +153,18 @@ class Search:
             abs_url = urljoin(source.base_url, f"{base_url}{sep}{kw_param}={quote(keyword)}")
             text = self._http_get(source, abs_url, http=http)
 
-        doc = self._parser.parse(text)
         item_cfg = search_cfg.get("item") or {}
         root_sel = item_cfg.get("root_selector")
         fields = item_cfg.get("fields") or {}
         if not root_sel:
             return []
+
+        # render: "playwright" → 反爬 SPA 站（搜索结果 JS 渲染 + 类名混淆），
+        # 用 Playwright 渲染页面提取各项（title/href/src）。
+        if search_cfg.get("render") == "playwright":
+            return self._search_html_rendered(source, abs_url, item_cfg, keyword)
+
+        doc = self._parser.parse(text)
         items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         results = []
         seen_urls = set()
@@ -179,6 +185,79 @@ class Search:
                     cover=it.get("cover", ""),
                     author=it.get("author", ""),
                     update=it.get("update", ""),
+                )
+            )
+        return results
+
+    def _search_html_rendered(
+        self,
+        source: SourceConfig,
+        abs_url: str,
+        item_cfg: dict,
+        keyword: str = "",
+    ) -> List[SearchResult]:
+        """Playwright 渲染搜索页，按 root_selector 提取搜索结果。
+
+        适用于反爬 SPA 站（CSS 类名混淆 + JS 动态填充，如 fdzys）。
+        渲染配置从 item.render_config 读取。
+
+        keyword 非空时，结果按「标题/文本含关键词」过滤——反爬站常在搜索页
+        塞入热门榜（无关项），过滤后只留真正命中关键词的结果，避免误导。
+        """
+        from .playwright_helper import fetch_rendered_items_sync, fetch_rendered_search_sync
+
+        rc = item_cfg.get("render_config") or {}
+
+        def _sel(spec) -> str:
+            """root_selector 可能为 {"css": "..."} 或纯字符串。"""
+            if isinstance(spec, dict):
+                return spec.get("css") or spec.get("xpath") or ""
+            return spec or ""
+
+        if rc.get("interact"):
+            # 交互式搜索：访问首页 → 填搜索框 → 提交（JS 加载真实结果）
+            home = rc.get("home_url") or source.base_url
+            items = fetch_rendered_search_sync(
+                home,
+                keyword,
+                input_selector=rc.get("input_selector") or "input[name='wd'], input[name='searchword']",
+                result_selector=_sel(item_cfg.get("root_selector")),
+                wait_until=rc.get("wait_until") or "networkidle",
+                timeout_ms=int(rc.get("timeout_ms") or 30000),
+                extra_delay_ms=int(rc.get("extra_delay_ms") or 3000),
+                proxy=source.transports().get("proxy"),
+            )
+        else:
+            items = fetch_rendered_items_sync(
+                abs_url,
+                _sel(item_cfg.get("root_selector")),
+                wait_for=rc.get("wait_for") or "",
+                wait_until=rc.get("wait_until") or "networkidle",
+                timeout_ms=int(rc.get("timeout_ms") or 30000),
+                extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
+                proxy=source.transports().get("proxy"),
+            )
+        kw = (keyword or "").strip()
+        results = []
+        seen_urls = set()
+        for it in items:
+            url = it.get("href") or ""
+            if not url or not url.startswith("http"):
+                url = urljoin(source.base_url, url)
+            title = it.get("title") or it.get("text") or ""
+            if not title or not url or url in seen_urls:
+                continue
+            # 关键词过滤：标题/文本含关键词才算真实命中（剔除热门榜无关项）
+            if kw and kw not in title and kw not in it.get("text", ""):
+                continue
+            seen_urls.add(url)
+            results.append(
+                SearchResult(
+                    title=title,
+                    url=url,
+                    source_id=source.source_id,
+                    source_name=source.source_name,
+                    cover=it.get("src", ""),
                 )
             )
         return results

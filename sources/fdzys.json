@@ -55,12 +55,16 @@
       "base_url": "/search",
       "method": "GET",
       "keyword_param": "wd",
+      "render": "playwright",
       "item": {
-        "root_selector": { "css": ".myui-vodbox-content, .myui-search-box" },
-        "fields": {
-          "title": { "css": "img", "attr": "alt" },
-          "url": { "css": "a[href*='/tv/']", "attr": "href" },
-          "cover": { "css": "img", "attr": "data-src" }
+        "root_selector": { "css": "a[href*='/yu-']" },
+        "render_config": {
+          "interact": true,
+          "home_url": "https://fdzys.com/",
+          "input_selector": "input[name='wd']",
+          "wait_until": "networkidle",
+          "extra_delay_ms": 3000,
+          "timeout_ms": 30000
         }
       }
     },

@@ -48,6 +48,7 @@ class VideoView(QWidget):
         self._switching = False      # 换源进行中锁（防止重复触发）
         self._play_cache: dict = {}  # 播放地址缓存 {episode_url: play}（预加载/命中秒开）
         self._prefetch_idx = -2      # 正在预拉下一集的索引（<0 空闲）
+        self._detail_url_for_play = ""  # 无分集时记录详情 URL（供自动播放）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -111,9 +112,10 @@ class VideoView(QWidget):
                     break
         self.ep_list.setCurrentRow(idx)
         if not detail.chapters:
-            # 无分集列表（如 B站番剧 season 页）→ 直接取详情页播放地址，不自动弹播放器
+            # 无分集列表（如 B站番剧 season 页）→ 直接取详情页播放地址，自动播放
             self.play_label.setText("正在获取播放地址...")
             self._current_idx = -1
+            self._detail_url_for_play = detail.url  # 供 _on_play_loaded 自动播放
             from PySide6.QtCore import QThreadPool
 
             task = _LoadVideoTask(self._content, self._source, None, detail_url=detail.url)
@@ -180,13 +182,14 @@ class VideoView(QWidget):
             return
         self._current_idx = idx
         ep = self._episodes[idx]
-        # 已预加载播放地址 → 直接显示，秒开不白屏
+        # 已预加载播放地址 → 直接显示并自动播放，秒开不白屏
         cached = self._play_cache.get(ep.url)
         if cached:
             self._current_play = cached
             self.play_label.setText(f"播放地址（已解密）：\n{cached}")
             self.episode_changed.emit((self._detail, ep.title, ep.url))
             self._prefetch_next(idx)
+            self._open_embed(ep.url)  # 自动播放
             return
         self.play_label.setText(f"正在获取播放地址：{ep.title}...")
         self._current_play = ""
@@ -198,7 +201,6 @@ class VideoView(QWidget):
         self._video_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
         self.episode_changed.emit((self._detail, ep.title, ep.url))
-        # 不自动弹 mpv：用户点「在应用内观看」才拉起播放器
 
     def _on_ep_clicked(self, item) -> None:
         idx = item.data(Qt.UserRole)
@@ -217,9 +219,15 @@ class VideoView(QWidget):
         self._current_play = play
         if ep is not None and getattr(ep, "url", ""):
             self._play_cache[ep.url] = play  # 写缓存，切集命中秒开
-        self.play_label.setText(f"播放地址（已解密）：\n{play}")
-        # 预加载下一集播放地址（切集不白屏）
-        self._prefetch_next(self._current_idx)
+            # 预加载下一集播放地址（切集不白屏）
+            self._prefetch_next(self._current_idx)
+            # 自动播放当前集（地址已解密 → 取流 → mpv）
+            self._open_embed(ep.url)
+        else:
+            # 无分集（详情页单视频）→ 用详情 URL 自动播放
+            detail_url = getattr(self, "_detail_url_for_play", "") or (self._detail.url if self._detail else "")
+            if detail_url:
+                self._open_embed(detail_url)
 
     # ------------------------------------------------------------------ #
     def _prefetch_next(self, idx: int = -1) -> None:
@@ -276,6 +284,7 @@ class VideoView(QWidget):
         self._episodes = new_detail.chapters
         self._play_cache.clear()  # 换源 → 旧源播放地址缓存作废
         self._prefetch_idx = -2
+        self._detail_url_for_play = ""
         self.ep_list.clear()
         for i, ep in enumerate(new_detail.chapters):
             item = QListWidgetItem(ep.title or f"第{i+1}集")
