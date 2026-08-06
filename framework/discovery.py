@@ -305,6 +305,10 @@ class Discovery:
 
         与 list_works 内联同步解密分离：列表先返回（不阻塞），GUI 异步调本方法
         恢复封面后刷新卡片。单张失败跳过（保留原 URL 兜底）。
+
+        每批用独立 HttpClient：GUI 多页并发调本方法时，若共享 self._http
+        （requests.Session 非线程安全）会在并发下载时 Session 竞态，偶发
+        下载失败 → 部分页封面加载不出（实测发现页奇数页封面空白）。
         """
         targets = [
             (w.url, w.cover)
@@ -313,32 +317,45 @@ class Discovery:
         ]
         if not targets:
             return {}
+        # 独立 HttpClient（复用同套 defaults），避免 Session 跨线程竞态
+        worker_http = self._http.__class__(
+            sleeper=getattr(self._http, "_sleeper", None),
+            defaults=self._http.defaults,
+        )
         from concurrent.futures import ThreadPoolExecutor
 
         result: dict = {}
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futs = {
-                pool.submit(self._decrypt_cover, source, url): wurl
-                for wurl, url in targets
-            }
-            for fut in futs:
-                try:
-                    data_uri = fut.result()
-                    if data_uri and data_uri.startswith("data:"):
-                        result[futs[fut]] = data_uri
-                except Exception:  # noqa: BLE001
-                    pass
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futs = {
+                    pool.submit(self._decrypt_cover, source, url, worker_http): wurl
+                    for wurl, url in targets
+                }
+                for fut in futs:
+                    try:
+                        data_uri = fut.result()
+                        if data_uri and data_uri.startswith("data:"):
+                            result[futs[fut]] = data_uri
+                    except Exception:  # noqa: BLE001
+                        pass
+        finally:
+            try:
+                worker_http.close()
+            except Exception:  # noqa: BLE001
+                pass
         return result
 
-    def _decrypt_cover(self, source: SourceConfig, cover_url: str) -> str:
+    def _decrypt_cover(self, source: SourceConfig, cover_url: str, http=None) -> str:
         """下载并解密带加密的封面 → data URI。解密失败保留原 URL（封面留空不阻塞）。
 
         复用 Decrypter.decrypt_bytes；与正文图片同密钥（decryption.image）。
+        http：可指定独立 HttpClient（多任务并发时避免共享 Session 竞态）。
         """
+        http = http or self._http
         try:
             from .decrypter import Decrypter
 
-            raw = self._http.get_bytes(
+            raw = http.get_bytes(
                 self._abs_url(source, cover_url),
                 headers=self._headers(source),
                 timeout=self._timeout(source),
@@ -481,7 +498,7 @@ class Discovery:
             from .ytdlp import Ytdlp
 
             self._ytdlp = Ytdlp()
-        limit = 20
+        limit = 15
         try:
             items = self._ytdlp.search(keyword, limit=limit)
         except Exception:

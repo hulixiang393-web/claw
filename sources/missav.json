@@ -1,0 +1,216 @@
+{
+  "$schema_version": 2,
+  "$id": "missav",
+  "$type": "video",
+  "$name": "MissAV",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://missav.ws",
+    "description": "MissAV - 日本 JAV 在线观看站（HLS m3u8 主播放列表，播放地址 JS packer 混淆）",
+    "lang": "ja",
+    "region": "jp",
+    "tags": [
+      "视频",
+      "成人",
+      "JAV",
+      "日本",
+      "hls"
+    ],
+    "last_verified": "2026-08-07"
+  },
+  "transports": {
+    "base_url": "https://missav.ws",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "ja,zh-CN;q=0.9,en;q=0.8",
+      "Referer": "https://missav.ws/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "retry_backoff": {
+      "base": 2,
+      "max": 10,
+      "jitter": 0.5
+    },
+    "interval_ms": 800,
+    "charset": "utf-8",
+    "follow_redirects": true
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/ja/new",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "最新作品",
+            "url": "/ja/new?page={page}"
+          },
+          {
+            "title": "首页推荐",
+            "url": "/dm285/ja?page={page}"
+          },
+          {
+            "title": "每周热门",
+            "url": "/ja/weekly-hot?page={page}"
+          },
+          {
+            "title": "今日热门",
+            "url": "/ja/today-hot?page={page}"
+          },
+          {
+            "title": "每月热门",
+            "url": "/ja/monthly-hot?page={page}"
+          },
+          {
+            "title": "英文字幕",
+            "url": "/ja/english-subtitle?page={page}"
+          },
+          {
+            "title": "无码流出",
+            "url": "/ja/uncensored-leak?page={page}"
+          },
+          {
+            "title": "TWAV",
+            "url": "/ja/twav?page={page}"
+          },
+          {
+            "title": "HEYZO",
+            "url": "/ja/heyzo?page={page}"
+          },
+          {
+            "title": "FC2",
+            "url": "/ja/fc2?page={page}"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.thumbnail.group"
+        },
+        "fields": {
+          "title": {
+            "css": ".my-2.text-sm.text-nord4.truncate a"
+          },
+          "url": {
+            "css": "a[href*='/ja/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.lozad",
+            "attr": "data-src"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/ja/search/{keyword}",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "paginator": {
+        "url_template": "/ja/search/{keyword}?page={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.thumbnail.group"
+        },
+        "fields": {
+          "title": {
+            "css": ".my-2.text-sm.text-nord4.truncate a"
+          },
+          "url": {
+            "css": "a[href*='/ja/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.lozad",
+            "attr": "data-src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "(?:/ja/|/dm\\d+/ja/)[a-z0-9-]+",
+      "fields": {
+        "title": {
+          "css": "meta[property='og:title']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[property='og:description']",
+          "attr": "content"
+        },
+        "status": {
+          "css": "meta[property='og:video:duration']",
+          "attr": "content"
+        },
+        "meta": {
+          "release_date": {
+            "css": "meta[property='og:video:release_date']",
+            "attr": "content"
+          }
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "play_url": {
+          "regex": "https:\\\\/\\\\/surrit\\.com\\\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\\\/",
+          "suffix": "/playlist.m3u8"
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    },
+    "hls": {
+      "workers": 4
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 5,
+      "max_results": 60
+    },
+    "detail": {
+      "max_pages": 1,
+      "timeout_per_page_sec": 20
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    },
+    "max_concurrency": 2,
+    "global": {
+      "total_timeout_sec": 3600
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "div.thumbnail.group"
+      }
+    }
+  }
+}

@@ -315,6 +315,27 @@ class Content:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
+        """后台线程执行结构自检，不阻塞抓取（阅读/下载/播放提速）。
+
+        checker.check() 会对同一 URL 额外发一次 GET（最长 timeout×retries），
+        同步等待会让每章下载/每页漫画/每次取流慢一倍。自检仅健康监控，
+        移后台 daemon 线程（与 discovery 一致）。
+        """
+        from threading import Thread
+
+        def _run():
+            try:
+                ok = self._checker.check(source, abs_url)
+                self._report_health(
+                    source, HEALTH_OK if ok else "broken",
+                    "" if ok else "结构自检失败",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        Thread(target=_run, daemon=True).start()
+
     # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
         return source.request_headers()
@@ -362,8 +383,7 @@ class Content:
                 return self._fetch_detail_ytdlp(source, url, detail_api)
             return self._fetch_detail_api(source, url, detail_api)
 
-        ok = self._checker.check(source, self._abs_url(source, url))
-        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
+        self._bg_check(source, self._abs_url(source, url))
         html = self._get(source, url)
         doc = self._parser.parse(html)
 
@@ -698,8 +718,7 @@ class Content:
         3. 再兜底从页面找 _<数字>.html 的分页链接。
         返回的 nxt 是否同章续页由调用方 _chapter_base 判定。
         """
-        ok = self._checker.check(source, self._abs_url(source, url))
-        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
+        self._bg_check(source, self._abs_url(source, url))
         html = self._get(source, url)
         doc = self._parser.parse(html)
 
@@ -745,6 +764,10 @@ class Content:
                 raise ContentMissingError(
                     f"渲染正文为空（{url}）", source_id=source.source_id
                 )
+            if source.content_type == "novel":
+                text = self._normalize_para_indent(text)
+                if self._decrypter is not None:
+                    text = self._decrypter.decrypt(source, text, "chapter")
             return text, nxt
 
         if not selector:
@@ -756,7 +779,31 @@ class Content:
             text = self._decrypt_chapter(source, html, url)
         else:
             text = "\n".join(paragraphs)
+        # 小说正文段落开头空格规范化（18mh 等站原文多个空格缩进）
+        if source.content_type == "novel":
+            text = self._normalize_para_indent(text)
+            # 字符映射解密（番茄小说字体混淆等）：decryption.targets.chapter.strategy=translit
+            if self._decrypter is not None:
+                text = self._decrypter.decrypt(source, text, "chapter")
         return text, nxt
+
+    @staticmethod
+    def _normalize_para_indent(text: str) -> str:
+        """段落开头空格规范化：前导空白（半角/全角）>2 的行统一为 2 个全角缩进。
+
+        18mh 等站正文段落原文用多个半角空格缩进（实测 29 个），中文排版
+        标准是「　　」两格全角。只压缩**异常多**的前导空白，正常缩进/无
+        缩进/标题行保持原样，避免误伤。
+        """
+        out = []
+        for ln in (text or "").split("\n"):
+            stripped = ln.lstrip(" \t　")
+            lead = len(ln) - len(stripped)
+            if lead > 2 and stripped:
+                out.append("　　" + stripped)
+            else:
+                out.append(ln)
+        return "\n".join(out)
 
     def _detect_next_page(self, doc, source: SourceConfig, url: str) -> str:
         """自动探测章节分页的「下一页」链接。
@@ -887,14 +934,15 @@ class Content:
                     page_container_selector=rc.get("page_container_selector"),
                     scroll_step_px=int(rc.get("scroll_step_px", 600)),
                     scroll_stale_rounds=int(rc.get("scroll_stale_rounds", 6)),
+                    wheel_scroll=bool(rc.get("wheel_scroll", False)),
+                    img_selector=rc.get("img_selector"),
                 )
             except Exception as exc:
                 # Playwright 渲染失败 → 降级到普通 HTML 提取（站点改版/选择器不匹配时
                 # 不整话失败，尝试 HTML 兜底；若 HTML 也提取不到，下方会抛 ContentMissingError）
                 log.warning("[%s] Playwright 渲染失败，降级 HTML 提取：%s", source.source_id, exc)
 
-        ok = self._checker.check(source, abs_url)
-        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
+        self._bg_check(source, abs_url)
         # 图片列表优先 body，兼容旧 list
         list_cfg = body_cfg or block.get("list") or {}
         urls = self._fetch_comic_page_imgs(source, list_cfg, chapter_url)
@@ -1031,8 +1079,7 @@ class Content:
         block = content_cfg.get("page") or {}
         body_cfg = block.get("body") or {}
         abs_url = self._abs_url(source, chapter_url)
-        ok = self._checker.check(source, abs_url)
-        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
+        self._bg_check(source, abs_url)
         list_cfg = body_cfg or block.get("list") or {}
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
@@ -1070,6 +1117,8 @@ class Content:
                 "scroll_to_bottom": rc.get("scroll_to_bottom", False),
                 "extract_mode": rc.get("extract_mode", "canvas"),
                 "proxy": source.transports().get("proxy"),
+                "wheel_scroll": bool(rc.get("wheel_scroll", False)),
+                "img_selector": rc.get("img_selector"),
             }
         from .playwright_helper import fetch_rendered_pages_batch_sync
 
@@ -1136,8 +1185,7 @@ class Content:
             if play:
                 return play
 
-        ok = self._checker.check(source, self._abs_url(source, episode_url))
-        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
+        self._bg_check(source, self._abs_url(source, episode_url))
         html = self._get(source, episode_url)
         doc = self._parser.parse(html)
 
@@ -1178,6 +1226,10 @@ class Content:
                 play = m.group(1) if m.groups() else m.group(0)
                 # unescape JS 转义（\/ → /）
                 play = play.replace("\\/", "/")
+                # 通用后缀：正则只提取到 CDN base 时补全（如 missav → /playlist.m3u8）
+                suffix = play_cfg.get("suffix", "")
+                if suffix:
+                    play = play.rstrip("/") + "/" + suffix.lstrip("/")
                 return play
             raise ContentMissingError(
                 f"未匹配到播放地址（{episode_url}）", source_id=source.source_id
@@ -1458,11 +1510,27 @@ class Content:
         q_param = (cfg.get("quality") or {}).get("param") or "quality"
         q_default = (cfg.get("quality") or {}).get("default") or "best"
         q_value = quality_map.get(quality, quality_map.get(q_default, quality or q_default))
+        # {id} 从 episode_url 末段提取，去掉 .html/.htm 扩展名（avgood 分集 URL 带扩展名，
+        # 直接拼接会成 xxx.html.html → 接口返回"视频不存在"）
+        ep_id = episode_url.split("/")[-1]
+        if ep_id.endswith((".html", ".htm")):
+            ep_id = ep_id.rsplit(".", 1)[0]
+        # 占位符同样替换进 URL 路径（如 avgood /play/ajax/{id}.html）。
+        # 原实现只在 params 值里替换，URL 路径里的 {id} 会原样发出 → 接口返回"不存在"
+        api_url = api_url.replace("{id}", ep_id)
+        m_bv = _re.search(r"(BV[0-9A-Za-z]+)", episode_url)
+        if m_bv:
+            api_url = api_url.replace("{bvid}", m_bv.group(1))
+        m_cid = _re.search(r"(?:cid|p)=(\d+)", episode_url)
+        if m_cid:
+            api_url = api_url.replace("{cid}", m_cid.group(1))
+        api_url = api_url.replace("{" + q_param + "}", str(q_value))
+        api_url = api_url.replace("{quality}", str(q_value))
         filled = {}
         # 占位符：{bvid}/{cid}/{id} 从 episode_url 提取；{quality} 从画质映射；{keyword} 不适用
         for k, v in params.items():
             val = str(v)
-            val = val.replace("{id}", episode_url.split("/")[-1])
+            val = val.replace("{id}", ep_id)
             # 从 episode_url 尝试提取 bvid / cid
             m_bv = _re.search(r"(BV[0-9A-Za-z]+)", episode_url)
             if m_bv:
@@ -1514,6 +1582,9 @@ class Content:
         elif isinstance(play, dict):
             play = next((play[k] for k in ("baseUrl", "base_url", "url") if play.get(k)), "")
         play_url = str(play) if play else ""
+        # 相对播放地址补全（如 avgood playlink 是 /remote_m3u8/...，缺绝对地址无法播）
+        if play_url and not play_url.startswith(("http://", "https://", "data:")):
+            play_url = urljoin(source.base_url, play_url)
 
         # dash 双流：额外取音频轨 URL（B 站音视频分离）
         if want_streams:
@@ -1526,6 +1597,8 @@ class Content:
                 if isinstance(au, dict):
                     au = next((au[k] for k in ("baseUrl", "url") if au.get(k)), "")
                 audio_url = str(au) if au else ""
+                if audio_url and not audio_url.startswith(("http://", "https://", "data:")):
+                    audio_url = urljoin(source.base_url, audio_url)
             return {"video": play_url, "audio": audio_url}
         return play_url
 

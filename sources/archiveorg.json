@@ -10,7 +10,12 @@
     "description": "Archive.org 公共资源视频（yt-dlp 引擎，URL 解析）",
     "lang": "en",
     "region": "en",
-    "tags": ["视频", "公共资源", "免费", "yt-dlp"]
+    "tags": [
+      "视频",
+      "公共资源",
+      "免费",
+      "yt-dlp"
+    ]
   },
   "transports": {
     "base_url": "https://archive.org",
@@ -22,17 +27,38 @@
     "interval_ms": 50
   },
   "api_endpoints": {
-    "detail": { "engine": "ytdlp" },
-    "episode": { "engine": "ytdlp", "format": "bestvideo+bestaudio/best" }
+    "detail": {
+      "engine": "ytdlp"
+    },
+    "episode": {
+      "engine": "ytdlp",
+      "format": "bestvideo+bestaudio/best"
+    }
   },
   "media": {
     "format": "dash",
-    "select": { "video": { "quality": "best" } },
-    "merge": { "tool": "ffmpeg", "output_format": "mp4" }
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
   },
   "constraints": {
-    "detail": { "max_pages": 1 },
-    "episode": { "max_pages": 1, "max_items": 1 }
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
   },
-  "diagnostics": { "selfcheck": { "strategy": "off" } }
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
 }

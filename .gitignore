@@ -10,6 +10,11 @@ logs/
 downloads/
 library/
 
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
 # 截图/临时
 nav_screenshot.png
 

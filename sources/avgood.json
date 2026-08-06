@@ -1,0 +1,244 @@
+{
+  "$schema_version": 2,
+  "$id": "avgood",
+  "$type": "video",
+  "$name": "AvGood（成人影片）",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://avgood.com/t/",
+    "description": "AvGood - 成人影片资源库（線上影片，HLS m3u8，无登录）。站点分『線上影片』（详情页带 iframe 播放器）与『AV番号/磁力』两类，本源仅覆盖線上影片。播放地址提取链：详情页 iframe#video-player src=/remote_play/video/play/{id}.html → 播放页含 ajax_url=/remote_play/index.php/play/ajax/{id}.html → 该 JSON 接口返回 playlink（相对 /remote_m3u8/... m3u8，urljoin 后为绝对地址）。m3u8 无防盗链（不需 Referer/UA 也可取流）。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "成人",
+      "AV",
+      "hls",
+      "線上影片"
+    ],
+    "last_verified": "2026-08-07"
+  },
+  "transports": {
+    "base_url": "https://avgood.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://avgood.com/t/"
+    },
+    "timeout": 10,
+    "retries": 2,
+    "interval_ms": 800,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/t/664/{page}/",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "線上影片列表",
+            "url": "/t/664/{page}/"
+          },
+          {
+            "title": "91精選",
+            "url": "/t/665/{page}/"
+          },
+          {
+            "title": "綜合二區",
+            "url": "/t/666/{page}/"
+          },
+          {
+            "title": "三級倫理",
+            "url": "/t/673/{page}/"
+          },
+          {
+            "title": "亞洲無碼",
+            "url": "/t/675/{page}/"
+          },
+          {
+            "title": "亞洲有碼",
+            "url": "/t/676/{page}/"
+          },
+          {
+            "title": "偷拍自拍",
+            "url": "/t/677/{page}/"
+          },
+          {
+            "title": "歐美性愛",
+            "url": "/t/678/{page}/"
+          },
+          {
+            "title": "動漫卡通",
+            "url": "/t/679/{page}/"
+          },
+          {
+            "title": "三級情色",
+            "url": "/t/680/{page}/"
+          },
+          {
+            "title": "中文字幕",
+            "url": "/t/682/{page}/"
+          },
+          {
+            "title": "中文動漫",
+            "url": "/t/685/{page}/"
+          },
+          {
+            "title": "vr有碼",
+            "url": "/t/697/{page}/"
+          },
+          {
+            "title": "vr無碼",
+            "url": "/t/698/{page}/"
+          },
+          {
+            "title": "麻豆傳媒",
+            "url": "/t/804/{page}/"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.grid-item"
+        },
+        "fields": {
+          "title": {
+            "css": "h3.card-title"
+          },
+          "url": {
+            "css": "a.card",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.lazy",
+            "attr": "data-original"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/t/s/",
+      "method": "GET",
+      "keyword_param": "q",
+      "paginator": {
+        "url_template": "/t/s/?q={keyword}&m=&f=_all&syn=&s=pubdate_DESC&typeid=&p={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.result-card"
+        },
+        "fields": {
+          "title": {
+            "css": "h3.result-title a"
+          },
+          "url": {
+            "css": "h3.result-title a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.result-image img",
+            "attr": "src"
+          },
+          "update": {
+            "css": "span.result-date"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/[a-z]/\\d+\\.html",
+      "fields": {
+        "title": {
+          "css": "h1.content-title"
+        },
+        "cover": {
+          "css": ".description-images img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": ".description-section"
+        },
+        "tags": {
+          "css": ".nav-block .nav-link"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "list": {
+          "root_selector": {
+            "css": "div.content-container"
+          },
+          "fields": {
+            "title": {
+              "css": "h1.content-title"
+            },
+            "url": {
+              "css": "iframe#video-player",
+              "attr": "src"
+            }
+          }
+        },
+        "play_url": {
+          "selector": {
+            "css": "iframe#video-player",
+            "attr": "src"
+          }
+        }
+      }
+    }
+  },
+  "api_endpoints": {
+    "episode": {
+      "url": "/remote_play/index.php/play/ajax/{id}.html",
+      "method": "GET",
+      "response_path": "playlink",
+      "field_extractors": {
+        "play_url": "playlink"
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    },
+    "hls": {
+      "workers": 4
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 10,
+      "max_results": 200
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 10
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "div.grid-item"
+      }
+    }
+  }
+}

@@ -146,7 +146,7 @@ class SearchPage(BasePage):
             self.type_combo.addItem(t, t)
         self.src_combo = QComboBox()
         self.src_combo.addItem("全部源", "")
-        for s in source_manager.all():
+        for s in source_manager.enabled_sources():
             self.src_combo.addItem(s.source_name, s)
         self.merge_check = QCheckBox("合并相似")
         self.merge_check.setToolTip("按书名+作者模糊匹配，合并同书多源版本（默认关）")
@@ -257,7 +257,7 @@ class SearchPage(BasePage):
         if selected_src:
             sources = [selected_src]
         else:
-            sources = self._manager.all()
+            sources = self._manager.enabled_sources()
             if selected_type:
                 sources = [s for s in sources if s.content_type == selected_type]
 
@@ -684,4 +684,17 @@ class SearchPage(BasePage):
             self._load_more_results()
 
     def refresh(self) -> None:
-        pass
+        """重建源范围下拉（源选择变更后，禁用源不再列出）。"""
+        self._rebuild_src_combo()
+
+    def _rebuild_src_combo(self) -> None:
+        """按当前启用的源重建 src_combo，尽量保持原选中源。"""
+        current = self.src_combo.currentData()
+        self.src_combo.blockSignals(True)
+        self.src_combo.clear()
+        self.src_combo.addItem("全部源", "")
+        for s in self._manager.enabled_sources():
+            self.src_combo.addItem(s.source_name, s)
+        idx = self.src_combo.findData(current) if current is not None else 0
+        self.src_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.src_combo.blockSignals(False)

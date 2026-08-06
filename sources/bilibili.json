@@ -10,7 +10,11 @@
     "description": "哔哩哔哩视频站（无登录，API 直调，buvid3 cookie 绕过风控）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["视频", "免费", "正规站"]
+    "tags": [
+      "视频",
+      "免费",
+      "正规站"
+    ]
   },
   "transports": {
     "base_url": "https://www.bilibili.com",
@@ -53,26 +57,86 @@
       },
       "list_item": {
         "categories": [
-          { "title": "全部", "url": "https://www.bilibili.com/v/popular?tids=&keyword=" },
-          { "title": "动画", "url": "https://www.bilibili.com/v/popular?tids=1&keyword=新番" },
-          { "title": "番剧", "url": "https://www.bilibili.com/v/popular?tids=13&keyword=番剧" },
-          { "title": "国创", "url": "https://www.bilibili.com/v/popular?tids=167&keyword=国创" },
-          { "title": "音乐", "url": "https://www.bilibili.com/v/popular?tids=3&keyword=音乐" },
-          { "title": "舞蹈", "url": "https://www.bilibili.com/v/popular?tids=129&keyword=宅舞" },
-          { "title": "游戏", "url": "https://www.bilibili.com/v/popular?tids=4&keyword=游戏" },
-          { "title": "知识", "url": "https://www.bilibili.com/v/popular?tids=36&keyword=知识" },
-          { "title": "科技", "url": "https://www.bilibili.com/v/popular?tids=188&keyword=科技评测" },
-          { "title": "运动", "url": "https://www.bilibili.com/v/popular?tids=234&keyword=运动" },
-          { "title": "汽车", "url": "https://www.bilibili.com/v/popular?tids=223&keyword=汽车" },
-          { "title": "生活", "url": "https://www.bilibili.com/v/popular?tids=160&keyword=生活" },
-          { "title": "美食", "url": "https://www.bilibili.com/v/popular?tids=211&keyword=美食探店" },
-          { "title": "动物圈", "url": "https://www.bilibili.com/v/popular?tids=217&keyword=萌宠" },
-          { "title": "鬼畜", "url": "https://www.bilibili.com/v/popular?tids=119&keyword=鬼畜" },
-          { "title": "娱乐", "url": "https://www.bilibili.com/v/popular?tids=5&keyword=娱乐" },
-          { "title": "影视", "url": "https://www.bilibili.com/v/popular?tids=181&keyword=影视" },
-          { "title": "纪录片", "url": "https://www.bilibili.com/v/popular?tids=177&keyword=纪录片" },
-          { "title": "电影", "url": "https://www.bilibili.com/v/popular?tids=23&keyword=电影" },
-          { "title": "电视剧", "url": "https://www.bilibili.com/v/popular?tids=11&keyword=电视剧" }
+          {
+            "title": "全部",
+            "url": "https://www.bilibili.com/v/popular?tids=&keyword="
+          },
+          {
+            "title": "动画",
+            "url": "https://www.bilibili.com/v/popular?tids=1&keyword=新番"
+          },
+          {
+            "title": "番剧",
+            "url": "https://www.bilibili.com/v/popular?tids=13&keyword=番剧"
+          },
+          {
+            "title": "国创",
+            "url": "https://www.bilibili.com/v/popular?tids=167&keyword=国创"
+          },
+          {
+            "title": "音乐",
+            "url": "https://www.bilibili.com/v/popular?tids=3&keyword=音乐"
+          },
+          {
+            "title": "舞蹈",
+            "url": "https://www.bilibili.com/v/popular?tids=129&keyword=宅舞"
+          },
+          {
+            "title": "游戏",
+            "url": "https://www.bilibili.com/v/popular?tids=4&keyword=游戏"
+          },
+          {
+            "title": "知识",
+            "url": "https://www.bilibili.com/v/popular?tids=36&keyword=知识"
+          },
+          {
+            "title": "科技",
+            "url": "https://www.bilibili.com/v/popular?tids=188&keyword=科技评测"
+          },
+          {
+            "title": "运动",
+            "url": "https://www.bilibili.com/v/popular?tids=234&keyword=运动"
+          },
+          {
+            "title": "汽车",
+            "url": "https://www.bilibili.com/v/popular?tids=223&keyword=汽车"
+          },
+          {
+            "title": "生活",
+            "url": "https://www.bilibili.com/v/popular?tids=160&keyword=生活"
+          },
+          {
+            "title": "美食",
+            "url": "https://www.bilibili.com/v/popular?tids=211&keyword=美食探店"
+          },
+          {
+            "title": "动物圈",
+            "url": "https://www.bilibili.com/v/popular?tids=217&keyword=萌宠"
+          },
+          {
+            "title": "鬼畜",
+            "url": "https://www.bilibili.com/v/popular?tids=119&keyword=鬼畜"
+          },
+          {
+            "title": "娱乐",
+            "url": "https://www.bilibili.com/v/popular?tids=5&keyword=娱乐"
+          },
+          {
+            "title": "影视",
+            "url": "https://www.bilibili.com/v/popular?tids=181&keyword=影视"
+          },
+          {
+            "title": "纪录片",
+            "url": "https://www.bilibili.com/v/popular?tids=177&keyword=纪录片"
+          },
+          {
+            "title": "电影",
+            "url": "https://www.bilibili.com/v/popular?tids=23&keyword=电影"
+          },
+          {
+            "title": "电视剧",
+            "url": "https://www.bilibili.com/v/popular?tids=11&keyword=电视剧"
+          }
         ]
       }
     },
@@ -138,17 +202,30 @@
   "media": {
     "format": "dash",
     "select": {
-      "video": { "quality": "best" }
+      "video": {
+        "quality": "best"
+      }
     },
-    "merge": { "tool": "ffmpeg", "output_format": "mp4" }
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
   },
   "ad_block": {
     "enabled": true
   },
   "constraints": {
-    "search": { "max_pages": 3, "max_results": 60 },
-    "detail": { "max_pages": 1 },
-    "episode": { "max_pages": 50, "max_items": 300 }
+    "search": {
+      "max_pages": 3,
+      "max_results": 60
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 50,
+      "max_items": 300
+    }
   },
   "diagnostics": {
     "selfcheck": {

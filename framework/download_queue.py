@@ -145,7 +145,7 @@ class DownloadQueue:
         self._tasks: List[DownloadTask] = []
         self._seq = itertools.count(1)
         self._concurrent = max(
-            1, int(settings.get("download", "max_concurrent_downloads", 4))
+            1, int(settings.get("download", "max_concurrent_downloads", 6))
         )
         self._active_workers = 0
 

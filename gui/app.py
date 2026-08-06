@@ -63,6 +63,14 @@ IMPLEMENTED_TABS = {
 }
 
 
+def _app_base_dir() -> Path:
+    """应用根目录：PyInstaller 打包后为 exe 所在目录（sources/data/docs 随 exe 旁），
+    开发运行时为项目根（gui/ 的上一级）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
 class _CentralArea(QWidget):
     """中央区容器：paintEvent 直接绘制背景图（最底层）。
 
@@ -130,7 +138,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 640)
 
         # 基础设施
-        base_dir = Path(__file__).resolve().parent.parent
+        base_dir = _app_base_dir()
         self.settings = SettingsManager(base_dir / "app_config.json")
         self.event_bus = EventBus()
         self.theme_manager = ThemeManager(self.settings)
@@ -225,6 +233,9 @@ class MainWindow(QMainWindow):
         # 启动自动诊断：后台对所有启用源跑一次 selfcheck，健康灯一开始就准确
         self._schedule_startup_diag()
 
+        # 首次启动源选择引导（可跳过；未做过源选择时窗口显示后弹出）
+        self._schedule_source_selection()
+
     # ------------------------------------------------------------------ #
     def _build_pages(self) -> None:
         """构建导航栏各 Tab。未实现界面在标签后标注「·开发中」。"""
@@ -307,7 +318,7 @@ class MainWindow(QMainWindow):
         try:
             from framework.library_store import LibraryStore
 
-            base_dir = Path(__file__).resolve().parent.parent
+            base_dir = _app_base_dir()
             self.library_store = LibraryStore(base_dir / "data" / "library.json")
             return self.library_store
         except Exception:  # noqa: BLE001
@@ -493,7 +504,7 @@ class MainWindow(QMainWindow):
         """书架：本地 epub + 收藏聚合。"""
         from gui.pages.library_page import LibraryPage
 
-        base_dir = Path(__file__).resolve().parent.parent
+        base_dir = _app_base_dir()
         # 复用收藏库（阅读器可能已先构建），避免重复读文件
         self.library_store = self._ensure_library_store()
         output_dir = self.settings.get("download", "output_dir", "downloads")
@@ -539,6 +550,10 @@ class MainWindow(QMainWindow):
         self.settings_page.theme_changed.connect(self._apply_theme_qss)
         # 应用 → 重跑主题 + 字体缩放 + 背景图（实时生效）
         self.settings_page.settings_applied.connect(self._on_settings_applied)
+        # 源选择 → 打开同一个引导对话框（重新勾选启用源）
+        self.settings_page.source_select_requested.connect(
+            self._open_source_selection_dialog
+        )
         return self.settings_page
         self.tabs.setCurrentIndex(self._tab_index["reader"])
 
@@ -546,7 +561,7 @@ class MainWindow(QMainWindow):
         """源管理页：源列表 + 诊断 + 编辑入口。"""
         from gui.pages.source_page import SourcePage
 
-        base_dir = Path(__file__).resolve().parent.parent
+        base_dir = _app_base_dir()
         self.source_page = SourcePage(
             source_manager=self.source_manager,
             checker=self.checker,
@@ -562,7 +577,7 @@ class MainWindow(QMainWindow):
         from gui.components.source_editor import SourceEditor
         from framework.preview import Preview
 
-        base_dir = Path(__file__).resolve().parent.parent
+        base_dir = _app_base_dir()
         config = None
         if source_id:
             try:
@@ -582,7 +597,7 @@ class MainWindow(QMainWindow):
         """编辑器保存后：重载源 + 刷新列表。"""
         try:
             self.source_manager.load_dir(
-                Path(__file__).resolve().parent.parent / "sources"
+                _app_base_dir() / "sources"
             )
         except Exception:
             pass
@@ -724,7 +739,7 @@ class MainWindow(QMainWindow):
         tokens = self.theme_manager.current_tokens()
         bg_color = tokens.get("bg", "#FFF6F9")
         # 缓存 key
-        cache_dir = Path(__file__).resolve().parent.parent / "data" / "cache"
+        cache_dir = _app_base_dir() / "data" / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = cache_dir / "bg_composed.png"
         key_file = cache_dir / "bg_composed.key"
@@ -1001,13 +1016,60 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
                     row.set_error(err if not ok else "")
                     break
 
+    # ------------------------------------------------------------------ #
+    # 源选择引导（首次启动 + 设置界面「源选择」共用）
+    # ------------------------------------------------------------------ #
+    def _schedule_source_selection(self) -> None:
+        """首次启动源选择引导：未做过源选择时，等窗口显示后弹出（可跳过）。
+
+        确认 / 跳过都会写入「已做过源选择」标记，下次启动不再弹。
+        """
+        if self.settings.get("sources_runtime", "sources_selected", False):
+            return
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(0, lambda: self._open_source_selection_dialog(first_run=True))
+
+    def _open_source_selection_dialog(self, first_run: bool = False) -> None:
+        """打开源选择引导对话框，应用勾选结果并刷新相关页面。
+
+        first_run=True：跳过或确定都视为「已做过源选择」，写入标记；
+        确定后把勾选结果应用到源启用状态（持久化到源 JSON）。
+        """
+        from PySide6.QtWidgets import QDialog
+
+        from gui.components.source_select_dialog import SourceSelectDialog
+
+        dlg = SourceSelectDialog(self.source_manager, first_run=first_run, parent=self)
+        accepted = dlg.exec() == QDialog.Accepted
+        if accepted:
+            self.source_manager.apply_enabled_selection(dlg.selected_ids())
+        if first_run:
+            self.settings.set("sources_runtime", "sources_selected", True)
+            self.settings.save()
+        if accepted:
+            self._on_sources_reselected()
+
+    def _on_sources_reselected(self) -> None:
+        """源选择应用后：刷新源管理页 + 发现页 + 搜索页（禁用源不再列出）。"""
+        page = getattr(self, "source_page", None)
+        if page is not None:
+            page.refresh()
+        for key in ("discover", "search"):
+            idx = self._tab_index.get(key)
+            if idx is None:
+                continue
+            page = self.tabs.widget(idx)
+            if page is not None and hasattr(page, "refresh"):
+                page.refresh()
+
 
 def main() -> int:
     from framework.logging_setup import setup_logging
     from framework.settings_manager import SettingsManager
 
     # 日志初始化（诊断区 verbose_logging / log_dir）
-    base_dir = Path(__file__).resolve().parent.parent
+    base_dir = _app_base_dir()
     setup_logging(SettingsManager(base_dir / "app_config.json"))
 
     app = QApplication(sys.argv)

@@ -41,6 +41,7 @@
   "sources_runtime": {
     "broken_source_warn_interval_hours": 24,
     "auto_disable_after_failures": 3,
-    "selfcheck_strategy": "soft"
+    "selfcheck_strategy": "soft",
+    "sources_selected": true
   }
 }

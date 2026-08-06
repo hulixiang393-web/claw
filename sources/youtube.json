@@ -10,7 +10,12 @@
     "description": "YouTube 视频源（yt-dlp 引擎，高清签名多流）",
     "lang": "en",
     "region": "en",
-    "tags": ["视频", "免费", "正规站", "yt-dlp"]
+    "tags": [
+      "视频",
+      "免费",
+      "正规站",
+      "yt-dlp"
+    ]
   },
   "transports": {
     "base_url": "https://www.youtube.com",
@@ -27,16 +32,46 @@
       "default_keyword": "热门",
       "list_item": {
         "categories": [
-          { "title": "全部", "url": "https://www.youtube.com/results?keyword=热门" },
-          { "title": "音乐", "url": "https://www.youtube.com/results?keyword=音乐" },
-          { "title": "游戏", "url": "https://www.youtube.com/results?keyword=游戏" },
-          { "title": "教育", "url": "https://www.youtube.com/results?keyword=教程" },
-          { "title": "科技", "url": "https://www.youtube.com/results?keyword=科技评测" },
-          { "title": "美食", "url": "https://www.youtube.com/results?keyword=美食" },
-          { "title": "体育", "url": "https://www.youtube.com/results?keyword=sports" },
-          { "title": "新闻", "url": "https://www.youtube.com/results?keyword=news" },
-          { "title": "旅游", "url": "https://www.youtube.com/results?keyword=travel vlog" },
-          { "title": "Vlog", "url": "https://www.youtube.com/results?keyword=vlog" }
+          {
+            "title": "全部",
+            "url": "https://www.youtube.com/results?keyword=热门"
+          },
+          {
+            "title": "音乐",
+            "url": "https://www.youtube.com/results?keyword=音乐"
+          },
+          {
+            "title": "游戏",
+            "url": "https://www.youtube.com/results?keyword=游戏"
+          },
+          {
+            "title": "教育",
+            "url": "https://www.youtube.com/results?keyword=教程"
+          },
+          {
+            "title": "科技",
+            "url": "https://www.youtube.com/results?keyword=科技评测"
+          },
+          {
+            "title": "美食",
+            "url": "https://www.youtube.com/results?keyword=美食"
+          },
+          {
+            "title": "体育",
+            "url": "https://www.youtube.com/results?keyword=sports"
+          },
+          {
+            "title": "新闻",
+            "url": "https://www.youtube.com/results?keyword=news"
+          },
+          {
+            "title": "旅游",
+            "url": "https://www.youtube.com/results?keyword=travel vlog"
+          },
+          {
+            "title": "Vlog",
+            "url": "https://www.youtube.com/results?keyword=vlog"
+          }
         ]
       }
     },
@@ -57,14 +92,27 @@
   "media": {
     "format": "dash",
     "select": {
-      "video": { "quality": "best" }
+      "video": {
+        "quality": "best"
+      }
     },
-    "merge": { "tool": "ffmpeg", "output_format": "mp4" }
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 40 },
-    "detail": { "max_pages": 1 },
-    "episode": { "max_pages": 1, "max_items": 1 }
+    "search": {
+      "max_pages": 1,
+      "max_results": 40
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
   },
   "diagnostics": {
     "selfcheck": {

@@ -10,7 +10,13 @@
     "description": "哔哩轻小说 - 日文轻小说汉化/插图站（目录页入口，正文无加密）",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["小说", "轻小说", "汉化", "插图", "日本"]
+    "tags": [
+      "小说",
+      "轻小说",
+      "汉化",
+      "插图",
+      "日本"
+    ]
   },
   "transports": {
     "base_url": "https://www.linovelib.com",
@@ -30,45 +36,82 @@
       "list_url": "/novel/1/catalog",
       "list_item": {
         "categories": [
-          { "title": "恶魔高校DxD", "url": "/novel/1/catalog" },
-          { "title": "刀剑神域", "url": "/novel/38/catalog" },
-          { "title": "魔法科高校劣等生", "url": "/novel/35/catalog" }
+          {
+            "title": "恶魔高校DxD",
+            "url": "/novel/1/catalog"
+          },
+          {
+            "title": "刀剑神域",
+            "url": "/novel/38/catalog"
+          },
+          {
+            "title": "魔法科高校劣等生",
+            "url": "/novel/35/catalog"
+          }
         ]
       },
       "works_list_item": {
-        "root_selector": { "css": "a[href*='/novel/']" },
+        "root_selector": {
+          "css": "a[href*='/novel/']"
+        },
         "fields": {
-          "title": { "css": "a" },
-          "url": { "css": "a", "attr": "href" }
+          "title": {
+            "css": "a"
+          },
+          "url": {
+            "css": "a",
+            "attr": "href"
+          }
         }
       }
     },
     "detail": {
       "fields": {
-        "title": { "css": "h1" },
-        "summary": { "css": "meta[name='description']", "attr": "content" }
+        "title": {
+          "css": "h1"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        }
       }
     },
     "content": {
       "chapter": {
         "list": {
-          "root_selector": { "css": "a[href*='/novel/']" },
+          "root_selector": {
+            "css": "a[href*='/novel/']"
+          },
           "fields": {
-            "title": { "css": "a" },
-            "url": { "css": "a", "attr": "href" }
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
           }
         },
         "body": {
-          "selector": { "css": "#mlfy_main_text p" }
+          "selector": {
+            "css": "#mlfy_main_text p"
+          }
         }
       }
     }
   },
   "constraints": {
-    "detail": { "max_pages": 1 },
-    "chapter": { "max_pages": 500, "max_items": 500 }
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 500,
+      "max_items": 500
+    }
   },
   "diagnostics": {
-    "selfcheck": { "strategy": "off" }
+    "selfcheck": {
+      "strategy": "off"
+    }
   }
 }

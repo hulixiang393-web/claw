@@ -1,0 +1,148 @@
+{
+  "$schema_version": 2,
+  "$id": "zonghengmh",
+  "$type": "comic",
+  "$name": "纵横漫画",
+  "$enabled": false,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.zongheng.com/comic.html",
+    "icon": "https://static.zongheng.com/favicon.ico",
+    "description": "纵横中文网旗下漫画平台（comic.zongheng.com）。受限源：阅读需登录并每话付费（纵横币），详情/目录/阅读页为 JS 渲染 SPA 且无公开 API；仅首页作品列表可免登录抓取，且列表卡片链接为 javascript:;（无 href），detail 需按 comicId 拼 /chapter?comicId={id}。默认禁用，使用前需配置 auth 登录并实测验证选择器。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "漫画",
+      "纵横",
+      "付费",
+      "需登录",
+      "受限"
+    ],
+    "last_verified": "2026-08-07"
+  },
+  "transports": {
+    "base_url": "https://www.zongheng.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.zongheng.com/"
+    },
+    "timeout": 10,
+    "retries": 2,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/comic.html",
+      "note": "首页即全部作品列表（实测 27 部，无分页无分类）。卡片链接为 javascript:; 无真实 href；url 字段经 xpath '.' + attr 'comicid' 取卡片根节点上的 comicId 属性（lxml 会把属性名小写化，故用 comicid）。正确详情 URL 应为 https://comic.zongheng.com/chapter?comicId={comic_id}，但框架 discovery 列表项无 URL 模板，需代码层拼接（当前返回裸 ID）。",
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.comicCell"
+        },
+        "fields": {
+          "title": {
+            "css": "div.bookname a"
+          },
+          "url": {
+            "xpath": ".",
+            "attr": "comicid"
+          },
+          "cover": {
+            "css": "div.imgbox a img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "note": "需实测验证（详情为登录后 SPA 渲染，免登录仅得到统一 SPA shell）。以下为推测选择器，登录后按实际 DOM 修正。",
+      "fields": {
+        "title": {
+          "css": "h1"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "author": {
+          "css": "meta[name='author']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[property='og:description']",
+          "attr": "content"
+        },
+        "status": {
+          "css": ".book-status"
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "note": "需实测验证：目录为登录后 SPA 渲染。纵横漫画阅读 URL 形如 /chapter?comicId={id}（comic.min.js 确认）。",
+          "root_selector": {
+            "css": "a[href*='/chapter']"
+          },
+          "fields": {
+            "title": {
+              "css": "a[href*='/chapter']"
+            },
+            "url": {
+              "css": "a[href*='/chapter']",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "note": "需实测验证：阅读页需登录+按话付费。comic.min.js 中阅读器容器为 #comicReader；图片可能 src 或 data-src 懒加载，下载需 Referer=https://comic.zongheng.com/。",
+          "render": "playwright",
+          "render_config": {
+            "wait_for": "#comicReader",
+            "wait_until": "networkidle",
+            "extra_delay_ms": 3000,
+            "timeout_ms": 30000,
+            "scroll_to_bottom": true,
+            "extract_mode": "img"
+          },
+          "root_selector": {
+            "css": "#comicReader img"
+          },
+          "fields": {
+            "url": {
+              "css": "#comicReader img",
+              "attr": "src"
+            }
+          }
+        }
+      }
+    }
+  },
+  "auth": {
+    "login_required": true,
+    "cookie_check": {
+      "field": "passToken",
+      "min_length": 1,
+      "on_expired": "warn"
+    },
+    "note": "需实测验证：cookie 字段名未知（阅读页会 302 到 passport.zongheng.com），登录后抓包确认。即使登录，每话仍需纵横币付费，框架不支持付费自动化。"
+  },
+  "constraints": {
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 20,
+      "max_items": 500
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "div.comicCell"
+      }
+    }
+  }
+}

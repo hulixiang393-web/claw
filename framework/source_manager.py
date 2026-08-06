@@ -154,6 +154,39 @@ class SourceManager:
         source = self.get(source_id)
         source.weight = weight
 
+    def enabled_sources(self) -> List[SourceConfig]:
+        """当前启用的源（搜索页源范围、发现页源列表据此过滤）。"""
+        return [s for s in self._sources.values() if s.enabled]
+
+    def apply_enabled_selection(self, selected_ids) -> None:
+        """按「源选择引导」勾选结果批量启停，并把 $enabled 持久化到各源 JSON。
+
+        只启用勾选的源，其余禁用。内存态立即生效（发现/搜索页下一次
+        refresh 即按 enabled 过滤），JSON 持久化保证重启后保留。
+        """
+        selected = set(selected_ids)
+        for source in self._sources.values():
+            enabled = source.source_id in selected
+            source.enabled = enabled
+            self._persist_enabled(source, enabled)
+
+    @staticmethod
+    def _persist_enabled(source: SourceConfig, enabled: bool) -> None:
+        """把源 JSON 的 $enabled 字段写回磁盘。
+
+        失败不阻塞：内存态已生效，仅失去持久化（下次启动恢复原状态）。
+        """
+        path = source.source_path
+        if not path:
+            return
+        source.raw["$enabled"] = enabled
+        try:
+            Path(path).write_text(
+                json.dumps(source.raw, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
     # ------------------------------------------------------------------ #
     # 健康状态
     # ------------------------------------------------------------------ #
@@ -262,5 +295,5 @@ class SourceManager:
             pass  # 健康状态写失败不阻塞
 
     def discoverable_sources(self) -> List[SourceConfig]:
-        """配置了发现规则的源（发现界面只列这些）。"""
-        return [s for s in self._sources.values() if s.has_discovery()]
+        """配置了发现规则且已启用的源（发现界面只列这些）。"""
+        return [s for s in self._sources.values() if s.has_discovery() and s.enabled]

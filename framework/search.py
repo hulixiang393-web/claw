@@ -391,7 +391,7 @@ class Search:
                     url=url,
                     source_id=source.source_id,
                     source_name=source.source_name,
-                    cover=it.get("src", ""),
+                    cover=Search._clean_cover(it.get("src", "")),
                 )
             )
         return results

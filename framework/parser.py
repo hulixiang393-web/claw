@@ -173,9 +173,12 @@ class Parser:
             if sel is None:
                 item[key] = ""
                 continue
-            # 仅 URL 类 attr 才做绝对化拼接
+            # 仅 URL 类 attr 才做绝对化拼接（含懒加载属性 data-*，
+            # 否则封面等返回相对路径 GUI 加载不出）
             attr = sel.get("attr")
-            use_base = base_url if attr in ("href", "src", "srcset") else ""
+            use_base = base_url if attr in (
+                "href", "src", "srcset", "data-src", "data-original", "data-lazy-src"
+            ) else ""
             item[key] = self.extract_first(doc, sel, use_base)
         return item
 
@@ -184,7 +187,10 @@ class Parser:
     def _abs(base_url: str, url: str) -> str:
         from urllib.parse import urlsplit
 
-        if url.startswith(("http://", "https://", "data:", "javascript:", "//")):
+        # 协议相对 URL（//host/path）补 https:，否则 GUI 加载不了
+        if url.startswith("//"):
+            return "https:" + url
+        if url.startswith(("http://", "https://", "data:", "javascript:")):
             return url
         # 大写协议也识别（HTTP:// 等）
         if (urlsplit(url).scheme or "").lower() in ("http", "https"):

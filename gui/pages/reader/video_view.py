@@ -98,6 +98,8 @@ class VideoView(QWidget):
         self._player = None
         self._dragging = False
         self._fs_win = None  # 全屏顶层窗口
+        self._cached_length = 0  # 缓存视频总时长（length_changed 更新，避免每次 get_length 阻塞）
+        self._last_tick = 0.0  # time_changed 节流时间戳（长视频防信号堆积卡主线程）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -457,7 +459,16 @@ class VideoView(QWidget):
     def _on_time_changed(self, ms: int) -> None:
         if self._dragging or not self.isVisible():
             return
-        length = self._player.get_length() if self._player else 0
+        # 节流：VLC time_changed 约 250ms 一次，长视频（如 MissAV 1-2h）时
+        # 信号 queued 到主线程若每次更新 UI 会堆积卡死；限 300ms 更新一次。
+        import time
+
+        now = time.monotonic()
+        if now - self._last_tick < 0.3:
+            return
+        self._last_tick = now
+        # 用缓存时长，不在每次回调里 get_length()（网络流该调用会阻塞）
+        length = self._cached_length
         if length > 0:
             self.progress.setValue(int(ms / length * 1000))
             self.time_label.setText(f"{_fmt_time(ms)} / {_fmt_time(length)}")
@@ -467,6 +478,7 @@ class VideoView(QWidget):
 
     def _on_length_changed(self, ms: int) -> None:
         if ms > 0:
+            self._cached_length = ms
             self.time_label.setText(
                 f"{_fmt_time(self._player.get_time() if self._player else 0)} / {_fmt_time(ms)}"
             )

@@ -131,6 +131,7 @@ class SettingsPage(BasePage):
 
     theme_changed = Signal(str)  # 主题切换 → App 层刷新全局 QSS
     settings_applied = Signal()  # 点「应用」→ App 层重跑主题 QSS / 字体缩放 / 背景图
+    source_select_requested = Signal()  # 点「源选择」→ App 层打开源选择引导对话框
 
     def __init__(self, settings, theme_manager, parent=None):
         super().__init__(parent)
@@ -210,6 +211,18 @@ class SettingsPage(BasePage):
         row.addWidget(hint)
         row.addStretch(1)
         sec._form.addRow("缓存", row)
+
+        # 源选择入口：重开首次启动的引导对话框，重新勾选启用源
+        src_row = QHBoxLayout()
+        src_row.setSpacing(8)
+        self._source_select_btn = QPushButton("源选择 / 重新下载源")
+        self._source_select_btn.clicked.connect(self._on_source_select)
+        src_row.addWidget(self._source_select_btn)
+        src_hint = QLabel("重新勾选要启用的源，未勾选的源从发现/搜索页隐藏")
+        src_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        src_row.addWidget(src_hint)
+        src_row.addStretch(1)
+        sec._form.addRow("源选择", src_row)
         self.tabs.addTab(sec, "UI")
 
     def _on_cache_clear(self) -> None:
@@ -238,6 +251,10 @@ class SettingsPage(BasePage):
                     except OSError:
                         pass
         QMessageBox.information(self, "清除缓存", f"已清除缓存（删除 {removed} 个临时文件）")
+
+    def _on_source_select(self) -> None:
+        """点「源选择 / 重新下载源」→ 由 App 层打开同一个引导对话框。"""
+        self.source_select_requested.emit()
 
     def _build_download(self) -> None:
         sec = _Section()

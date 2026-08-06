@@ -88,8 +88,17 @@ class DiscoverPage(BasePage):
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(8)
 
-        # ---- 顶部：源选择器 + 抓取全部 ----
+        # ---- 顶部：类型筛选 + 源选择器 + 抓取全部 ----
         top = QHBoxLayout()
+        self.type_filter = QComboBox()
+        self.type_filter.addItem("全部类型", "")
+        self.type_filter.addItem("小说", "novel")
+        self.type_filter.addItem("漫画", "comic")
+        self.type_filter.addItem("视频", "video")
+        self.type_filter.setFixedWidth(96)
+        self.type_filter.currentIndexChanged.connect(self._on_type_filter_changed)
+        top.addWidget(self.type_filter)
+
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         top.addWidget(self.source_combo, stretch=1)
@@ -201,11 +210,21 @@ class DiscoverPage(BasePage):
         viewport.mouseMoveEvent = on_move
         viewport.mouseReleaseEvent = on_release
 
+    def _on_type_filter_changed(self, idx: int) -> None:
+        """类型筛选变化 → 按类型重建源列表（数据源分类显示）。"""
+        self._reload_sources()
+
     def _reload_sources(self) -> None:
-        """只列配置了 discovery 的源（避免多次触发切换）。加健康灯前缀。"""
+        """只列配置了 discovery 的源（避免多次触发切换）。加健康灯前缀。
+
+        type_filter 筛选：只列当前所选类型（全部/小说/漫画/视频）的源。
+        """
         self.source_combo.blockSignals(True)
         self.source_combo.clear()
+        ftype = self.type_filter.currentData() if hasattr(self, "type_filter") else ""
         sources = self._manager.discoverable_sources()
+        if ftype:
+            sources = [s for s in sources if s.content_type == ftype]
         for s in sources:
             label = f"{self._health_icon(s.source_id)} {s.source_name} ({s.content_type})"
             self.source_combo.addItem(label, s)
@@ -217,6 +236,12 @@ class DiscoverPage(BasePage):
         if sources:
             self.source_combo.setCurrentIndex(0)
         self.source_combo.blockSignals(False)
+        if not sources:
+            # 该类型无可用源：清空网格与分类，避免残留旧源内容
+            self.status_label.setText("该类型暂无可用源")
+            self._clear_works()
+            self._clear_cat_buttons()
+            return
         # 手动触发一次源切换
         self._on_source_changed(self.source_combo.currentIndex())
 

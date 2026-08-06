@@ -44,6 +44,8 @@ class Decrypter:
             return self._base64_decode(content)
         if strategy == "custom_endpoint":
             return self._call_endpoint(cfg, content)
+        if strategy == "translit":
+            return self._translit(content, cfg)
         # 默认原样返回
         return content
 
@@ -158,6 +160,26 @@ class Decrypter:
             return raw.decode("utf-8", errors="replace")
         except Exception as exc:
             raise DecryptError(f"base64 解码失败：{exc}") from exc
+
+    def _translit(self, content: str, cfg: dict) -> str:
+        """字符映射解密（如番茄小说字体混淆：PUA 码位 → 汉字）。
+
+        映射表由 cfg["map_module"] 指定（默认 framework.data.fanqie_glyph_map），
+        用 str.translate 批量替换。加载失败/异常时原样返回（不阻塞正文）。
+        """
+        if not content:
+            return content
+        try:
+            mod_name = cfg.get("map_module") or "framework.data.fanqie_glyph_map"
+            import importlib
+
+            table = getattr(importlib.import_module(mod_name), "FANQIE_GLYPH_MAP", None)
+            if isinstance(table, dict) and table:
+                # str.translate 只接受 ord(int) 作 key，字符 key 不生效（实测静默失败）
+                return content.translate({ord(k): v for k, v in table.items()})
+        except Exception:  # noqa: BLE001
+            pass
+        return content
 
     def _call_endpoint(self, cfg: dict, content: str) -> str:
         endpoint = cfg.get("endpoint")

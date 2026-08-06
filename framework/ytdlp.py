@@ -39,10 +39,13 @@ def _find_ytdlp() -> str:
 class Ytdlp:
     """yt-dlp 子进程封装。"""
 
+    # 类级共享搜索缓存：search/discovery/content 各持一个 Ytdlp 实例，
+    # 缓存跨实例复用（同关键词重复搜索秒回，减少 yt-dlp 子进程冷启动）
+    _search_cache: dict = {}
+
     def __init__(self, binary: Optional[str] = None, timeout: float = 60.0):
         self._bin = binary or _find_ytdlp()
         self._timeout = timeout
-        self._search_cache: dict = {}  # (prefix, keyword, limit) → results，重复搜索秒回
 
     # ------------------------------------------------------------------ #
     def _run(self, args: List[str]) -> str:
@@ -104,13 +107,14 @@ class Ytdlp:
         秒回（Content 复用单例 Ytdlp，缓存跨搜索有效）。
         """
         key = (prefix, keyword, limit)
-        if key in self._search_cache:
-            return list(self._search_cache[key])
+        if key in Ytdlp._search_cache:
+            return list(Ytdlp._search_cache[key])
 
         q = f"{prefix}{limit}:{keyword}"
         out = self._run([
             "--dump-single-json", "--no-warnings",
             "--flat-playlist",
+            "--socket-timeout", "10",
             q,
         ])
         try:
@@ -130,7 +134,7 @@ class Ytdlp:
                 "cover": (e.get("thumbnail") or "").split("?")[0],
                 "author": e.get("channel") or e.get("uploader") or "",
             })
-        self._search_cache[key] = results
+        Ytdlp._search_cache[key] = results
         return results
 
     # ------------------------------------------------------------------ #

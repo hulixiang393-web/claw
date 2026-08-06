@@ -159,6 +159,8 @@ async def fetch_rendered_images(
     page_container_selector: Optional[str] = None,
     scroll_step_px: int = 600,
     scroll_stale_rounds: int = 6,
+    wheel_scroll: bool = False,
+    img_selector: Optional[str] = None,
 ) -> List[str]:
     """用 Playwright 渲染页面，提取内容。
 
@@ -170,10 +172,15 @@ async def fetch_rendered_images(
         extra_delay_ms:    渲染后额外等待（ms）
         click_selector:    可选：渲染后点击该元素（展开弹层/触发懒加载）
         scroll_to_bottom:  可选：滚动到页底，触发滚动懒加载
+        wheel_scroll:      可选：true 时用 mouse.wheel 触发滚动/翻页（翻页式阅读器
+            靠 wheel 事件翻页加载后续图片，window.scrollBy 不派发 wheel 事件）；
+            false 时保持原 window.scrollBy 行为（canvas 懒加载站默认）。
         extract_mode:      提取方式
             "canvas"  → 收集所有 canvas 的 toDataURL（加密分片图合并结果）
-            "img"     → 收集所有 img 的 data-src/src（普通图片 URL）
+            "img"     → 收集所有 img 的 data-src/src（普通图片 URL）。
+                        img_selector 给出时只收集匹配元素（过滤 UI 图标等非正文图）
             "text"    → 收集页面 body 文本（JS 渲染出的正文）
+        img_selector:      可选：extract_mode="img" 时限定收集的选择器（如 "img.indexImg"）
         proxy:             显式代理（如 http://127.0.0.1:7890）；None 时自动探测系统代理。
     """
     try:
@@ -248,10 +255,15 @@ async def fetch_rendered_images(
 
                     # 大步快滚 + 边滚边收集：按已收集的页 id 数判断是否到底，
                     # 不再机械滚满 150 步。新的页 id 不再增长即视为结束（更快）。
+                    # wheel_scroll=true 时用 mouse.wheel 派发 wheel 事件（翻页式阅读器
+                    # 靠 wheel 事件翻页加载后续图片）；false 保持 window.scrollBy。
                     step = max(scroll_step_px, 1000)
                     no_new_pages = 0
                     for _scroll_step in range(120):
-                        await page.evaluate(f"window.scrollBy(0, {step})")
+                        if wheel_scroll:
+                            await page.mouse.wheel(0, step)
+                        else:
+                            await page.evaluate(f"window.scrollBy(0, {step})")
                         await page.wait_for_timeout(80)  # 80ms/步，更快
                         prev_count = len(drawn_pages)
                         await _collect_drawn()
@@ -276,8 +288,11 @@ async def fetch_rendered_images(
                     text = await page.evaluate("() => document.body.innerText")
                     images = [t.strip() for t in (text or "").splitlines() if t.strip()] or []
                 elif extract_mode == "img":
-                    # 普通图片 URL（懒加载 data-src / src）
-                    imgs = await page.query_selector_all("img")
+                    # 普通图片 URL（懒加载 data-src / src）。
+                    # img_selector 给出时只收集匹配元素（如 "img.indexImg"，
+                    # 过滤翻页 UI 图标等非正文图）。
+                    sel = img_selector or "img"
+                    imgs = await page.query_selector_all(sel)
                     images = []
                     for img in imgs[:500]:
                         try:
@@ -375,6 +390,8 @@ def fetch_rendered_images_sync(
     page_container_selector: Optional[str] = None,
     scroll_step_px: int = 600,
     scroll_stale_rounds: int = 6,
+    wheel_scroll: bool = False,
+    img_selector: Optional[str] = None,
 ) -> List[str]:
     """同步版本的 fetch_rendered_images。"""
     return asyncio.run(
@@ -382,6 +399,7 @@ def fetch_rendered_images_sync(
             url, wait_for, wait_until, timeout_ms, extra_delay_ms,
             click_selector, scroll_to_bottom, extract_mode, output_dir, proxy,
             page_container_selector, scroll_step_px, scroll_stale_rounds,
+            wheel_scroll, img_selector,
         )
     )
 
@@ -395,6 +413,8 @@ async def _render_one_url(
     extra_delay_ms: int,
     scroll_to_bottom: bool,
     extract_mode: str,
+    wheel_scroll: bool = False,
+    img_selector: Optional[str] = None,
 ):
     """在给定 page（复用浏览器）上渲染单个 URL 并提取。
 
@@ -435,7 +455,10 @@ async def _render_one_url(
         step = 1500
         no_new = 0
         for _ in range(80):
-            await page.evaluate(f"window.scrollBy(0, {step})")
+            if wheel_scroll:
+                await page.mouse.wheel(0, step)
+            else:
+                await page.evaluate(f"window.scrollBy(0, {step})")
             await page.wait_for_timeout(50)
             prev = len(drawn)
             await _collect_drawn()
@@ -453,7 +476,8 @@ async def _render_one_url(
         text = await page.evaluate("() => document.body.innerText")
         images = [t.strip() for t in (text or "").splitlines() if t.strip()] or []
     elif extract_mode == "img":
-        imgs = await page.query_selector_all("img")
+        sel = img_selector or "img"
+        imgs = await page.query_selector_all(sel)
         for img in imgs[:500]:
             try:
                 src = await img.get_attribute("data-src") or await img.get_attribute("src")
@@ -524,6 +548,8 @@ async def _fetch_pages_batch(
                         "extra_delay_ms": int(per.get("extra_delay_ms", render_cfg.get("extra_delay_ms", 2500))),
                         "scroll_to_bottom": per.get("scroll_to_bottom", render_cfg.get("scroll_to_bottom", False)),
                         "extract_mode": per.get("extract_mode", render_cfg.get("extract_mode", "canvas")),
+                        "wheel_scroll": per.get("wheel_scroll", render_cfg.get("wheel_scroll", False)),
+                        "img_selector": per.get("img_selector", render_cfg.get("img_selector")),
                     }
                     try:
                         imgs = await _render_one_url(page, url, **cfg)

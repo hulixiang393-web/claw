@@ -1,0 +1,175 @@
+{
+  "$schema_version": 2,
+  "$id": "xuandm",
+  "$type": "video",
+  "$name": "XDM动漫",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://xuandm.com/",
+    "icon": "https://xuandm.com/favicon.svg",
+    "description": "XDM动漫 - 海量动漫/电影/电视剧在线观看（Next.js SSR，发现/搜索走 JSON API，详情/分集走 SSR HTML，HLS m3u8 无防盗链）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "动漫",
+      "电影",
+      "电视剧",
+      "在线",
+      "hls"
+    ]
+  },
+  "transports": {
+    "base_url": "https://xuandm.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://xuandm.com/"
+    },
+    "timeout": 12,
+    "retries": 3,
+    "retry_backoff": {
+      "base": 1.0,
+      "max": 8.0,
+      "jitter": 0.3
+    },
+    "interval_ms": 300,
+    "charset": "utf-8",
+    "follow_redirects": true
+  },
+  "api_endpoints": {
+    "discovery": {
+      "url": "/api/category",
+      "params": {
+        "parent_id": "{parent_id}",
+        "page": "{page}"
+      },
+      "response_path": "results",
+      "item_fields": {
+        "title": "title",
+        "url": "/video/{id}",
+        "cover": "cover",
+        "update": "remark"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "动漫",
+            "url": "/category?parent_id=4"
+          },
+          {
+            "title": "电影",
+            "url": "/category?parent_id=1"
+          },
+          {
+            "title": "电视剧",
+            "url": "/category?parent_id=2"
+          },
+          {
+            "title": "综艺",
+            "url": "/category?parent_id=3"
+          },
+          {
+            "title": "爽文短剧",
+            "url": "/category?parent_id=46"
+          },
+          {
+            "title": "体育",
+            "url": "/category?parent_id=17"
+          },
+          {
+            "title": "福利",
+            "url": "/category?parent_id=5"
+          }
+        ]
+      }
+    },
+    "search": {
+      "url": "/api/search",
+      "params": {
+        "q": "{keyword}"
+      },
+      "response_path": "results",
+      "item_fields": {
+        "title": "title",
+        "url": "/video/{id}",
+        "cover": "cover",
+        "update": "remark"
+      }
+    }
+  },
+  "endpoints": {
+    "detail": {
+      "url_pattern": "/video/\\d+",
+      "fields": {
+        "title": {
+          "css": "h1"
+        },
+        "cover": {
+          "css": "img[data-testid='detail-cover']",
+          "attr": "src"
+        },
+        "summary": {
+          "css": "div.line-clamp-4 p"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "list": {
+          "root_selector": {
+            "css": "a[data-testid^='episode-card-']"
+          },
+          "fields": {
+            "title": {
+              "css": "a[data-testid^='episode-card-']"
+            },
+            "url": {
+              "css": "a[data-testid^='episode-card-']",
+              "attr": "href"
+            }
+          },
+          "chapter_order": "desc"
+        },
+        "play_url": {
+          "regex": "\\\\\"url\\\\\":\\\\\"(https://[^\\\\\"]+?m3u8)\\\\\""
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 50
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 600
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "a[href*='/video/']"
+      }
+    }
+  }
+}

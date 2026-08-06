@@ -1,0 +1,155 @@
+{
+  "$schema_version": 2,
+  "$id": "fanqie",
+  "$type": "novel",
+  "$name": "番茄小说",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://fanqienovel.com",
+    "description": "番茄小说（字节跳动旗下免费正版小说站）。首页精选/详情页为服务端渲染，可抓作品列表与完整目录；章节正文虽是 SSR 输出，但被自定义字体混淆（PUA 私有区码位，需字体 cmap 反向映射才能还原，当前框架不支持），且网页端仅开放部分章节。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "小说",
+      "免费",
+      "正版"
+    ],
+    "last_verified": "2026-08-07"
+  },
+  "transports": {
+    "base_url": "https://fanqienovel.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://fanqienovel.com/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 800,
+    "follow_redirects": true
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/",
+      "works_list_url": "/",
+      "works_list_item": {
+        "root_selector": {
+          "css": "a.muye-bottom-choiceness-item"
+        },
+        "fields": {
+          "title": {
+            "css": "h3.title"
+          },
+          "url": {
+            "xpath": "@href",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.book-cover-img",
+            "attr": "src"
+          },
+          "author": {
+            "css": "h4.author"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/{keyword}",
+      "method": "GET",
+      "render": "playwright",
+      "paginator": {
+        "url_template": "/search/{keyword}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "a[href*='/page/']"
+        },
+        "render_config": {
+          "wait_for": "a[href*='/page/']",
+          "wait_until": "networkidle",
+          "timeout_ms": 30000,
+          "extra_delay_ms": 3000
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/page/(\\d+)",
+      "fields": {
+        "title": {
+          "css": "h1"
+        },
+        "author": {
+          "css": ".author-name-text"
+        },
+        "cover": {
+          "css": "img.book-cover-img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": ".page-abstract-content"
+        },
+        "status": {
+          "css": ".info-label-yellow"
+        },
+        "tags": {
+          "css": ".info-label-grey"
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "pagination": {
+          "enabled": true,
+          "max_pages": 1
+        },
+        "list": {
+          "root_selector": {
+            "css": "div.chapter-item"
+          },
+          "fields": {
+            "title": {
+              "css": "a.chapter-item-title"
+            },
+            "url": {
+              "css": "a.chapter-item-title",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": ".muye-reader-content p"
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 30
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 1,
+      "max_items": 2000
+    }
+  },
+  "decryption": {
+    "targets": {
+      "chapter": {
+        "strategy": "translit"
+      }
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}
