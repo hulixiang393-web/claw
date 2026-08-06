@@ -21,8 +21,8 @@
       "Accept-Encoding": "identity",
       "Referer": "https://www.linovelib.com/"
     },
-    "timeout": 20,
-    "retries": 3,
+    "timeout": 10,
+    "retries": 2,
     "interval_ms": 800
   },
   "endpoints": {

@@ -602,3 +602,15 @@ selector:
 | `increment` | URL 页码递增 `?page=N` | `start`（默认 1） / `step`（默认 1） / `param`（默认 `page`） |
 | `next_link` | 抓"下一页"链接 | `selector`（下一页 URL） |
 | `cursor` | 游标偏移 `?offset=N` | `param`（默认 `offset`） / `start` / `step` / `max`（可选硬上限） |
+
+> **`url_template`（分页 URL 模板，search 专用）**：不同源的分页拼接规则差异大
+> （maccms 的 `/search/wd/{kw}/page/{n}.html`、Discuz 的 `index-{n}.html`、参数名非
+> `page` 的 `&p={n}` 等），统一用模板表达，搜索翻页时优先按它拼 URL：
+> - 含 `{keyword}` → 完整 URL 模板（自动拼 `transports.base_url`），如
+>   `/search.php?q={keyword}&f=_all&sort=relevance&p={page}`
+> - 不含 `{keyword}` → 页码拼接片段：`?`/`&` 开头作为查询参数追加到「搜索 URL +
+>   关键词」后（如 `?page={page}`），否则作为路径后缀（如 `-{page}.html`）
+> - 留空 → 默认自动拼 `?page=N`（POST 源 body 加 page 参数）
+>
+> 编辑器「搜索」Tab 的「换页逻辑」字段即写此键。无法 URL 翻页的站（SPA 无限滚动、
+> 分页不带关键词等）应把 `constraints.search.max_pages` 设为 1，避免白请求。

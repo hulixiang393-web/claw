@@ -66,12 +66,19 @@ class Search:
 
     # ------------------------------------------------------------------ #
     def search_one(
-        self, source: SourceConfig, keyword: str, http: Optional[HttpClient] = None
+        self,
+        source: SourceConfig,
+        keyword: str,
+        http: Optional[HttpClient] = None,
+        on_page=None,
     ) -> List[SearchResult]:
         """单源搜索。优先 yt-dlp 引擎，其次 api_endpoints.search，否则 endpoints.search。
 
         http：可指定独立 HttpClient（并发搜索时每 worker 各用一个，requests.Session
         非线程安全）。None 用 self._http。
+        on_page：可选回调 on_page(source, page, new_results)。HTML 搜索每翻一页
+        解析完成后调用（传本页新增结果），供 GUI 边抓边显示（第 1 页秒出、后续
+        页后台抓到即追加），避免 max_pages 调大后全部抓完才显示导致卡死。
         """
         http = http or self._http
         api = source.raw.get("api_endpoints") or {}
@@ -80,7 +87,7 @@ class Search:
             return self._search_ytdlp(source, keyword, search_cfg, http=http)
         if search_cfg:
             return self._search_api(source, keyword, http=http)
-        return self._search_html(source, keyword, http=http)
+        return self._search_html(source, keyword, http=http, on_page=on_page)
 
     def search_type(
         self, sources: List[SourceConfig], keyword: str
@@ -126,9 +133,17 @@ class Search:
 
     # ------------------------------------------------------------------ #
     def _search_html(
-        self, source: SourceConfig, keyword: str, http: Optional[HttpClient] = None
+        self,
+        source: SourceConfig,
+        keyword: str,
+        http: Optional[HttpClient] = None,
+        on_page=None,
     ) -> List[SearchResult]:
-        """HTML 站搜索（endpoints.search）。"""
+        """HTML 站搜索（endpoints.search）。
+
+        on_page(source, page, new_results)：每翻完一页后回调本页新增结果
+        （供 GUI 边抓边显示）。None 则只返回全量。
+        """
         http = http or self._http
         search_cfg = source.get_search_config()
         if not search_cfg.get("item") or not search_cfg.get("item", {}).get("fields"):
@@ -138,12 +153,16 @@ class Search:
         kw_param = search_cfg.get("keyword_param") or "keyword"
 
         # 翻页：读 constraints.search.max_pages（schema 默认 3），多页合并去重。
-        # URL 支持 {keyword}（自动 encode）与 {page} 占位；无 {page} 时 GET 加 ?page=N、
-        # POST body 加 page 参数。
+        # 分页 URL 模板（endpoints.search.paginator.url_template，编辑器「换页逻辑」）：
+        # - 含 {keyword} → 完整 URL 模板（如 /search/{keyword}/{page}.html）
+        # - 不含 {keyword} → 页码拼接片段（?page={page} 或 -{page}.html）
+        # - 留空 → 默认自动 ?page=N（POST 源 body 加 page 参数）
         constraints = source.raw.get("constraints") or {}
         max_pages = int((constraints.get("search") or {}).get("max_pages") or 3)
         max_results = int((constraints.get("search") or {}).get("max_results") or 0)
-        page_param = (search_cfg.get("paginator") or {}).get("param") or "page"
+        paginator_cfg = search_cfg.get("paginator") or {}
+        page_param = paginator_cfg.get("param") or "page"
+        url_template = paginator_cfg.get("url_template") or ""
         extra = search_cfg.get("extra_params") or {}
         if not isinstance(extra, dict):
             extra = {}
@@ -154,45 +173,69 @@ class Search:
         if not root_sel:
             return []
 
-        results = []
-        seen_urls = set()
+        # render: "playwright" → 反爬 SPA 站（结果 JS 渲染），交互式只搜第一页
+        if search_cfg.get("render") == "playwright":
+            abs_url = self._build_page_url(
+                source=source, base_url=base_url, keyword=keyword,
+                kw_param=kw_param, page=1, page_param=page_param,
+                url_template=url_template,
+            )
+            return self._search_html_rendered(source, abs_url, item_cfg, keyword)
 
-        for page in range(1, max_pages + 1):
+        def _fetch(page: int):
+            """抓取并解析第 page 页，返回 (page, items)。失败返回空列表。"""
             try:
-                if method == "POST":
+                if method == "POST" and not url_template:
+                    # POST：body 加 page 参数（配了 url_template 则改用 GET 模板拼 URL）
                     abs_url = urljoin(source.base_url, base_url)
                     body = {kw_param: keyword, page_param: page}
                     for k, v in extra.items():
                         body.setdefault(k, v)
                     text = self._http_post_form(source, abs_url, body, http=http)
                 else:
-                    # GET：URL 含 {page} 占位 → 替换；否则追加 ?page=N
-                    page_url = base_url
-                    if "{page}" in page_url:
-                        page_url = page_url.replace("{page}", str(page))
-                        url_kw = page_url.replace("{keyword}", quote(keyword))
-                        abs_url = urljoin(source.base_url, url_kw)
-                    else:
-                        sep = "&" if "?" in base_url else "?"
-                        abs_url = urljoin(
-                            source.base_url,
-                            f"{base_url}{sep}{kw_param}={quote(keyword)}&{page_param}={page}",
-                        )
+                    # GET / 分页模板：统一由 _build_page_url 构造第 page 页 URL
+                    # （用关键字参数传递，避免位置参数错位导致 `&1=page` 这类 bug）
+                    abs_url = self._build_page_url(
+                        source=source,
+                        base_url=base_url,
+                        keyword=keyword,
+                        kw_param=kw_param,
+                        page=page,
+                        page_param=page_param,
+                        url_template=url_template,
+                    )
                     text = self._http_get(source, abs_url, http=http)
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] 搜索第 %d 页失败：%s", source.source_id, page, exc)
-                continue  # 单页失败跳过，继续下一页
+                return (page, [])
+            try:
+                doc = self._parser.parse(text)
+                items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
+                return (page, items or [])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] 搜索第 %d 页解析失败：%s", source.source_id, page, exc)
+                return (page, [])
 
-            # render: "playwright" → 反爬 SPA 站（结果 JS 渲染），只搜第一页（交互式）
-            if search_cfg.get("render") == "playwright":
-                if page == 1:
-                    return self._search_html_rendered(source, abs_url, item_cfg, keyword)
-                continue
+        # 受控并发翻页：每源最多 3 页在途请求（防反爬）。
+        # 保留 transports.interval_ms 间隔（_http_get 内部已 sleep）；
+        # 并发上限 3 平衡提速与反爬风险，不放大单源请求频率。
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            doc = self._parser.parse(text)
-            items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
+        page_items: dict = {}
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futs = {pool.submit(_fetch, p): p for p in range(1, max_pages + 1)}
+            for fut in as_completed(futs):
+                page, items = fut.result()
+                page_items[page] = items
+
+        # 按页序合并（第 1 页先回调 on_page 秒出），URL 去重
+        results = []
+        seen_urls = set()
+        for page in sorted(page_items):
+            items = page_items[page]
             if not items:
-                break  # 本页无结果 → 后续页大概率也无
+                break  # 本页无结果 → 后续页大概率也无（沿用串行语义）
+            page_start = len(results)  # 本页处理前的累计数（切分本页新增）
             for it in items:
                 title = it.get("title", "")
                 url = it.get("url", "")
@@ -212,9 +255,73 @@ class Search:
                         update=it.get("update", ""),
                     )
                 )
-                if max_results and len(results) >= max_results:
-                    return results
+            # 边抓边显示：本页新增结果回调给 GUI（第 1 页秒出，后续页抓到即追加）
+            if on_page:
+                try:
+                    on_page(source, page, results[page_start:])
+                except Exception:  # noqa: BLE001
+                    pass
+            # 达到结果总数上限：本页完整并入后再停，而不是每页内部提前 return。
+            # 否则「单页条数 >= max_results」的源第一页就返回，真实站几十页也只
+            # 显示一页。max_results 是跨页总数上限，由源配置保证 >= 单页条数。
+            if max_results and len(results) >= max_results:
+                break
         return results
+
+    @staticmethod
+    def _build_page_url(
+        *,
+        source: SourceConfig,
+        base_url: str,
+        keyword: str,
+        kw_param: str,
+        page: int,
+        page_param: str = "page",
+        url_template: str = "",
+    ) -> str:
+        """构造搜索第 page 页的 URL（分页拼接规则由源配置决定）。
+
+        url_template（endpoints.search.paginator.url_template，编辑器「换页逻辑」）：
+        - 含 {keyword} → 完整 URL 模板：替换 {keyword}/{page} 后拼 base_url
+          （如 /search/{keyword}/{page}.html、/search?q={keyword}&p={page}）
+        - 不含 {keyword} → 页码拼接片段：?/& 开头作为 query 参数追加到
+          「搜索 URL + 关键词」后，否则作为路径后缀（如 -{page}.html）
+        - 留空 → 默认：GET 追加 ?{page_param}={page}；{page} 占位走占位替换
+
+        全部参数用关键字传递（* 强制），避免位置错位生成 `&1=page` 的错误 URL。
+        """
+        if url_template:
+            if "{keyword}" in url_template:
+                tpl = url_template.replace("{keyword}", quote(keyword)).replace(
+                    "{page}", str(page)
+                )
+                if tpl.startswith(("http://", "https://")):
+                    return tpl
+                return source.base_url.rstrip("/") + "/" + tpl.lstrip("/")
+            seg = url_template.replace("{page}", str(page))
+            if seg.startswith("?"):
+                sep = "&" if "?" in base_url else "?"
+                return source.base_url.rstrip("/") + "/" + (
+                    f"{base_url}{sep}{kw_param}={quote(keyword)}&{seg[1:]}"
+                ).lstrip("/")
+            if seg.startswith("&"):
+                sep = "&" if "?" in base_url else "?"
+                return source.base_url.rstrip("/") + "/" + (
+                    f"{base_url}{sep}{kw_param}={quote(keyword)}{seg}"
+                ).lstrip("/")
+            # 路径后缀：如 -{page}.html、/list/{page}.html（追加到搜索 URL 路径后）
+            path = base_url.split("?", 1)[0].rstrip("/")
+            return source.base_url.rstrip("/") + "/" + (path + seg).lstrip("/")
+        # 默认逻辑：{page} 占位 或 ?page=N
+        if "{page}" in base_url:
+            tpl = base_url.replace("{page}", str(page)).replace(
+                "{keyword}", quote(keyword)
+            )
+            return source.base_url.rstrip("/") + "/" + tpl.lstrip("/")
+        sep = "&" if "?" in base_url else "?"
+        return source.base_url.rstrip("/") + "/" + (
+            f"{base_url}{sep}{kw_param}={quote(keyword)}&{page_param}={page}"
+        ).lstrip("/")
 
     def _search_html_rendered(
         self,
@@ -460,6 +567,38 @@ class Search:
         if cover.startswith("//"):
             return "https:" + cover
         return cover
+
+    # ------------------------------------------------------------------ #
+    def decrypt_search_covers(self, source: SourceConfig, results) -> dict:
+        """批量解密搜索结果的封面 → {result.url: data_uri}。
+
+        18mh 类加密站：搜索结果封面是加密 URL，直接加载不出图。复用 discovery
+        （list_works）的 AES 解密逻辑（decrypt_covers，8 并发），与分类页封面
+        解密同一套。返回 {SearchResult.url: data_uri}，解密失败的结果不出现。
+        非加密源或空结果返回 {}（GUI 层据此跳过后台任务）。
+        """
+        need = bool(
+            source.raw.get("decryption", {}).get("targets", {}).get("image")
+        )
+        if not need or not results:
+            return {}
+        from types import SimpleNamespace
+
+        if self._discovery is None:
+            # 懒创建（复用分类页同一套 Discovery：含 checker 自检器）
+            from .selfcheck import StructureChecker
+
+            self._discovery = Discovery(
+                self._http, self._parser, StructureChecker(self._http, self._parser)
+            )
+        carriers = [
+            SimpleNamespace(url=r.url, cover=r.cover)
+            for r in results
+            if getattr(r, "url", "") and getattr(r, "cover", "")
+        ]
+        if not carriers:
+            return {}
+        return self._discovery.decrypt_covers(source, carriers)
 
     # ------------------------------------------------------------------ #
     def _http_get(

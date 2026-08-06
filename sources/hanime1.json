@@ -20,8 +20,8 @@
       "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
       "Referer": "https://hanime1.me/"
     },
-    "timeout": 20,
-    "retries": 3,
+    "timeout": 10,
+    "retries": 2,
     "interval_ms": 500,
     "charset": "utf-8"
   },
@@ -101,7 +101,7 @@
     }
   },
   "constraints": {
-    "search": { "max_pages": 3, "max_results": 60 },
+    "search": { "max_pages": 10, "max_results": 610 },
     "detail": { "max_pages": 1 },
     "episode": { "max_pages": 1, "max_items": 20 }
   },

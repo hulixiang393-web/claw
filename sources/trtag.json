@@ -24,8 +24,8 @@
       "Accept-Language": "zh-CN,zh;q=0.9",
       "Referer": "https://jyoyuy.com/"
     },
-    "timeout": 15,
-    "retries": 3,
+    "timeout": 10,
+    "retries": 2,
     "interval_ms": 200,
     "charset": "utf-8"
   },
@@ -89,6 +89,9 @@
             "css": "span.list-score"
           }
         }
+      },
+      "paginator": {
+        "url_template": "/search.php?searchword={keyword}&searchtype=&page={page}"
       }
     },
     "detail": {
@@ -136,8 +139,8 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 3,
-      "max_results": 60
+      "max_pages": 30,
+      "max_results": 1800
     },
     "detail": {
       "max_pages": 1

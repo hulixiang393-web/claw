@@ -326,6 +326,11 @@ class ReaderPage(BasePage):
         if hasattr(self, "novel_view"):
             self.novel_view.set_reading_style(bg, font_size)
 
+    def shutdown_video(self) -> None:
+        """App 退出释放 VLC 播放器（必须先于 shutdown_vlc 释放实例）。"""
+        if hasattr(self, "video_view"):
+            self.video_view.shutdown_video()
+
 
 class _DetailSignals(QObject):
     """详情加载信号。"""

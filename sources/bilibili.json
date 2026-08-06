@@ -118,24 +118,21 @@
         "bvid": "{bvid}",
         "cid": "{cid}",
         "qn": "{quality}",
-        "fnval": "16",
+        "fnval": "1",
         "platform": "pc"
       },
       "quality": {
         "param": "qn",
         "default": "best",
         "map": {
-          "best": "127",
+          "best": "80",
           "1080p": "80",
           "720p": "64",
           "480p": "32",
           "360p": "16"
         }
       },
-      "response_path": "data.dash.video.0.baseUrl",
-      "field_extractors": {
-        "audio_url": "data.dash.audio.0.baseUrl"
-      }
+      "response_path": "data.durl.0.url"
     }
   },
   "media": {

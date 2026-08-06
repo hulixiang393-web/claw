@@ -74,18 +74,50 @@ class _CentralArea(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._bg_pixmap = None  # 由 App 层注入（合成后的背景图）
+        self._bg_scaled = None  # 按窗口尺寸预缩放的绘制用缓存（避免每次重绘都缩放）
 
     def set_bg_pixmap(self, pixmap) -> None:
         """注入背景图（QPixmap 或 None 关闭）。"""
         self._bg_pixmap = pixmap
+        self._bg_scaled = None  # 尺寸未变时重绘仍用旧缓存
         self.update()  # 触发重绘
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._bg_scaled = None  # 窗口尺寸变了，下次重绘重新缩放
+
+    def _ensure_bg_scaled(self) -> None:
+        """把背景图预缩放到当前窗口尺寸（KeepAspectRatioByExpanding + 居中裁剪）。
+
+        只在尺寸变化时缩放一次（SmoothTransformation），paintEvent 直接
+        drawPixmap 同尺寸（无运行时缩放），大幅降低 Tab 切换/窗口重绘开销。
+        """
+        if self._bg_pixmap is None or self._bg_pixmap.isNull():
+            return
+        if self._bg_scaled is not None and self._bg_scaled.size() == self.size():
+            return
+        size = self.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        from PySide6.QtCore import Qt
+
+        scaled = self._bg_pixmap.scaled(
+            size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+        )
+        # 居中裁剪到窗口尺寸（超出部分去掉），避免 drawPixmap 用负坐标
+        sx = max(0, (scaled.width() - size.width()) // 2)
+        sy = max(0, (scaled.height() - size.height()) // 2)
+        self._bg_scaled = scaled.copy(
+            sx, sy, min(size.width(), scaled.width()), min(size.height(), scaled.height())
+        )
 
     def paintEvent(self, event) -> None:  # noqa: N802
         if self._bg_pixmap is not None and not self._bg_pixmap.isNull():
-            painter = QPainter(self)
-            # 背景图铺满整个区域（KeepAspectRatioByExpanding + 居中裁剪）
-            painter.drawPixmap(self.rect(), self._bg_pixmap)
-            painter.end()
+            self._ensure_bg_scaled()
+            if self._bg_scaled is not None and not self._bg_scaled.isNull():
+                painter = QPainter(self)
+                painter.drawPixmap(0, 0, self._bg_scaled)
+                painter.end()
         super().paintEvent(event)
 
 
@@ -248,6 +280,13 @@ class MainWindow(QMainWindow):
             self.settings.get("ui", "reading_bg", "") or "",
             int(self.settings.get("ui", "reading_font_size", 0) or 0),
         )
+        # App 退出：先释放 VLC 播放器，再释放共享 vlc.Instance
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.instance().aboutToQuit.connect(self.reader.shutdown_video)
+        from framework.vlc_player import shutdown_vlc
+
+        QApplication.instance().aboutToQuit.connect(shutdown_vlc)
         return self.reader
 
     def _favorite_has(self, url: str) -> bool:

@@ -76,6 +76,27 @@ class Discovery:
                 pass
 
     # ------------------------------------------------------------------ #
+    def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
+        """后台线程执行结构自检，不阻塞抓取。
+
+        checker.check() 会对同一 URL 额外发一次 GET（最长 timeout×retries），
+        同步等待会让发现页每页慢一倍。自检仅健康监控，移后台 daemon 线程。
+        """
+        from threading import Thread
+
+        def _run():
+            try:
+                ok = self._checker.check(source, abs_url)
+                self._report_health(
+                    source, HEALTH_OK if ok else "broken",
+                    "" if ok else "结构自检失败",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        Thread(target=_run, daemon=True).start()
+
+    # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
         return source.request_headers()
 
@@ -154,8 +175,8 @@ class Discovery:
             or disc.get("list_url")
             or source.base_url
         )
-        ok = self._checker.check(source, self._abs_url(source, list_url))
-        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
+        # 自检移后台线程（不阻塞分类抓取，防每页多一次 GET 拖慢）
+        self._bg_check(source, self._abs_url(source, list_url))
         html = self._get(source, list_url)
         doc = self._parser.parse(html)
 
@@ -208,8 +229,8 @@ class Discovery:
             return self._list_works_api(source, url, page)
 
         fetch_url = self._build_page_url(source, url, page)
-        ok = self._checker.check(source, self._abs_url(source, fetch_url))
-        self._report_health(source, HEALTH_OK if ok else "broken", "" if ok else "结构自检失败")
+        # 自检移后台线程（不阻塞作品抓取）
+        self._bg_check(source, self._abs_url(source, fetch_url))
         html = self._get(source, fetch_url)
         doc = self._parser.parse(html)
 

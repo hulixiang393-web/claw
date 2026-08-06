@@ -97,6 +97,21 @@ class WorkCard(QFrame):
         except Exception:  # noqa: BLE001
             pass
 
+    def set_cover_data(self, data_uri: str) -> None:
+        """用解密后的 data URI 刷新封面（加密站搜索结果封面后补）。
+
+        搜索结果返回时 cover 是加密 URL，WorkCard 直接加载不出图；后台
+        AES 解密完成后调用本方法，把 data URI 画上。同时回写 work.cover，
+        便于后续复用（详情/加入书架）。
+        """
+        if not data_uri or not data_uri.startswith("data:"):
+            return
+        try:
+            self.work.cover = data_uri
+        except Exception:  # noqa: BLE001
+            pass
+        self._load_data_cover(data_uri)
+
     def _load_cover(self, url: str) -> None:
         """通过 CoverLoader 加载封面（全局最多 4 个并发）。"""
         CoverLoader.instance().load(url, self._on_cover_ready)

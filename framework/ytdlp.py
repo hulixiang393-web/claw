@@ -9,7 +9,7 @@
 能力（均 subprocess 调 yt-dlp，不依赖其 Python 库解析）：
 - search(keyword, limit)     → 搜索结果 [{title,url,cover,author}]
 - fetch_detail(url)          → {title, author, cover, summary, chapters}
-- fetch_streams(url, fmt)    → (video_url, audio_url) 高清双流（供 mpv/下载）
+- fetch_streams(url, fmt)    → (video_url, audio_url) 高清双流（供播放器/下载）
 - 下载仍走 ffmpeg_merger（双流 → mp4）
 
 源配置以 api_endpoints.* .engine == "ytdlp" 声明启用本引擎。
@@ -42,6 +42,7 @@ class Ytdlp:
     def __init__(self, binary: Optional[str] = None, timeout: float = 60.0):
         self._bin = binary or _find_ytdlp()
         self._timeout = timeout
+        self._search_cache: dict = {}  # (prefix, keyword, limit) → results，重复搜索秒回
 
     # ------------------------------------------------------------------ #
     def _run(self, args: List[str]) -> str:
@@ -98,7 +99,14 @@ class Ytdlp:
         prefix: 搜索前缀（如 "ytsearch"），limit 附后。
         url_tpl: 结果 ID → 视频 URL 模板（默认 YouTube）。
         返回 [{title, url, cover, author}]。
+
+        yt-dlp 子进程冷启动 + 网络签名通常 5~15s，同关键词重复搜索走缓存
+        秒回（Content 复用单例 Ytdlp，缓存跨搜索有效）。
         """
+        key = (prefix, keyword, limit)
+        if key in self._search_cache:
+            return list(self._search_cache[key])
+
         q = f"{prefix}{limit}:{keyword}"
         out = self._run([
             "--dump-single-json", "--no-warnings",
@@ -122,6 +130,7 @@ class Ytdlp:
                 "cover": (e.get("thumbnail") or "").split("?")[0],
                 "author": e.get("channel") or e.get("uploader") or "",
             })
+        self._search_cache[key] = results
         return results
 
     # ------------------------------------------------------------------ #
@@ -184,7 +193,7 @@ class Ytdlp:
 
     # ------------------------------------------------------------------ #
     def fetch_streams(self, url: str, fmt: str = "bestvideo+bestaudio/best") -> tuple:
-        """高清双流（video_url, audio_url）。供 mpv 播放 / ffmpeg 下载。"""
+        """高清双流（video_url, audio_url）。供播放器（VLC）播放 / ffmpeg 下载。"""
         # 拿 video 与 audio 两个 URL（有 audio 则分离）
         fmt_video, fmt_audio = None, None
         m = re.match(r"^(?P<v>[^+]+)\+(?P<a>.+)$", fmt)

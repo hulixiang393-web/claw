@@ -70,12 +70,14 @@ class DiscoverPage(BasePage):
         self._theme_manager = theme_manager
         self._current_source = None
         self._current_page = 0
-        self._loading = False
         self._has_more = True
         self._current_cat_url = None
         self._work_count = 0
         self._source_epoch = 0  # 源切换序号，防止旧请求回调竞态
-        self._preload_limit = 3  # 最多预加载到第 3 页，防无限翻页
+        self._preload_ahead = 2  # 预加载缓冲深度：第 1 页后最多再预加载 2 页，防一次拉太多
+        self._active_pages: set = set()  # 正在抓取的页码（防重复请求）
+        self._loaded_pages: set = set()  # 已完成且有数据的页码
+        self._page_tasks: list = []  # 多页并发任务引用（防 GC）
         self._cat_buttons: list = []
         self._cat_collapsed = True
         self._cat_bar_populated = False
@@ -247,7 +249,6 @@ class DiscoverPage(BasePage):
         self._current_cat_url = None
         self._cat_collapsed = True
         self.status_label.setText("正在加载分类...")
-        self._loading = False  # 取消旧加载状态
         # 立即清空旧源的作品网格，避免换源瞬间旧内容残留/溢出
         self._clear_works()
         self._clear_cat_buttons()
@@ -398,18 +399,29 @@ class DiscoverPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def _reset_works(self) -> None:
-        """清空网格，重新从第 1 页加载。"""
+        """清空网格，只加载第 1 页（懒加载 + 预加载缓冲）。
+
+        不做并发多页预加载——一次并发爬多页会让封面（CoverLoader 限流）跟不上，
+        反爬风险也高。首屏 1 页 + 滚动到 80% 触发下一页（_on_scroll），
+        视口未填满时 _maybe_preload 补足（预加载缓冲）。
+        """
         self._clear_works()
         self._current_page = 0
         self._has_more = True
         self._work_count = 0
-        self._load_next_page()
+        self._active_pages = set()
+        self._loaded_pages = set()
+        self._page_tasks = []
+        self._source_epoch += 1
+        self._load_next_page(page=1)
 
     def _clear_works(self) -> None:
         while self.grid_layout.count():
             child = self.grid_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            w = child.widget()
+            if w is not None:
+                w.setParent(None)  # 立即解除父子关系（防换源闪旧内容）
+                w.deleteLater()
         self._work_count = 0
         self._works = []
 
@@ -421,55 +433,78 @@ class DiscoverPage(BasePage):
         """
         while self.grid_layout.count():
             child = self.grid_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            w = child.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
         self._work_count = 0
 
-    def _load_next_page(self) -> None:
-        """异步加载下一页：后台线程抓作品，加载中显示状态，完成后更新网格。"""
-        if self._loading or not self._has_more or self._current_source is None:
+    def _load_next_page(self, page: int = -1) -> None:
+        """异步加载某一页（后台线程）。page 为 -1 时自动取下一页（滚动加载用）。
+
+        去掉 _loading 互斥锁：多页并发加载时每页独立追踪，_active_pages
+        防重复请求；_on_page_loaded 按 epoch 防旧源/旧分类结果污染。
+        """
+        if self._current_source is None or self._current_cat_url is None:
             return
-        if self._current_cat_url is None:
-            return
-        self._loading = True
-        self._current_page += 1
-        page = self._current_page
-        source = self._current_source
-        cat_url = self._current_cat_url
-        discovery = self._discovery
+        if page < 1:
+            # 滚动加载：取下一个未请求页 = 已请求最大页 + 1。
+            # 关键修复：不从 1 重扫（旧逻辑会跳过 active 中的页，滚动条
+            # 范围因内容加载变化时，一次触发序列会连环加载 N+1/N+2/N+3，
+            # 误加载好多页）。现在 page 固定，已在加载的页被 _active_pages 挡掉。
+            requested_max = max(self._active_pages | self._loaded_pages, default=0)
+            page = requested_max + 1
+            loaded_max = max(self._loaded_pages, default=0)
+            if page > loaded_max + self._preload_ahead:
+                return  # 预加载缓冲已到位，等用户继续滚动
+        if page in self._active_pages or page in self._loaded_pages:
+            return  # 已请求或已加载
+        if not self._has_more and page > max(self._loaded_pages or [0]):
+            return  # 没更多页了
+
+        self._active_pages.add(page)
+        self._current_page = max(self._current_page, page)
         epoch = self._source_epoch
 
-        self.status_label.setText("正在加载第 %d 页..." % page)
+        self.status_label.setText(f"正在加载第 {page} 页...")
         self.status_label.setVisible(True)
 
-        # 后台线程抓取
-        thread_pool = QThreadPool.globalInstance()
-        runnable = _FetchWorksTask(discovery, source, cat_url, page)
+        runnable = _FetchWorksTask(self._discovery, self._current_source, self._current_cat_url, page)
         runnable.signals.finished.connect(
             lambda works, err, e=epoch, p=page: self._on_page_loaded(works, err, p, e)
         )
-        self._fetch_task = runnable  # 持有引用，防止被 GC
-        thread_pool.start(runnable)
+        self._page_tasks.append(runnable)  # 持有引用防 GC
+        QThreadPool.globalInstance().start(runnable)
 
     def _on_page_loaded(self, works, err, page: int, epoch: int) -> None:
-        """后台抓取完成，更新 UI（回到主线程）。"""
+        """后台抓取完成，立即追加到网格（多页并发，第1页秒出）。
+
+        epoch 不匹配 → 整页丢弃（用户已换源/切分类，这是旧请求的回调）。
+        """
         if epoch != self._source_epoch:
-            return  # 源已切换，丢弃旧结果
-        self._loading = False
+            return
+        self._active_pages.discard(page)
         if err:
-            self._has_more = False
-            self.status_label.setText(f"加载失败：{err}")
+            # 单页失败不标记 _has_more=False（其他页可能成功，继续加载）
+            log.warning("[discover] 第 %d 页失败：%s", page, err)
+            self._maybe_preload()
             return
         if not works:
-            self._has_more = False
-            self.status_label.setText("到底啦～")
-        else:
-            self._append_works(works)
-            self.status_label.setText(f"已加载 {self._current_page} 页 · 共 {self._work_count} 部")
-            # 封面需异步恢复（AES 解密 或 Playwright 渲染）：后台恢复，完成后刷新卡片
-            if self._needs_cover_recovery(works):
-                self._start_cover_recovery(epoch, page_works=works)
-        # 自动继续加载下一页直到填满视口（预加载）
+            if page > max(self._loaded_pages or [0]) + 1:
+                pass  # 不是连续末页（中间有空洞）→ 不标记无更多
+            else:
+                self._has_more = False
+            self._maybe_preload()
+            return
+        self._loaded_pages.add(page)
+        self._append_works(works)
+        self.status_label.setText(
+            f"已加载 {len(self._loaded_pages)} 页 · 共 {self._work_count} 部"
+        )
+        # 封面异步恢复（AES 解密 / Playwright 渲染）
+        if self._needs_cover_recovery(works):
+            self._start_cover_recovery(epoch, page, page_works=works)
+        # 视口未填满 → 继续补足（并发加载）
         self._maybe_preload()
 
     def _needs_cover_recovery(self, works) -> bool:
@@ -480,12 +515,13 @@ class DiscoverPage(BasePage):
             for w in works
         )
 
-    def _start_cover_recovery(self, epoch: int, page_works=None) -> None:
+    def _start_cover_recovery(self, epoch: int, page: int, page_works=None) -> None:
         """后台恢复当前页封面，完成后刷新卡片封面图。
 
         - AES 加密站（18mh 类）：_needs_cover_decrypt → 下载字节+AES 解密成 data URI
         - Playwright 渲染站（分片加密）：_needs_cover_recovery → 整页渲染恢复
 
+        page: 本批作品对应的页码（并发多页时不再依赖 _current_page，防竞态）。
         page_works: 本次加载的那一批作品（page 粒度），避免传全量导致
         恢复页与实际作品不对齐（翻页后新页作品不在恢复页里）。
         """
@@ -504,7 +540,7 @@ class DiscoverPage(BasePage):
             from urllib.parse import urlencode
 
             sep = "&" if "?" in base_url else "?"
-            works_url = f"{base_url}{sep}{urlencode({'page': self._current_page})}"
+            works_url = f"{base_url}{sep}{urlencode({'page': page})}"
             book_urls = [w.url for w in targets if w.url]
             if not book_urls:
                 return
@@ -557,14 +593,24 @@ class DiscoverPage(BasePage):
         self.status_label.setText(f"已加载 {self._current_page} 页 · 共 {self._work_count} 部")
 
     def _maybe_preload(self) -> None:
-        """内容未填满视口时预加载，但最多额外预加载 PRELOAD_LIMIT 页（防失控）。"""
-        if self._loading or not self._has_more:
+        """内容未填满视口时补足加载（只预加载下 2 页缓冲）。
+
+        首屏第 1 页 + 缓冲 2 页 = 最多 3 页，不再像之前那样视口不满就
+        连续补到填满（一次爬多页 → 封面跟不上 / 反爬风险高）。
+        预加载深度到顶后停止，剩下的交给滚动 80% 触发（_on_scroll）。
+        _has_more=False 或缓冲页已在加载中 → 跳过。
+        """
+        if not self._has_more:
             return
-        preloaded = self._current_page
-        if preloaded >= self._preload_limit:
+        if self.scroll.verticalScrollBar().maximum() >= self.scroll.height():
+            return  # 视口已填满，等滚动触发下一页
+        loaded_max = max(self._loaded_pages or {0})
+        next_page = loaded_max + 1
+        if next_page > 1 + self._preload_ahead:
+            return  # 预加载深度到顶（只缓冲 2 页），等滚动
+        if next_page in self._active_pages or next_page in self._loaded_pages:
             return
-        if self.scroll.verticalScrollBar().maximum() < self.scroll.height():
-            self._load_next_page()
+        self._load_next_page(page=next_page)
 
     def _columns(self) -> int:
         """按可视宽度计算作品列数，避免固定列数导致横向溢出。"""
@@ -692,9 +738,13 @@ class DiscoverPage(BasePage):
         self.favorite_requested.emit(detail)
 
     def _on_scroll(self, value: int) -> None:
-        """滚动接近底部（阈值 200px）触发加载下一页。"""
+        """滚动到 80% 触发加载下一页（懒加载 + 预加载缓冲）。
+
+        提前到 80% 而非贴底：滚动到底前下一批已在后台抓取，视觉无停顿；
+        又不一次性并发爬多页（防封面加载不过来 / 反爬）。
+        """
         vbar = self.scroll.verticalScrollBar()
-        if value >= vbar.maximum() - 200:
+        if vbar.maximum() > 0 and value >= vbar.maximum() * 0.8:
             self._load_next_page()
 
     def eventFilter(self, obj, event):  # noqa: N802

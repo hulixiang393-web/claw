@@ -25,8 +25,8 @@
       "Referer": "https://cn.pornhub.com/"
     },
     "cookie": "age_verified=1; accessAgeDisclaimerPH=1; accessAgeDisclaimerUK=1; accessPH=1; platform=pc",
-    "timeout": 20,
-    "retries": 3,
+    "timeout": 10,
+    "retries": 2,
     "interval_ms": 800
   },
   "endpoints": {
@@ -144,8 +144,8 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 3,
-      "max_results": 36
+      "max_pages": 9,
+      "max_results": 450
     },
     "detail": {
       "max_pages": 1

@@ -25,8 +25,8 @@
       "Accept-Language": "zh-CN,zh;q=0.9",
       "Referer": "https://18mh.net/"
     },
-    "timeout": 20,
-    "retries": 3,
+    "timeout": 10,
+    "retries": 2,
     "interval_ms": 500
   },
   "endpoints": {
@@ -100,9 +100,12 @@
       }
     },
     "search": {
-      "base_url": "/novel/all",
+      "base_url": "/novel/search/{keyword}",
       "method": "GET",
       "keyword_param": "keyword",
+      "paginator": {
+        "url_template": "/novel/search/{keyword}/page/{page}"
+      },
       "item": {
         "root_selector": {
           "css": "ul.dx-novel-list li"
@@ -128,14 +131,14 @@
           "css": "h1"
         },
         "author": {
-          "css": ".detail-page__meta-item--author"
+          "css": "a[href*='/novel/all/author/']"
         },
         "summary": {
           "css": "meta[name='description']",
           "attr": "content"
         },
         "status": {
-          "css": ".detail-page__meta-item"
+          "css": "span.detail-page__cover-corner-badge"
         }
       }
     },
@@ -156,13 +159,6 @@
           }
         },
         "body": {
-          "render": "playwright",
-          "render_config": {
-            "wait_for": ".dx-container.app-content",
-            "wait_until": "domcontentloaded",
-            "extra_delay_ms": 2000,
-            "timeout_ms": 30000
-          },
           "selector": {
             "css": ".dx-container.app-content"
           }
@@ -172,8 +168,8 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 3,
-      "max_results": 48
+      "max_pages": 30,
+      "max_results": 1440
     },
     "detail": {
       "max_pages": 1

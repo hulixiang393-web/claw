@@ -127,8 +127,8 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 3,
-      "max_results": 20
+      "max_pages": 1,
+      "max_results": 50
     },
     "detail": {
       "max_pages": 1

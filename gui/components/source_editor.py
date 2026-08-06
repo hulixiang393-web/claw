@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -275,6 +276,23 @@ class SourceEditor(QDialog):
         layout.addLayout(btns)
 
         self._load_into_form()
+
+    # ================================================================== #
+    # 滚动包装
+    # ================================================================== #
+    @staticmethod
+    def _wrap_scroll(widget: QWidget) -> QScrollArea:
+        """把 Tab 表单包进滚动区：内容超过可视高度时可滚动查看。
+
+        各 Tab 字段数不一（视频「正文」Tab 有媒体+换源两套子表单，最多），
+        内容超出窗口时底部字段会被裁掉且无法看到，包一层滚动区解决。
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(widget)
+        return scroll
 
     # ================================================================== #
     # 顶部栏
@@ -581,7 +599,7 @@ class SourceEditor(QDialog):
         self._f_tags = sec._line("标签", "$metadata.tags", "逗号分隔，例：漫画, 汉化")
         self._f_weight = sec._double("权重", "$weight", 0.0, 10.0,
                                      hint="搜索排序权重，默认 1.0")
-        self.tabs.addTab(sec, "基本信息")
+        self.tabs.addTab(self._wrap_scroll(sec), "基本信息")
 
     def _build_network(self) -> None:
         sec = _FormSection()
@@ -604,7 +622,7 @@ class SourceEditor(QDialog):
         self._f_retries = sec._spin("重试", "transports.retries", 0, 10, hint="默认 3")
         self._f_interval = sec._spin("请求间隔(ms)", "transports.interval_ms",
                                      0, 10000, " ms", hint="反爬站调大到 800+")
-        self.tabs.addTab(sec, "网络")
+        self.tabs.addTab(self._wrap_scroll(sec), "网络")
 
     def _build_discovery(self) -> None:
         sec = _FormSection()
@@ -621,7 +639,7 @@ class SourceEditor(QDialog):
                                          "有分类浏览页才勾选")
         self._f_list_url = sec._line("列表入口 URL", "endpoints.discovery.list_url",
                                      "例：/comic/all")
-        self.tabs.addTab(sec, "发现")
+        self.tabs.addTab(self._wrap_scroll(sec), "发现")
 
     def _build_search(self) -> None:
         sec = _FormSection()
@@ -630,6 +648,7 @@ class SourceEditor(QDialog):
             [
                 "搜索 URL：搜索页地址（如 /search 或 /comic/all）。",
                 "关键词参数：看搜索页 URL 问号后的参数名（?keyword=xxx → keyword）。",
+                "换页逻辑：分页时页码怎么拼 URL，不同源规则不同，默认自动 ?page=N。",
                 "结果项选择器：搜索结果中每个结果卡片的外层元素（F12 右键检查）。",
                 "提示：很多站搜索和发现用同一个入口，URL 可跟发现一样。",
             ],
@@ -641,9 +660,13 @@ class SourceEditor(QDialog):
                                       "看 ?keyword=xxx 里的 keyword")
         self._f_search_method = sec._combo("方法", "endpoints.search.method",
                                            ["GET", "POST"], hint="多数站 GET")
+        self._f_search_page_tpl = sec._line(
+            "换页逻辑", "endpoints.search.paginator.url_template",
+            "分页 URL 模板：/search?q={keyword}&page={page}；留空自动 ?page=N"
+        )
         self._f_search_root = sec._line("结果项选择器", "endpoints.search.item.root_selector",
                                         "例：.dx-novel-list li")
-        self.tabs.addTab(sec, "搜索")
+        self.tabs.addTab(self._wrap_scroll(sec), "搜索")
 
     def _build_detail(self) -> None:
         sec = _FormSection()
@@ -664,14 +687,14 @@ class SourceEditor(QDialog):
                                      "懒加载站注意 data-src")
         self._f_de_summary = sec._line("简介选择器", "endpoints.detail.fields.summary",
                                        "可选，例 .desc")
-        self.tabs.addTab(sec, "详情")
+        self.tabs.addTab(self._wrap_scroll(sec), "详情")
 
     def _build_content(self) -> None:
         """正文块：按 $type 动态显示 chapter/page/episode。"""
         self.content_tab_widget = QWidget()
         self.content_tab_layout = QVBoxLayout(self.content_tab_widget)
         self.content_tab_layout.setContentsMargins(0, 0, 0, 0)
-        self.tabs.insertTab(5, self.content_tab_widget, "正文")
+        self.tabs.insertTab(5, self._wrap_scroll(self.content_tab_widget), "正文")
 
     def _build_content_forms(self) -> None:
         """按当前 $type 重建正文表单。"""
@@ -815,7 +838,7 @@ class SourceEditor(QDialog):
                                           1, 500, hint="默认 50")
         self._f_content_items = sec._spin("正文最大条", "_flag_content_items",
                                           1, 5000, hint="默认 500")
-        self.tabs.addTab(sec, "限制")
+        self.tabs.addTab(self._wrap_scroll(sec), "限制")
 
     def _build_diagnostics(self) -> None:
         sec = _FormSection()
@@ -832,7 +855,7 @@ class SourceEditor(QDialog):
                                          ["off", "soft", "strict"], hint="建议 soft")
         self._f_sc_selector = sec._line("自检选择器", "diagnostics.selfcheck.selector",
                                         "例：li.gallary_item")
-        self.tabs.addTab(sec, "诊断")
+        self.tabs.addTab(self._wrap_scroll(sec), "诊断")
 
     def _build_adblock(self) -> None:
         """广告过滤（ad_block）：源级开关 + 补充规则。"""
@@ -850,7 +873,7 @@ class SourceEditor(QDialog):
                                      "逗号分隔，例：adserver,/gg/")
         self._f_ad_domains = sec._line("广告域名", "ad_block.block_domains",
                                        "逗号分隔，例：ads.xxx.com")
-        self.tabs.addTab(sec, "广告过滤")
+        self.tabs.addTab(self._wrap_scroll(sec), "广告过滤")
 
     # ================================================================== #
     # 示例填充
@@ -975,6 +998,9 @@ class SourceEditor(QDialog):
         self._f_search_kw.setText(_deep_get(raw, "endpoints.search.keyword_param", ""))
         self._f_search_method.setCurrentText(_deep_get(raw, "endpoints.search.method", "GET"))
         self._f_search_root.setText(_deep_get(rootish(raw, "endpoints.search.item.root_selector"), "css", ""))
+        self._f_search_page_tpl.setText(
+            _deep_get(raw, "endpoints.search.paginator.url_template", "")
+        )
 
         # 详情
         self._f_de_title.setText(_deep_get(rootish(raw, "endpoints.detail.fields.title"), "css", ""))
@@ -1061,6 +1087,14 @@ class SourceEditor(QDialog):
             root_sel = self._f_search_root.text().strip()
             if root_sel:
                 search.setdefault("item", {})["root_selector"] = {"css": root_sel}
+            # 换页逻辑（分页 URL 模板）：留空则删除，避免残留空 paginator
+            tpl = self._f_search_page_tpl.text().strip()
+            if tpl:
+                search.setdefault("paginator", {})["url_template"] = tpl
+            elif "paginator" in search:
+                search["paginator"].pop("url_template", None)
+                if not search["paginator"]:
+                    del search["paginator"]
         else:
             if "endpoints" in raw:
                 raw["endpoints"].pop("search", None)

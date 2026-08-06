@@ -33,27 +33,76 @@ GRID_COLUMNS = 5
 
 
 class _SearchSignals(QObject):
-    finished = Signal(object, object, object)  # (source, results, err)
+    finished = Signal(object, object, object, object)  # (source, results, err, epoch)
+    page = Signal(object, object, object)  # (source, 本页新增结果, epoch) 边抓边显示
 
 
 class _SearchTask(QRunnable):
-    """后台单源搜索（每源一个任务，驱动源状态条）。"""
+    """后台单源搜索（每源一个任务，驱动源状态条）。
 
-    def __init__(self, search_obj, source, keyword):
+    通过 search_one 的 on_page 回调逐页把结果发到主线程（page 信号），
+    第 1 页秒出、后续页抓到即追加；finished 在全部页抓完后发（全量）。
+
+    epoch：本次搜索会话标记。换源/换关键词再搜时 epoch 自增，旧任务的
+    结果回调到达主线程后因 epoch 过期被丢弃，避免「闪出上次没换源时的内容」。
+    """
+
+    def __init__(self, search_obj, source, keyword, epoch=0):
         super().__init__()
         self.signals = _SearchSignals()
         self._search = search_obj
         self._source = source
         self._keyword = keyword
+        self._epoch = epoch
 
     def run(self) -> None:
         results, err = [], None
+
+        def on_page(source, page, new_results):
+            try:
+                self.signals.page.emit(source, new_results, self._epoch)
+            except RuntimeError:
+                pass
+
         try:
-            results = self._search.search_one(self._source, self._keyword)
+            results = self._search.search_one(
+                self._source, self._keyword, on_page=on_page
+            )
         except Exception as exc:
             err = str(exc)
         try:
-            self.signals.finished.emit(self._source, results, err)
+            self.signals.finished.emit(self._source, results, err, self._epoch)
+        except RuntimeError:
+            pass
+
+
+class _SearchCoverDecryptSignals(QObject):
+    finished = Signal(object, object)  # (source, {result.url: data_uri})
+
+
+class _SearchCoverDecryptTask(QRunnable):
+    """后台批量解密封面（加密站搜索结果，18mh 类）。
+
+    搜索返回时封面是加密 URL 直接加载不出图，后台复用 discovery 的
+    AES 解密（decrypt_search_covers）后，GUI 把 data URI 回填刷新。
+    非加密源不启动此任务（decrypt_search_covers 返回 {}）。
+    """
+
+    def __init__(self, search_obj, source, results):
+        super().__init__()
+        self.signals = _SearchCoverDecryptSignals()
+        self._search = search_obj
+        self._source = source
+        self._results = results
+
+    def run(self) -> None:
+        covers = {}
+        try:
+            covers = self._search.decrypt_search_covers(self._source, self._results)
+        except Exception:  # noqa: BLE001
+            covers = {}
+        try:
+            self.signals.finished.emit(self._source, covers)
         except RuntimeError:
             pass
 
@@ -78,6 +127,9 @@ class SearchPage(BasePage):
         self._page_size = 20  # 每批渲染条数（搜索结果分批，防一次几百张卡片卡顿）
         self._selected: dict = {}  # 勾选批量：url → SearchResult
         self._select_mode = False  # 是否进入勾选模式
+        self._cover_tasks = []  # 封面解密后台任务引用（防 GC）
+        self._streamed: set = set()  # 已边抓边渲染的源（finished 不重复追加）
+        self._search_epoch = 0  # 搜索会话标记：换源/换关键词自增，过期任务结果丢弃
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -218,9 +270,13 @@ class SearchPage(BasePage):
         self.status_bar.setVisible(True)
         self._pending_count = len(sources)
         self._search_tasks = []
+        self._streamed = set()
+        self._search_epoch += 1
+        epoch = self._search_epoch
         for source in sources:
-            task = _SearchTask(self._search, source, keyword)
+            task = _SearchTask(self._search, source, keyword, epoch=epoch)
             task.signals.finished.connect(self._on_source_done)
+            task.signals.page.connect(self._on_source_page)  # 边抓边显示
             self._search_tasks.append(task)  # 持引用防 GC
             QThreadPool.globalInstance().start(task)
 
@@ -272,21 +328,83 @@ class SearchPage(BasePage):
             )
             chip.setToolTip(f"{source.source_name}：失败\n{err or '未知错误'}")
 
-    def _on_source_done(self, source, results, err) -> None:
-        """单源搜索完成：更新状态 chip + 追加结果。"""
+    def _on_source_page(self, source, new_results, epoch) -> None:
+        """边抓边显示：单源某页结果就绪，立即追加渲染（第 1 页秒出）。
+
+        合并模式下不渲染（等全部完成统一合并），但结果照常累计进 _results。
+        epoch 不匹配说明这次搜索已被新的搜索替代，结果丢弃（防闪旧内容）。
+        """
+        if epoch != self._search_epoch or not new_results:
+            return
+        self._results.extend(new_results)
+        self._streamed.add(source.source_id)
+        if not self.merge_check.isChecked():
+            self._append_results(new_results)
+        self._update_batch_status()
+
+    def _on_source_done(self, source, results, err, epoch) -> None:
+        """单源搜索完成：更新状态 chip + 追加结果。
+
+        已通过 page 事件边抓边渲染的源（_streamed），finished 的全量结果
+        不重复追加；否则（on_page 缺省/回调异常）一次性补全。
+        epoch 不匹配（已被新搜索替代）→ 整单丢弃。
+        """
+        if epoch != self._search_epoch:
+            return
         if err:
             self._set_source_status(source, "failed", str(err))
         else:
             self._set_source_status(source, "done")
-            self._results.extend(results or [])
-            if self.merge_check.isChecked():
-                # 合并模式：只累积结果，全部完成后再统一合并渲染
-                pass
-            else:
-                self._append_results(results or [])
+            if source.source_id not in self._streamed:
+                self._results.extend(results or [])
+                if self.merge_check.isChecked():
+                    # 合并模式：只累积结果，全部完成后再统一合并渲染
+                    pass
+                else:
+                    self._append_results(results or [])
+            # 加密站（18mh 类）：搜索结果封面后补解密——列表秒开，封面后台恢复
+            if results and self._needs_cover_decrypt(source):
+                task = _SearchCoverDecryptTask(self._search, source, results)
+                task.signals.finished.connect(self._on_covers_decrypted)
+                self._cover_tasks.append(task)  # 持引用防 GC
+                QThreadPool.globalInstance().start(task)
         self._pending_count -= 1
         if self._pending_count <= 0:
             self._on_all_done()
+
+    @staticmethod
+    def _needs_cover_decrypt(source) -> bool:
+        """该源搜索结果封面是否需 AES 解密（decryption.targets.image，18mh 类）。"""
+        try:
+            return bool(
+                source.raw.get("decryption", {}).get("targets", {}).get("image")
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _on_covers_decrypted(self, source, covers) -> None:
+        """封面解密完成：回写 SearchResult.cover + 刷新对应卡片。
+
+        covers = {result.url: data_uri}。合并模式下卡片 work 是合并代表
+        （url 与原始结果一致），按 url 匹配刷新。
+        """
+        if not covers:
+            return
+        for r in self._results:
+            uri = covers.get(r.url)
+            if uri:
+                r.cover = uri
+        import shiboken6
+
+        for card in self.grid_container.findChildren(WorkCard):
+            try:
+                if not shiboken6.isValid(card):
+                    continue
+                uri = covers.get(getattr(card.work, "url", ""))
+                if uri:
+                    card.set_cover_data(uri)
+            except Exception:  # noqa: BLE001
+                continue
 
     def _on_merge_toggled(self, checked: bool) -> None:
         """合并相似开关切换：对当前结果重新合并渲染（结果已加载时）。"""
@@ -313,9 +431,9 @@ class SearchPage(BasePage):
     def _append_displayed_batch(self) -> None:
         """按 _results_display 渲染下一批（合并后走此路径）。
 
-        渲染一批后若视口未填满（结果不足以撑满一屏），自动补足下一批，
-        直到填满或全部渲染完——保证搜索完第一屏就能看到尽可能多的结果，
-        无需手动滚动才触发加载。
+        每次只渲染一批（_page_size 条），不自动补足视口——防止搜索完
+        一次性插入大量卡片闪屏。首屏一屏内容 + 滚动到 80% 逐批加载
+        （_on_scroll），与发现页懒加载一致。
         """
         display = getattr(self, "_results_display", None)
         if display is None:
@@ -331,18 +449,23 @@ class SearchPage(BasePage):
             self._shown_count += 1
         self._apply_column_stretch(cols)
         self._update_batch_status()
-        # 视口未填满 → 自动补足下一批（滚动懒加载由 _on_scroll 继续）
-        if self._shown_count < len(display):
-            if self.scroll.verticalScrollBar().maximum() < self.scroll.height():
-                self._append_displayed_batch()
 
     def _on_all_done(self) -> None:
-        """全部源搜索结束。"""
+        """全部源搜索结束。
+
+        非合并模式：边抓边显示已渲染首屏，直接更新状态（不重建网格，
+        避免搜索完成瞬间清空重插导致闪屏）；合并模式：结果一直在累积
+        未渲染，统一合并后渲染首屏，剩余滚动懒加载。
+        """
         if not self._results:
             self.status_label.setText("搜不到这个哦，换个词试试？")
-        else:
+            return
+        if self.merge_check.isChecked():
             self._rebuild_results_with_merge()
-            self._update_batch_status()
+        elif self._shown_count == 0:
+            # 兜底：边抓边显示异常（on_page 缺省）→ 直接渲染首屏
+            self._append_results(self._results)
+        self._update_batch_status()
 
     def _update_batch_status(self) -> None:
         """更新状态文本：已显示 X / 共 Y 条。"""
@@ -357,18 +480,20 @@ class SearchPage(BasePage):
             self.status_label.setText(f"已显示 {self._shown_count} / {total} 条，滚动加载更多...")
 
     def _append_results(self, items) -> None:
-        """把一批结果卡片追加到网格尾部（按当前列数排），分批懒加载。
+        """把一批结果卡片追加到网格尾部（按当前列数排），首屏懒加载。
 
-        每次追加只渲染到 _page_size 的整数倍边界，其余留待滚动到底
-        （_load_more_results）再渲染，防止一次几百条结果全量建卡卡顿。
+        结果累积到 _results（_on_source_page），这里只渲染到首屏
+        （_page_size 条）；不自动补足视口——避免边抓边显示时一次性
+        插入几百张卡片导致闪屏/跳动（与发现页懒加载一致）。其余结果
+        留待滚动到 80%（_on_scroll）再逐批渲染。
         """
         if not items:
             return
-        # 渲染源：合并时 _results_display 在 _on_all_done 统一生成；
-        # 非合并时 _results_display 由 _rebuild_results_with_merge 首次触发
         display = self._current_display()
         cols = self._columns()
-        new_shown = min(len(display), self._shown_count + self._page_size)
+        # 首屏只渲染到 _page_size 条上限；后续页到达只累积 _results，
+        # 超过上限不再追着渲染（防边抓边显示一次性插入大量卡片闪屏）
+        new_shown = min(len(display), self._page_size)
         while self._shown_count < new_shown:
             r = display[self._shown_count]
             row, col = divmod(self._work_count, cols)
@@ -377,10 +502,7 @@ class SearchPage(BasePage):
             self._work_count += 1
             self._shown_count += 1
         self._apply_column_stretch(cols)
-        # 若视口未填满（结果少），自动补足
-        if self._shown_count < len(display):
-            if self.scroll.verticalScrollBar().maximum() < self.scroll.height():
-                self._load_more_results()
+        self._update_batch_status()
 
     def _current_display(self):
         """当前渲染源：合并后为 _results_display，否则 _results。"""
@@ -528,8 +650,12 @@ class SearchPage(BasePage):
     def _clear_grid(self) -> None:
         while self.grid_layout.count():
             child = self.grid_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            w = child.widget()
+            if w is not None:
+                # 立即解除父子关系（不再渲染/被 findChildren 找到），deleteLater 再释放内存。
+                # 只用 deleteLater 时旧卡片在事件循环处理前短暂残留，换源搜索会"闪出旧内容"。
+                w.setParent(None)
+                w.deleteLater()
         self._work_count = 0
 
     def _set_filter(self, source_id: str) -> None:
@@ -548,9 +674,13 @@ class SearchPage(BasePage):
         self._show_results()
 
     def _on_scroll(self, value: int) -> None:
-        """滚动接近底部 → 渲染下一批结果（懒加载）。"""
+        """滚动到 80% → 渲染下一批结果（懒加载，与发现页一致）。
+
+        提前到 80% 而非贴底：滚动到底前下一批已在渲染，视觉无停顿；
+        又不一次性把全部结果建卡（防闪屏/封面加载不过来）。
+        """
         vbar = self.scroll.verticalScrollBar()
-        if value >= vbar.maximum() - 200:
+        if vbar.maximum() > 0 and value >= vbar.maximum() * 0.8:
             self._load_more_results()
 
     def refresh(self) -> None:

@@ -1083,7 +1083,7 @@ class Content:
         返回 (video_url, audio_url)；非 dash/无音频时 audio_url 为 ""。
         quality: 画质名（"best"/"1080p"/...），空=源配置默认。经
         api_endpoints.episode 的 quality 映射为请求参数（如 B 站 qn）。
-        mpv 播放 dash 需要同时喂视频轨+音频轨（B 站音视频分离）。
+        播放器（VLC）播放 dash 需要同时喂视频轨+音频轨（B 站音视频分离）。
 
         返回前经 adblock 广告过滤：URL 命中广告特征 → 置空（下载/播放均跳过）。
         """
@@ -1426,15 +1426,19 @@ class Content:
 
     @staticmethod
     def _ytdlp_format(cfg: dict, quality: str = "") -> str:
-        """quality → yt-dlp 格式串。默认 bestvideo+bestaudio。"""
-        fmt = str(cfg.get("format") or "bestvideo+bestaudio/best")
+        """quality → yt-dlp 格式串。统一返回合并单流（含音视频）。
+
+        分离双流（bestvideo+bestaudio）VLC 的 input-slave 对 DASH/fMP4
+        支持不可靠（YouTube googlevideo / B站 m4s → 黑屏）。改用 `best`/
+        高度限制的合并流，VLC 单流直播，稳定出画面+声音。
+        """
+        fmt = str(cfg.get("format") or "best")
         if not quality or quality == "best":
             return fmt
-        # 精确画质：bestvideo[height<=X]+bestaudio
+        # 精确画质：高度限制的合并流（best[height<=X]，VLC 可单流播放）
         m = __import__("re").match(r"^(\d{3,4})p$", quality or "")
         if m:
-            h = m.group(1)
-            return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+            return f"best[height<={m.group(1)}]"
         return fmt
 
     def _fetch_episode_api(self, source: SourceConfig, episode_url: str, cfg: dict, want_streams: bool = False, quality: str = "") -> str | dict:
