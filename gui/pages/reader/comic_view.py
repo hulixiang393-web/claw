@@ -287,6 +287,7 @@ class ComicView(QWidget):
 
     def _render_images(self) -> None:
         self._clear_images()
+        referer = ""
         # 每话开头显示章节编号（如「第12话」），不含标题文字
         if 0 <= self._current_idx < len(self._chapters):
             from framework.content import chapter_label
@@ -299,8 +300,10 @@ class ComicView(QWidget):
             )
             header.setWordWrap(True)
             self.gallery_layout.addWidget(header)
+            # 防盗链：以当前章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
+            referer = self._chapters[self._current_idx].url
         for url in self._images:
-            lbl = _ComicImageLabel(url)
+            lbl = _ComicImageLabel(url, referer=referer)
             lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
@@ -462,9 +465,10 @@ class _ComicImageLabel(QLabel):
 
     loaded = Signal()
 
-    def __init__(self, url, parent=None):
+    def __init__(self, url, referer="", parent=None):
         super().__init__(parent)
         self.url = url
+        self._referer = referer  # 防盗链 Referer（当前章节页 URL），传 CoverLoader
         self.setAlignment(Qt.AlignCenter)
         self._loading = True
         self._orig: QPixmap | None = None  # 原始像素图（缩放基准）
@@ -498,7 +502,7 @@ class _ComicImageLabel(QLabel):
             return
         from gui.components.cover_loader import CoverLoader
 
-        CoverLoader.instance().load(self.url, self._on_image)
+        CoverLoader.instance().load(self.url, self._on_image, referer=self._referer or None)
 
     def _on_image(self, pixmap) -> None:
         if pixmap is None:

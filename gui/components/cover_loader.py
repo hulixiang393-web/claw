@@ -45,6 +45,10 @@ _REFERER_RULES = (
     ("ccavbox.com", "https://www.comicbox.xyz/"),
     # B 站封面 CDN → B 站（防风控，部分环境需 Referer 才放行）
     ("hdslb.com", "https://www.bilibili.com/"),
+    # manben 漫画图床 → 满本网站点根（发现页/详情封面）。
+    # 正文图（manhua*.cdndm5.com）校验精确章节页 Referer，由 ComicView
+    # 显式传入章节 URL 覆盖此处（_infer_referer 仅是兜底）。
+    ("cdndm5.com", "https://www.manben.com/"),
 )
 
 
@@ -93,7 +97,7 @@ class _CoverLoader(QObject):
         self._manager_direct = QNetworkAccessManager(self)  # 无代理 fallback manager
         self._manager_direct.finished.connect(self._on_direct_reply)
         self._queue: List[tuple] = []
-        self._pending: dict = {}  # reply → (callback, url, used_proxy)
+        self._pending: dict = {}  # reply → (callback, url, used_proxy, referer)
         self._direct_pending: dict = {}  # direct reply → callback
         self._active = 0
         self._proxy_set = False
@@ -167,7 +171,17 @@ class _CoverLoader(QObject):
         self._proxy_set = True
 
     # ------------------------------------------------------------------ #
-    def load(self, url: str, callback: Callable[[Optional[QPixmap]], None]) -> None:
+    def load(
+        self,
+        url: str,
+        callback: Callable[[Optional[QPixmap]], None],
+        referer: Optional[str] = None,
+    ) -> None:
+        """异步加载图片。
+
+        referer: 可选，精确 Referer（漫画正文图 = 章节页 URL，图床校验精确页）。
+        为空时按图片域名从 _REFERER_RULES 推导兜底。
+        """
         if not url:
             callback(None)
             return
@@ -175,27 +189,27 @@ class _CoverLoader(QObject):
         if cached is not None:
             callback(cached)
             return
-        self._queue.append((url, callback))
+        self._queue.append((url, callback, referer))
         self._pump()
 
     def _pump(self) -> None:
         self._ensure_proxy()
         while self._active < MAX_CONCURRENT and self._queue:
-            url, callback = self._queue.pop(0)
+            url, callback, referer = self._queue.pop(0)
             request = QNetworkRequest(QUrl(url))
             request.setHeader(QNetworkRequest.UserAgentHeader, _BROWSER_UA)
             request.setTransferTimeout(REQUEST_TIMEOUT_MS)  # 超时，防卡队列
-            referer = _infer_referer(url)
+            referer = referer or _infer_referer(url)
             if referer:
                 request.setRawHeader(b"Referer", referer.encode("utf-8"))
             self._active += 1
             # 用属性存回调 + 代理标记，reply 完成后取出
             reply = self._manager.get(request)
             used_proxy = self._proxy_url is not None
-            self._pending[reply] = (callback, url, used_proxy)
+            self._pending[reply] = (callback, url, used_proxy, referer)
 
     def _on_reply(self, reply: QNetworkReply) -> None:
-        callback, url, used_proxy = self._pending.pop(reply, (None, "", False))
+        callback, url, used_proxy, referer = self._pending.pop(reply, (None, "", False, None))
         self._active -= 1
         pixmap = None
         try:
@@ -213,7 +227,7 @@ class _CoverLoader(QObject):
                 req2 = QNetworkRequest(QUrl(url))
                 req2.setHeader(QNetworkRequest.UserAgentHeader, _BROWSER_UA)
                 req2.setTransferTimeout(REQUEST_TIMEOUT_MS)
-                referer = _infer_referer(url)
+                referer = referer or _infer_referer(url)
                 if referer:
                     req2.setRawHeader(b"Referer", referer.encode("utf-8"))
                 r2 = self._manager_direct.get(req2)

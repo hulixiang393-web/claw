@@ -125,7 +125,8 @@ class Downloader:
         img_map = {i: b"" for i in range(len(images))}
         progress_cb = getattr(task, "image_progress_cb", None)
         with ThreadPoolExecutor(max_workers=8) as pool:
-            futs = {pool.submit(self._image_bytes, img): i for i, img in enumerate(images)}
+            # 防盗链：以章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
+            futs = {pool.submit(self._image_bytes, img, chapter.url): i for i, img in enumerate(images)}
             for fut in as_completed(futs):
                 idx = futs[fut]
                 try:
@@ -233,7 +234,8 @@ class Downloader:
             images = result_map.get(ch.url)
             if images is None:
                 raise RuntimeError(f"渲染失败：{ch.title or ch.url}")
-            img_bytes = [self._image_bytes(img) for img in images]
+            # 防盗链：以章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
+            img_bytes = [self._image_bytes(img, ch.url) for img in images]
             task.epub_chapters.append((ch.title or f"第{idx+1}话", img_bytes))
             out[idx] = sum(len(b) for b in img_bytes)
         # 未处理的话标记 0
@@ -258,15 +260,18 @@ class Downloader:
         path.write_bytes(raw)
         return len(raw)
 
-    def _image_bytes(self, img: str) -> bytes:
+    def _image_bytes(self, img: str, referer: str = "") -> bytes:
         """单张图字节：data URI 解码 / http URL 下载。不落盘（供 epub 累积）。
 
         受 network.max_bytes_per_image 上限约束：超过则跳过该图并告警（不中断整本）。
+        referer: 防盗链图床所需的 Referer（漫画正文图 = 当前章节页 URL，
+        如 manben 的 manhua*.cdndm5.com 校验精确章节页 Referer）。
         """
         if img.startswith("data:"):
             _, b64 = img.split(",", 1)
             return base64.b64decode(b64)
-        raw = self._http.get_bytes(img)
+        headers = {"Referer": referer} if referer else None
+        raw = self._http.get_bytes(img, headers=headers)
         limit = int(self._settings.get("network", "max_bytes_per_image", 0) or 0)
         if limit > 0 and len(raw) > limit:
             import logging

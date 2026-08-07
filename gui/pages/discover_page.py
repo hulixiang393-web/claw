@@ -425,11 +425,12 @@ class DiscoverPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def _reset_works(self) -> None:
-        """清空网格，只加载第 1 页（懒加载 + 预加载缓冲）。
+        """清空网格，首屏并发加载第 1 页 + 预加载缓冲页（快速填满视口）。
 
-        不做并发多页预加载——一次并发爬多页会让封面（CoverLoader 限流）跟不上，
-        反爬风险也高。首屏 1 页 + 滚动到 80% 触发下一页（_on_scroll），
-        视口未填满时 _maybe_preload 补足（预加载缓冲）。
+        首屏并发爬 1+缓冲页（_preload_ahead），谁先完成先显示（_on_page_loaded
+        边收边渲染）——比等第 1 页完成再串行补预加载更快。其余靠 80% 滚动
+        懒加载（_on_scroll 保留）。封面解密/恢复已独立 Session + 任务列表
+        持有，多页并发不丢封面；CoverLoader 全局限流防封面风暴。
         """
         self._clear_works()
         self._current_page = 0
@@ -440,7 +441,8 @@ class DiscoverPage(BasePage):
         self._page_tasks = []
         self._cover_tasks = []  # 换源/切分类时清空旧封面恢复任务
         self._source_epoch += 1
-        self._load_next_page(page=1)
+        for p in range(1, 1 + self._preload_ahead + 1):
+            self._load_next_page(page=p)
 
     def _clear_works(self) -> None:
         while self.grid_layout.count():
