@@ -59,17 +59,26 @@ class Ytdlp:
         import tempfile
         import os
 
+        # stdout 与 stderr 分开写文件：yt-dlp 会把 Python 3.10 弃用警告等
+        # 打到 stderr，若 stderr=STDOUT 合并会污染 JSON（json.loads 失败 →
+        # 搜索/详情返回空）。stderr 独立文件，成功只取 stdout，失败读 stderr。
         tmp = tempfile.NamedTemporaryFile(
-            mode="w+", suffix=".log", delete=False, encoding="utf-8"
+            mode="w+", suffix=".out", delete=False, encoding="utf-8"
+        )
+        tmp_err = tempfile.NamedTemporaryFile(
+            mode="w+", suffix=".err", delete=False, encoding="utf-8"
         )
         log_path = tmp.name
+        err_path = tmp_err.name
         tmp.close()
+        tmp_err.close()
         try:
-            with open(log_path, "w", encoding="utf-8", errors="replace") as f:
+            with open(log_path, "w", encoding="utf-8", errors="replace") as f, \
+                 open(err_path, "w", encoding="utf-8", errors="replace") as ef:
                 proc = subprocess.run(
                     cmd,
                     stdout=f,
-                    stderr=subprocess.STDOUT,
+                    stderr=ef,
                     text=True,
                     errors="replace",
                     timeout=self._timeout,
@@ -79,17 +88,23 @@ class Ytdlp:
                     out = f.read()
             except OSError:
                 out = ""
+            try:
+                with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+                    err_out = f.read()
+            except OSError:
+                err_out = ""
         except subprocess.TimeoutExpired:
             raise YtdlpError("yt-dlp 超时")
         except FileNotFoundError:
             raise YtdlpError(f"未找到 yt-dlp：{self._bin}")
         finally:
-            try:
-                os.unlink(log_path)
-            except OSError:
-                pass
+            for p in (log_path, err_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
         if proc.returncode != 0:
-            err = (out or "")[-300:].strip()
+            err = (err_out or out or "")[-300:].strip()
             raise YtdlpError(f"yt-dlp 错误({proc.returncode})：{err}")
         return out
 
