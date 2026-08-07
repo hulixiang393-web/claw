@@ -21,10 +21,10 @@ from .cover_loader import CoverLoader
 
 # 封面容器高度：固定高 180，保证卡片上半区统一
 COVER_HEIGHT = 180
-# 标题区高度：限 2 行，超出截断（固定高度保证卡片等高）
-TITLE_HEIGHT = 38
+# 标题区高度：限 2 行。13px 字 2 行约需 40px，38 会裁掉第 2 行下半截（标题被遮住）
+TITLE_HEIGHT = 44
 # 整卡固定高度：封面 180 + 标题 2 行 + 作者 + 来源 + 边距/间距
-CARD_HEIGHT = 284
+CARD_HEIGHT = 292
 
 
 class WorkCard(QFrame):

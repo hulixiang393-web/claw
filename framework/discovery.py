@@ -238,7 +238,18 @@ class Discovery:
         优先 api_endpoints（JSON API 站），否则 HTML selector。
         """
         api = source.raw.get("api_endpoints") or {}
-        if api.get("discovery") or api.get("search"):
+        # 仅 API 发现源才走 _list_works_api：显式配置了 api_endpoints.discovery，
+        # 或仅有 api_endpoints.search 且无 HTML 发现规则（API 站用搜索接口兜底当列表）。
+        # 有 HTML 发现规则（endpoints.discovery）的源即使配了 api_endpoints.search
+        # 也走 HTML 解析（如纵横小说：发现走榜单 HTML、搜索走官方 JSON API），
+        # 否则 list_works 会被 search API 劫持返回 0。
+        disc_html = source.get_discovery_config()
+        has_html_rules = bool(
+            (disc_html.get("works_list_item") or {}).get("root_selector")
+            or (disc_html.get("list_item") or {}).get("root_selector")
+            or (disc_html.get("list_item") or {}).get("categories")
+        )
+        if api.get("discovery") or (api.get("search") and not has_html_rules):
             return self._list_works_api(source, url, page)
 
         fetch_url = self._build_page_url(source, url, page)

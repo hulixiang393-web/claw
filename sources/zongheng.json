@@ -8,7 +8,7 @@
   "$metadata": {
     "homepage": "https://www.zongheng.com",
     "icon": "https://static.zongheng.com/favicon.ico",
-    "description": "纵横中文网官方正版小说站。榜单页 /rank（SSR）可抓作品列表；详情页元数据在 og:novel meta（SSR）；免费章节正文为 SSR 纯文本可直接抓全文；目录（章节列表）为详情页 #pane-catalogue 标签 JS 渲染（SSR 为空），完整目录官方来源是 JSON API bookapi.zongheng.com/api/chapter/getChapterList（当前框架的 fetch_detail 不渲染详情页也不直调章节 API，需框架扩展才能拿到目录，见 endpoints.content.chapter.list.note）；VIP 章节需纵横币付费，免登录仅能读到约 300 字试读预览。",
+    "description": "纵横中文网官方正版小说站。榜单页 /rank?nav=default（SSR）可抓 60 部作品（标题+详情链接，封面/作者 SSR 缺失）；详情页元数据在 og:novel meta（SSR）；目录经官方 JSON API POST bookapi.zongheng.com/api/chapter/getChapterList 直调（content.chapter.list.chapters_api）；免费章节正文 read.zongheng.com 为 SSR 纯文本可抓全文，VIP 章免登录仅能读到约 300 字试读预览。搜索走官方 JSON API search.zongheng.com/search/book（api_endpoints.search）。",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -35,12 +35,11 @@
   "endpoints": {
     "discovery": {
       "list_url": "/rank?nav=default",
-      "note": "纵横书库/发现页（/books）为 JS 渲染空壳，SSR 作品列表只有榜单页 /rank?nav=default（每榜 Top60，实测免登录可抓）。榜单项 div.zh-modules-rank-book 常规项只含 书名+详情链接+榜值（book-rank--title-text a），作者/封面仅在每榜 Top3 悬停卡片（.rank-content-default__right-slot a / .book-rankimg--cover img）上有，其余项取到为空；封面 SSR 全空（JS 注入），cover_render: playwright 由 GUI 异步恢复（仅 Top3）。无 URL 分页（?page=N 返回同页）；换榜靠 rankType 参数：/rank?nav=monthly-ticket&rankType=1（月票）、/rank?nav=new-book&rankType=4（新书）、/rank?nav=click&rankType=5（点击）、/rank?nav=recommend&rankType=6（推荐）、/rank?nav=end&rankType=8（完结）等。更完整的发现卡片是首页 / 的 div.recommend-item（15 张：封面真实 src+书名+作者+分类+简介），可选作 list_url 替换。",
+      "note": "实测仅 /rank?nav=default（综合榜 Top60）SSR 可抓，一次 60 部：div.zh-modules-rank-book 常规项含 书名+详情链接（.book-rank--title-text a，attr title/href），作者仅 Top3 悬停卡片（.rank-content-default__right-slot a）可取到、其余为空；封面 img 无 src（JS 注入），SSR 抓不到（框架 cover_render 恢复只支持 canvas 分片站，不适用本页，故不配置）。其余榜单页 /rank?nav=monthly-ticket&rankType=1（月票）等实测为 JS 空壳（直接 GET 无 SSR 内容）→ 不可作分类；发现页 /books 同为空壳。无 URL 分页（?page=N 返回同页）。首页 / 的 div.recommend-item 有封面真实 src+书名+作者+分类，但 SSR 仅填前 6 张、其余 9 张为空壳，不稳，不作 list_url。",
       "works_list_item": {
         "root_selector": {
           "css": "div.zh-modules-rank-book"
         },
-        "cover_render": "playwright",
         "fields": {
           "title": {
             "css": ".book-rank--title-text a"
@@ -56,26 +55,6 @@
           "author": {
             "css": ".rank-content-default__right-slot a"
           }
-        }
-      }
-    },
-    "search": {
-      "base_url": "/s?keyword={keyword}",
-      "method": "GET",
-      "render": "playwright",
-      "note": "搜索结果页 search.zongheng.com/s?keyword={keyword}&pageNo=1 为 JS 渲染（注意参数名是 keyword 而非 q，用 ?q= 会拿到 keyword=null → 无结果）。页面是空壳，结果由 GET https://search.zongheng.com/search/book 的 JSON 动态拼成 div.search-result-list DOM（实测 playwright 渲染后可提取 20 条：title=书名、href=//book.zongheng.com/book/{bookId}.html、src=封面，keyword 命中即本页真实结果）。分页：页面 JS 读 ?keyword=...&pageNo=N 翻页，但框架渲染搜索只抓第 1 页（constraints.search.max_pages=1）。更稳的直连方式（无需渲染）：GET https://search.zongheng.com/search/book?keyword={keyword}&pageNo={page}&pageNum=20&isFromHuayu=0，返回 data.datas.list（bookId/name/authorName/coverUrl/serialStatus/totalWord/description），name 可能含 <font color=RED> 高亮需清洗。",
-      "paginator": {
-        "url_template": "https://search.zongheng.com/s?keyword={keyword}"
-      },
-      "item": {
-        "root_selector": {
-          "css": "div.search-result-list"
-        },
-        "render_config": {
-          "wait_for": "div.search-result-list",
-          "wait_until": "domcontentloaded",
-          "timeout_ms": 30000,
-          "extra_delay_ms": 2500
         }
       }
     },
@@ -116,7 +95,22 @@
           "max_pages": 1
         },
         "list": {
-          "note": "目录 = 详情页 #pane-catalogue 标签（Vue/Element UI el-tab-pane），SSR HTML 中该标签为空，点击后才由 JS 渲染出 a.chapter-list--item（实测渲染后单页包含全部 303 章，无分页/无加载更多；VIP 章为 span.chapter-list--item-main.chapter-list--item-vip 标记）。当前框架 fetch_detail 不渲染详情页（endpoints 只有 search/body/page/play 支持 render: playwright），纯 HTML 抓不到目录 → 章节提取需实测验证：方案一 框架给 fetch_detail/目录加 playwright 渲染；方案二（更稳）框架的 _fetch_chapters 支持 API 目录，直调官方接口：POST https://bookapi.zongheng.com/api/chapter/getChapterList，Content-Type: application/x-www-form-urlencoded，body bookId={bookId}（免登录）→ result.chapterList[].chapterViewList[]（chapterId/chapterName/wordNums/price），章节 URL = https://read.zongheng.com/chapter/{bookId}/{chapterId}.html。",
+          "note": "目录来源（最终方案）：官方 JSON API POST https://bookapi.zongheng.com/api/chapter/getChapterList（Content-Type: application/x-www-form-urlencoded，body bookId={bookId}，免登录）→ result.chapterList[].chapterViewList[]（chapterId/chapterName/wordNums/price），章节 URL = https://read.zongheng.com/chapter/{bookId}/{chapterId}.html。框架 _fetch_chapters 已支持 chapters_api 直调（见下配置，实测单卷 1646 章全量返回）。详情页 #pane-catalogue 为 Vue/Element UI JS 渲染（SSR 该标签为空，a.chapter-list--item 渲染后才出现），root_selector 仅作 HTML 回退（普通 GET 拿不到目录）。",
+          "chapters_api": {
+            "url": "https://bookapi.zongheng.com/api/chapter/getChapterList",
+            "method": "POST",
+            "body": {
+              "bookId": "{id}"
+            },
+            "body_format": "form",
+            "response_path": "result.chapterList",
+            "children_path": "chapterViewList",
+            "item_fields": {
+              "title": "chapterName",
+              "chapter_id": "chapterId"
+            },
+            "url_template": "https://read.zongheng.com/chapter/{id}/{chapter_id}.html"
+          },
           "root_selector": {
             "css": "#pane-catalogue a.chapter-list--item"
           },
@@ -131,12 +125,32 @@
           }
         },
         "body": {
-          "note": "正文容器：read.zongheng.com/chapter/{bookId}/{chapterId}.html 的 div.reader-content#Jcontent > div.reader-box > div.content，段落为 <p>（SSR 纯 UTF-8 文本，无字体混淆，实测免登录可抓全文）。免费章（data-prescription=\"0\"，price=0）整章完整；VIP 章（data-prescription=\"1\"，约占 287/303）HTML 只含约 16 段/300 字试读预览 + 试读结束块（.reader-app-download），剩余需纵横币付费，框架不支持付费自动化 → 只能免费章全文 + VIP 预览。每章单页，无 _N.html 章内分页。",
+          "note": "正文容器：read.zongheng.com/chapter/{bookId}/{chapterId}.html 的 div.reader-content#Jcontent > div.reader-box > div.content，段落为 <p>（SSR 纯 UTF-8 文本，无字体混淆，实测免登录可抓全文）。免费章（data-prescription=\"0\"）整章完整；VIP 章（data-prescription=\"1\"，大部章节）HTML 只含约 16 段/300 字试读预览 + 试读结束块（.reader-app-download），剩余需纵横币付费，框架不支持付费自动化 → 只能免费章全文 + VIP 预览。每章单页，无 _N.html 章内分页。",
           "selector": {
             "css": ".reader-content .content p"
           },
           "attr": "text"
         }
+      }
+    }
+  },
+  "api_endpoints": {
+    "search": {
+      "url": "https://search.zongheng.com/search/book",
+      "params": {
+        "keyword": "{keyword}",
+        "pageNo": "{page}",
+        "pageNum": "20",
+        "isFromHuayu": "0"
+      },
+      "response_path": "data.datas.list",
+      "note": "搜索走官方 JSON API（无需渲染，比 playwright 渲染搜索页更稳）：GET https://search.zongheng.com/search/book?keyword={keyword}&pageNo=1&pageNum=20&isFromHuayu=0 → data.datas.list（bookId/name/authorName/coverUrl/serialStatus/updateTime/description）。注意参数名是 keyword 而非 q（用 ?q= 会拿到 keyword=null → 无结果）。name 含 <font color=RED> 高亮，框架 _clean_title 自动去标签。url=书详情 https://book.zongheng.com/book/{bookId}.html（服务端 301 到 www.zongheng.com/detail/{id}），cover=静态图 https://static.zongheng.com{coverUrl}。只抓第 1 页（constraints.search.max_pages=1）。",
+      "item_fields": {
+        "title": "name",
+        "url": "https://book.zongheng.com/book/{bookId}.html",
+        "cover": "https://static.zongheng.com{coverUrl}",
+        "author": "authorName",
+        "update": "updateTime"
       }
     }
   },
@@ -154,7 +168,7 @@
     },
     "chapter": {
       "max_pages": 1,
-      "max_items": 2000
+      "max_items": 10000
     }
   },
   "diagnostics": {

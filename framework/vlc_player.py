@@ -244,6 +244,19 @@ class VlcPlayer(QObject):
         if not video_url:
             self._bridge.error.emit("无播放地址")
             return
+        # 新播放前释放上次的本地代理与 media（多次播放会累积资源 → 界面卡）
+        if self._proxy is not None:
+            try:
+                self._proxy.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._proxy = None
+        if self._media is not None:
+            try:
+                self._media.release()
+            except Exception:  # noqa: BLE001
+                pass
+            self._media = None
         self.stop()
         self._current_url = video_url
         opts = []

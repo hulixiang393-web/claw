@@ -600,7 +600,7 @@ class Content:
         list_cfg = block.get("list") or {}
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
-        if not root_sel:
+        if not root_sel and not list_cfg.get("chapters_api"):
             return []
 
         # 独立目录页：content.chapter.list.chapters_url 为模板（如 /other/chapters/id/{id}.html），
@@ -617,7 +617,29 @@ class Content:
                 except Exception:
                     pass  # 目录页抓取失败回退详情页
 
-        items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
+        items = None
+        # API 目录（SPA 目录站，如纵横小说）：详情页目录为 JS 渲染（SSR 空），
+        # HTML 解析抓不到；直调官方章节 API 拿全部章节。
+        # 配置（content.chapter.list.chapters_api）：
+        #   url             章节 API（支持 {id} 占位）
+        #   method          GET / POST（缺省 GET）
+        #   body            请求体（POST，支持 {id} 占位）
+        #   body_format     form（urlencoded，缺省）/ json
+        #   response_path   JSONPath 定位卷/章列表（如 result.chapterList）
+        #   children_path   卷内章节子数组字段（如 chapterViewList），缺省把
+        #                   response_path 结果直接当章节列表
+        #   item_fields     title → 章节名字段；chapter_id → 章节 ID 字段
+        #   url_template    章节 URL 模板（支持 {id}/{chapter_id}/{任意字段} 占位）
+        chapters_api = list_cfg.get("chapters_api") or {}
+        if chapters_api and detail_url:
+            try:
+                api_items = self._fetch_chapters_api(source, chapters_api, detail_url)
+                if api_items is not None:
+                    items = api_items
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] API 目录抓取失败，回退 HTML 解析：%s", source.source_id, exc)
+        if items is None:
+            items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         chapters: List[Chapter] = []
         seen_norm = set()
         seen_title = set()
@@ -678,6 +700,92 @@ class Content:
         ):
             chapters = _sort_chapters(chapters)
         return chapters
+
+    # ------------------------------------------------------------------ #
+    def _fetch_chapters_api(
+        self, source: SourceConfig, cfg: dict, detail_url: str
+    ) -> Optional[List[dict]]:
+        """API 目录：从详情 URL 提取 book id，直调章节 API，返回 [{title, url}]。
+
+        供 SPA 目录站（详情页目录为 JS 渲染、SSR 空，如纵横小说）直接拿 JSON
+        章节列表，避免渲染详情页。配置见 _fetch_chapters 的 chapters_api 注释。
+
+        - 从 detail_url 提取 book id（/{id} 占位）：无法提取 → 返回 None（调用方
+          回退 HTML 解析）
+        - 网络/解析失败 → 抛异常（调用方 catch 后回退 HTML 解析）
+        - 成功（含空列表）→ 返回 [{title, url}]，调用方直接用（不回退）
+        """
+        from urllib.parse import urlencode, urljoin
+
+        m_id = _re.search(r"/(?:novel|book|comic|detail|bookinfo)/(\w+)", detail_url)
+        if not m_id:
+            return None
+        book_id = m_id.group(1)
+        api_url = str(cfg.get("url") or "").replace("{id}", book_id)
+        abs_url = urljoin(source.base_url, api_url)
+        headers = dict(self._headers(source))
+        body = cfg.get("body") or {}
+        filled = {k: str(v).replace("{id}", book_id) for k, v in body.items()}
+
+        method = (cfg.get("method") or "GET").upper()
+        if method == "POST":
+            body_format = (cfg.get("body_format") or "form").lower()
+            if body_format == "json":
+                resp = self._http.post_json(
+                    abs_url, json_body=filled, headers=headers,
+                    timeout=self._timeout(source), retries=self._retries(source),
+                    proxy_pool=source.proxy_pool(),
+                )
+            else:
+                text = self._http.post_form(
+                    abs_url, form_data=filled, headers=headers,
+                    timeout=self._timeout(source), retries=self._retries(source),
+                    proxy_pool=source.proxy_pool(),
+                )
+                import json as _json
+
+                resp = _json.loads(text) if text else {}
+        else:
+            qs = urlencode(filled)
+            abs_url = f"{abs_url}&{qs}" if "?" in abs_url else f"{abs_url}?{qs}"
+            resp = self._http.get_json(
+                abs_url, headers=headers,
+                timeout=self._timeout(source), retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
+            )
+
+        # response_path 定位列表
+        node = resp
+        rpath = cfg.get("response_path") or ""
+        if rpath:
+            node = self._jsonpath(resp, rpath)
+        # children_path 扁平化卷内章节子数组；缺省直接把 response_path 结果当章节列表
+        children_path = cfg.get("children_path") or ""
+        raw_items = []
+        if children_path and isinstance(node, list):
+            for sub in node:
+                if isinstance(sub, dict) and isinstance(sub.get(children_path), list):
+                    raw_items.extend(sub[children_path])
+        elif isinstance(node, list):
+            raw_items = node
+
+        item_fields = cfg.get("item_fields") or {}
+        title_key = item_fields.get("title") or "title"
+        cid_key = item_fields.get("chapter_id") or "chapter_id"
+        url_tpl = str(cfg.get("url_template") or "")
+        out: List[dict] = []
+        for it in raw_items:
+            if not isinstance(it, dict):
+                continue
+            c_title = str(it.get(title_key) or "").strip()
+            c_url = url_tpl
+            for ph, val in (("{id}", book_id), ("{chapter_id}", str(it.get(cid_key) or ""))):
+                c_url = c_url.replace(ph, val)
+            for m in _re.finditer(r"\{(\w+)\}", c_url):
+                c_url = c_url.replace("{" + m.group(1) + "}", str(it.get(m.group(1), "")))
+            if c_title and c_url:
+                out.append({"title": c_title, "url": c_url})
+        return out
 
     # ------------------------------------------------------------------ #
     def fetch_chapter(self, source: SourceConfig, url: str) -> str:

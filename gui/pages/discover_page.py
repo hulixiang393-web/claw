@@ -78,6 +78,7 @@ class DiscoverPage(BasePage):
         self._active_pages: set = set()  # 正在抓取的页码（防重复请求）
         self._loaded_pages: set = set()  # 已完成且有数据的页码
         self._page_tasks: list = []  # 多页并发任务引用（防 GC）
+        self._cover_tasks: list = []  # 封面恢复任务持有（防 GC，逐页覆盖引用会丢早任务）
         self._cat_buttons: list = []
         self._cat_collapsed = True
         self._cat_bar_populated = False
@@ -437,6 +438,7 @@ class DiscoverPage(BasePage):
         self._active_pages = set()
         self._loaded_pages = set()
         self._page_tasks = []
+        self._cover_tasks = []  # 换源/切分类时清空旧封面恢复任务
         self._source_epoch += 1
         self._load_next_page(page=1)
 
@@ -573,7 +575,11 @@ class DiscoverPage(BasePage):
         task.signals.finished.connect(
             lambda covers, e=epoch: self._on_covers_recovered(covers, e)
         )
-        self._cover_task = task  # 防 GC
+        # 列表持有所有封面恢复任务（防 GC）：只用 _cover_task 覆盖引用时，
+        # 先提交的任务失去 Python 引用可能被 GC → run() 不执行 → 该页封面
+        # 永不恢复（实测 18mh 发现页奇数页封面空白）。列表持有保证全部执行。
+        self._cover_tasks.append(task)
+        self._cover_task = task  # 兼容旧引用
         QThreadPool.globalInstance().start(task)
         self.status_label.setText("正在恢复封面...")
 

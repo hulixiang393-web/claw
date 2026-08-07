@@ -294,6 +294,9 @@ class NovelView(QWidget):
         if time.time() - self._last_auto_nav_ts < 2.0:
             return
         max_v = vbar.maximum()
+        # 读到 70% → 预加载下一章（只下一章；_prefetch_next 有锁防重复，翻章时命中缓存秒开）
+        if value >= max_v * 0.7:
+            self._prefetch_next(self._current_idx)
         # 向下：近底部且非末章 → 下一章
         if value >= max_v - 40:
             if self._auto_loading or self._current_idx >= len(self._chapters) - 1:
@@ -404,6 +407,9 @@ class NovelView(QWidget):
         self.paged_label.setText(self._pages[page])
         self.paged_scroll.verticalScrollBar().setValue(0)
         self.pager_indicator.setText(f"{page + 1} / {self._page_count} 页")
+        # 分页读到 70% → 预加载下一章（只下一章，防提前加载过多）
+        if self._page_count > 0 and page >= self._page_count * 0.7:
+            self._prefetch_next(self._current_idx)
 
     def _pager_turn(self, delta: int) -> None:
         """翻到上一页/下一页；越过章边界时自动切换章节（自然衔接）。

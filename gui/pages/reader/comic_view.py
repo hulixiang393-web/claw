@@ -30,8 +30,8 @@ from PySide6.QtWidgets import (
 
 from framework.content import Content, Detail
 
-# 预加载后续话数（仅拉 URL 不下载图，保内存）
-PREFETCH_COUNT = 5
+# 预加载后续话数：只预加载下一话（读到 70% 才触发，不加载过多）
+PREFETCH_COUNT = 1
 
 
 class ComicView(QWidget):
@@ -210,7 +210,8 @@ class ComicView(QWidget):
             vbar.blockSignals(True)
             vbar.setValue(0)
             vbar.blockSignals(False)
-        self._prefetch_future(self._current_idx, PREFETCH_COUNT)
+        # 预加载不在加载后立即发起：等读到当前话 70% 再预渲染下一话
+        # （_maybe_auto_next），避免提前占用 Playwright 资源拖慢当前话。
 
     def _scroll_to_bottom_silently(self) -> None:
         """无触发地滚到底（blockSignals 包住，防自动翻话循环）。"""
@@ -363,6 +364,9 @@ class ComicView(QWidget):
             return
         max_v = vbar.maximum()
         total = len(self._chapters)
+        # 读到 70% → 预加载下一话（只 1 话，避免加载过多；_prefetch_future 有队列锁防重复）
+        if value >= max_v * 0.7:
+            self._prefetch_future(self._current_idx, PREFETCH_COUNT)
         # 向下：近底部 → 下一话
         if value >= max_v - 40:
             if self._auto_loading or self._current_idx >= total - 1:
