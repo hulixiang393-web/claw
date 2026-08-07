@@ -142,18 +142,30 @@ class SourceConfig:
         return self.raw.get("transports") or {}
 
     def proxy_pool(self):
-        """transports.proxy_pool 的代理 IP 池（惰性构建并缓存，跨请求/多线程共享）。
+        """代理 IP 池（惰性构建并缓存，跨请求/多线程共享）。
 
         未配置或配置无效返回 None（请求走直连/单代理）。返回 proxy_pool.ProxyPool。
         配置形式见 proxy_pool.py：list[str] / list[dict] / dict{"proxies": [...],
         "max_switches": N} / 代理池 JSON 文件路径。
+
+        源未显式配置 proxy_pool 时：返回框架级全局 auto 池（读 app_config /
+        data/proxies.json 的代理列表）。auto 池默认直连，该源首次触发反爬时
+        由 HttpClient 自动启用——只针对触发反爬的源，非全量代理。
         """
         if self._proxy_pool is None:
-            from .proxy_pool import ProxyPool
+            from .proxy_pool import ProxyPool, global_proxy_config
 
             cfg = self.transports().get("proxy_pool")
-            pool = ProxyPool.from_config(cfg) if cfg else None
-            self._proxy_pool = pool if (pool is not None and len(pool) > 0) else None
+            if cfg:
+                self._proxy_pool = ProxyPool.from_config(cfg)
+            else:
+                proxies, max_sw = global_proxy_config()
+                if proxies:
+                    self._proxy_pool = ProxyPool(
+                        list(proxies), max_switches=max_sw, auto=True
+                    )
+            if self._proxy_pool is not None and len(self._proxy_pool) == 0:
+                self._proxy_pool = None
         return self._proxy_pool
 
     def request_headers(self) -> dict:

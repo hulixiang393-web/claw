@@ -220,6 +220,8 @@ class VideoView(QWidget):
     def load(self, source, detail: Detail, start_ep_url: str = "") -> None:
         self._source = source
         self._detail = detail
+        # 换视频先停旧播放（不堆积缓存/后台占用），再预建播放器。
+        self._stop_player()
         # 【播放加速】详情打开即预建 VLC 播放器：取流完成直接 play，
         # 不再现场 import vlc + 建 MediaPlayer（约几百 ms，首播更跟手）。
         self._ensure_player()
@@ -255,6 +257,7 @@ class VideoView(QWidget):
 
     def reload_detail(self, new_detail: Detail) -> None:
         """换源重载分集后调用：重建列表 + 加载第 0 集（不自动播）。"""
+        self._stop_player()  # 换源先停旧播放流
         self._detail = new_detail
         self._episodes = new_detail.chapters
         self._play_cache.clear()
@@ -290,6 +293,35 @@ class VideoView(QWidget):
         if self._player is not None:
             self._player.close()
             self._player = None
+
+    # ------------------------------------------------------------------ #
+    def _stop_player(self) -> None:
+        """停止当前视频播放并释放媒体/代理（保留播放器实例复用）。
+
+        换视频/换源时调用，避免旧视频在后台继续播放占用网络/CPU。
+        """
+        if self._player is not None:
+            self._player.release()
+            self.play_btn.setText("▶ 播放")
+
+    def stop_playback(self) -> None:
+        """离开视频视图时释放资源：停播放 + 清空播放缓存（不堆积）。
+
+        换小说/漫画/换另一部视频前由 ReaderPage 调用；全屏状态先退出，
+        播放缓存与取流预拉全部清空，下次进入按需重新拉取。
+        """
+        if self._fs_win is not None:
+            self._exit_fullscreen()
+        self._stop_player()
+        self._current_play = ""
+        self._detail_url_for_play = ""
+        self._prefetch_idx = -2
+        self._play_cache.clear()
+        self._stream_cache.clear()
+        self._cached_length = 0
+        self.progress.setValue(0)
+        self.time_label.setText("00:00 / 00:00")
+        self.play_label.setText("请选择一集")
 
     # ------------------------------------------------------------------ #
     def _populate_source_combo(self, detail: Detail) -> None:

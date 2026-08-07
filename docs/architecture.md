@@ -333,6 +333,8 @@ app_config.example.json         # 应用级设置示例（首次运行自动生�
 
 > 尊重站点：请勿调小间隔对目标站点构成压力；配置仅供合法爬取使用。
 
+**代理池（IP 池）**：除单 `proxy` 外，支持代理池换 IP。源显式配置 `transports.proxy_pool` → 始终启用（请求失败/反爬自动换 IP，见 proxy_pool.py）。未配置的源可走**框架级全局 auto 池**：`app_config.json network.proxy_pool` 指向代理列表文件（默认 `data/proxies.json`），该源**首次触发反爬（403/429/5xx/验证码封禁特征）才自动启用**代理，仅针对触发反爬的源——每源持有独立池实例，一个源启用不影响其他源。默认 `data/proxies.json` 为空 → 各源直连，填入代理后自动生效。
+
 ### 5.8 `check_selector` — 结构校验标签
 
 ```jsonc

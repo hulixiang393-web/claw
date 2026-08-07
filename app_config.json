@@ -5,6 +5,7 @@
     "default_retries": 3,
     "default_request_interval": 0,
     "proxy": null,
+    "proxy_pool": {"file": "data/proxies.json", "max_switches": 3},
     "concurrent_search_sources": 4,
     "max_bytes_per_image": 5242880
   },

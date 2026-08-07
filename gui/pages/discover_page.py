@@ -83,6 +83,7 @@ class DiscoverPage(BasePage):
         self._cat_collapsed = True
         self._cat_bar_populated = False
         self._works: list = []  # 已加载作品全量（resize 自适应列宽时重排用）
+        self._seen_urls: set = set()  # 已出现作品 URL（跨页去重，防分页异常重复显示）
         self._last_columns = 0
 
         layout = QVBoxLayout(self)
@@ -453,6 +454,7 @@ class DiscoverPage(BasePage):
                 w.deleteLater()
         self._work_count = 0
         self._works = []
+        self._seen_urls = set()
 
     def _clear_grid_widgets(self) -> None:
         """只清空网格卡片（保留 self._works 数据）。
@@ -677,10 +679,22 @@ class DiscoverPage(BasePage):
         self._reflow()
 
     def _append_works(self, works) -> None:
-        """把作品卡片按网格排列（每行自适应列数个）。"""
-        self._works.extend(works)
-        cols = self._columns()
+        """把作品卡片按网格排列（每行自适应列数个）。
+
+        跨页按 URL 去重：分页异常/并发预加载时同一作品可能重复出现
+        （如 maccms 分页失效返回相同内容），已显示过的跳过，不重复渲染。
+        """
+        fresh = []
         for w in works:
+            if w.url in self._seen_urls:
+                continue
+            self._seen_urls.add(w.url)
+            fresh.append(w)
+        if not fresh:
+            return
+        self._works.extend(fresh)
+        cols = self._columns()
+        for w in fresh:
             row, col = divmod(self._work_count, cols)
             card = WorkCard(w)
             card.clicked.connect(self._on_work_clicked)

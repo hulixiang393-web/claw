@@ -285,9 +285,14 @@ class Discovery:
 
         items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         works: List[Work] = []
+        seen: set = set()  # 同页内按 URL 去重（maccms 等列表页偶发重复项）
         for it in items:
             if not it.get("title") or not it.get("url"):
                 continue
+            url_key = it.get("url", "")
+            if url_key in seen:
+                continue
+            seen.add(url_key)
             cover = it.get("cover", "")
             works.append(
                 Work(

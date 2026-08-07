@@ -219,6 +219,9 @@ class ReaderPage(BasePage):
         if err or detail is None:
             self.title_label.setText(f"加载失败：{err}")
             return
+        # 切走视频视图前释放播放资源：换小说/漫画/另一部视频都不在后台
+        # 继续播放、不堆积播放缓存（stop_playback 幂等，非视频时无副作用）
+        self.video_view.stop_playback()
         self.title_label.setText(detail.title or "无标题")
         self.refresh_favorite_state()  # 按当前书 URL 刷新收藏按钮
         # 按类型切视图
@@ -295,6 +298,7 @@ class ReaderPage(BasePage):
         self.source_label.setText(path)
         self.fav_btn.setEnabled(False)  # epub 本地书不收藏
         self.fav_btn.setText("☆ 收藏")
+        self.video_view.stop_playback()  # 切 epub 前也释放视频播放资源
         self.stack.setCurrentWidget(self.epub_view)
         if self.epub_view.open(path, start_idx=0):
             # 续读：按上次章节标题定位

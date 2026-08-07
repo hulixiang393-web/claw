@@ -86,6 +86,10 @@ class HttpClient:
         self._session = None
         if _REQUESTS_AVAILABLE:
             self._session = requests.Session()
+            # 关闭系统代理环境变量继承：框架按源显式管理代理（proxy / proxy_pool），
+            # "直连"即真直连。否则 HTTP(S)_PROXY 环境变量会让 requests 静默走
+            # 环境代理，可能被拦截返回 502 等（实测开发机代理干扰）。
+            self._session.trust_env = False
             self._bump_connection_pool()
 
     def _bump_connection_pool(self) -> None:
@@ -119,6 +123,10 @@ class HttpClient:
         """代理池换 IP 重试外壳：每次用 proxy_pool.next() 取代理，失败（含反爬）
         则 mark_bad 换下一个，最多换 max_switches 次。
 
+        auto 池（触发反爬才启用）：首次请求直连，遇 AntiScrapeError 自动
+        engage() 启用代理并用第一个代理重试——只针对触发反爬的源（每源持有
+        独立池实例，互不影响）。普通失败（非反爬）不触发启用。
+
         未配置代理池（或池为空）时行为与原逻辑完全一致：直连/单代理跑一次。
         once(current_proxy)：单次（含原 retries 重试）请求，抛异常表示该 IP 失败。
         """
@@ -130,13 +138,27 @@ class HttpClient:
             current_proxy = proxy_pool.next()
             try:
                 return once(current_proxy)
-            except Exception as exc:  # noqa: BLE001
+            except AntiScrapeError as exc:
                 last_error = exc
+                if proxy_pool.is_auto and not proxy_pool.engaged:
+                    # 触发反爬 → 启用代理池（针对该源），立即用第一个代理重试
+                    proxy_pool.engage()
+                    continue
                 if attempt >= total - 1:
                     break
                 proxy_pool.mark_bad()
                 if not proxy_pool.available():
                     break  # 代理全部失效：抛最后错误，不再直连兜底
+                self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if proxy_pool.is_auto and not proxy_pool.engaged:
+                    raise  # 普通失败（非反爬）：不自动启用代理，直连错误原样抛
+                if attempt >= total - 1:
+                    break
+                proxy_pool.mark_bad()
+                if not proxy_pool.available():
+                    break
                 self._sleeper(min(0.5 * (2 ** attempt), 2.0))
         if isinstance(last_error, RequestError):
             raise last_error

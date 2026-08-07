@@ -383,6 +383,8 @@ class VlcPlayer(QObject):
                 p = self._player
                 if p is None or self._proxy is not None:
                     return
+                if self._current_url != url:
+                    return  # 已切换/释放到其他播放，旧看门狗失效（防切走后复活）
                 st = p.get_state()
                 # VLC state: 1=Opening, 2=Buffering, 3=Playing, 7=Error
                 if st in (1, 7):
@@ -440,6 +442,30 @@ class VlcPlayer(QObject):
             self._player.stop()
         except Exception:  # noqa: BLE001
             pass
+
+    def release(self) -> None:
+        """停止播放并释放当前媒体/本地代理（保留 MediaPlayer 实例可复用）。
+
+        切走视图/换视频时调用：停网络拉流、断开代理、释放解码资源，
+        避免旧视频在后台继续播放/占用资源堆积。
+        """
+        if self._proxy is not None:
+            try:
+                self._proxy.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._proxy = None
+        if self._media is not None:
+            try:
+                self._media.release()
+            except Exception:  # noqa: BLE001
+                pass
+            self._media = None
+        try:
+            self._player.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self._current_url = ""
 
     def set_volume(self, v: int) -> None:
         try:
