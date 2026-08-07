@@ -476,6 +476,7 @@ class Search:
                 abs_url,
                 headers=source.request_headers(),
                 timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+                proxy_pool=source.proxy_pool(),
             )
             items = resp
             rpath = cfg.get("response_path")
@@ -611,6 +612,7 @@ class Search:
             timeout=float(source.transports().get("timeout") or http.defaults.timeout),
             retries=int(source.transports().get("retries") or http.defaults.retries),
             encoding=source.transports().get("charset"),
+            proxy_pool=source.proxy_pool(),
         )
 
     def _http_post_form(
@@ -625,6 +627,7 @@ class Search:
             headers=source.request_headers(),
             timeout=float(source.transports().get("timeout") or http.defaults.timeout),
             encoding=source.transports().get("charset"),
+            proxy_pool=source.proxy_pool(),
         )
 
     @staticmethod

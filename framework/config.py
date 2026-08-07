@@ -50,6 +50,7 @@ class SourceConfig:
     source_path: str = ""
     _buvid3: str = field(default="", init=False, repr=False)  # 缓存，复用连接
     cookie_provider: object = field(default=None, init=False, repr=False)  # 可选: load(source_id)->str
+    _proxy_pool: object = field(default=None, init=False, repr=False)  # 代理IP池缓存（跨请求共享）
 
     @classmethod
     def from_dict(cls, data: Any, path: str = "<memory>") -> "SourceConfig":
@@ -139,6 +140,21 @@ class SourceConfig:
     def transports(self) -> dict:
         """读取 transports 配置。"""
         return self.raw.get("transports") or {}
+
+    def proxy_pool(self):
+        """transports.proxy_pool 的代理 IP 池（惰性构建并缓存，跨请求/多线程共享）。
+
+        未配置或配置无效返回 None（请求走直连/单代理）。返回 proxy_pool.ProxyPool。
+        配置形式见 proxy_pool.py：list[str] / list[dict] / dict{"proxies": [...],
+        "max_switches": N} / 代理池 JSON 文件路径。
+        """
+        if self._proxy_pool is None:
+            from .proxy_pool import ProxyPool
+
+            cfg = self.transports().get("proxy_pool")
+            pool = ProxyPool.from_config(cfg) if cfg else None
+            self._proxy_pool = pool if (pool is not None and len(pool) > 0) else None
+        return self._proxy_pool
 
     def request_headers(self) -> dict:
         """合并 transports.headers 与 cookie 的完整请求头。

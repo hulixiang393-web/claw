@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from typing import List
 
 from .config import SourceConfig
-from .errors import ContentMissingError
+from .errors import ContentMissingError, StructureChangedError
 from .http import HttpClient
 from .parser import Parser
 from .selfcheck import StructureChecker
-from .source_manager import HEALTH_OK
+from .source_manager import HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN
 
 
 @dataclass
@@ -81,18 +81,30 @@ class Discovery:
 
         checker.check() 会对同一 URL 额外发一次 GET（最长 timeout×retries），
         同步等待会让发现页每页慢一倍。自检仅健康监控，移后台 daemon 线程。
+
+        状态映射（与 GUI 诊断一致，避免把活源标死）：
+        - 自检通过（True）→ 绿 ok
+        - 软失败（False：网络/超时/反爬/未达硬失败阈值）→ 黄 warn，不标 broken
+        - 硬失败（StructureChangedError：结构确认变更）→ 红 broken
         """
         from threading import Thread
 
         def _run():
             try:
                 ok = self._checker.check(source, abs_url)
+            except StructureChangedError as exc:
                 self._report_health(
-                    source, HEALTH_OK if ok else "broken",
-                    "" if ok else "结构自检失败",
+                    source, HEALTH_BROKEN,
+                    getattr(exc, "message", "") or "站点结构已变更",
                 )
-            except Exception:  # noqa: BLE001
-                pass
+                return
+            except Exception:  # noqa: BLE001  未知异常：不误标死，降级 WARN
+                self._report_health(source, HEALTH_WARN, "自检异常")
+                return
+            self._report_health(
+                source, HEALTH_OK if ok else HEALTH_WARN,
+                "" if ok else "自检软失败",
+            )
 
         Thread(target=_run, daemon=True).start()
 
@@ -130,6 +142,7 @@ class Discovery:
             retries=self._retries(source),
             interval_ms=self._interval_ms(source),
             encoding=source.transports().get("charset"),
+            proxy_pool=source.proxy_pool(),
         )
 
     # ------------------------------------------------------------------ #
@@ -360,6 +373,7 @@ class Discovery:
                 headers=self._headers(source),
                 timeout=self._timeout(source),
                 retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
             )
             decrypter = Decrypter(self._http)
             plain = decrypter.decrypt_bytes(source, raw, target="image")
@@ -461,6 +475,7 @@ class Discovery:
             headers=self._headers(source),
             timeout=self._timeout(source),
             retries=self._retries(source),
+            proxy_pool=source.proxy_pool(),
         )
 
         # 提取列表项

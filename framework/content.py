@@ -27,11 +27,11 @@ from typing import List, Optional
 log = logging.getLogger(__name__)
 
 from .config import SourceConfig
-from .errors import ContentMissingError
+from .errors import ContentMissingError, StructureChangedError
 from .http import HttpClient
 from .parser import Parser
 from .selfcheck import StructureChecker
-from .source_manager import HEALTH_OK
+from .source_manager import HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN
 from .decrypter import Decrypter  # noqa: F401  (类型提示用)
 
 # ---- 章节标题数字解析 ------------------------------------------------- #
@@ -321,18 +321,30 @@ class Content:
         checker.check() 会对同一 URL 额外发一次 GET（最长 timeout×retries），
         同步等待会让每章下载/每页漫画/每次取流慢一倍。自检仅健康监控，
         移后台 daemon 线程（与 discovery 一致）。
+
+        状态映射（与 GUI 诊断一致，避免把活源标死）：
+        - 自检通过（True）→ 绿 ok
+        - 软失败（False：网络/超时/反爬/未达硬失败阈值）→ 黄 warn，不标 broken
+        - 硬失败（StructureChangedError：结构确认变更）→ 红 broken
         """
         from threading import Thread
 
         def _run():
             try:
                 ok = self._checker.check(source, abs_url)
+            except StructureChangedError as exc:
                 self._report_health(
-                    source, HEALTH_OK if ok else "broken",
-                    "" if ok else "结构自检失败",
+                    source, HEALTH_BROKEN,
+                    getattr(exc, "message", "") or "站点结构已变更",
                 )
-            except Exception:  # noqa: BLE001
-                pass
+                return
+            except Exception:  # noqa: BLE001  未知异常：不误标死，降级 WARN
+                self._report_health(source, HEALTH_WARN, "自检异常")
+                return
+            self._report_health(
+                source, HEALTH_OK if ok else HEALTH_WARN,
+                "" if ok else "自检软失败",
+            )
 
         Thread(target=_run, daemon=True).start()
 
@@ -367,6 +379,7 @@ class Content:
             retries=self._retries(source),
             interval_ms=self._interval_ms(source),
             encoding=source.transports().get("charset"),
+            proxy_pool=source.proxy_pool(),
         )
 
     # ------------------------------------------------------------------ #
@@ -482,6 +495,7 @@ class Content:
             headers=self._headers(source),
             timeout=self._timeout(source),
             retries=self._retries(source),
+            proxy_pool=source.proxy_pool(),
         )
         if not isinstance(resp, dict):
             return Detail(source_id=source.source_id, content_type=source.content_type, url=url)
@@ -1562,6 +1576,7 @@ class Content:
             headers=self._headers(source),
             timeout=self._timeout(source),
             retries=self._retries(source),
+            proxy_pool=source.proxy_pool(),
         )
         rpath = cfg.get("response_path") or ""
         node = resp

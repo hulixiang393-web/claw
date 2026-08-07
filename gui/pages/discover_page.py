@@ -588,13 +588,12 @@ class DiscoverPage(BasePage):
         for w in self._works:
             if w.url in covers:
                 w.cover = covers[w.url]
-        # 重建卡片封面
+        # 重建卡片封面（复用 WorkCard 的统一裁剪，与初始加载尺寸一致）
         hit = 0
         cards = self.list_container.findChildren(WorkCard)
         for card in cards:
             if card.work.url in covers:
                 from PySide6.QtGui import QPixmap
-                from PySide6.QtCore import Qt as _Qt
                 # data URI → QPixmap
                 data_uri = covers[card.work.url]
                 if data_uri.startswith("data:"):
@@ -604,13 +603,7 @@ class DiscoverPage(BasePage):
                         pix = QPixmap()
                         pix.loadFromData(base64.b64decode(b64))
                         if not pix.isNull():
-                            scaled = pix.scaled(
-                                140, 180, _Qt.KeepAspectRatioByExpanding, _Qt.SmoothTransformation
-                            )
-                            sx = max(0, (scaled.width() - 140) // 2)
-                            sy = max(0, (scaled.height() - 180) // 2)
-                            cropped = scaled.copy(sx, sy, min(140, scaled.width()), min(180, scaled.height()))
-                            card._cover.setPixmap(cropped)
+                            card.set_cover_pixmap(pix)
                             hit += 1
                     except Exception:
                         pass

@@ -94,6 +94,7 @@
 | `headers` | `object<string,string>` | 请求头（含 UA） |
 | `cookies` | `object<string,string>` | 每次请求携带的 Cookie |
 | `proxy` | `string` | 代理 URL（`http://user:pass@host:port`） |
+| `proxy_pool` | `array\|object\|string` | 代理 IP 池：`["http://ip:port", ...]` 或 `[{"proxy": "http://...", "name": "..."}]`，或 `{"proxies": [...], "max_switches": N}`（N=换 IP 次数上限，默认 3），或代理池 JSON 文件路径。请求失败/反爬（403/429/5xx/验证码封禁特征）时 HttpClient 自动换 IP 重试（见 proxy_pool.py） |
 | `tls` | `object` | TLS 配置（`verify` / `fingerprint`） |
 | `timeout` | `int` | 单请求超时秒（默认 10） |
 | `retries` | `int` | 失败重试次数（默认 3） |
