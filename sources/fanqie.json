@@ -27,7 +27,7 @@
     },
     "timeout": 15,
     "retries": 3,
-    "interval_ms": 800,
+    "interval_ms": 250,
     "follow_redirects": true
   },
   "endpoints": {
@@ -48,11 +48,19 @@
           },
           "cover": {
             "css": "img.book-cover-img",
-            "attr": "src"
+            "attr": "src",
+            "placeholder": "5cb03bd"
           },
           "author": {
             "css": "h4.author"
           }
+        },
+        "cover_state": {
+          "lists": [
+            "home.boyList",
+            "home.girlList"
+          ],
+          "cover_key": "thumbUri"
         }
       }
     },
@@ -86,7 +94,10 @@
         },
         "cover": {
           "css": "img.book-cover-img",
-          "attr": "src"
+          "attr": "src",
+          "placeholder": "5cb03bd",
+          "regex": "\"image\":\\[\"(https://[^\\\"]+)\"\\]",
+          "state": "page.thumbUri"
         },
         "summary": {
           "css": ".page-abstract-content"

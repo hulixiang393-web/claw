@@ -98,6 +98,9 @@
       "base_url": "/vod/",
       "method": "GET",
       "keyword_param": "wd",
+      "paginator": {
+        "url_template": "/s/wd/{keyword}/"
+      },
       "item": {
         "root_selector": {
           "css": "div.box"

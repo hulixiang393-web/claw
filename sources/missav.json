@@ -28,7 +28,7 @@
       "Referer": "https://missav.ws/"
     },
     "timeout": 15,
-    "retries": 3,
+    "retries": 2,
     "retry_backoff": {
       "base": 2,
       "max": 10,
@@ -166,7 +166,7 @@
       "episode": {
         "single_chapter": true,
         "play_url": {
-          "regex": "https:\\\\/\\\\/surrit\\.com\\\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\\\/",
+          "regex": "https:\\\\/\\\\/[a-z0-9.-]+\\\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\\\/",
           "suffix": "/playlist.m3u8"
         }
       }

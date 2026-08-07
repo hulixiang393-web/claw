@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -69,9 +70,32 @@ def _is_anti_scrape_status(status: int) -> bool:
 
 
 def _is_anti_scrape_text(text: str) -> bool:
-    """按特征词判定反爬：验证码/封禁提示等。只扫前 2000 字符降低误报与开销。"""
-    snippet = (text or "")[:2000].lower()
+    """按特征词判定反爬：验证码/封禁提示等。只扫前 2000 字符降低误报与开销。
+
+    先剔除 HTML 注释与标签：关键词在标签属性里会误报（如
+    comment-captcha-dialog.css 的 'captcha' 是正常资源文件名，非反爬）。
+    真实反爬页关键词在可见文本/脚本正文，剥标签后仍命中。
+    """
+    snippet = (text or "")[:2000]
+    snippet = re.sub(r"<!--.*?-->", " ", snippet, flags=re.S)
+    snippet = re.sub(r"<[^>]*>", " ", snippet)
+    snippet = snippet.lower()
     return any(k in snippet for k in ANTI_SCRAPE_KEYWORDS)
+
+
+def _log_non_json(url: str, text: str) -> None:
+    """记录"响应非 JSON"警告（E1 修复）。
+
+    原实现 JSONDecodeError 时静默 return {}，把反爬/错误页当空数据吞掉，
+    用户只看到"无地址/空章节"。保持返回 {} 兼容（不破坏调用方），
+    但带响应前 200 字符打 warning，便于定位真实原因。
+    """
+    import logging
+
+    snippet = (text or "")[:200].replace("\n", " ").strip()
+    logging.getLogger(__name__).warning(
+        "JSON 解析失败 %s：响应非 JSON（前 200 字符）：%s", url, snippet
+    )
 
 
 class HttpClient:
@@ -86,10 +110,10 @@ class HttpClient:
         self._session = None
         if _REQUESTS_AVAILABLE:
             self._session = requests.Session()
-            # 关闭系统代理环境变量继承：框架按源显式管理代理（proxy / proxy_pool），
-            # "直连"即真直连。否则 HTTP(S)_PROXY 环境变量会让 requests 静默走
-            # 环境代理，可能被拦截返回 502 等（实测开发机代理干扰）。
-            self._session.trust_env = False
+            # 注意：不要设 trust_env=False——那会忽略用户系统的 HTTP(S)_PROXY
+            # 代理（如加速器 127.0.0.1:7890），导致所有请求绕过代理直连，
+            # 在直连 IPv6 不通的环境下每次连接超时 10~40s（实测"加载慢"根因）。
+            # requests 默认读系统代理，代理/代理池按源显式配置仍优先。
             self._bump_connection_pool()
 
     def _bump_connection_pool(self) -> None:
@@ -281,6 +305,7 @@ class HttpClient:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
+            _log_non_json(url, text)
             return {}
 
     def post_json(
@@ -338,6 +363,7 @@ class HttpClient:
                     try:
                         return _json.loads(text)
                     except _json.JSONDecodeError:
+                        _log_non_json(url, text)
                         return {}
                 except AntiScrapeError as exc:
                     if proxy_pool is not None:

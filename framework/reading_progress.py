@@ -25,8 +25,18 @@ MEMORY_TTL_SECONDS = 24 * 3600
 
 
 class ReadingProgress:
-    def __init__(self, path: str | Path = "reading_progress.json"):
+    def __init__(
+        self,
+        path: str | Path = "reading_progress.json",
+        shelf_cb: Optional[Callable[[str], bool]] = None,
+    ):
+        """shelf_cb(book_url) -> bool：该书是否已入书架。
+
+        传入后 save/prune 对已收藏的书永久保留续读（超 24h 也不删），
+        仅清理未收藏的过期记忆——修复"收藏的书也丢续读位置"。
+        """
         self.path = Path(path)
+        self.shelf_cb = shelf_cb
         self._data: dict = self._load()
 
     # ------------------------------------------------------------------ #
@@ -71,7 +81,7 @@ class ReadingProgress:
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         self._save()
-        self.prune(shelf_cb=None)  # 每次写入顺带清理超期项
+        self.prune(shelf_cb=self.shelf_cb)  # 每次写入顺带清理超期项（收藏的书保留）
 
     def resume(self, book_url: str) -> Optional[dict]:
         """取某本书的进度（供续读定位）。无则 None。"""

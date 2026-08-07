@@ -146,13 +146,16 @@
       "url_pattern": "/book/(\\d+)",
       "fields": {
         "title": {
-          "css": "meta[property='og:novel:book_name']"
+          "css": "meta[property='og:novel:book_name']",
+          "attr": "content"
         },
         "author": {
-          "css": "meta[property='og:novel:author']"
+          "css": "meta[property='og:novel:author']",
+          "attr": "content"
         },
         "cover": {
-          "css": "div.novel-cover img"
+          "css": "div.novel-cover img",
+          "attr": "data-src"
         },
         "summary": {
           "css": "div.novel-info-main div.novel-info-content"
@@ -178,7 +181,8 @@
               "css": "div.module-row-title span"
             },
             "url": {
-              "css": "a.module-row-text"
+              "css": "a.module-row-text",
+              "attr": "href"
             }
           }
         },

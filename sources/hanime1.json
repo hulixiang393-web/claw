@@ -160,8 +160,24 @@
         "single_chapter": true,
         "play_url": {
           "selector": {
-            "css": "video#player source[src*='1080p']",
-            "attr": "src"
+            "fallback": [
+              {
+                "css": "video#player source[src*='1080p']",
+                "attr": "src"
+              },
+              {
+                "css": "video#player source[src*='720p']",
+                "attr": "src"
+              },
+              {
+                "css": "video#player source[src*='480p']",
+                "attr": "src"
+              },
+              {
+                "css": "video#player source",
+                "attr": "src"
+              }
+            ]
           }
         }
       }

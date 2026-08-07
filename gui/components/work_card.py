@@ -95,7 +95,6 @@ class WorkCard(QFrame):
         layout.addWidget(self._meta_label)
 
         # 异步加载封面（全局限流，不会并发爆炸）
-        self._pix = None
         if work.cover:
             if work.cover.startswith("data:"):
                 # data URI（解密后的封面）直接解码显示，无需网络

@@ -215,7 +215,7 @@
           "render_config": {
             "wait_for": "img.loaded.lazy, img.indexImg",
             "wait_until": "domcontentloaded",
-            "extra_delay_ms": 4000,
+            "extra_delay_ms": 1000,
             "scroll_to_bottom": true,
             "wheel_scroll": true,
             "extract_mode": "img",

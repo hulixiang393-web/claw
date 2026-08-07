@@ -39,8 +39,6 @@ from .base_page import BasePage
 
 # 分类折叠栏默认显示的按钮数（其余收起，点展开显示全部）
 COLLAPSED_CATEGORY_COUNT = 6
-# 作品网格列数
-GRID_COLUMNS = 5
 
 
 class DiscoverPage(BasePage):
@@ -79,6 +77,10 @@ class DiscoverPage(BasePage):
         self._loaded_pages: set = set()  # 已完成且有数据的页码
         self._page_tasks: list = []  # 多页并发任务引用（防 GC）
         self._cover_tasks: list = []  # 封面恢复任务持有（防 GC，逐页覆盖引用会丢早任务）
+        self._backfill_pool = QThreadPool(self)  # 详情封面回填专用池（限流，≤3 并发）
+        self._backfill_pool.setMaxThreadCount(3)
+        self._cover_backfill_tasks: list = []  # 详情封面回填任务持有（防 GC）
+        self._cover_backfill_submitted: set = set()  # 已提交回填的 url（防逐页/重排重复）
         self._cat_buttons: list = []
         self._cat_collapsed = True
         self._cat_bar_populated = False
@@ -441,6 +443,8 @@ class DiscoverPage(BasePage):
         self._loaded_pages = set()
         self._page_tasks = []
         self._cover_tasks = []  # 换源/切分类时清空旧封面恢复任务
+        self._cover_backfill_tasks = []  # 换源/切分类时清空旧回填任务引用
+        self._cover_backfill_submitted = set()  # 新一轮会话可重新提交回填
         self._source_epoch += 1
         for p in range(1, 1 + self._preload_ahead + 1):
             self._load_next_page(page=p)
@@ -535,6 +539,9 @@ class DiscoverPage(BasePage):
         # 封面异步恢复（AES 解密 / Playwright 渲染）
         if self._needs_cover_recovery(works):
             self._start_cover_recovery(epoch, page, page_works=works)
+        # 详情封面回填（cover_backfill 源：列表纯文本无封面，后台按需抓详情封面）
+        if self._cover_backfill_enabled():
+            self._submit_cover_backfill(epoch, page, page_works=works)
         # 视口未填满 → 继续补足（并发加载）
         self._maybe_preload()
 
@@ -620,6 +627,73 @@ class DiscoverPage(BasePage):
         log.info("[discover] 封面恢复命中 %d 张 / %d 卡片", hit, len(cards))
         self.status_label.setText(f"已加载 {self._current_page} 页 · 共 {self._work_count} 部")
 
+    # ------------------------------------------------------------------ #
+    # 详情封面回填（cover_backfill 源：列表纯文本无封面，后台按需抓详情封面）
+    # ------------------------------------------------------------------ #
+    def _cover_backfill_enabled(self) -> bool:
+        """该源是否启用详情封面回填（works_list_item.cover_backfill）。"""
+        try:
+            disc = self._current_source.get_discovery_config()
+            return bool((disc.get("works_list_item") or {}).get("cover_backfill"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _submit_cover_backfill(self, epoch: int, page: int, page_works=None) -> None:
+        """后台按需抓详情页封面回填（cover_backfill 源，列表纯文本无封面）。
+
+        只提交当前批（page 粒度）cover 为空且 url 非空的作品，不是全部历史页；
+        一个 QRunnable 内串行 fetch_cover 并带反爬间隔，并发由 _backfill_pool
+        限流（≤3）。已提交过的 url 跳过（_cover_backfill_submitted 去重，
+        逐页/重排不重复提交）。失败静默：fetch_cover 空/异常 → 该条跳过。
+        """
+        source = self._current_source
+        if source is None:
+            return
+        targets = page_works if page_works is not None else self._works
+        pending = [
+            w for w in targets
+            if w.url and not w.cover
+            and w.url not in self._cover_backfill_submitted
+        ]
+        if not pending:
+            return
+        for w in pending:
+            self._cover_backfill_submitted.add(w.url)
+        task = _CoverBackfillTask(self._content, source, pending, epoch)
+        task.signals.finished.connect(
+            lambda covers, e=epoch: self._on_covers_backfilled(covers, e)
+        )
+        # 持有引用防 GC（独立列表，与恢复/解密任务分开，互不干扰）
+        self._cover_backfill_tasks.append(task)
+        self._backfill_pool.start(task)
+
+    def _on_covers_backfilled(self, covers: dict, epoch: int) -> None:
+        """详情封面回填完成：回写 work.cover + 经 CoverLoader 刷新对应卡片。
+
+        epoch 不符（换源/切分类）→ 丢弃；卡片已销毁由 set_cover_pixmap 内
+        shiboken6 校验跳过；空封面条目静默跳过，不弹错误。
+        """
+        if epoch != self._source_epoch:
+            return
+        if not covers:
+            return
+        # 回写 work.cover（后续复用：reflow 重建卡片 / 加入书架 / 再次刷新）
+        for w in self._works:
+            url = getattr(w, "url", "")
+            if url in covers and covers[url]:
+                w.cover = covers[url]
+        # 经 CoverLoader 异步加载并刷新卡片（全局限流，裁剪与初始加载一致）
+        from gui.components.cover_loader import CoverLoader
+
+        cards = self.list_container.findChildren(WorkCard)
+        for card in cards:
+            cover_url = covers.get(getattr(card.work, "url", ""))
+            if not cover_url:
+                continue
+            CoverLoader.instance().load(
+                cover_url, lambda pix, c=card: c.set_cover_pixmap(pix)
+            )
+
     def _maybe_preload(self) -> None:
         """内容未填满视口时补足加载（只预加载下 2 页缓冲）。
 
@@ -643,15 +717,24 @@ class DiscoverPage(BasePage):
     def _columns(self) -> int:
         """按可视宽度计算作品列数，避免固定列数导致横向溢出。"""
         view_w = self.scroll.viewport().width() or self.width() or 900
-        cols = max(2, view_w // 170)  # 每列期望 ~170px
-        return min(cols, 8)
+        return self.grid_columns(view_w)
 
     def _apply_column_stretch(self, cols: int) -> None:
         """让网格每列等宽，卡片均匀分布（避免某列标题长导致列宽参差）。"""
-        for i in range(self.grid_layout.columnCount()):
-            self.grid_layout.setColumnStretch(i, 0)
-        for i in range(cols):
-            self.grid_layout.setColumnStretch(i, 1)
+        self.apply_column_stretch(self.grid_layout, cols)
+
+    def _append_card(self, w, cols) -> None:
+        """建一张作品卡片并放进网格（按 cols 列排列）。
+
+        只负责「建卡 + 放网格 + 计数」；cols 必须由调用方在循环前
+        用 _columns() 算好传入（助手内不再重算，防滚动条宽度变化导致
+        与外部列数不一致、卡片错乱）。
+        """
+        row, col = divmod(self._work_count, cols)
+        card = WorkCard(w)
+        card.clicked.connect(self._on_work_clicked)
+        self.grid_layout.addWidget(card, row, col)
+        self._work_count += 1
 
     def _reflow(self) -> None:
         """窗口尺寸变化时按新列数重排作品网格。
@@ -667,11 +750,7 @@ class DiscoverPage(BasePage):
         self._clear_grid_widgets()
         self._work_count = 0
         for w in self._works:
-            row, col = divmod(self._work_count, cols)
-            card = WorkCard(w)
-            card.clicked.connect(self._on_work_clicked)
-            self.grid_layout.addWidget(card, row, col)
-            self._work_count += 1
+            self._append_card(w, cols)
         self._apply_column_stretch(cols)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -695,11 +774,7 @@ class DiscoverPage(BasePage):
         self._works.extend(fresh)
         cols = self._columns()
         for w in fresh:
-            row, col = divmod(self._work_count, cols)
-            card = WorkCard(w)
-            card.clicked.connect(self._on_work_clicked)
-            self.grid_layout.addWidget(card, row, col)
-            self._work_count += 1
+            self._append_card(w, cols)
         self._apply_column_stretch(cols)
 
     # ------------------------------------------------------------------ #
@@ -815,9 +890,6 @@ class DiscoverPage(BasePage):
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
         self._reload_sources()
-
-    def _show_empty(self) -> None:
-        self._clear_works()
 
 
 class _FetchWorkerSignals(QObject):
@@ -952,6 +1024,55 @@ class _CoverDecryptTask(QRunnable):
             self.signals.finished.emit(covers)
         except RuntimeError:
             pass
+
+
+class _CoverBackfillSignals(QObject):
+    """详情封面回填信号。"""
+
+    finished = Signal(object)  # (covers: dict{work_url: cover_url})
+
+
+class _CoverBackfillTask(QRunnable):
+    """后台按需抓详情页封面（cover_backfill 源）。
+
+    列表页纯文本无封面、详情页有封面：对 cover 为空的作品逐个
+    fetch_cover（轻量，只取详情封面字段），复用 Content._detail_html_cache
+    免重复下载；请求间带源 transports.interval_ms 反爬间隔。单条失败/空 →
+    跳过（静默），不影响其它条目。
+    """
+
+    def __init__(self, content, source, works, epoch):
+        super().__init__()
+        self.signals = _CoverBackfillSignals()
+        self._content = content
+        self._source = source
+        self._works = works
+        self._epoch = epoch
+
+    def run(self) -> None:
+        covers = {}
+        try:
+            import time
+
+            # 反爬间隔：跟随源 transports.interval_ms（下限 0.2s）
+            interval = float(self._source.transports().get("interval_ms") or 200) / 1000.0
+            if interval < 0.2:
+                interval = 0.2
+            for i, w in enumerate(self._works):
+                if i > 0:
+                    time.sleep(interval)
+                try:
+                    cover_url = self._content.fetch_cover(self._source, w.url) or ""
+                except Exception:  # noqa: BLE001
+                    cover_url = ""
+                if cover_url:
+                    covers[w.url] = cover_url
+        except Exception:  # noqa: BLE001
+            pass  # 单条已内层容错，整批异常兜底静默
+        try:
+            self.signals.finished.emit(covers)
+        except RuntimeError:
+            pass  # 页面已销毁，忽略信号
 
 
 class _BulkFetchSignals(QObject):

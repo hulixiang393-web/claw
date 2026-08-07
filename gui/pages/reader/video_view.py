@@ -43,7 +43,7 @@ class _VideoFrame(QWidget):
 
 
 class _VideoSignals(QObject):
-    finished = Signal(object, object, object, object)  # (ep_url, video, audio, err)
+    finished = Signal(object, object, object, object, object)  # (ep_url, video, audio, err, quality)
 
 
 class _FetchStreamTask(QRunnable):
@@ -68,7 +68,9 @@ class _FetchStreamTask(QRunnable):
         except Exception as exc:  # noqa: BLE001
             err = str(exc)
         try:
-            self.signals.finished.emit(self._url, video, audio, err)
+            # quality 随任务回传：切画质后旧任务缓存 key 用发起时画质，
+            # 不与当前画质错位（B3）
+            self.signals.finished.emit(self._url, video, audio, err, self._quality)
         except RuntimeError:
             pass
 
@@ -87,7 +89,6 @@ class VideoView(QWidget):
         self._episodes = []
         self._current_idx = -1
         self._current_play = ""  # 单流播放地址（展示/复制）
-        self._stream_seq = 0  # 取流请求序号（防乱序覆盖）
         self._source_list = []  # [{sid, name, ...}]
         self._current_sid = ""
         self._switching = False
@@ -406,6 +407,11 @@ class VideoView(QWidget):
         task.signals.finished.connect(self._on_stream_loaded)
         self._stream_task = task  # 防 GC
         QThreadPool.globalInstance().start(task)
+        # 取流慢（yt-dlp 签名/慢站反爬）时，本集加载期间即预拉下一集——
+        # 预拉是后台串行，本集完成后下一集大概率已缓存，连播/点下一集秒切。
+        # _prefetch_next 内部有 _prefetch_idx 串行闸门，不会与 _on_stream_loaded
+        # 里的预拉重复；单集源无下一集自动跳过。
+        self._prefetch_next(idx)
 
     def _on_ep_clicked(self, item) -> None:
         idx = item.data(Qt.UserRole)
@@ -434,22 +440,44 @@ class VideoView(QWidget):
         if self._player is not None:
             self._player.set_rate(rate)
 
-    def _on_stream_loaded(self, ep_url, video, audio, err) -> None:
-        """取流完成：写缓存 → 播放 → 预拉下一集。"""
+    def _is_current_stream(self, ep_url: str, quality: str) -> bool:
+        """回调结果是否仍对应当前选中的集 + 画质。
+
+        快速连点集/切画质时旧取流任务后到，其结果只应写缓存、
+        不应覆盖当前播放（否则播错集）。无分集（season 页）用详情 URL 校验。
+        """
+        if self._current_idx < 0:
+            return self._detail_url_for_play == ep_url and quality == self._quality
+        if 0 <= self._current_idx < len(self._episodes):
+            return (
+                self._episodes[self._current_idx].url == ep_url
+                and quality == self._quality
+            )
+        return False
+
+    def _on_stream_loaded(self, ep_url, video, audio, err, quality) -> None:
+        """取流完成：写缓存 →（仍为当前集/画质则）播放 → 预拉下一集。
+
+        旧任务后到（ep_url/quality 已非当前）：只写缓存，不覆盖播放。
+        缓存 key 用发起时 quality，避免切画质后 key 错位（B3）。
+        """
         if self._source is None:
             return
         if err or not video:
-            self.play_label.setText(f"获取播放流失败：{err or '无播放地址'}")
-            # 自动降级换源（多源站）
-            nxt = self._next_available_sid()
-            if nxt:
-                self.source_changed.emit((self._detail, nxt))
+            if self._is_current_stream(ep_url, quality):
+                self.play_label.setText(f"获取播放流失败：{err or '无播放地址'}")
+                # 自动降级换源（多源站）
+                nxt = self._next_available_sid()
+                if nxt:
+                    self.source_changed.emit((self._detail, nxt))
             return
-        self._stream_cache[(ep_url, self._quality)] = (video, audio)
-        self._current_play = video
+        self._stream_cache[(ep_url, quality)] = (video, audio)
         # 单流地址写展示缓存
         if not audio:
             self._play_cache[ep_url] = video
+        if not self._is_current_stream(ep_url, quality):
+            return  # 旧任务/旧画质后到：不覆盖当前播放（B2）
+        self._current_play = video
         self.play_label.setText(f"播放地址（已解密）：\n{video}")
         title = ""
         if 0 <= self._current_idx < len(self._episodes):
@@ -486,8 +514,18 @@ class VideoView(QWidget):
             self._player = None
 
     def _play(self, video: str, audio: str, title: str) -> None:
-        """创建/复用 VLC 播放器并播放。"""
+        """创建/复用 VLC 播放器并播放。
+
+        播放器构造失败（未装 VLC / 环境异常）时 _player 为 None：
+        不再调用 rehook 崩溃，提示用户走外部播放器（B1）。
+        """
         self._ensure_player()
+        if self._player is None:
+            self.play_label.setText(
+                "播放器不可用：未安装 VLC 或加载失败，可用「外部播放器」打开"
+            )
+            self.play_btn.setText("▶ 播放")
+            return
         self._player.rehook()  # 确保 hwnd 已挂
         self._player.play(video, audio, title=title)
         self.play_btn.setText("⏸ 暂停")
@@ -615,10 +653,6 @@ class VideoView(QWidget):
             return
         event.ignore()
 
-    def _layout_right(self):
-        # 定位右侧列布局（存引用更稳）
-        return self._right_layout
-
     # ------------------------------------------------------------------ #
     def _prefetch_next(self, idx: int = -1) -> None:
         """后台预拉下一集播放流（串行，命中缓存/无下一集/正在预拉则跳过）。"""
@@ -643,11 +677,12 @@ class VideoView(QWidget):
         self._prefetch_task = task
         QThreadPool.globalInstance().start(task)
 
-    def _on_prefetch_done(self, ep_url, video, audio, err) -> None:
+    def _on_prefetch_done(self, ep_url, video, audio, err, quality) -> None:
         self._prefetch_idx = -2
         if err or not video:
             return
-        self._stream_cache[(ep_url, self._quality)] = (video, audio)
+        # 预拉缓存 key 用发起时 quality（与任务一致，防切画质错位）
+        self._stream_cache[(ep_url, quality)] = (video, audio)
         if not audio:
             self._play_cache[ep_url] = video
 

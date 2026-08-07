@@ -157,6 +157,8 @@ class NovelView(QWidget):
         self._current_page = 0
         self._paged_full_text = ""
         self._apply_font()
+        # 懒加载预取：滚动读到 70% → 后台预取下一章（仅预取，不自动翻章）
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_prefetch)
 
         # ---- 键盘导航 ----
         self.setFocusPolicy(Qt.StrongFocus)
@@ -312,6 +314,23 @@ class NovelView(QWidget):
             self._last_auto_nav_ts = time.time()
             self._load_chapter(self._current_idx - 1, scroll_to_end=True)
             # 跳到上一章末尾在 _on_chapter_loaded 里处理（need_scroll_bottom）
+
+    def _on_scroll_prefetch(self, value: int) -> None:
+        """滚动读到 70% → 预取下一章（仅预取，不启用自动翻章/翻回）。
+
+        由滚动条 valueChanged 触发。区别于 _maybe_auto_next（同时含底部自动
+        翻章/顶部自动翻回）——这里只保留 70% 预取；自动翻章维持禁用，
+        用户手动点「下一章」按钮翻章。
+        """
+        if self._current_idx < 0:
+            return
+        if self._mode != "scroll":
+            return  # 翻页模式由 _pager_show_page 触发 70% 预取
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() == 0:
+            return
+        if value >= vbar.maximum() * 0.7:
+            self._prefetch_next(self._current_idx)
 
     @staticmethod
     def _clamp_font(size: int) -> int:

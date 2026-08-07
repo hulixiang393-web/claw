@@ -137,7 +137,7 @@ def test_chapter_pagination():
     }
 
     class MockHttp(HttpClient):
-        def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None):
+        def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None, proxy_pool=None):
             return urls.get(url) or page_html([])
 
     http = MockHttp(sleeper=lambda _: None)

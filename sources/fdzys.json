@@ -126,7 +126,7 @@
       "episode": {
         "source_switch": {
           "param": "sid",
-          "default_sid": "1",
+          "default_sid": "2",
           "list_selector": ".player_name[data-sid]",
           "list_attr": "data-sid",
           "name_selector": ".player_name",

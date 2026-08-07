@@ -185,7 +185,8 @@
         "bvid": "{bvid}",
         "cid": "{cid}",
         "qn": "{quality}",
-        "fnval": "1",
+        "fnval": "16",
+        "fourk": "1",
         "platform": "pc"
       },
       "quality": {
@@ -199,7 +200,10 @@
           "360p": "16"
         }
       },
-      "response_path": "data.durl.0.url"
+      "response_path": "data.dash.video.0.baseUrl",
+      "field_extractors": {
+        "audio_url": "data.dash.audio.0.baseUrl"
+      }
     }
   },
   "media": {

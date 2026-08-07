@@ -37,39 +37,52 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Playwright 每次 launch 一个 headless Chromium 约 1-2s，是"每次打开/播放慢"
 # 的主要耗时之一（SPA 小说每章、视频播放页每集、漫画每话都在现场启动）。
-# 常驻一个 Chromium 跨调用复用：首次后免启动，秒开。
+# 常驻 Chromium 跨调用复用：首次后免启动，秒开。
 #
-# 注意：sync/async Playwright 对象**非线程安全** → 复用路径全程持锁串行
-# （并发调用排队，等价于原"各自启动浏览器"的串行，但省去 N 次 launch）。
-_SYNC_PW = None
-_SYNC_BROWSER = None
+# 注意：Playwright sync API 把事件循环 + greenlet fiber **绑定在首次 start() 的线程**上，
+# 单一全局复用时，另一线程再调用会做跨 OS 线程的 greenlet 切换 →
+# 抛 `greenlet.error: cannot switch to a different thread`（browser.new_context 报错）。
+# 因此改为**按线程隔离**：注册表以 threading.get_ident() 为键，每线程各持一份
+# (pw, browser)。同线程内仍复用（保留提速收益），跨线程各自独立 Chromium
+# （每线程首次 1-2s 启动，可接受）。注册表读写由 _SYNC_LOCK 保护；线程退出后
+# 的残留由 atexit 兜底清理（跨线程 close 失败仅吞掉，管道断开 Chromium 自清）。
+_SYNC_REGS: dict = {}
 _SYNC_LOCK = threading.Lock()
 
 
 @atexit.register
 def _close_sync_browser() -> None:
-    """进程退出时关闭常驻浏览器，避免残留 Chromium 子进程。"""
-    global _SYNC_PW, _SYNC_BROWSER
-    if _SYNC_BROWSER is not None:
+    """进程退出时关闭全部线程的常驻浏览器，避免残留 Chromium 子进程。
+
+    Playwright 要求 stop() 与 start() 同线程——atexit 在主线程无法真正
+    stop worker 线程的浏览器，跨线程 close/stop 会抛 greenlet.error。
+    这里统一吞掉即可：进程退出时管道断开，Chromium 子进程自清。
+    能 close 的就 close，重点是避免崩溃与残留累积。
+    """
+    with _SYNC_LOCK:
+        regs = list(_SYNC_REGS.items())
+        _SYNC_REGS.clear()
+    for _tid, (_pw, _browser) in regs:
         try:
-            _SYNC_BROWSER.close()
+            _browser.close()
         except Exception:  # noqa: BLE001
             pass
-        _SYNC_BROWSER = None
-    if _SYNC_PW is not None:
         try:
-            _SYNC_PW.stop()
+            _pw.stop()
         except Exception:  # noqa: BLE001
             pass
-        _SYNC_PW = None
 
 
 @contextlib.contextmanager
 def _sync_browser(proxy: Optional[str] = None):
-    """获取可用 sync Playwright 的 (p, browser)。
+    """获取当前线程可用 sync Playwright 的 (p, browser)。
 
     proxy 指定时单独启动（代理不能与常驻浏览器混用，避免污染复用实例）；
-    无代理时复用常驻 headless Chromium（启动一次后跨调用免启动）。
+    无代理时复用**本线程**的常驻 headless Chromium（跨线程互不共享：
+    Playwright sync API 的 fiber 绑定在首次 start() 的线程上，跨线程复用
+    在 new_context 时抛 greenlet.error，故按线程隔离，每线程首次 1-2s 启动）。
+    同线程内仍复用（保留启动一次免启动的提速收益）；锁只保护注册表读写，
+    拿到本线程实例后即释放，各线程用自己的浏览器并行安全。
     """
     from playwright.sync_api import sync_playwright
 
@@ -86,23 +99,44 @@ def _sync_browser(proxy: Optional[str] = None):
                 except Exception:  # noqa: BLE001
                     pass
         return
-    global _SYNC_PW, _SYNC_BROWSER
-    with _SYNC_LOCK:  # sync_playwright 非线程安全：复用路径串行
-        if _SYNC_BROWSER is None or not _SYNC_BROWSER.is_connected():
+    tid = threading.get_ident()
+    with _SYNC_LOCK:  # 仅注册表查询/写入串行；拿到本线程实例后锁即释放
+        entry = _SYNC_REGS.get(tid)
+        alive = False
+        if entry is not None:
             try:
-                if _SYNC_BROWSER is not None:
-                    _SYNC_BROWSER.close()
-            except Exception:  # noqa: BLE001
-                pass
+                alive = entry[1].is_connected()
+            except Exception:  # 跨线程残留（线程退出后 tid 复用）→ 视为不可用
+                alive = False
+        if entry is None or not alive:
+            if entry is not None:
+                # 本线程浏览器已断开/残留 → 关掉并从注册表移除，重新启动
+                _SYNC_REGS.pop(tid, None)
+                try:
+                    entry[1].close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    entry[0].stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            pw = None
             try:
-                _SYNC_PW = sync_playwright().start()
-                _SYNC_BROWSER = _SYNC_PW.chromium.launch(
+                pw = sync_playwright().start()
+                browser = pw.chromium.launch(
                     headless=True, args=["--no-sandbox"]
                 )
             except Exception:
-                _SYNC_BROWSER = None
+                if pw is not None:
+                    try:
+                        pw.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
                 raise
-        yield _SYNC_PW, _SYNC_BROWSER
+            entry = (pw, browser)
+            _SYNC_REGS[tid] = entry
+    # 锁已释放：本线程只用自己持有的浏览器，与其他线程并行安全
+    yield entry[0], entry[1]
 
 
 @contextlib.contextmanager
@@ -984,20 +1018,26 @@ def fetch_rendered_video_sync(
     适用：播放页用 iframe 嵌套第三方解析站（如 agedm），解析站 JS
     解密后填充真实视频 URL 到 iframe 的 <video>。返回 video src；失败 ""。
     """
-    with _sync_browser(proxy) as (p, browser):
-        with _sync_page(browser) as page:
-            page.goto(url, timeout=timeout_ms, wait_until=wait_until)
-            page.wait_for_timeout(extra_delay_ms)
-            # 遍历全部 frame（含 iframe 解析站）找 video src
-            for _ in range(3):  # 多轮重试等解析站渲染
-                for f in page.frames:
-                    try:
-                        vids = f.query_selector_all("video")
-                        for v in vids:
-                            src = v.get_attribute("src") or ""
-                            if src and src.startswith("http"):
-                                return src
-                    except Exception:
-                        continue
-                page.wait_for_timeout(4000)
-            return ""
+    try:
+        with _sync_browser(proxy) as (p, browser):
+            with _sync_page(browser) as page:
+                page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+                page.wait_for_timeout(extra_delay_ms)
+                # 遍历全部 frame（含 iframe 解析站）找 video src
+                for _ in range(3):  # 多轮重试等解析站渲染
+                    for f in page.frames:
+                        try:
+                            vids = f.query_selector_all("video")
+                            for v in vids:
+                                src = v.get_attribute("src") or ""
+                                if src and src.startswith("http"):
+                                    return src
+                        except Exception:
+                            continue
+                    page.wait_for_timeout(4000)
+                return ""
+    except Exception as exc:  # noqa: BLE001
+        # 内部异常（greenlet.error / TimeoutError / playwright 错误）归一化为
+        # 无视频源（""），不把内部异常抛给上层 fetch_video_episode。
+        log.warning("[playwright] 渲染播放页失败 %s: %s", url, exc)
+        return ""

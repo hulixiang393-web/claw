@@ -39,31 +39,6 @@ from .events import (
 )
 
 
-class _DownloadWorker:
-    """QThreadPool 可执行的下载 worker（封装 _run_task 执行）。
-
-    与 DownloadQueue 的 _run_task 解耦：Queue 只做调度，worker 只负责跑。
-    保留 _active_workers 计数语义（并发槽仍由 Queue 的 _concurrent 控制）。
-    提供 is_alive() 兼容 threading.Thread 语义，供 resume_* 判断 worker 是否还在跑。
-    """
-
-    def __init__(self, queue: "DownloadQueue", task: "DownloadTask"):
-        self._queue = queue
-        self._task = task
-        self._running = threading.Event()
-
-    def is_alive(self) -> bool:
-        """正在 run() 中（与 threading.Thread.is_alive 语义一致）。"""
-        return self._running.is_set()
-
-    def run(self) -> None:
-        self._running.set()
-        try:
-            self._queue._run_task(self._task)
-        finally:
-            self._running.clear()
-
-
 class TaskStatus:
     """任务状态常量。"""
 
@@ -343,6 +318,7 @@ class DownloadQueue:
             t.status = TaskStatus.PAUSED
         elif t.status == TaskStatus.DOWNLOADING:
             t.pause_evt.set()
+            t.status = TaskStatus.PAUSED
 
     def _maybe_dispatch(self) -> None:
         """并发槽有空位且队首有 WAITING → 启动 worker。

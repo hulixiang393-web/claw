@@ -136,6 +136,8 @@ class _ShelfCard(QFrame):
         parts = []
         if type_label:
             parts.append(type_label)
+        if self.rec.get("episode_count"):
+            parts.append(f"共 {self.rec['episode_count']} 集")
         if self.rec.get("author"):
             parts.append(self.rec["author"])
         tags = self.rec.get("tags") or []
@@ -239,7 +241,7 @@ class LibraryPage(BasePage):
     def _refresh_data(self) -> list[dict]:
         """收集书库：本地 epub + 收藏，补充续读位置。"""
         books: list[dict] = []
-        # 本地已下载 epub（novel/comic 下载产物），排除用户主动隐藏的
+        # 本地已下载内容（novel/comic → epub；video → mp4 集），排除主动隐藏的
         hidden = self._hidden_local()
         if self._output_dir.is_dir():
             for sub in sorted(self._output_dir.iterdir()):
@@ -248,17 +250,30 @@ class LibraryPage(BasePage):
                 if sub.name in hidden:
                     continue  # 用户从书架移除的本地书不显示
                 epubs = list(sub.glob("*.epub"))
-                if not epubs:
-                    continue
-                path = str(epubs[0])
-                ct = _detect_epub_type(path)
-                rec = {
-                    "kind": "local",
-                    "title": sub.name,
-                    "path": path,
-                    "content_type": ct,
-                    "author": "",
-                }
+                if epubs:
+                    path = str(epubs[0])
+                    ct = _detect_epub_type(path)
+                    rec = {
+                        "kind": "local",
+                        "title": sub.name,
+                        "path": path,
+                        "content_type": ct,
+                        "author": "",
+                    }
+                else:
+                    # 视频下载产物：{书名}/N 集 mp4 → 书架显示"共 N 集"
+                    vids = sorted(sub.glob("*.mp4"))
+                    if not vids:
+                        continue  # 非 epub 也非视频目录 → 跳过
+                    path = str(vids[0])
+                    rec = {
+                        "kind": "local",
+                        "title": sub.name,
+                        "path": path,
+                        "content_type": "video",
+                        "author": "",
+                        "episode_count": len(vids),
+                    }
                 # 续读位置（按文件路径 key）
                 if self._progress is not None:
                     pres = self._progress.resume(path)
@@ -563,7 +578,10 @@ class LibraryPage(BasePage):
     # ------------------------------------------------------------------ #
     def _on_card_clicked(self, rec: dict) -> None:
         if rec.get("kind") == "local" and rec.get("path"):
-            self.open_epub_requested.emit(rec["path"])
+            if rec.get("content_type") == "video":
+                self._open_folder(rec)  # 视频不内置播放本地文件，打开所在文件夹
+            else:
+                self.open_epub_requested.emit(rec["path"])
         elif rec.get("url"):
             # 收藏在线书：打开在线阅读器
             self.open_online_requested.emit(

@@ -33,34 +33,57 @@
   },
   "endpoints": {
     "discovery": {
-      "list_url": "/novel/1/catalog",
+      "list_url": "/topfull/allvisit/1.html",
+      "list_paginator": {
+        "type": "increment",
+        "page_placeholder": "\\d+(?=\\.html)"
+      },
       "list_item": {
         "categories": [
           {
-            "title": "恶魔高校DxD",
-            "url": "/novel/1/catalog"
+            "title": "完本榜",
+            "url": "/topfull/allvisit/1.html"
           },
           {
-            "title": "刀剑神域",
-            "url": "/novel/38/catalog"
+            "title": "最近更新",
+            "url": "/topfull/lastupdate/1.html"
           },
           {
-            "title": "魔法科高校劣等生",
-            "url": "/novel/35/catalog"
+            "title": "最新入库",
+            "url": "/topfull/postdate/1.html"
+          },
+          {
+            "title": "收藏榜",
+            "url": "/topfull/goodnum/1.html"
+          },
+          {
+            "title": "新书榜",
+            "url": "/topfull/newhot/1.html"
+          },
+          {
+            "title": "月点击榜",
+            "url": "/topfull/monthvisit/1.html"
           }
         ]
       },
       "works_list_item": {
         "root_selector": {
-          "css": "a[href*='/novel/']"
+          "css": "div.rank_d_list"
         },
         "fields": {
           "title": {
-            "css": "a"
+            "css": ".rank_d_b_name a"
           },
           "url": {
-            "css": "a",
+            "css": ".rank_d_b_name a",
             "attr": "href"
+          },
+          "cover": {
+            "css": ".rank_d_book_img img",
+            "attr": "data-original"
+          },
+          "author": {
+            "css": ".rank_d_b_cate a"
           }
         }
       }
@@ -70,8 +93,24 @@
         "title": {
           "css": "h1"
         },
+        "book_name": {
+          "css": "meta[property='og:novel:book_name']",
+          "attr": "content"
+        },
         "summary": {
           "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "author": {
+          "css": "meta[property='og:novel:author']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "status": {
+          "css": "meta[property='og:novel:status']",
           "attr": "content"
         }
       }
@@ -79,9 +118,11 @@
     "content": {
       "chapter": {
         "list": {
+          "chapters_url": "/novel/{id}/catalog",
           "root_selector": {
-            "css": "a[href*='/novel/']"
+            "css": "ul.chapter-list li a"
           },
+          "chapter_order": "asc",
           "fields": {
             "title": {
               "css": "a"

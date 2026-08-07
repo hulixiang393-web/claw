@@ -157,7 +157,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 return
             text = body.decode("utf-8", "replace")
             if text.lstrip().startswith("#EXTM3U"):
-                text = self._rewrite(text, t)
+                text = self._rewrite(text, t, real)
                 body = text.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.apple.mpegurl")
@@ -191,16 +191,25 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 pass
 
-    def _rewrite(self, text: str, t: dict) -> str:
-        """m3u8 里非注释行（分片/子清单 URL）全部改写为本地代理路径。"""
+    def _rewrite(self, text: str, t: dict, real: str = "") -> str:
+        """m3u8 里非注释行（分片/子清单 URL）全部改写为本地代理路径。
+
+        real 为当前 m3u8 的真实上游 URL：相对分片以它做基准拼接
+        （urljoin 取到 m3u8 所在目录）。不能直接用 t["base"]——那是站点根
+        scheme://netloc，深目录 m3u8（avgood /remote_m3u8/.../ts/index.m3u8、
+        missav 360p/video.m3u8 子清单等）的相对分片会拼到站点根假路径 → 404。
+        绝对分片 URL（http 开头）urljoin 原样返回，不受影响；根相对 `/...`
+        仍落在站点根，行为不变。
+        """
         pb = t["proxy"]
+        base = real or t["base"]
         out = []
         for line in text.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 out.append(line)
                 continue
-            out.append(pb + "/p/" + urljoin(t["base"], line))
+            out.append(pb + "/p/" + urljoin(base, line))
         return "\n".join(out)
 
     def log_message(self, *args):  # noqa: A002
@@ -378,16 +387,23 @@ class VlcPlayer(QObject):
         def _watch() -> None:
             import time as _t
 
-            _t.sleep(4)
+            _t.sleep(2)
+            try:
+                s1 = self._player.get_state()
+            except Exception:  # noqa: BLE001
+                return
+            _t.sleep(2)
             try:
                 p = self._player
                 if p is None or self._proxy is not None:
                     return
                 if self._current_url != url:
                     return  # 已切换/释放到其他播放，旧看门狗失效（防切走后复活）
-                st = p.get_state()
+                s2 = p.get_state()
                 # VLC state: 1=Opening, 2=Buffering, 3=Playing, 7=Error
-                if st in (1, 7):
+                # 两次采样（2s/4s）都在 Opening/Error 才触发：状态在推进说明启动
+                # 正常，避免 DASH 双流启动慢被误杀；总等待仍为 4s
+                if s1 in (1, 7) and s2 in (1, 7):
                     # 调度回主线程：winId/set_hwnd 等 Qt 操作必须主线程，否则内嵌黑屏
                     self._proxy_retry.emit(url, audio_url)
             except Exception:  # noqa: BLE001
@@ -407,14 +423,24 @@ class VlcPlayer(QObject):
                 base, referer=self._referer, user_agent=self._user_agent
             )
             local = proxy.local(url)
+            # 与 play() 相同的 media 级选项：referer/UA 对 input-slave 同样生效
+            opts = []
+            if self._referer:
+                opts.append("http-referrer=" + self._referer)
+            if self._user_agent:
+                opts.append("http-user-agent=" + self._user_agent)
             self.stop()
             self._proxy = proxy
             if audio_url:
+                # DASH 双流：音频也走本地代理（带 referer/UA，防 CDN 403 卡 Opening）
+                local_a = proxy.local(audio_url)
                 self._media = _get_instance().media_new(local)
-                self._media.add_option("input-slave=" + audio_url)
+                self._media.add_option("input-slave=" + local_a)
+                for o in opts:
+                    self._media.add_option(o)
                 self._player.set_media(self._media)
             else:
-                self._player.set_mrl(local)
+                self._player.set_mrl(local, *opts)
             self._attach_window()
             self._player.play()
         except Exception:  # noqa: BLE001

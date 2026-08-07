@@ -2,6 +2,7 @@
 
 消费 endpoints.detail 与 endpoints.content：
 - fetch_detail(source, url)  → 详情元数据 + 章节列表
+- fetch_cover(source, url)   → 详情页封面（轻量，回填用，不抓章节）
 - fetch_chapter(source, url) → 单章正文（按 content_type 分派）
 
 章节列表自动排序（三种类型 novel/comic/video 共用）：
@@ -21,191 +22,21 @@ from __future__ import annotations
 import json
 import logging
 import re as _re
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 log = logging.getLogger(__name__)
 
 from .config import SourceConfig
-from .errors import ContentMissingError, StructureChangedError
+from .errors import ContentMissingError
 from .http import HttpClient
 from .parser import Parser
 from .selfcheck import StructureChecker
-from .source_manager import HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN
+from . import utils
+from .chapter_sort import chapter_label, _extract_chapter_number, _sort_chapters
+from .health import report_bg_check
 from .decrypter import Decrypter  # noqa: F401  (类型提示用)
-
-# ---- 章节标题数字解析 ------------------------------------------------- #
-# 汉字数字（含大写：壹贰叁…）
-_CN_DIGITS = {
-    "零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4,
-    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
-    "壹": 1, "贰": 2, "叁": 3, "肆": 4, "伍": 5,
-    "陆": 6, "柒": 7, "捌": 8, "玖": 9,
-}
-_CN_UNITS = {
-    "十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000,
-    "万": 10000, "萬": 10000, "亿": 100000000, "億": 100000000,
-}
-_ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
-
-
-def _cn_to_int(s: str) -> int | None:
-    """汉字数字串转整数。'十二'→12，'三百零五'→305。非数字串→None。"""
-    total = section = number = 0
-    for ch in s:
-        if ch in _CN_DIGITS:
-            number = _CN_DIGITS[ch]
-        elif ch in _CN_UNITS:
-            unit = _CN_UNITS[ch]
-            if unit >= 10000:
-                section = (section + number) * unit
-                total += section
-                section = number = 0
-            else:
-                section += (number or 1) * unit
-                number = 0
-        else:
-            return None
-    return total + section + number
-
-
-def _roman_to_int(s: str) -> int | None:
-    """罗马数字转整数。'XII'→12。非法→None。"""
-    total = prev = 0
-    for ch in reversed(s.upper()):
-        v = _ROMAN.get(ch)
-        if v is None:
-            return None
-        if v < prev:
-            total -= v
-        else:
-            total += v
-        prev = v
-    return total if total > 0 else None
-
-
-# 半角罗马数字匹配：前后若不是 ASCII 字母/数字即为边界。
-# （汉字「第X话」里 X 前后是中文字符，算边界；LOVE/VALUE 里才是字母，不误判）
-_ROMA_HALF = _re.compile(r"(?<![A-Za-z0-9])([IVXLCDM]{1,6})(?![A-Za-z0-9])")
-_ROMA_FULL = _re.compile(r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+")
-
-
-def _extract_chapter_number(title: str) -> tuple | None:
-    """从章节标题提取排序键（卷号, 章号）。
-
-    排序键设计（用户确认：卷号+章号复合排序）：
-        第1卷 第3章  → (1, 3)；第2卷 第1章 → (2, 1)；第2卷 第1章 排在第1卷 第3章 之后。
-    优先级：
-    1. 同时有「第X卷/Vol.X」和「第Y章/话/回/集」→ (卷号, 章号)。
-    2. 只有章号无卷号 → (0, 章号)（无卷排最前）。
-    3. 只有卷号无章号 → (卷号, 0)。
-    4. 纯数字/数字开头标题（"12"、"第十二"）→ (0, 12)。
-    5. 仍提取不到 → None（排末尾）。
-
-    支持的数字写法：阿拉伯 / 汉字（含大写）/ 罗马（全角+半角）/ 全角阿拉伯（０-９）/ 英文（Vol.1 / Ch.5）。
-    """
-    if not title:
-        return None
-    # 特殊章节词（楔子/序章/番外/卷首/尾声等）不算数字章节
-    if _re.search(r"楔|序章|番外|卷首|前言|后记|尾声|番外篇", title):
-        return None
-
-    # 找出所有「第X卷」与「第X章/话/回/集/节」
-    volume = None
-    chapter = None
-    # 卷号：中文「第X卷」或英文「Vol.X」「VOL.X」
-    m_vol = _re.search(
-        r"(?:第\s*([0-9０-９零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXLCDMivxlcdm]+)\s*卷|Vol\.?\s*([0-9０-９IVXLCDMivxlcdm]+))",
-        title,
-        _re.IGNORECASE,
-    )
-    if m_vol:
-        token = m_vol.group(1) or m_vol.group(2)
-        v = _parse_num_token(token)
-        if v is not None:
-            volume = v
-    # 章号：中文「第X章/话/回/集/节」或英文「Ch.X」「CHAPTER X」
-    # （话/話 兼容简繁；回/囘 变体；集/節）
-    m_ch = _re.search(
-        r"(?:第\s*([0-9０-９零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXLCDMivxlcdm]+)\s*(?:章|话|話|回|囘|集|節|节)|(?:Ch(?:apter)?\.?\s*([0-9０-９IVXLCDMivxlcdm]+)))",
-        title,
-        _re.IGNORECASE,
-    )
-    if m_ch:
-        token = m_ch.group(1) or m_ch.group(2)
-        v = _parse_num_token(token)
-        if v is not None:
-            chapter = v
-    # 有卷有章
-    if volume is not None and chapter is not None:
-        return (volume, chapter)
-    # 有卷无章（如 "第1卷 序章" → 已排除；"Vol.1" 只有卷）→ (卷, 0)
-    if volume is not None:
-        return (volume, 0)
-    # 有章无卷 → (0, 章)
-    if chapter is not None:
-        return (0, chapter)
-
-    # 退化：标题以数字开头（纯数字/汉字数字/罗马），视为无卷的章号
-    m = _re.match(r"\s*([０-９\d]{1,6})\b", title)
-    if m:
-        return (0, _to_int_full(m.group(1)))
-    m = _re.match(r"\s*[零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億]+", title)
-    if m:
-        v = _cn_to_int(m.group(0))
-        if v is not None:
-            return (0, v)
-    m = _re.match(r"\s*[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+", title)
-    if m:
-        v = _roman_to_int(m.group(0))
-        if v is not None and v <= 9999:
-            return (0, v)
-    m = _ROMA_HALF.match(title)
-    if m:
-        v = _roman_to_int(m.group(1))
-        if v is not None and v <= 9999:
-            return (0, v)
-    # 退化：标题结尾带数字（如「书名 2」「名3」），常见于短篇集/番外连载，
-    # 数字是章节序号（无「第X话」前缀）。仅在标题非纯数字开头时兜底提取。
-    # 收紧：排除「楔/序/番外/完结/篇/卷」等特殊词，避免「完结篇2」「第0话 序章」
-    # 误判为章号；数字可紧贴标题（如「名3」）或带分隔符（如「书名 2」）。
-    if _re.search(r"楔|序章|番外|完结|篇|前言|后记|尾声|卷首", title):
-        return None
-    m = _re.match(r".+[ \t#・\-—\.]?([０-９\d]{1,5})\s*$", title)
-    if m and not _re.match(r"\s*[０-９\d]", title):
-        v = _to_int_full(m.group(1))
-        return (0, v)
-    return None
-
-
-def _to_int_full(s: str) -> int:
-    """全角数字（０-９）与半角混合转 int。"""
-    trans = str.maketrans("０１２３４５６７８９", "0123456789")
-    return int(s.translate(trans))
-
-
-# 章节编号前缀：只取「第X章/话/回/集/节」或「Vol.X」「Ch.X」，不含标题文字
-# （话/話 简繁；回/囘；集/節 兼容）
-_CHAPTER_LABEL = _re.compile(
-    r"第\s*[0-9０-９零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXLCDMivxlcdm]+\s*(?:章|话|話|回|囘|集|節|节)"
-    r"|Vol\.?\s*[0-9０-９IVXLCDMivxlcdm]+"
-    r"|Ch(?:apter)?\.?\s*[0-9０-９IVXLCDMivxlcdm]+",
-    _re.IGNORECASE,
-)
-
-
-def chapter_label(title: str) -> str:
-    """从章节标题提取编号前缀（如「第12话」），不含标题文字/标签。
-
-    - 匹配「第X章/话/回/集/节」「Vol.3」「Ch.5」等编号部分并原样返回
-    - 匹配不到则返回原标题（兜底，避免空标题）
-    """
-    if not title:
-        return ""
-    m = _CHAPTER_LABEL.search(title)
-    if m:
-        return m.group(0).strip()
-    return title.strip()
 
 
 def _strip_html_tags(text: str) -> str:
@@ -231,37 +62,6 @@ def _strip_html_tags(text: str) -> str:
         # lxml 解析失败 → 去标签兜底
         clean = _re.sub(r"<[^>]+>", "\n", text)
         return _re.sub(r"\n{3,}", "\n\n", clean).strip()
-
-
-def _parse_num_token(token: str) -> int | None:
-    """解析「第X」中 X 的数字：阿拉伯/汉字/罗马/全角统一转 int。"""
-    if not token:
-        return None
-    if _re.fullmatch(r"[０-９\d]{1,6}", token):
-        return _to_int_full(token)
-    if _re.fullmatch(r"[零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟萬億]+", token):
-        return _cn_to_int(token)
-    if _re.fullmatch(r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+", token):
-        v = _roman_to_int(token)
-        return v if v is not None and v <= 9999 else None
-    if _re.fullmatch(r"[IVXLCDM]{1,6}", token.upper()):
-        v = _roman_to_int(token)
-        return v if v is not None and v <= 9999 else None
-    return None
-
-
-def _sort_chapters(chapters: List["Chapter"]) -> List["Chapter"]:
-    """按标题序号升序排序章节（稳定）。
-
-    - 有数字的章节按序号排序（倒序/先最新后顺序/反爬乱序都能恢复正序）
-    - 无数字章节（楔子/序章/番外/卷名）保持原相对顺序，排在有数字之后
-    """
-    numbered = [(n, idx, ch) for idx, ch in enumerate(chapters)
-                if (n := _extract_chapter_number(ch.title)) is not None]
-    unnumbered = [(idx, ch) for idx, ch in enumerate(chapters)
-                  if _extract_chapter_number(ch.title) is None]
-    numbered.sort(key=lambda t: (t[0], t[1]))
-    return [ch for _, _, ch in numbered] + [ch for _, ch in unnumbered]
 
 
 @dataclass
@@ -306,14 +106,16 @@ class Content:
         # yt-dlp 流 URL 缓存（同视频短时复用，避免重复签名等待）
         self._ytdlp_stream_cache: dict = {}
         self._ytdlp = None  # 懒加载单例，复用 yt-dlp 子进程
-
-    def _report_health(self, source: SourceConfig, state: str, error: str = "") -> None:
-        """上报源健康状态（若注入 health_reporter）。"""
-        if self._health_reporter is not None:
-            try:
-                self._health_reporter.update_health(source.source_id, state, error)
-            except Exception:  # noqa: BLE001
-                pass
+        # 视频详情页 HTML 复用缓存：single_chapter 源（missav/hanime1/18j/18mh-video
+        # 等）取流 URL == 详情 URL，fetch_detail 已整页下载，取流时复用免二次下载
+        # （慢站反爬延迟下详情+取流各一次，复用省约一半同步等待）。只留最近一部
+        # （每次详情加载重新填充，天然不过期）。
+        self._video_html_cache: dict = {}
+        # 详情页 HTML 短 TTL 缓存：重复打开同一本书免二次整页下载（慢站详情慢）。
+        # 只缓存最近 _detail_html_max 条，防长期会话无界增长（dict 保持插入序）。
+        self._detail_html_cache: dict = {}  # {(source_id, abs_url): (expire_ts, html)}
+        self._detail_html_ttl = 300.0  # 5 分钟
+        self._detail_html_max = 50
 
     def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
         """后台线程执行结构自检，不阻塞抓取（阅读/下载/播放提速）。
@@ -327,26 +129,14 @@ class Content:
         - 软失败（False：网络/超时/反爬/未达硬失败阈值）→ 黄 warn，不标 broken
         - 硬失败（StructureChangedError：结构确认变更）→ 红 broken
         """
-        from threading import Thread
-
-        def _run():
-            try:
-                ok = self._checker.check(source, abs_url)
-            except StructureChangedError as exc:
-                self._report_health(
-                    source, HEALTH_BROKEN,
-                    getattr(exc, "message", "") or "站点结构已变更",
-                )
-                return
-            except Exception:  # noqa: BLE001  未知异常：不误标死，降级 WARN
-                self._report_health(source, HEALTH_WARN, "自检异常")
-                return
-            self._report_health(
-                source, HEALTH_OK if ok else HEALTH_WARN,
-                "" if ok else "自检软失败",
-            )
-
-        Thread(target=_run, daemon=True).start()
+        # 源配置 diagnostics.selfcheck.strategy="off" → 完全关闭后台自检。
+        # 自检会对同一 URL 并发第二 GET（后台线程），fanqie 等已配 off 的源
+        # 继续触发会放大反爬尖峰（实测详情慢 ~6s），此处跳过不再发请求。
+        if (
+            (source.raw.get("diagnostics") or {}).get("selfcheck") or {}
+        ).get("strategy") == "off":
+            return
+        report_bg_check(self._checker, self._health_reporter, source, abs_url)
 
     # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
@@ -387,13 +177,7 @@ class Content:
         return int(source.transports().get("interval_ms") or self._http.defaults.interval_ms)
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
-        from urllib.parse import urljoin, urlsplit
-
-        # 协议判断（大小写不敏感 + 协议相对 //），避免 "HTTP://" 被误当相对路径
-        scheme = (urlsplit(url).scheme or "").lower()
-        if scheme in ("http", "https") or url.startswith("//"):
-            return url
-        return urljoin(source.base_url, url)
+        return utils.abs_url(source.base_url, url)
 
     def _get(self, source: SourceConfig, url: str) -> str:
         abs_url = self._abs_url(source, url)
@@ -406,6 +190,46 @@ class Content:
             encoding=source.transports().get("charset"),
             proxy_pool=source.proxy_pool(),
         )
+
+    def _get_detail_html(self, source: SourceConfig, url: str, abs_url: str) -> str:
+        """详情页 HTML：短 TTL 缓存命中直接返回，否则抓取并缓存。
+
+        重复打开同一本书（详情抽屉多次/刷新）免二次整页下载，慢站详情慢时
+        省约整页等待。缓存键 (source_id, abs_url)，TTL 5 分钟，超上限丢最旧。
+        """
+        key = (source.source_id, abs_url)
+        hit = self._detail_html_cache.get(key)
+        if hit and hit[0] > time.time():
+            return hit[1]
+        html = self._get(source, url)
+        self._detail_html_cache[key] = (time.time() + self._detail_html_ttl, html)
+        if len(self._detail_html_cache) > self._detail_html_max:
+            # dict 保持插入序：弹出最先插入的一条（近似 LRU）
+            self._detail_html_cache.pop(next(iter(self._detail_html_cache)))
+        return html
+
+    def _content_block(self, source: SourceConfig) -> dict:
+        """endpoints.content 配置块（可能缺失 → {}）。"""
+        return source.raw.get("endpoints", {}).get("content") or {}
+
+    def fetch_cover(self, source: SourceConfig, url: str) -> str:
+        """按需抓详情页封面（cover_backfill 源：列表页纯文本无封面，详情页补回）。
+
+        轻量：只取 endpoints.detail.fields.cover 选择器，不抓章节列表/正文。
+        复用 _detail_html_cache，重复打开/回填同一本书不重复下载。
+        异常/解析为空 → 返回 ""（失败静默，调用方跳过该条、不影响其它条目）。
+        """
+        try:
+            abs_url = self._abs_url(source, url)
+            html = self._get_detail_html(source, url, abs_url)
+            doc = self._parser.parse(html)
+            detail_cfg = source.get_detail_config()
+            cover_sel = (detail_cfg.get("fields") or {}).get("cover")
+            if not cover_sel:
+                return ""
+            return self._parser.extract_first(doc, cover_sel, source.base_url)
+        except Exception:  # noqa: BLE001
+            return ""
 
     # ------------------------------------------------------------------ #
     def fetch_detail(self, source: SourceConfig, url: str) -> Detail:
@@ -421,8 +245,15 @@ class Content:
                 return self._fetch_detail_ytdlp(source, url, detail_api)
             return self._fetch_detail_api(source, url, detail_api)
 
-        self._bg_check(source, self._abs_url(source, url))
-        html = self._get(source, url)
+        abs_url = self._abs_url(source, url)
+        self._bg_check(source, abs_url)
+        html = self._get_detail_html(source, url, abs_url)
+        if source.content_type == "video":
+            # 缓存视频详情页 HTML：single_chapter 源取流 URL == 详情 URL，
+            # fetch_video_episode 复用，避免二次整页下载（慢站省约一半等待）。
+            self._video_html_cache = {
+                (source.source_id, abs_url): html
+            }
         doc = self._parser.parse(html)
 
         detail_cfg = source.get_detail_config()
@@ -434,15 +265,18 @@ class Content:
             book = self._parser.extract_first(doc, book_fields)
             if book:
                 title = book
+        cover_cfg = fields.get("cover")
+        cover = self._parser.extract_first(doc, cover_cfg, source.base_url)
+        # 封面兜底：选择器封面为空/命中共享占位时，按 fields.cover 的 regex / state
+        # 配置从 JSON-LD / window.__INITIAL_STATE__ 取真实封面（番茄等 SSR 占位图源）。
+        cover = self._extract_cover_fallback(source, html, cover_cfg, cover)
         detail = Detail(
             source_id=source.source_id,
             content_type=source.content_type,
             url=url,
             title=title,
             author=self._parser.extract_first(doc, fields.get("author")),
-            cover=self._parser.extract_first(
-                doc, fields.get("cover"), source.base_url
-            ),
+            cover=cover,
             status=self._parser.extract_first(doc, fields.get("status")),
             summary=self._parser.extract_first(doc, fields.get("summary")),
         )
@@ -561,26 +395,100 @@ class Content:
                     c_url = c_url.replace("{cid}", str(it.get(num_key) or ""))
                 c_url = c_url.replace("{bvid}", bvid).replace("{id}", bvid)
                 # 模板里 {title}/{part} 等占位填充
-                for m in _re.finditer(r"\{(\w+)\}", c_url):
-                    c_url = c_url.replace("{" + m.group(1) + "}", str(it.get(m.group(1), "")))
+                c_url = utils.fill_template(c_url, it)
                 detail.chapters.append(Chapter(title=c_title, url=c_url))
         return detail
 
     @staticmethod
     def _jsonpath(node, path: str):
         """极简 JSONPath：data.owner.name / data.list.0 点号路径。"""
-        if not path:
+        return utils.jsonpath(node, path)
+
+    def _extract_cover_fallback(
+        self, source: SourceConfig, html: str, cover_cfg, current: str = ""
+    ) -> str:
+        """详情封面兜底：选择器封面为空/命中占位时，按配置从 JSON-LD / INITIAL_STATE 取真实封面。
+
+        fields.cover 可选键（配置驱动，全部容错，失败保留原值）：
+            regex       对原始 html 做 re.search 取 group(1)（如 JSON-LD image[0]）
+            state       解析 window.__INITIAL_STATE__ 后按 JSONPath 取（如 page.thumbUri）
+            placeholder 共享占位封面标记（子串/正则，命中视为无有效封面 → 触发兜底）
+        尝试顺序：regex → state。
+        """
+        if current and not self._is_placeholder_cover(current, cover_cfg):
+            return current
+        cfg = cover_cfg or {}
+        # 1) 正则兜底（JSON-LD image 等）
+        pat = cfg.get("regex")
+        if pat:
+            m = _re.search(pat, html)
+            if m:
+                cover = m.group(1) if m.groups() else m.group(0)
+                cover = cover.replace("\\/", "/").strip()
+                if cover:
+                    return utils.abs_url(source.base_url, cover)
+        # 2) INITIAL_STATE 兜底（page.thumbUri 等）
+        state_path = cfg.get("state")
+        if state_path:
+            state = self._parse_initial_state(html)
+            if state:
+                val = self._jsonpath(state, state_path)
+                if val:
+                    return str(val)
+        return current
+
+    @staticmethod
+    def _is_placeholder_cover(cover: str, cover_cfg) -> bool:
+        """封面是否命中配置的占位标记（命中 → 视为无有效封面，触发兜底）。"""
+        cfg = cover_cfg if isinstance(cover_cfg, dict) else {}
+        pat = cfg.get("placeholder")
+        if not pat or not cover:
+            return False
+        try:
+            return _re.search(str(pat), cover) is not None
+        except Exception:  # noqa: BLE001  非法正则退化为子串匹配
+            return str(pat) in cover
+
+    @staticmethod
+    def _parse_initial_state(html: str):
+        """从 html 中提取 window.__INITIAL_STATE__ = {...}; 并解析为 dict。
+
+        用大括号平衡扫描（跳过字符串内）切出 JSON，容错：找不到/解析失败返回 None。
+        """
+        if not html:
             return None
-        cur = node
-        for part in str(path).split("."):
-            if isinstance(cur, dict) and part in cur:
-                cur = cur[part]
-            elif isinstance(cur, list) and part.lstrip("-").isdigit():
-                idx = int(part)
-                cur = cur[idx] if -len(cur) <= idx < len(cur) else None
-            else:
-                return None
-        return cur
+        marker = "window.__INITIAL_STATE__"
+        idx = html.find(marker)
+        if idx < 0:
+            return None
+        start = html.find("{", idx)
+        if start < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(html)):
+            c = html[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(html[start:i + 1])
+                    except Exception:  # noqa: BLE001
+                        return None
+        return None
 
     # ------------------------------------------------------------------ #
     def _fetch_chapters(
@@ -598,7 +506,7 @@ class Content:
         - content.<type>.single_chapter: true → 详情页即单章图集（无章节列表），
           直接以详情 URL 作为唯一章节（如 wnacg 每 aid 一图集）。
         """
-        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        content_cfg = self._content_block(source)
         if source.content_type == "novel":
             block = content_cfg.get("chapter") or {}
         elif source.content_type == "comic":
@@ -806,8 +714,8 @@ class Content:
             c_url = url_tpl
             for ph, val in (("{id}", book_id), ("{chapter_id}", str(it.get(cid_key) or ""))):
                 c_url = c_url.replace(ph, val)
-            for m in _re.finditer(r"\{(\w+)\}", c_url):
-                c_url = c_url.replace("{" + m.group(1) + "}", str(it.get(m.group(1), "")))
+            # 模板里其它 {占位符} 统一填充
+            c_url = utils.fill_template(c_url, it)
             if c_title and c_url:
                 out.append({"title": c_title, "url": c_url})
         return out
@@ -821,7 +729,7 @@ class Content:
         链接判定：URL 基路径（去 _<数字>.html 后缀）与当前页相同 → 同章续页，
         继续抓取并拼接；否则为真正的下一章，停止。
         """
-        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        content_cfg = self._content_block(source)
         if source.content_type == "novel":
             block = content_cfg.get("chapter") or {}
         elif source.content_type == "comic":
@@ -869,7 +777,7 @@ class Content:
         html = self._get(source, url)
         doc = self._parser.parse(html)
 
-        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        content_cfg = self._content_block(source)
         if source.content_type == "novel":
             block = content_cfg.get("chapter") or {}
         elif source.content_type == "comic":
@@ -1048,7 +956,7 @@ class Content:
         on_page：可选分批回调 on_page(已就绪的前缀列表)。解密型源在
         _decrypt_image_urls 解密过程中分批回调（连续前缀），GUI 边收边渲染。
         """
-        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        content_cfg = self._content_block(source)
         block = content_cfg.get("page") or {}
         abs_url = self._abs_url(source, chapter_url)
 
@@ -1173,18 +1081,8 @@ class Content:
 
     @staticmethod
     def _guess_image_mime(data: bytes) -> str:
-        """按魔数猜图片 mime（JPEG/PNG/GIF/WEBP/BMP），默认 octet-stream。"""
-        if data[:3] == b"\xff\xd8\xff":
-            return "image/jpeg"
-        if data[:4] == b"\x89PNG":
-            return "image/png"
-        if data[:6] in (b"GIF89a", b"GIF87a"):
-            return "image/gif"
-        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            return "image/webp"
-        if data[:2] == b"BM":
-            return "image/bmp"
-        return "image/jpeg"
+        """按魔数猜图片 mime（JPEG/PNG/GIF/WEBP/BMP），默认 image/jpeg。"""
+        return utils.guess_image_mime(data)
 
     def _fetch_comic_page_imgs(
         self, source: SourceConfig, list_cfg: dict, chapter_url: str
@@ -1250,7 +1148,7 @@ class Content:
         不走 Playwright。返回原始图片 URL 列表（可能为混淆地址，
         仅用于统计页数与占位，正文显示仍走 fetch_comic_pages 渲染）。
         """
-        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        content_cfg = self._content_block(source)
         block = content_cfg.get("page") or {}
         body_cfg = block.get("body") or {}
         abs_url = self._abs_url(source, chapter_url)
@@ -1278,7 +1176,7 @@ class Content:
         """
         if not chapter_urls:
             return {}
-        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        content_cfg = self._content_block(source)
         block = content_cfg.get("page") or {}
         body_cfg = block.get("body") or {}
         abs_urls = [self._abs_url(source, u) for u in chapter_urls]
@@ -1366,11 +1264,17 @@ class Content:
             if play:
                 return play
 
-        self._bg_check(source, self._abs_url(source, episode_url))
-        html = self._get(source, episode_url)
+        abs_ep = self._abs_url(source, episode_url)
+        self._bg_check(source, abs_ep)
+        # single_chapter 视频源：取流 URL == 详情 URL，复用 fetch_detail 已取回的
+        # HTML，免对慢站（如 missav 反爬延迟）二次整页下载（详情+取流省约一半等待）。
+        # 非单章源（episode URL 与详情不同）key 不命中 → 正常请求。
+        html = self._video_html_cache.get((source.source_id, abs_ep))
+        if html is None:
+            html = self._get(source, episode_url)
         doc = self._parser.parse(html)
 
-        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        content_cfg = self._content_block(source)
         block = content_cfg.get("episode") or {}
         play_cfg = block.get("play_url") or {}
         switch_cfg = block.get("source_switch") or {}
@@ -1474,10 +1378,9 @@ class Content:
     # ------------------------------------------------------------------ #
     # 换源支持（source_switch）
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _get_source_switch_cfg(source: SourceConfig) -> dict:
+    def _get_source_switch_cfg(self, source: SourceConfig) -> dict:
         """取源配置 content.episode.source_switch（换源配置），无则 {}。"""
-        content_cfg = source.raw.get("endpoints", {}).get("content") or {}
+        content_cfg = self._content_block(source)
         block = content_cfg.get("episode") or {}
         return block.get("source_switch") or {}
 

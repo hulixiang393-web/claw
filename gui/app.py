@@ -158,8 +158,11 @@ class MainWindow(QMainWindow):
         self.reading_progress = None
         from framework.reading_progress import ReadingProgress
 
-        self.reading_progress = ReadingProgress(base_dir / "data" / "reading_progress.json")
-        self.reading_progress.prune(shelf_cb=None)  # 启动时清理过期记忆
+        self.reading_progress = ReadingProgress(
+            base_dir / "data" / "reading_progress.json",
+            shelf_cb=self._favorite_has,  # 收藏的书续读永久保留，未收藏 24h 清理
+        )
+        self.reading_progress.prune(shelf_cb=self._favorite_has)  # 启动清理（收藏保留）
 
         # 爬取执行链（网络默认值从 settings 接线）
         from framework.http import NetworkDefaults

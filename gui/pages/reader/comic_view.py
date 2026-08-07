@@ -32,6 +32,9 @@ from framework.content import Content, Detail
 
 # 预加载后续话数：只预加载下一话（读到 70% 才触发，不加载过多）
 PREFETCH_COUNT = 1
+# 懒加载：首屏渲染页数 / 滚动增量渲染每批页数
+INITIAL_RENDER_COUNT = 10
+LAZY_BATCH = 12
 
 
 class ComicView(QWidget):
@@ -57,6 +60,7 @@ class ComicView(QWidget):
         self._prefetch_busy = False  # 是否正在预渲染
         self._rendered_count = 0  # 已渲染图片数（边抓边显示增量用）
         self._rendered_header = False  # 话头 QLabel 是否已创建
+        self._pending_swap = False  # 换话保留旧画面：新话首批图就绪后再清空替换
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -117,6 +121,9 @@ class ComicView(QWidget):
         # （_maybe_auto_next 保留但不连接，避免滚动到底意外跳话）
 
         self._apply_mode()
+        # 懒加载 + 读到 70% 预渲染下一话：监听滚动（不启用自动翻话，保留手动「下一话」按钮）
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_prefetch)
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_lazy)
         # Ctrl+滚轮缩放：用事件过滤器抢在 scroll area / 图片子控件之前捕获
         self.scroll.viewport().installEventFilter(self)
         self.scroll.installEventFilter(self)
@@ -190,7 +197,9 @@ class ComicView(QWidget):
             )
         else:
             self.progress_label.setText(f"第{idx+1}/{len(self._chapters)}话 · 加载中")
-        self._clear_images()
+        # 换话保留旧画面：不立即清空（慢源换话 15-19s 空白+闪屏），
+        # 等新话首批图就绪（_prepare_new_episode_render）再清空替换。
+        self._pending_swap = True
         # 后台加载图片 URL
         from PySide6.QtCore import QThreadPool
 
@@ -232,11 +241,17 @@ class ComicView(QWidget):
             self._auto_loading = False  # 加载失败也要解锁，防死锁
             self._auto_prev_loading = False
             return
+        if self._current_idx < 0 or ch.url != self._chapters[self._current_idx].url:
+            ch._cached_images = images  # 过期回调：仅写缓存，不渲染当前画面
+            return
         self._images = images
         ch._cached_images = images  # 缓存本话，避免重复爬
         self.progress_label.setText(f"第{self._current_idx+1}/{len(self._chapters)}话 · {len(images)}张")
-        # 增量补全（partial 已渲染部分；无 on_page 的源这里一次渲染全部）
-        self._render_incremental()
+        # 新话首批图就绪 → 清空旧画面并渲染新话（换话保留旧画面到此刻）
+        self._prepare_new_episode_render()
+        # 增量补全（partial 已渲染部分；无 on_page 的源这里渲染首屏批）。
+        # 横向翻页模式/定位话尾需完整高度 → force_full 一次渲染全部
+        self._render_incremental(force_full=self._should_render_full())
         # 当前话加载完成后再串行预渲染后续话（切话秒开，且不抢当前话资源）
         self._finish_episode_load(ch)
 
@@ -247,10 +262,21 @@ class ComicView(QWidget):
         if not images:
             return
         self._images = images
-        self._render_incremental()
         self.progress_label.setText(
             f"第{self._current_idx+1}/{len(self._chapters)}话 · 已加载 {len(images)} 张"
         )
+        # 换话等待中：旧画面还在时攒够一屏（INITIAL_RENDER_COUNT）再替换，避免
+        # 首批只有 1-2 张就清空旧画面导致大半空白；partial 继续攒，finished 兜底。
+        # 首次加载（gallery 空）无需攒屏，直接按批次渲染。
+        if (
+            self._pending_swap
+            and self.gallery_layout.count() > 0
+            and len(images) < INITIAL_RENDER_COUNT
+        ):
+            return
+        # 新话首批图就绪 → 清空旧画面并渲染新话（换话保留旧画面到此刻）
+        self._prepare_new_episode_render()
+        self._render_incremental(force_full=self._should_render_full())
 
     # ------------------------------------------------------------------ #
     def _prefetch_future(self, idx: int, n: int) -> None:
@@ -306,6 +332,9 @@ class ComicView(QWidget):
 
     def _render_images(self) -> None:
         self._clear_images()
+        self._pending_swap = False  # 命中缓存直接渲染，无换话等待
+        self._rendered_count = 0
+        self._rendered_header = False
         referer = ""
         # 每话开头显示章节编号（如「第12话」），不含标题文字
         if 0 <= self._current_idx < len(self._chapters):
@@ -319,25 +348,30 @@ class ComicView(QWidget):
             )
             header.setWordWrap(True)
             self.gallery_layout.addWidget(header)
+            self._rendered_header = True
             # 防盗链：以当前章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
             referer = self._chapters[self._current_idx].url
-        for url in self._images:
+        # 首屏只渲染前 INITIAL_RENDER_COUNT 张，其余交给滚动懒加载分批补全；
+        # 横向翻页模式无纵向滚动懒加载 → 一次全量渲染
+        images = self._images or []
+        limit = len(images) if self._mode == "flip" else min(INITIAL_RENDER_COUNT, len(images))
+        for url in images[:limit]:
             lbl = _ComicImageLabel(url, referer=referer)
             lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
+        self._rendered_count = limit
         # 刷新 gallery 尺寸（widgetResizable=False 需手动定宽+按内容定高）
         self._apply_zoom()
         self._relayout_gallery()
-        # 全量渲染完成：记录增量计数（后续 on_page 分批不再重复渲染）
-        self._rendered_count = len(self._images or [])
-        self._rendered_header = True
 
-    def _render_incremental(self) -> None:
-        """边抓边显示：渲染 self._images 中尚未渲染的（连续前缀，保持顺序）。
+    def _render_incremental(self, force_full: bool = False) -> None:
+        """边抓边显示 / 滚动懒加载：渲染 self._images 中尚未渲染的连续前缀。
 
-        首次创建话头，之后按序 append 新图片 label。供 fetch_comic_pages 的
-        on_page 分批回调（解密型源先显示已就绪的，不等整话抓完）。
+        每次调用最多渲染 LAZY_BATCH 张（避免一次性创建全部 label 导致卡顿/闪屏），
+        其余由滚动懒加载（_on_scroll_lazy）逐批补全；force_full=True 时一次渲染
+        全部（横向翻页模式/定位话尾需要完整高度）。首次创建话头。
+        供 fetch_comic_pages 的 on_page 分批回调（解密型源先显示已就绪的）。
         """
         images = self._images or []
         if not self._rendered_header and 0 <= self._current_idx < len(self._chapters):
@@ -358,7 +392,8 @@ class ComicView(QWidget):
             if 0 <= self._current_idx < len(self._chapters)
             else ""
         )
-        while self._rendered_count < len(images):
+        target = len(images) if force_full else min(self._rendered_count + LAZY_BATCH, len(images))
+        while self._rendered_count < target:
             url = images[self._rendered_count]
             lbl = _ComicImageLabel(url, referer=referer)
             lbl.loaded.connect(self._relayout_gallery_queued)
@@ -368,9 +403,28 @@ class ComicView(QWidget):
         self._apply_zoom()
         self._relayout_gallery()
 
+    def _should_render_full(self) -> bool:
+        """是否需要一次性渲染全部图片（而非懒加载分批）。
+
+        横向翻页模式无纵向滚动事件、或定位话尾需要完整高度时，懒加载会缺图，
+        须全量渲染。
+        """
+        return self._mode == "flip" or bool(getattr(self, "_scroll_on_load", 0))
+
     def _relayout_gallery_queued(self) -> None:
-        """图片异步加载完/重绘后，排队重算 gallery 高度（避免频繁触发）。"""
-        QTimer.singleShot(0, self._relayout_gallery)
+        """图片异步加载完/重绘后，排队重算 gallery 高度。
+
+        单批多图同时加载完成会并发多次触发：用 _relayout_pending 标记合并，
+        保证每个事件循环轮次最多重排一次，避免高度反复跳动拉跳阅读位置。
+        """
+        if getattr(self, "_relayout_pending", False):
+            return
+        self._relayout_pending = True
+        QTimer.singleShot(0, self._relayout_gallery_pending)
+
+    def _relayout_gallery_pending(self) -> None:
+        self._relayout_pending = False
+        self._relayout_gallery()
 
     def _relayout_gallery(self) -> None:
         """按内容重算 gallery 高度（widgetResizable=False 不会自动跟随）。"""
@@ -379,6 +433,15 @@ class ComicView(QWidget):
         # 刷新滚动范围（高度变化后滚动条最大值跟着更新）
         vbar = self.scroll.verticalScrollBar()
         vbar.setValue(min(vbar.value(), vbar.maximum()))
+        # 懒加载安全网：内容不足一屏（maximum==0）时没有滚动事件可触发，
+        # 主动补一批直至可滚动，避免短页/小图章节读到后面缺图。
+        if (
+            not self._pending_swap
+            and self._mode == "gallery"
+            and vbar.maximum() == 0
+            and self._rendered_count < len(self._images or [])
+        ):
+            QTimer.singleShot(0, self._render_incremental)
 
     def _clear_images(self) -> None:
         while self.gallery_layout.count():
@@ -386,11 +449,28 @@ class ComicView(QWidget):
             if child.widget():
                 child.widget().deleteLater()
 
+    def _prepare_new_episode_render(self) -> None:
+        """新话首批图就绪 → 清空旧画面并重建（换话保留旧画面到此刻）。
+
+        _load_episode 未命中缓存时不立即 _clear_images，而是等 _pending_swap
+        后首批新图到达再替换，避免慢源（manben 等）换话 15-19s 空白+闪屏。
+        """
+        if not self._pending_swap:
+            return
+        self._pending_swap = False
+        self._clear_images()
+        self._rendered_header = False  # 重建新话话头
+        self._rendered_count = 0
+
     # ------------------------------------------------------------------ #
     def _toggle_mode(self) -> None:
         self._mode = "flip" if self._mode == "gallery" else "gallery"
         self.mode_btn.setText("切换横向模式" if self._mode == "gallery" else "切换画廊模式")
         self._apply_mode()
+        if self._mode == "flip" and not self._pending_swap:
+            # 横向翻页模式无纵向滚动懒加载 → 补齐剩余图片
+            # （换话等待中 _images 仍是旧话，等新话就绪后按需全量渲染）
+            self._render_incremental(force_full=True)
 
     def _apply_mode(self) -> None:
         if self._mode == "flip":
@@ -441,6 +521,47 @@ class ComicView(QWidget):
             self._auto_prev_loading = True
             self._last_auto_nav_ts = time.time()
             self._load_episode(self._current_idx - 1, scroll_to_end=True)
+
+    def _on_scroll_prefetch(self, value: int) -> None:
+        """滚动读到 70% → 预渲染下一话（仅预渲染，不自动翻话）。
+
+        由滚动条 valueChanged 触发。区别于 _maybe_auto_next（同时含底部自动
+        翻话/顶部自动翻回）——这里只保留预渲染部分；自动翻话维持禁用，
+        用户手动点「下一话」按钮翻话。
+        """
+        if self._current_idx < 0 or not self._images:
+            return
+        if self._pending_swap:
+            return  # 换话加载中，跳过
+        if self._mode != "gallery":
+            return
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() == 0:
+            return
+        if value >= vbar.maximum() * 0.7:
+            self._prefetch_future(self._current_idx, PREFETCH_COUNT)
+
+    def _on_scroll_lazy(self, value: int) -> None:
+        """滚动接近已渲染末端 → 增量渲染下一批图片（懒加载）。
+
+        以「滚动进度越过已渲染区域 85%」为界（已渲染最后一张距视口底部约
+        0.85 屏时触发），每次补 LAZY_BATCH 张，边滚边渲染不一次性全量。
+        """
+        if self._mode != "gallery":
+            return
+        if self._pending_swap:
+            return  # 换话加载中：_images 仍是旧话，勿用旧数据增量渲染
+        images = self._images or []
+        total = len(images)
+        if self._rendered_count >= total:
+            return
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() <= 0:
+            return  # 内容不足一屏由 _relayout_gallery 安全网补全
+        # 滚动值 ≥ 已渲染区域 85% 高度 → 补下一批
+        threshold = int(vbar.maximum() * (self._rendered_count / total) * 0.85)
+        if value >= threshold:
+            self._render_incremental()
 
     # ------------------------------------------------------------------ #
     # Ctrl+滚轮缩放（事件过滤器，抢在子控件 wheelEvent 之前）
@@ -562,6 +683,8 @@ class _ComicImageLabel(QLabel):
         self._orig: QPixmap | None = None  # 原始像素图（缩放基准）
         self.setText("加载中...")
         self.setMinimumWidth(200)
+        # 懒加载占位：图片加载前先撑起估算高度，减少批量加载高度跳动/换话闪屏
+        self.setMinimumHeight(600)
         self.setStyleSheet("border: 1px solid palette(mid); border-radius: 4px; padding: 4px;")
         self.setCursor(Qt.OpenHandCursor)
 

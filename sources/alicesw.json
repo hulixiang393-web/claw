@@ -29,7 +29,7 @@
   },
   "endpoints": {
     "discovery": {
-      "list_url": "/",
+      "list_url": "/original.html",
       "list_paginator": {
         "type": "increment",
         "start": 1,
@@ -92,6 +92,7 @@
         "root_selector": {
           "css": "li.two"
         },
+        "cover_backfill": true,
         "fields": {
           "title": {
             "css": "a[href*='/novel/']"

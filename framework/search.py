@@ -20,6 +20,7 @@ from .discovery import Discovery
 from .errors import SourceError
 from .http import HttpClient
 from .parser import Parser
+from .utils import fill_template, jsonpath
 
 log = logging.getLogger(__name__)
 
@@ -250,7 +251,7 @@ class Search:
                         url=url,
                         source_id=source.source_id,
                         source_name=source.source_name,
-                        cover=it.get("cover", ""),
+                        cover=Search._clean_cover(it.get("cover", "")),
                         author=it.get("author", ""),
                         update=it.get("update", ""),
                     )
@@ -632,24 +633,12 @@ class Search:
 
     @staticmethod
     def _simple_getpath(data, path: str):
-        cur = data
-        for part in path.split("."):
-            if isinstance(cur, dict) and part in cur:
-                cur = cur[part]
-            else:
-                return None
-        return cur
+        return jsonpath(data, path)
 
     @staticmethod
     def _tpl(item: dict, spec):
         if spec is None:
             return ""
         if isinstance(spec, str) and "{" in spec:
-            import re
-
-            result = spec
-            for m in re.finditer(r"\{(\w+)\}", spec):
-                key = m.group(1)
-                result = result.replace("{" + key + "}", str(item.get(key, "")))
-            return result
+            return fill_template(spec, item)
         return item.get(spec, "") if isinstance(spec, str) else ""

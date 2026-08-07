@@ -228,6 +228,7 @@ class Ytdlp:
         """拿单个 format 的 URL。用 --get-url。"""
         out = self._run([
             "-f", fmt, "--get-url", "--no-warnings",
+            "--no-playlist",  # 取流只要单条：URL 带 list 参数时不整表解析，省签名等待
             "--socket-timeout", "10",
             "--extractor-args", "youtube:skip=sections",
             url,

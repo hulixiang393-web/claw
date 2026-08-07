@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,8 +28,6 @@ from framework.source_manager import SourceManager
 
 from gui.components import WorkCard
 from .base_page import BasePage
-
-GRID_COLUMNS = 5
 
 
 class _SearchSignals(QObject):
@@ -125,9 +123,11 @@ class SearchPage(BasePage):
         self._work_count = 0  # 当前网格卡片计数（追加/重建共用）
         self._shown_count = 0  # 已渲染到 _results 的条数（分批懒加载用）
         self._page_size = 20  # 每批渲染条数（搜索结果分批，防一次几百张卡片卡顿）
+        self._preload_depth = 2  # 预加载缓冲批次：首屏 1 批 + 再预加载 2 批填满视口（防一次建太多卡片）
         self._selected: dict = {}  # 勾选批量：url → SearchResult
         self._select_mode = False  # 是否进入勾选模式
         self._cover_tasks = []  # 封面解密后台任务引用（防 GC）
+        self._cover_decrypt_submitted: set = set()  # 已提交封面解密的结果 url（防逐页/done 重复触发）
         self._streamed: set = set()  # 已边抓边渲染的源（finished 不重复追加）
         self._search_epoch = 0  # 搜索会话标记：换源/换关键词自增，过期任务结果丢弃
 
@@ -247,6 +247,7 @@ class SearchPage(BasePage):
         self._clear_grid()
         self._results = []
         self._shown_count = 0
+        self._cover_decrypt_submitted = set()
         self._selected = {}
         self.batch_bar.setVisible(False)
         self.select_all_check.setChecked(False)
@@ -340,6 +341,9 @@ class SearchPage(BasePage):
         self._streamed.add(source.source_id)
         if not self.merge_check.isChecked():
             self._append_results(new_results)
+        # 加密站（18mh 类）：边抓边显示首批就触发封面解密，不等全部页 done——
+        # 否则源搜索慢（多页）时封面整场是加密 URL 加载不出。逐页去重提交。
+        self._submit_cover_decrypt(source, new_results)
         self._update_batch_status()
 
     def _on_source_done(self, source, results, err, epoch) -> None:
@@ -362,12 +366,10 @@ class SearchPage(BasePage):
                     pass
                 else:
                     self._append_results(results or [])
-            # 加密站（18mh 类）：搜索结果封面后补解密——列表秒开，封面后台恢复
-            if results and self._needs_cover_decrypt(source):
-                task = _SearchCoverDecryptTask(self._search, source, results)
-                task.signals.finished.connect(self._on_covers_decrypted)
-                self._cover_tasks.append(task)  # 持引用防 GC
-                QThreadPool.globalInstance().start(task)
+            # 加密站（18mh 类）：搜索结果封面后补解密——列表秒开，封面后台恢复。
+            # 边抓边显示的页已逐批提交（_on_source_page → _submit_cover_decrypt），
+            # done 这里只补提交未解密过的剩余结果（_cover_decrypt_submitted 去重）。
+            self._submit_cover_decrypt(source, results or [])
         self._pending_count -= 1
         if self._pending_count <= 0:
             self._on_all_done()
@@ -406,6 +408,28 @@ class SearchPage(BasePage):
             except Exception:  # noqa: BLE001
                 continue
 
+    def _submit_cover_decrypt(self, source, results) -> None:
+        """为未提交过封面解密的结果启动后台解密（加密站 decryption.targets.image）。
+
+        边抓边显示逐页到达与 done 全量到达都走这里，用 _cover_decrypt_submitted
+        按 url 去重：同一批结果只提交一次，避免逐页触发 + done 全量触发重复
+        解密同一批封面。非加密源或空结果直接跳过。
+        """
+        if not results or not self._needs_cover_decrypt(source):
+            return
+        pending = [
+            r for r in results
+            if getattr(r, "url", "") and r.url not in self._cover_decrypt_submitted
+        ]
+        if not pending:
+            return
+        for r in pending:
+            self._cover_decrypt_submitted.add(r.url)
+        task = _SearchCoverDecryptTask(self._search, source, pending)
+        task.signals.finished.connect(self._on_covers_decrypted)
+        self._cover_tasks.append(task)  # 持引用防 GC
+        QThreadPool.globalInstance().start(task)
+
     def _on_merge_toggled(self, checked: bool) -> None:
         """合并相似开关切换：对当前结果重新合并渲染（结果已加载时）。"""
         if self._results:
@@ -442,13 +466,11 @@ class SearchPage(BasePage):
         new_shown = min(len(display), self._shown_count + self._page_size)
         while self._shown_count < new_shown:
             r = display[self._shown_count]
-            row, col = divmod(self._work_count, cols)
-            card = self._make_card(r)
-            self.grid_layout.addWidget(card, row, col)
-            self._work_count += 1
+            self._append_card(r, cols)
             self._shown_count += 1
         self._apply_column_stretch(cols)
         self._update_batch_status()
+        self._maybe_preload_results()
 
     def _on_all_done(self) -> None:
         """全部源搜索结束。
@@ -496,13 +518,11 @@ class SearchPage(BasePage):
         new_shown = min(len(display), self._page_size)
         while self._shown_count < new_shown:
             r = display[self._shown_count]
-            row, col = divmod(self._work_count, cols)
-            card = self._make_card(r)
-            self.grid_layout.addWidget(card, row, col)
-            self._work_count += 1
+            self._append_card(r, cols)
             self._shown_count += 1
         self._apply_column_stretch(cols)
         self._update_batch_status()
+        self._maybe_preload_results()
 
     def _current_display(self):
         """当前渲染源：合并后为 _results_display，否则 _results。"""
@@ -520,26 +540,59 @@ class SearchPage(BasePage):
         new_shown = min(len(display), self._shown_count + self._page_size)
         while self._shown_count < new_shown:
             r = display[self._shown_count]
-            row, col = divmod(self._work_count, cols)
-            card = self._make_card(r)
-            self.grid_layout.addWidget(card, row, col)
-            self._work_count += 1
+            self._append_card(r, cols)
             self._shown_count += 1
         self._apply_column_stretch(cols)
         self._update_batch_status()
+        self._maybe_preload_results()
+
+    def _maybe_preload_results(self) -> None:
+        """视口未填满 → 继续渲染下一批（有限预加载深度，与发现页 _maybe_preload 同思路）。
+
+        首屏一批渲染完视口没填满（结果较少时）继续补渲染，让首屏尽快填满、
+        滚动流畅；只预加载有限批次（_preload_depth 缓冲），到顶后停止，剩下
+        交给滚动 80%（_on_scroll）。不自动无限补足——防止搜索完成/边抓边显示
+        瞬间一次性建大量卡片闪屏（历史 bug，见 _append_results 注释）。
+
+        QTimer.singleShot(0) 延到布局完成后再查视口：addWidget 后 scrollbar
+        范围要等下一轮布局才更新，立即判断会误以为未填满、一次性预加载过多
+        卡片闪屏。布局稳定后按真实视口填满度决定是否补一批。
+        """
+        display = self._current_display()
+        if self._shown_count >= len(display):
+            return
+        if self._shown_count >= self._page_size * (1 + self._preload_depth):
+            return  # 预加载深度到顶（首屏 1 批 + 缓冲 _preload_depth 批），等滚动
+        if self.scroll.verticalScrollBar().maximum() >= self.scroll.height():
+            return  # 视口已填满，等滚动触发
+        QTimer.singleShot(0, self._load_more_results)
 
     def _columns(self) -> int:
-        """按可视宽度计算结果列数（与发现页一致，自适应不溢出）。"""
-        view_w = self.scroll.viewport().width() or self.width() or 900
-        cols = max(2, view_w // 170)
-        return min(cols, 8)
+        """搜索结果固定 4 列。
+
+        动态列数下滚动加载会错乱：加载更多时纵向滚动条出现使视口宽度
+        变化 ±15px，若恰在整除边界则列数跳变，新旧卡片列数不一致导致
+        排版错乱（第一页正常、超过后错乱）。固定 4 列保证首屏/滚动/
+        合并/筛选所有渲染路径列数统一。4×190px≈760px，900px 最小窗口
+        也能放下。
+        """
+        return 4
 
     def _apply_column_stretch(self, cols: int) -> None:
         """每列等宽，卡片均匀分布。"""
-        for i in range(self.grid_layout.columnCount()):
-            self.grid_layout.setColumnStretch(i, 0)
-        for i in range(cols):
-            self.grid_layout.setColumnStretch(i, 1)
+        self.apply_column_stretch(self.grid_layout, cols)
+
+    def _append_card(self, r, cols) -> None:
+        """建一张结果卡片并放进网格（按 cols 列排列）。
+
+        只负责「建卡 + 放网格 + 计数」；cols 必须由调用方在循环前
+        用 _columns() 算好传入（助手内不再重算，防滚动条宽度变化导致
+        与外部列数不一致、卡片错乱）。
+        """
+        row, col = divmod(self._work_count, cols)
+        card = self._make_card(r)
+        self.grid_layout.addWidget(card, row, col)
+        self._work_count += 1
 
     def _show_results(self) -> None:
         """按当前筛选重建结果网格（来源角标筛选用）。"""
@@ -552,10 +605,7 @@ class SearchPage(BasePage):
         # 筛选时全量渲染（结果通常较少）；无筛选时只渲染已加载批
         shown = items if self._filter_source else display[:self._shown_count]
         for r in shown:
-            row, col = divmod(self._work_count, cols)
-            card = self._make_card(r)
-            self.grid_layout.addWidget(card, row, col)
-            self._work_count += 1
+            self._append_card(r, cols)
         self._apply_column_stretch(cols)
         self._update_batch_status()
 

@@ -35,6 +35,18 @@ from framework.proxy_pool import (  # noqa: E402
 from framework.http import HttpClient, RequestError  # noqa: E402
 
 
+def _make_http():
+    """测试 HttpClient：禁用系统代理继承。
+
+    生产 HttpClient 默认走系统代理（用户加速器），但测试连 localhost
+    端到端服务器，不能被系统代理（如 127.0.0.1:7890）拦截。
+    """
+    http = HttpClient(sleeper=lambda s: None)
+    if http._session is not None:
+        http._session.trust_env = False
+    return http
+
+
 # ---------------------------------------------------------------------- #
 # localhost 服务器
 # ---------------------------------------------------------------------- #
@@ -151,7 +163,7 @@ def test_auto_engage_on_antiscrape():
              f"http://127.0.0.1:{proxy_via.server_port}"],
             max_switches=3, auto=True,
         )
-        http = HttpClient(sleeper=lambda s: None)
+        http = _make_http()
         text = http.get_text(base + "/blocked", proxy_pool=pool,
                              retries=0, interval_ms=0)
         assert "PROXIED" in text, text
@@ -170,7 +182,7 @@ def test_no_engage_on_normal_source():
     try:
         base = f"http://127.0.0.1:{target.server_port}"
         pool = ProxyPool(["http://127.0.0.1:1"], auto=True)  # 死代理，不应被使用
-        http = HttpClient(sleeper=lambda s: None)
+        http = _make_http()
         text = http.get_text(base + "/ok", proxy_pool=pool,
                              retries=0, interval_ms=0)
         assert "OK-DIRECT" in text
@@ -185,7 +197,7 @@ def test_no_engage_on_regular_error():
     try:
         base = f"http://127.0.0.1:{target.server_port}"
         pool = ProxyPool(["http://127.0.0.1:1"], auto=True)
-        http = HttpClient(sleeper=lambda s: None)
+        http = _make_http()
         try:
             http.get_text(base + "/notfound", proxy_pool=pool,
                           retries=0, interval_ms=0)
@@ -235,7 +247,7 @@ def test_per_source_auto_pool():
             assert pool_a is not pool_b   # 每源独立池实例（互不影响轮换状态）
             assert not pool_b.engaged
 
-            http = HttpClient(sleeper=lambda s: None)
+            http = _make_http()
             # src_a 正常抓取（直连 200），不启用
             ok = http.get_text(
                 f"http://127.0.0.1:{target.server_port}/ok",

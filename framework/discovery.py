@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from typing import List
 
 from .config import SourceConfig
-from .errors import ContentMissingError, StructureChangedError
+from .errors import ContentMissingError
+from .health import report_bg_check
 from .http import HttpClient
 from .parser import Parser
 from .selfcheck import StructureChecker
-from .source_manager import HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN
 
 
 @dataclass
@@ -67,46 +67,118 @@ class Discovery:
         self._ytdlp = None  # 懒加载单例
 
     # ------------------------------------------------------------------ #
-    def _report_health(self, source: SourceConfig, state: str, error: str = "") -> None:
-        """上报源健康状态（若注入 health_reporter）。"""
-        if self._health_reporter is not None:
-            try:
-                self._health_reporter.update_health(source.source_id, state, error)
-            except Exception:  # noqa: BLE001
-                pass
-
-    # ------------------------------------------------------------------ #
     def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
-        """后台线程执行结构自检，不阻塞抓取。
+        """后台线程执行结构自检，不阻塞抓取（委托 health.report_bg_check）。"""
+        # 源配置 diagnostics.selfcheck.strategy="off" → 关闭后台自检（同 content._bg_check）
+        if (
+            (source.raw.get("diagnostics") or {}).get("selfcheck") or {}
+        ).get("strategy") == "off":
+            return
+        report_bg_check(self._checker, self._health_reporter, source, abs_url)
 
-        checker.check() 会对同一 URL 额外发一次 GET（最长 timeout×retries），
-        同步等待会让发现页每页慢一倍。自检仅健康监控，移后台 daemon 线程。
+    def _apply_cover_state(
+        self, works: List[Work], cfg: dict, fields: dict, html: str
+    ) -> None:
+        """列表页封面兜底：INITIAL_STATE 里的真实封面填回为空/占位的条目。
 
-        状态映射（与 GUI 诊断一致，避免把活源标死）：
-        - 自检通过（True）→ 绿 ok
-        - 软失败（False：网络/超时/反爬/未达硬失败阈值）→ 黄 warn，不标 broken
-        - 硬失败（StructureChangedError：结构确认变更）→ 红 broken
+        cfg 配置（works_list_item.cover_state）：
+            lists       INITIAL_STATE 里的作品列表路径（如 ["home.boyList","home.girlList"]）
+            cover_key   列表项封面字段（如 thumbUri）
+            id_key      列表项作品 ID 字段（缺省 bookId），与列表页 href 对应
+        封面占位标记取 fields.cover.placeholder（与 detail 封面兜底一致）。
+        解析失败/无匹配 → 保留原封面（容错），不阻塞列表返回。
         """
-        from threading import Thread
+        import re as _re
 
-        def _run():
-            try:
-                ok = self._checker.check(source, abs_url)
-            except StructureChangedError as exc:
-                self._report_health(
-                    source, HEALTH_BROKEN,
-                    getattr(exc, "message", "") or "站点结构已变更",
-                )
-                return
-            except Exception:  # noqa: BLE001  未知异常：不误标死，降级 WARN
-                self._report_health(source, HEALTH_WARN, "自检异常")
-                return
-            self._report_health(
-                source, HEALTH_OK if ok else HEALTH_WARN,
-                "" if ok else "自检软失败",
-            )
+        state = self._parse_initial_state(html)
+        if not state:
+            return
+        cover_key = cfg.get("cover_key") or "thumbUri"
+        id_key = cfg.get("id_key") or "bookId"
+        # 跨多个列表路径扁平收集：{id: thumb} 映射 + 顺序封面序列（索引 zip 兜底）
+        cover_by_id: dict = {}
+        cover_seq: List[str] = []
+        for path in cfg.get("lists") or []:
+            lst = self._simple_getpath(state, path)
+            if not isinstance(lst, list):
+                continue
+            for it in lst:
+                if not isinstance(it, dict):
+                    continue
+                thumb = it.get(cover_key)
+                if not thumb:
+                    continue
+                cover_seq.append(str(thumb))
+                cid = it.get(id_key)
+                if cid is not None:
+                    cover_by_id[str(cid)] = str(thumb)
+        if not cover_by_id and not cover_seq:
+            return
+        # 占位标记（fields.cover.placeholder）
+        placeholder = ""
+        fcover = fields.get("cover")
+        if isinstance(fcover, dict):
+            placeholder = str(fcover.get("placeholder") or "")
+        idx = 0
+        for w in works:
+            # 已是有效封面（非占位）→ 跳过
+            if w.cover and not (placeholder and placeholder in w.cover):
+                continue
+            # 优先按 URL 里的 bookId 匹配（去重/过滤后顺序仍对齐）
+            m = _re.search(r"/page/(\d+)", w.url or "")
+            cid = m.group(1) if m else ""
+            new_cover = ""
+            if cid and cid in cover_by_id:
+                new_cover = cover_by_id[cid]
+            elif idx < len(cover_seq):
+                # 顺序 zip 兜底：列表页条目与 href 一一对应
+                new_cover = cover_seq[idx]
+                idx += 1
+            if new_cover:
+                w.cover = new_cover
 
-        Thread(target=_run, daemon=True).start()
+    @staticmethod
+    def _parse_initial_state(html: str):
+        """从 html 中提取 window.__INITIAL_STATE__ = {...}; 并解析为 dict。
+
+        大括号平衡扫描（跳过字符串内）切出 JSON，容错：找不到/解析失败返回 None。
+        """
+        if not html:
+            return None
+        marker = "window.__INITIAL_STATE__"
+        idx = html.find(marker)
+        if idx < 0:
+            return None
+        start = html.find("{", idx)
+        if start < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(html)):
+            c = html[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        import json as _json
+
+                        return _json.loads(html[start:i + 1])
+                    except Exception:  # noqa: BLE001
+                        return None
+        return None
 
     # ------------------------------------------------------------------ #
     def _headers(self, source: SourceConfig) -> dict:
@@ -122,12 +194,9 @@ class Discovery:
         return int(source.transports().get("interval_ms") or self._http.defaults.interval_ms)
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
-        from urllib.parse import urljoin, urlsplit
+        from . import utils
 
-        scheme = (urlsplit(url).scheme or "").lower()
-        if scheme in ("http", "https") or url.startswith("//"):
-            return url
-        return urljoin(source.base_url, url)
+        return utils.abs_url(source.base_url, url)
 
     def _get(self, source: SourceConfig, url: str) -> str:
         from urllib.parse import quote
@@ -315,18 +384,13 @@ class Discovery:
             works[0]._needs_cover_decrypt = True  # 标记：GUI 起 AES 异步恢复
         if works and works_list_item.get("cover_render") == "playwright":
             works[0]._needs_cover_recovery = True  # 标记：GUI 起 Playwright 恢复
+        # 封面兜底：works_list_item.cover_state 配置下，SSR 把全部封面渲染成共享
+        # 占位图，真实封面在 window.__INITIAL_STATE__（如 home.boyList/girlList 的
+        # thumbUri，与列表页条目 href 一一对应）。解析一次 state，把真实封面填回
+        # 为空/占位的条目（解析失败静默保留原封面，容错）。
+        if works and works_list_item.get("cover_state"):
+            self._apply_cover_state(works, works_list_item["cover_state"], fields, html)
         return works
-
-    def _recover_covers(self, source: SourceConfig, booklist_url: str, works: List[Work]) -> dict:
-        """批量恢复一页漫画封面 → {work_url: data_uri}。"""
-        from .comic_cover_recovery import recover_booklist_covers_sync
-
-        book_urls = [w.url for w in works if w.url]
-        return recover_booklist_covers_sync(
-            self._abs_url(source, booklist_url),
-            book_urls,
-            proxy=source.transports().get("proxy"),
-        )
 
     # ------------------------------------------------------------------ #
     def decrypt_covers(self, source: SourceConfig, works: List[Work]) -> dict:
@@ -554,15 +618,9 @@ class Discovery:
     @staticmethod
     def _simple_getpath(data, path: str):
         """简化的 JSONPath：data.list → data["list"]；data.list.0 → 列表首项。"""
-        import re as _re
+        from . import utils
 
-        cur = data
-        for part in path.split("."):
-            if isinstance(cur, dict) and part in cur:
-                cur = cur[part]
-            else:
-                return None
-        return cur
+        return utils.jsonpath(data, path)
 
     @staticmethod
     def _template_value(item: dict, field_spec):
@@ -572,14 +630,9 @@ class Discovery:
         if isinstance(field_spec, str):
             if "{" in field_spec:
                 # 模板如 https://bilibili.com/bangumi/media/md{media_id}
-                result = field_spec
-                import re as _re
+                from . import utils
 
-                for m in _re.finditer(r"\{(\w+)\}", field_spec):
-                    key = m.group(1)
-                    val = item.get(key, "")
-                    result = result.replace("{" + key + "}", str(val))
-                return result
+                return utils.fill_template(field_spec, item)
             if "." in field_spec:
                 # 嵌套路径如 owner.name 逐层取值
                 cur = item
