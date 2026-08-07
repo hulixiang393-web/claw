@@ -220,6 +220,9 @@ class VideoView(QWidget):
     def load(self, source, detail: Detail, start_ep_url: str = "") -> None:
         self._source = source
         self._detail = detail
+        # 【播放加速】详情打开即预建 VLC 播放器：取流完成直接 play，
+        # 不再现场 import vlc + 建 MediaPlayer（约几百 ms，首播更跟手）。
+        self._ensure_player()
         self._episodes = detail.chapters
         self._play_cache.clear()
         self._stream_cache.clear()
@@ -423,9 +426,16 @@ class VideoView(QWidget):
         self._prefetch_next(self._current_idx)
 
     # ------------------------------------------------------------------ #
-    def _play(self, video: str, audio: str, title: str) -> None:
-        """创建/复用 VLC 播放器并播放。"""
-        if self._player is None:
+    def _ensure_player(self) -> None:
+        """预建/复用 VLC 播放器（构造 MediaPlayer 是首播主要耗时之一）。
+
+        详情 load 即调用 → 取流完成直接 play，免现场构造。
+        构造失败（缺 vlc / 环境异常）保持 _player=None，_play 时仍会重试并报错，
+        不阻断详情加载。
+        """
+        if self._player is not None:
+            return
+        try:
             from framework.vlc_player import VlcPlayer
 
             referer = ""
@@ -440,6 +450,12 @@ class VideoView(QWidget):
             self._player.error.connect(self._on_play_error)
             self._player.time_changed.connect(self._on_time_changed)
             self._player.length_changed.connect(self._on_length_changed)
+        except Exception:  # noqa: BLE001 —— VLC 不可用时降级：播放时再试并报错
+            self._player = None
+
+    def _play(self, video: str, audio: str, title: str) -> None:
+        """创建/复用 VLC 播放器并播放。"""
+        self._ensure_player()
         self._player.rehook()  # 确保 hwnd 已挂
         self._player.play(video, audio, title=title)
         self.play_btn.setText("⏸ 暂停")

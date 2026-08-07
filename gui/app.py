@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -298,6 +299,11 @@ class MainWindow(QMainWindow):
         from framework.vlc_player import shutdown_vlc
 
         QApplication.instance().aboutToQuit.connect(shutdown_vlc)
+        # 启动即预热 VLC 实例（import vlc + 建 Instance 约 1-2s，是首播主要耗时）。
+        # 放后台线程不阻塞启动；首播时实例已就绪 → 秒开。
+        from framework.vlc_player import warmup_vlc
+
+        threading.Thread(target=warmup_vlc, daemon=True, name="vlc-warmup").start()
         return self.reader
 
     def _favorite_has(self, url: str) -> bool:

@@ -98,10 +98,14 @@ class FFmpegMerger:
             cmd += ["-protocol_whitelist", "file,crypto,data,http,https,tcp,tls"]
         if is_remote:
             cmd += ["-headers", headers]
+            # 多连接拉流：HLS/DASH 分段并发下载（等价于源配置 media.hls.workers 意图），
+            # CDN 支持时从单连接串行拉段提速为多连接并行，下载速率显著提升。
+            # 置于 -i 前作为输入选项；ffmpeg 8 http_multiple 默认 auto，显式置 1 兜底。
+            cmd += ["-http_multiple", "1", "-http_persistent", "1"]
         cmd += ["-i", video_url]
         if audio_url:
             if is_remote:
-                cmd += ["-headers", headers]
+                cmd += ["-headers", headers, "-http_multiple", "1", "-http_persistent", "1"]
             cmd += ["-i", audio_url]
         cmd += ["-c:v", "copy", "-c:a", "aac", "-shortest", str(out_path)]
         if not audio_url:
@@ -110,7 +114,7 @@ class FFmpegMerger:
             if not is_remote:
                 cmd += ["-protocol_whitelist", "file,crypto,data,http,https,tcp,tls"]
             if is_remote:
-                cmd += ["-headers", headers]
+                cmd += ["-headers", headers, "-http_multiple", "1", "-http_persistent", "1"]
             cmd += ["-i", video_url, "-c:v", "copy", "-an", str(out_path)]
 
         try:

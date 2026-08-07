@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -514,10 +514,41 @@ class ComicView(QWidget):
         super().keyPressEvent(event)
 
 
+class _PixmapDecodeSignals(QObject):
+    """后台图片解码完成信号（跨线程回主线程）。"""
+
+    done = Signal(object)  # QImage（解码失败/空 → null QImage）
+
+
+class _PixmapDecodeTask(QRunnable):
+    """后台线程解码图片字节 → QImage（JPEG/PNG 解压是重活，移出主线程防卡 UI）。
+
+    主线程收到 QImage 后仅做 QPixmap.fromImage（轻量拷贝），不再阻塞解压。
+    """
+
+    def __init__(self, data: bytes):
+        super().__init__()
+        self.signals = _PixmapDecodeSignals()
+        self._data = data
+
+    def run(self) -> None:
+        img = QImage()
+        try:
+            if self._data:
+                img.loadFromData(self._data)
+        except Exception:  # noqa: BLE001
+            img = QImage()
+        try:
+            self.signals.done.emit(img)
+        except RuntimeError:
+            pass
+
+
 class _ComicImageLabel(QLabel):
     """漫画单页图片（异步加载 + 跟随容器宽度自适应缩放）。
 
     loaded = Signal()：图片加载/重绘完成，通知宿主重排 gallery 高度。
+    data URI / 本地文件字节的解压在后台线程进行（主线程仅 QPixmap.fromImage）。
     """
 
     loaded = Signal()
@@ -535,31 +566,49 @@ class _ComicImageLabel(QLabel):
         self.setCursor(Qt.OpenHandCursor)
 
     def load(self) -> None:
-        # data URI（Playwright canvas 提取的 base64 图）→ 直接解码显示
+        # data URI（Playwright canvas 提取的 base64 图）→ 后台解码
         if self.url and self.url.startswith("data:"):
             import base64 as _b64
 
             try:
                 header, b64 = self.url.split(",", 1)
                 data = _b64.b64decode(b64)
-                pix = QPixmap()
-                _ok = pix.loadFromData(data)
-                if _ok:
-                    self._on_image(pix)
-                    return
+                self._decode_async(data)
+                return
             except Exception:
                 pass
             self._on_image(None)
             return
-        # Playwright 返回的本地文件路径 → 直接读（同步）
+        # Playwright 返回的本地文件路径 → 后台读字节 + 解码
         if self.url and (self.url.startswith(("file://", "/", "\\")) or "\\" in self.url or self.url.startswith(".")):
             path = self.url.replace("file://", "")
-            pix = QPixmap(path)
-            self._on_image(pix if not pix.isNull() else None)
-            return
+            try:
+                import pathlib
+
+                data = pathlib.Path(path).read_bytes()
+                self._decode_async(data)
+                return
+            except OSError:
+                self._on_image(None)
+                return
         from gui.components.cover_loader import CoverLoader
 
         CoverLoader.instance().load(self.url, self._on_image, referer=self._referer or None)
+
+    def _decode_async(self, data: bytes) -> None:
+        """把图片字节交给后台线程解码，完成后主线程转 QPixmap。"""
+        task = _PixmapDecodeTask(data)
+        task.signals.done.connect(self._on_decoded)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_decoded(self, img: "QImage") -> None:
+        if img.isNull():
+            self._on_image(None)
+            return
+        try:
+            self._on_image(QPixmap.fromImage(img))
+        except Exception:  # noqa: BLE001
+            self._on_image(None)
 
     def _on_image(self, pixmap) -> None:
         if pixmap is None:

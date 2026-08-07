@@ -20,14 +20,113 @@ headless 模式，无弹窗。
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
+import contextlib
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import List, Optional
 
 log = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# 浏览器实例复用（阅读/播放提速核心）
+# --------------------------------------------------------------------------- #
+# Playwright 每次 launch 一个 headless Chromium 约 1-2s，是"每次打开/播放慢"
+# 的主要耗时之一（SPA 小说每章、视频播放页每集、漫画每话都在现场启动）。
+# 常驻一个 Chromium 跨调用复用：首次后免启动，秒开。
+#
+# 注意：sync/async Playwright 对象**非线程安全** → 复用路径全程持锁串行
+# （并发调用排队，等价于原"各自启动浏览器"的串行，但省去 N 次 launch）。
+_SYNC_PW = None
+_SYNC_BROWSER = None
+_SYNC_LOCK = threading.Lock()
+
+
+@atexit.register
+def _close_sync_browser() -> None:
+    """进程退出时关闭常驻浏览器，避免残留 Chromium 子进程。"""
+    global _SYNC_PW, _SYNC_BROWSER
+    if _SYNC_BROWSER is not None:
+        try:
+            _SYNC_BROWSER.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _SYNC_BROWSER = None
+    if _SYNC_PW is not None:
+        try:
+            _SYNC_PW.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        _SYNC_PW = None
+
+
+@contextlib.contextmanager
+def _sync_browser(proxy: Optional[str] = None):
+    """获取可用 sync Playwright 的 (p, browser)。
+
+    proxy 指定时单独启动（代理不能与常驻浏览器混用，避免污染复用实例）；
+    无代理时复用常驻 headless Chromium（启动一次后跨调用免启动）。
+    """
+    from playwright.sync_api import sync_playwright
+
+    if proxy:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True, args=["--no-sandbox", f"--proxy-server={proxy}"]
+            )
+            try:
+                yield p, browser
+            finally:
+                try:
+                    browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return
+    global _SYNC_PW, _SYNC_BROWSER
+    with _SYNC_LOCK:  # sync_playwright 非线程安全：复用路径串行
+        if _SYNC_BROWSER is None or not _SYNC_BROWSER.is_connected():
+            try:
+                if _SYNC_BROWSER is not None:
+                    _SYNC_BROWSER.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _SYNC_PW = sync_playwright().start()
+                _SYNC_BROWSER = _SYNC_PW.chromium.launch(
+                    headless=True, args=["--no-sandbox"]
+                )
+            except Exception:
+                _SYNC_BROWSER = None
+                raise
+        yield _SYNC_PW, _SYNC_BROWSER
+
+
+@contextlib.contextmanager
+def _sync_page(browser, viewport: Optional[dict] = None):
+    """在复用浏览器上开新 page，退出时自动关闭 page + context。
+
+    复用常驻浏览器时若只关 page 不关 context，上下文会累积泄漏内存；
+    统一在此收尾（单独启动的一次性浏览器同样适用）。
+    """
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        viewport=viewport or {"width": 1366, "height": 768},
+    )
+    page = context.new_page()
+    try:
+        yield page
+    finally:
+        try:
+            page.close()
+        finally:
+            context.close()
 
 
 def _system_proxy() -> Optional[str]:
@@ -733,19 +832,8 @@ def fetch_rendered_text_sync(
     使用同步 API（部分站对 async headless 有反爬，sync API 指纹不同）。
     返回 selector 命中节点的合并文本（\\n 分隔），无命中返回 ""。
     """
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        launch_args = ["--no-sandbox"]
-        if proxy:
-            launch_args.append(f"--proxy-server={proxy}")
-        browser = p.chromium.launch(headless=True, args=launch_args)
-        try:
-            context = browser.new_context(user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ), viewport={"width": 1366, "height": 768})
-            page = context.new_page()
+    with _sync_browser(proxy) as (p, browser):
+        with _sync_page(browser) as page:
             page.goto(url, timeout=timeout_ms, wait_until=wait_until)
             if wait_for:
                 try:
@@ -760,8 +848,6 @@ def fetch_rendered_text_sync(
                 if t:
                     texts.append(t)
             return "\n".join(texts)
-        finally:
-            browser.close()
 
 
 def fetch_rendered_items_sync(
@@ -782,19 +868,8 @@ def fetch_rendered_items_sync(
       - src  : img 的 src / data-src / data-original
     无命中返回 []。
     """
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        launch_args = ["--no-sandbox"]
-        if proxy:
-            launch_args.append(f"--proxy-server={proxy}")
-        browser = p.chromium.launch(headless=True, args=launch_args)
-        try:
-            context = browser.new_context(user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ), viewport={"width": 1366, "height": 768})
-            page = context.new_page()
+    with _sync_browser(proxy) as (p, browser):
+        with _sync_page(browser) as page:
             page.goto(url, timeout=timeout_ms, wait_until=wait_until)
             if wait_for:
                 try:
@@ -831,8 +906,6 @@ def fetch_rendered_items_sync(
                 if item["href"]:
                     items.append(item)
             return items
-        finally:
-            browser.close()
 
 
 def fetch_rendered_search_sync(
@@ -851,19 +924,8 @@ def fetch_rendered_search_sync(
     适用：搜索框提交后由 JS 动态加载结果（如 fdzys），直接 GET /search?wd=
     只会拿到热门榜。返回 fetch_rendered_items_sync 同构的 [{title,href,src,text}]。
     """
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        launch_args = ["--no-sandbox"]
-        if proxy:
-            launch_args.append(f"--proxy-server={proxy}")
-        browser = p.chromium.launch(headless=True, args=launch_args)
-        try:
-            context = browser.new_context(user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ), viewport={"width": 1366, "height": 768})
-            page = context.new_page()
+    with _sync_browser(proxy) as (p, browser):
+        with _sync_page(browser) as page:
             page.goto(home_url, timeout=timeout_ms, wait_until="domcontentloaded")
             page.wait_for_timeout(1200)
             # 输入关键词并提交
@@ -908,8 +970,6 @@ def fetch_rendered_search_sync(
                 except Exception:  # noqa: BLE001
                     continue
             return items
-        finally:
-            browser.close()
 
 
 def fetch_rendered_video_sync(
@@ -924,19 +984,8 @@ def fetch_rendered_video_sync(
     适用：播放页用 iframe 嵌套第三方解析站（如 agedm），解析站 JS
     解密后填充真实视频 URL 到 iframe 的 <video>。返回 video src；失败 ""。
     """
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        launch_args = ["--no-sandbox"]
-        if proxy:
-            launch_args.append(f"--proxy-server={proxy}")
-        browser = p.chromium.launch(headless=True, args=launch_args)
-        try:
-            context = browser.new_context(user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ), viewport={"width": 1366, "height": 768})
-            page = context.new_page()
+    with _sync_browser(proxy) as (p, browser):
+        with _sync_page(browser) as page:
             page.goto(url, timeout=timeout_ms, wait_until=wait_until)
             page.wait_for_timeout(extra_delay_ms)
             # 遍历全部 frame（含 iframe 解析站）找 video src
@@ -952,5 +1001,3 @@ def fetch_rendered_video_sync(
                         continue
                 page.wait_for_timeout(4000)
             return ""
-        finally:
-            browser.close()

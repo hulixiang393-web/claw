@@ -22,6 +22,11 @@ from urllib.parse import urljoin
 from PySide6.QtCore import Qt, QObject, Signal
 
 _INSTANCE = None  # 模块级单例 vlc.Instance
+_INSTANCE_LOCK = threading.Lock()  # 预热/首播可能并发创建，防竞态
+# 本地代理转发用 requests Session（keep-alive）：HLS 分片逐段请求复用连接，
+# 避免每段一次 TCP+TLS 握手（本地代理播放加速关键）。
+_PROXY_SESSION = None
+_PROXY_SESSION_LOCK = threading.Lock()
 
 
 def _ensure_vlc_on_path() -> None:
@@ -37,19 +42,37 @@ def _ensure_vlc_on_path() -> None:
 
 
 def _get_instance():
-    """模块级单例 vlc.Instance（含内嵌去标题、网络缓冲选项）。"""
+    """模块级单例 vlc.Instance（含内嵌去标题、网络缓冲选项）。
+
+    加锁防竞态：App 启动预热（后台线程）与首次播放可能同时触发创建。
+    """
     global _INSTANCE
     if _INSTANCE is None:
-        _ensure_vlc_on_path()
-        import vlc
+        with _INSTANCE_LOCK:
+            if _INSTANCE is None:
+                _ensure_vlc_on_path()
+                import vlc
 
-        # --no-video-title-show：内嵌时不显示 VLC 标题条
-        # --network-caching=2000：HLS 网络流缓冲（防频繁卡顿）
-        _INSTANCE = vlc.Instance([
-            "--no-video-title-show",
-            "--network-caching=2000",
-        ])
+                # --no-video-title-show：内嵌时不显示 VLC 标题条
+                # --network-caching=2000：HLS 网络流缓冲（防频繁卡顿）
+                _INSTANCE = vlc.Instance([
+                    "--no-video-title-show",
+                    "--network-caching=2000",
+                ])
     return _INSTANCE
+
+
+def warmup_vlc() -> None:
+    """App 启动预热 VLC：提前 import vlc + 创建共享 vlc.Instance。
+
+    python-vlc 首次 import + 加载 libvlc + 建 Instance 是主要耗时（约 1-2s），
+    预热后首次播放不再现场加载，秒开。失败静默（懒加载兜底不受影响）。
+    调用方可放后台线程，不阻塞启动。
+    """
+    try:
+        _get_instance()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def shutdown_vlc() -> None:
@@ -61,6 +84,29 @@ def shutdown_vlc() -> None:
         except Exception:  # noqa: BLE001
             pass
         _INSTANCE = None
+
+
+def _get_proxy_session():
+    """模块级单例 requests.Session（本地代理转发复用连接，keep-alive 提速）。"""
+    global _PROXY_SESSION
+    if _PROXY_SESSION is None:
+        with _PROXY_SESSION_LOCK:
+            if _PROXY_SESSION is None:
+                import requests
+
+                _PROXY_SESSION = requests.Session()
+                try:
+                    from requests.adapters import HTTPAdapter
+
+                    _PROXY_SESSION.mount(
+                        "http://", HTTPAdapter(pool_connections=16, pool_maxsize=64)
+                    )
+                    _PROXY_SESSION.mount(
+                        "https://", HTTPAdapter(pool_connections=16, pool_maxsize=64)
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+    return _PROXY_SESSION
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -77,8 +123,6 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             real = path[3:]
         else:
             real = urljoin(t["base"], path.lstrip("/"))
-        import requests
-
         headers = dict(t["headers"])
         # 透传客户端 Range 头：VLC 渐进播放 MP4 依赖字节范围请求（moov/索引），
         # 不带 Range 上游回 200 全量 → VLC 无法建 chunks 索引（mp4 demux 失败）
@@ -86,7 +130,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if range_h:
             headers["Range"] = range_h
         try:
-            r = requests.get(real, headers=headers, timeout=20, stream=True)
+            r = _get_proxy_session().get(real, headers=headers, timeout=20, stream=True)
         except Exception:  # noqa: BLE001
             self.send_response(502)
             self.end_headers()

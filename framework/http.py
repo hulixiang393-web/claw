@@ -75,12 +75,37 @@ def _is_anti_scrape_text(text: str) -> bool:
 
 
 class HttpClient:
+    # 连接池参数：并发下载（漫画多线程取图、批量任务）时同 host 请求远超 requests
+    # 默认池（10）→ 会排队等连接。放大池容量，配合 keep-alive 显著提速。
+    _POOL_CONNECTIONS = 40
+    _POOL_MAXSIZE = 128
+
     def __init__(self, sleeper=None, defaults: Optional[NetworkDefaults] = None):
         self._sleeper = sleeper if sleeper is not None else time.sleep
         self.defaults = defaults or NetworkDefaults()
         self._session = None
         if _REQUESTS_AVAILABLE:
             self._session = requests.Session()
+            self._bump_connection_pool()
+
+    def _bump_connection_pool(self) -> None:
+        """放大 requests HTTPAdapter 连接池（每 host 并发连接数）。
+
+        默认 pool_maxsize=10 时，8 线程取图 + 主请求并发会互相阻塞等连接；
+        放大后同 host 可同时建立更多连接，漫画/批量下载吞吐明显提升。
+        """
+        try:
+            from requests.adapters import HTTPAdapter
+
+            adapter = HTTPAdapter(
+                pool_connections=self._POOL_CONNECTIONS,
+                pool_maxsize=self._POOL_MAXSIZE,
+                max_retries=0,
+            )
+            self._session.mount("http://", adapter)
+            self._session.mount("https://", adapter)
+        except Exception:  # noqa: BLE001 —— 池放大失败不影响使用
+            pass
 
     # ------------------------------------------------------------------ #
     def _headers_with_ua(self, headers: Optional[dict]) -> Optional[dict]:
