@@ -1013,12 +1013,15 @@ class Content:
             )
 
     # ------------------------------------------------------------------ #
-    def fetch_comic_pages(self, source: SourceConfig, chapter_url: str) -> List[str]:
+    def fetch_comic_pages(self, source: SourceConfig, chapter_url: str, on_page=None) -> List[str]:
         """漫画：抓取一话的全部分页图片 URL。
 
         对应 endpoints.content.page：
         - render: playwright → 用 Playwright 渲染（分片加密站）
         - 普通源 → HTML 提取图片 URL
+
+        on_page：可选分批回调 on_page(已就绪的前缀列表)。解密型源在
+        _decrypt_image_urls 解密过程中分批回调（连续前缀），GUI 边收边渲染。
         """
         content_cfg = source.raw.get("endpoints", {}).get("content") or {}
         block = content_cfg.get("page") or {}
@@ -1043,7 +1046,7 @@ class Content:
             try:
                 from .playwright_helper import fetch_rendered_images_sync
 
-                return fetch_rendered_images_sync(
+                imgs = fetch_rendered_images_sync(
                     abs_url,
                     wait_for=rc.get("wait_for", "canvas"),
                     wait_until=rc.get("wait_until", "domcontentloaded"),
@@ -1060,6 +1063,9 @@ class Content:
                     img_selector=rc.get("img_selector"),
                     img_js_path=rc.get("img_js_path"),
                 )
+                if on_page and imgs:
+                    on_page(list(imgs))
+                return imgs
             except Exception as exc:
                 # Playwright 渲染失败 → 降级到普通 HTML 提取（站点改版/选择器不匹配时
                 # 不整话失败，尝试 HTML 兜底；若 HTML 也提取不到，下方会抛 ContentMissingError）
@@ -1072,28 +1078,49 @@ class Content:
         # 图片解密源（如 18mh AES-CBC 加密图）：下载并把每张解密成 data URI，
         # 使阅读器/下载器无需改动即可显示/保存解密图。
         if urls and source.raw.get("decryption", {}).get("targets", {}).get("image"):
-            return self._decrypt_image_urls(source, urls)
+            return self._decrypt_image_urls(source, urls, on_page)
+        if on_page and urls:
+            on_page(list(urls))
         return urls
 
-    def _decrypt_image_urls(self, source: SourceConfig, urls: List[str]) -> List[str]:
+    def _decrypt_image_urls(self, source: SourceConfig, urls: List[str], on_page=None) -> List[str]:
         """把加密图片 URL 并发下载并 AES 解密成 data URI（供阅读器/下载器直接用）。
 
         一话常几十张图，串行下载+解密要 15-30s 卡半天；改为 8 并发，
         并发把耗时压到 2-4s。单张失败 → 保留原 URL（可能封面等非加密图混入）。
 
+        on_page：可选分批回调 on_page(已解密的前缀列表)。每次「从 0 起的连续
+        前缀」增长时回调一次（保持顺序），GUI 可边解密边渲染，不等整话。
+
         注意：HttpClient 非线程安全，每 worker 各建独立实例（复用默认值）。
         """
         if len(urls) <= 1:
             # 单张直接走原逻辑（无并发开销）
-            return [self._decrypt_one_image(source, u) for u in urls]
+            result = [self._decrypt_one_image(source, u) for u in urls]
+            if on_page and result:
+                on_page(list(result))
+            return result
 
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def _worker(u: str) -> str:
-            return self._decrypt_one_image(source, u)
-
+        result: List = [None] * len(urls)
         with ThreadPoolExecutor(max_workers=8) as pool:
-            return list(pool.map(_worker, urls))
+            futs = {pool.submit(self._decrypt_one_image, source, u): i for i, u in enumerate(urls)}
+            last_emit = 0
+            for fut in as_completed(futs):
+                i = futs[fut]
+                try:
+                    result[i] = fut.result()
+                except Exception:  # noqa: BLE001
+                    result[i] = urls[i]
+                # 连续前缀完成 → 分批回调（边解密边显示，保持顺序）
+                done = 0
+                while done < len(result) and result[done] is not None:
+                    done += 1
+                if on_page and done > last_emit:
+                    on_page(list(result[:done]))
+                    last_emit = done
+        return list(result)
 
     def _decrypt_one_image(self, source: SourceConfig, u: str) -> str:
         """下载单张并 AES 解密 → data URI；失败保留原 URL。

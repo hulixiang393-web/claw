@@ -55,6 +55,8 @@ class ComicView(QWidget):
         self._prefetched = {}  # {url: {"images":[...], "count":N}} 预渲染的后续话
         self._prefetch_queue = []  # 串行预渲染队列（同一时间只渲染 1 话）
         self._prefetch_busy = False  # 是否正在预渲染
+        self._rendered_count = 0  # 已渲染图片数（边抓边显示增量用）
+        self._rendered_header = False  # 话头 QLabel 是否已创建
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -155,6 +157,9 @@ class ComicView(QWidget):
         if self._source is None or not (0 <= idx < len(self._chapters)):
             return
         self._current_idx = idx
+        # 切换话：重置增量渲染计数（gallery 将清空重建，防旧计数错乱）
+        self._rendered_count = 0
+        self._rendered_header = False
         ch = self._chapters[idx]
         self.toc_list.setCurrentRow(idx)  # 目录高亮当前话
         self._scroll_on_load = 1 if scroll_to_end else 0
@@ -191,6 +196,7 @@ class ComicView(QWidget):
 
         task = _LoadComicTask(self._content, self._source, ch)
         task.signals.finished.connect(self._on_images_loaded)
+        task.signals.partial.connect(self._on_images_partial)  # 边抓边显示
         self._comic_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
         self.chapter_changed.emit((self._detail, ch.title, ch.url))
@@ -229,9 +235,22 @@ class ComicView(QWidget):
         self._images = images
         ch._cached_images = images  # 缓存本话，避免重复爬
         self.progress_label.setText(f"第{self._current_idx+1}/{len(self._chapters)}话 · {len(images)}张")
-        self._render_images()
+        # 增量补全（partial 已渲染部分；无 on_page 的源这里一次渲染全部）
+        self._render_incremental()
         # 当前话加载完成后再串行预渲染后续话（切话秒开，且不抢当前话资源）
         self._finish_episode_load(ch)
+
+    def _on_images_partial(self, ch, images, err) -> None:
+        """fetch_comic_pages 分批回调：已就绪前缀 → 增量渲染（边抓边显示）。"""
+        if self._current_idx < 0 or ch.url != self._chapters[self._current_idx].url:
+            return  # 已切话/换章，丢弃旧批次
+        if not images:
+            return
+        self._images = images
+        self._render_incremental()
+        self.progress_label.setText(
+            f"第{self._current_idx+1}/{len(self._chapters)}话 · 已加载 {len(images)} 张"
+        )
 
     # ------------------------------------------------------------------ #
     def _prefetch_future(self, idx: int, n: int) -> None:
@@ -308,6 +327,44 @@ class ComicView(QWidget):
             lbl.load()
             self.gallery_layout.addWidget(lbl)
         # 刷新 gallery 尺寸（widgetResizable=False 需手动定宽+按内容定高）
+        self._apply_zoom()
+        self._relayout_gallery()
+        # 全量渲染完成：记录增量计数（后续 on_page 分批不再重复渲染）
+        self._rendered_count = len(self._images or [])
+        self._rendered_header = True
+
+    def _render_incremental(self) -> None:
+        """边抓边显示：渲染 self._images 中尚未渲染的（连续前缀，保持顺序）。
+
+        首次创建话头，之后按序 append 新图片 label。供 fetch_comic_pages 的
+        on_page 分批回调（解密型源先显示已就绪的，不等整话抓完）。
+        """
+        images = self._images or []
+        if not self._rendered_header and 0 <= self._current_idx < len(self._chapters):
+            from framework.content import chapter_label
+
+            label = chapter_label(self._chapters[self._current_idx].title) or f"第{self._current_idx+1}话"
+            header = QLabel(f"【{label}】")
+            header.setAlignment(Qt.AlignCenter)
+            header.setStyleSheet(
+                "font-size: 15px; font-weight: bold; padding: 12px 8px;"
+                "color: palette(text);"
+            )
+            header.setWordWrap(True)
+            self.gallery_layout.addWidget(header)
+            self._rendered_header = True
+        referer = (
+            self._chapters[self._current_idx].url
+            if 0 <= self._current_idx < len(self._chapters)
+            else ""
+        )
+        while self._rendered_count < len(images):
+            url = images[self._rendered_count]
+            lbl = _ComicImageLabel(url, referer=referer)
+            lbl.loaded.connect(self._relayout_gallery_queued)
+            lbl.load()
+            self.gallery_layout.addWidget(lbl)
+            self._rendered_count += 1
         self._apply_zoom()
         self._relayout_gallery()
 
@@ -542,10 +599,11 @@ class _ComicImageLabel(QLabel):
 class _ComicSignals(QObject):
     """漫画加载信号。"""
     finished = Signal(object, object, object)  # (chapter, images, err)
+    partial = Signal(object, object, object)  # (chapter, 已就绪前缀, None) 边抓边显示
 
 
 class _LoadComicTask(QRunnable):
-    """后台加载漫画话图片 URL。"""
+    """后台加载漫画话图片 URL（on_page 分批回调，边抓边显示）。"""
 
     def __init__(self, content, source, chapter):
         super().__init__()
@@ -557,11 +615,20 @@ class _LoadComicTask(QRunnable):
     def run(self) -> None:
         images, err = [], None
         try:
-            images = self._content.fetch_comic_pages(self._source, self._chapter.url)
+            images = self._content.fetch_comic_pages(
+                self._source, self._chapter.url, on_page=self._emit_partial
+            )
         except Exception as exc:
             err = str(exc)
         try:
             self.signals.finished.emit(self._chapter, images, err)
+        except RuntimeError:
+            pass
+
+    def _emit_partial(self, part) -> None:
+        """解密/抓取进度分批回调 → 主线程 partial 信号（增量渲染）。"""
+        try:
+            self.signals.partial.emit(self._chapter, list(part), None)
         except RuntimeError:
             pass
 
