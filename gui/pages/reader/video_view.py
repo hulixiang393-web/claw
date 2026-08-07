@@ -60,8 +60,10 @@ class _FetchStreamTask(QRunnable):
     def run(self) -> None:
         video, audio, err = "", "", None
         try:
+            # merged=True：取合并单流（含音视频）供 VLC 直接播——
+            # 双流 input-slave 对 DASH/fMP4 不可靠（黑屏），单流最稳
             video, audio = self._content.fetch_video_streams(
-                self._source, self._url, quality=self._quality
+                self._source, self._url, quality=self._quality, merged=True
             )
         except Exception as exc:  # noqa: BLE001
             err = str(exc)

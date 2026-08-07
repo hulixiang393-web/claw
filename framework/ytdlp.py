@@ -191,7 +191,7 @@ class Ytdlp:
         """详情元数据 + 章节。一个 --dump-single-json 全拿。"""
         out = self._run([
             "--dump-single-json", "--no-warnings", "--no-download",
-            "--encoding", "utf-8", url,
+            "--socket-timeout", "10", "--encoding", "utf-8", url,
         ])
         try:
             d = json.loads(out)
@@ -228,6 +228,7 @@ class Ytdlp:
         """拿单个 format 的 URL。用 --get-url。"""
         out = self._run([
             "-f", fmt, "--get-url", "--no-warnings",
+            "--socket-timeout", "10",
             "--extractor-args", "youtube:skip=sections",
             url,
         ])

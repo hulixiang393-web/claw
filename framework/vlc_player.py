@@ -79,31 +79,73 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             real = urljoin(t["base"], path.lstrip("/"))
         import requests
 
+        headers = dict(t["headers"])
+        # 透传客户端 Range 头：VLC 渐进播放 MP4 依赖字节范围请求（moov/索引），
+        # 不带 Range 上游回 200 全量 → VLC 无法建 chunks 索引（mp4 demux 失败）
+        range_h = self.headers.get("Range")
+        if range_h:
+            headers["Range"] = range_h
         try:
-            r = requests.get(real, headers=t["headers"], timeout=20)
+            r = requests.get(real, headers=headers, timeout=20, stream=True)
         except Exception:  # noqa: BLE001
             self.send_response(502)
             self.end_headers()
             return
-        if r.status_code != 200:
-            self.send_response(r.status_code)
-            self.end_headers()
-            return
-        body = r.content
-        ctype = r.headers.get("Content-Type", "") or ""
-        if "m3u8" in ctype or body[:8] == b"#EXTM3U":
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        first = next(r.iter_content(65536), b"")
+        is_hls = (
+            "m3u8" in ctype
+            or real.split("?", 1)[0].lower().endswith(".m3u8")
+            or first[:8] == b"#EXTM3U"
+        )
+        if is_hls:
+            # HLS 小清单：整读 → 重写分片为本地代理路径（VLC 只连 127.0.0.1）
+            parts = [first]
+            for chunk in r.iter_content(65536):
+                if not chunk:
+                    break
+                parts.append(chunk)
+            body = b"".join(parts)
+            r.close()
+            if r.status_code != 200:
+                self.send_response(r.status_code)
+                self.end_headers()
+                return
             text = body.decode("utf-8", "replace")
-            text = self._rewrite(text, t)
-            body = text.encode("utf-8")
-            ctype = "application/vnd.apple.mpegurl"
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
+            if text.lstrip().startswith("#EXTM3U"):
+                text = self._rewrite(text, t)
+                body = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # 音视频媒体（mp4/m4s/webm）：流式转发，透传状态码与范围响应头
+        # （206 + Content-Range/Accept-Ranges，支持 VLC 拖动/渐进播放）
+        self.send_response(r.status_code)
+        for hk in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+            hv = r.headers.get(hk)
+            if hv:
+                self.send_header(hk, hv)
         self.end_headers()
         try:
-            self.wfile.write(body)
+            if first:
+                self.wfile.write(first)
+            for chunk in r.iter_content(65536):
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            try:
+                r.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _rewrite(self, text: str, t: dict) -> str:
         """m3u8 里非注释行（分片/子清单 URL）全部改写为本地代理路径。"""

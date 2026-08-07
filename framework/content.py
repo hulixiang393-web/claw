@@ -352,6 +352,31 @@ class Content:
     def _headers(self, source: SourceConfig) -> dict:
         return source.request_headers()
 
+    def _endpoint_headers(self, source: SourceConfig, cfg: dict) -> dict:
+        """api_endpoints.<endpoint> 级请求头：源级 headers 基础上做端点覆盖。
+
+        cfg["headers"] 支持：
+            "Header": "value"    覆盖/新增该头
+            "Header": "" 或 null  移除该头（大小写不敏感）
+        用途：B 站 detail 接口带 Referer 会固定 412，但 CDN 取流又必须带
+        Referer —— 用端点级覆盖在 detail 上摘掉 Referer，源级保持不动。
+        """
+        headers = self._headers(source)
+        overrides = cfg.get("headers") or {}
+        if not overrides:
+            return headers
+        for k, v in overrides.items():
+            if v is None or v == "":
+                for hk in list(headers):
+                    if hk.lower() == k.lower():
+                        headers.pop(hk, None)
+            else:
+                for hk in list(headers):
+                    if hk.lower() == k.lower():
+                        headers.pop(hk, None)
+                headers[k] = v
+        return headers
+
     def _timeout(self, source: SourceConfig) -> float:
         return float(source.transports().get("timeout") or self._http.defaults.timeout)
 
@@ -492,7 +517,7 @@ class Content:
             abs_url = f"{abs_url}?{qs}"
         resp = self._http.get_json(
             abs_url,
-            headers=self._headers(source),
+            headers=self._endpoint_headers(source, cfg),
             timeout=self._timeout(source),
             retries=self._retries(source),
             proxy_pool=source.proxy_pool(),
@@ -1277,12 +1302,17 @@ class Content:
         # 以原始 chapter_url 为 key 返回（调用方用 ch.url 直接查）
         return {u: raw.get(a) for u, a in zip(chapter_urls, abs_urls)}
 
-    def fetch_video_streams(self, source: SourceConfig, episode_url: str, quality: str = "") -> tuple:
+    def fetch_video_streams(self, source: SourceConfig, episode_url: str, quality: str = "",
+                            merged: bool = False) -> tuple:
         """视频：抓取单集 dash 音视频双流（播放/下载用）。
 
         返回 (video_url, audio_url)；非 dash/无音频时 audio_url 为 ""。
         quality: 画质名（"best"/"1080p"/...），空=源配置默认。经
         api_endpoints.episode 的 quality 映射为请求参数（如 B 站 qn）。
+        merged: True 时 yt-dlp 引擎强制合并单流（含音视频的 `best`）——
+        VLC 内嵌播放器喂双流 input-slave 对 DASH/fMP4 支持不可靠（黑屏），
+        播放端应传 merged=True（单流稳定出画面+声音）；下载端留 False 走
+        高清双流再 ffmpeg 合并。
         播放器（VLC）播放 dash 需要同时喂视频轨+音频轨（B 站音视频分离）。
 
         返回前经 adblock 广告过滤：URL 命中广告特征 → 置空（下载/播放均跳过）。
@@ -1297,7 +1327,7 @@ class Content:
             # yt-dlp 引擎（YouTube 高清双流，需签名）
             if episode_api.get("engine") == "ytdlp":
                 video, audio = self._fetch_streams_ytdlp(
-                    source, episode_url, episode_api, quality
+                    source, episode_url, episode_api, quality, merged=merged
                 )
             else:
                 streams = self._fetch_episode_api(
@@ -1328,9 +1358,9 @@ class Content:
         api = source.raw.get("api_endpoints") or {}
         episode_api = api.get("episode") or {}
         if episode_api:
-            # yt-dlp 引擎：单流播放地址（拿视频轨）
+            # yt-dlp 引擎：单流播放地址（合并单流，含音视频，VLC 可直接播）
             if episode_api.get("engine") == "ytdlp":
-                v, _ = self._fetch_streams_ytdlp(source, episode_url, episode_api)
+                v, _ = self._fetch_streams_ytdlp(source, episode_url, episode_api, merged=True)
                 return v
             play = self._fetch_episode_api(source, episode_url, episode_api)
             if play:
@@ -1402,19 +1432,24 @@ class Content:
             return self._decrypter.decrypt(source, play, "video_url")
         return play
 
-    def _fetch_streams_ytdlp(self, source: SourceConfig, episode_url: str, cfg: dict, quality: str = "") -> tuple:
+    def _fetch_streams_ytdlp(self, source: SourceConfig, episode_url: str, cfg: dict,
+                             quality: str = "", merged: bool = False) -> tuple:
         """yt-dlp 引擎：拿高清双流（YouTube 需签名，委托 yt-dlp）。
+
+        merged=True 时强制 `best` 合并单流（含音视频）：VLC input-slave
+        对双流 DASH/fMP4 支持不可靠（黑屏），播放端走单流最稳；且少一次
+        yt-dlp 子进程调用（bestvideo+bestaudio 是两次 --get-url，合并一次）。
 
         缓存：yt-dlp 取流 ~10s（签名+网络），同视频短时间复用，避免重复等待。
         """
         yt = self._get_ytdlp()
 
-        key = (episode_url, quality)
+        key = (episode_url, quality, merged)
         cached = self._ytdlp_stream_cache.get(key)
         if cached is not None:
             return cached
 
-        fmt = self._ytdlp_format(cfg, quality)
+        fmt = "best" if merged else self._ytdlp_format(cfg, quality)
         try:
             streams = yt.fetch_streams(episode_url, fmt=fmt)
         except Exception as exc:
@@ -1629,19 +1664,19 @@ class Content:
 
     @staticmethod
     def _ytdlp_format(cfg: dict, quality: str = "") -> str:
-        """quality → yt-dlp 格式串。统一返回合并单流（含音视频）。
+        """quality → yt-dlp 格式串（下载端双流路径）。
 
-        分离双流（bestvideo+bestaudio）VLC 的 input-slave 对 DASH/fMP4
-        支持不可靠（YouTube googlevideo / B站 m4s → 黑屏）。改用 `best`/
-        高度限制的合并流，VLC 单流直播，稳定出画面+声音。
+        下载用双流（bestvideo+bestaudio，ffmpeg 合并出高清）；播放端
+        由 _fetch_streams_ytdlp(merged=True) 强制 `best` 合并单流，不经本方法。
         """
         fmt = str(cfg.get("format") or "best")
         if not quality or quality == "best":
             return fmt
-        # 精确画质：高度限制的合并流（best[height<=X]，VLC 可单流播放）
+        # 精确画质：高度限制（bestvideo[height<=X]+bestaudio，ffmpeg 可合并）
         m = __import__("re").match(r"^(\d{3,4})p$", quality or "")
         if m:
-            return f"best[height<={m.group(1)}]"
+            h = m.group(1)
+            return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
         return fmt
 
     def _fetch_episode_api(self, source: SourceConfig, episode_url: str, cfg: dict, want_streams: bool = False, quality: str = "") -> str | dict:
@@ -1708,7 +1743,7 @@ class Content:
             abs_url = f"{abs_url}?{qs}"
         resp = self._http.get_json(
             abs_url,
-            headers=self._headers(source),
+            headers=self._endpoint_headers(source, cfg),
             timeout=self._timeout(source),
             retries=self._retries(source),
             proxy_pool=source.proxy_pool(),

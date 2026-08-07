@@ -163,6 +163,9 @@
       "params": {
         "bvid": "{bvid}"
       },
+      "headers": {
+        "Referer": ""
+      },
       "field_extractors": {
         "title": "title",
         "author": "owner.name",
