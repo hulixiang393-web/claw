@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import time
 import webbrowser
 
 from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
@@ -1055,6 +1056,15 @@ class VideoView(QWidget):
             # 已进入过播放 → 本次是中途缓冲（卡顿），浮层提示
             self._buffer_shown = True
             self._show_status(f"缓冲中 {percent}%…")
+        elif self._has_played and self._buffer_shown:
+            # 浮层已显示：百分比文本节流 1s 更新一次——
+            # VLC buffering 事件约 100ms 一发，逐次 adjustSize+几何重排
+            # 会拖慢主线程（缓冲越久越卡），1s 刷新感知无差
+            if not hasattr(self, "_buffer_label_ts"):
+                self._buffer_label_ts = 0.0
+            if time.monotonic() - self._buffer_label_ts >= 1.0:
+                self._buffer_label_ts = time.monotonic()
+                self._show_status(f"缓冲中 {percent}%…")
         self.buffer_spinner.show()
         if self._has_played and self._tuner.should_upgrade():
             if self._player is not None and self._player.increase_buffer():
