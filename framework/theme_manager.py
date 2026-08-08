@@ -172,7 +172,8 @@ class ThemeManager:
 BASE_QSS = """
 /* ---------- 全局 ---------- */
 * {{
-    font-family: "Noto Sans CJK SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei", "Segoe UI Emoji",
+        "Apple Color Emoji", "Noto Color Emoji", "Helvetica Neue", sans-serif;
 }}
 QMainWindow, QDialog {{
     background-color: {bg};

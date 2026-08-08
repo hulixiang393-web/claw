@@ -257,7 +257,7 @@ class VideoView(QWidget):
         self.center_play_btn.setStyleSheet(
             "QPushButton { background: rgba(0,0,0,150); color: white;"
             " border: 2px solid rgba(255,255,255,120); border-radius: 36px;"
-            " font-size: 30px; }"
+            " font-size: 30px; padding: 0px; }"
             "QPushButton:hover { background: rgba(40,40,40,180); }"
         )
         self.center_play_btn.clicked.connect(self._toggle_play_pause)
@@ -281,24 +281,24 @@ class VideoView(QWidget):
         help_lbl.adjustSize()
         self.help_overlay.hide()
 
+    def _icon_btn(self, text: str, tip: str, slot, width: int = 36) -> QPushButton:
+        """控制条图标按钮：覆写全局 QSS 的 8px 18px padding（窄按钮会挤掉文字）。"""
+        b = QPushButton(text)
+        b.setFixedWidth(width)
+        b.setToolTip(tip)
+        b.clicked.connect(slot)
+        b.setStyleSheet("padding: 0px;")
+        return b
+
     def _build_control_bar(self, cb: QHBoxLayout) -> None:
         """控制条：播放 / 上下集 / 进度 / 时间 / 音量 / 倍速 / 设置 / 全屏。"""
-        self.prev_btn = QPushButton("⏮")
-        self.prev_btn.setFixedWidth(36)
-        self.prev_btn.setToolTip("上一集")
-        self.prev_btn.clicked.connect(self._on_prev_ep)
+        self.prev_btn = self._icon_btn("⏮", "上一集", self._on_prev_ep)
         cb.addWidget(self.prev_btn)
 
-        self.play_btn = QPushButton("▶")
-        self.play_btn.setFixedWidth(36)
-        self.play_btn.setToolTip("播放 / 暂停（空格）")
-        self.play_btn.clicked.connect(self._toggle_play_pause)
+        self.play_btn = self._icon_btn("▶", "播放 / 暂停（空格）", self._toggle_play_pause)
         cb.addWidget(self.play_btn)
 
-        self.next_btn = QPushButton("⏭")
-        self.next_btn.setFixedWidth(36)
-        self.next_btn.setToolTip("下一集")
-        self.next_btn.clicked.connect(self._on_next_ep)
+        self.next_btn = self._icon_btn("⏭", "下一集", self._on_next_ep)
         cb.addWidget(self.next_btn)
 
         self.progress = QSlider(Qt.Horizontal)
@@ -322,10 +322,7 @@ class VideoView(QWidget):
         self.time_label.setStyleSheet("color: palette(dark); font-size: 11px;")
         cb.addWidget(self.time_label)
 
-        self.vol_btn = QPushButton("🔊")
-        self.vol_btn.setFixedWidth(32)
-        self.vol_btn.setToolTip("静音（M）")
-        self.vol_btn.clicked.connect(self._toggle_mute)
+        self.vol_btn = self._icon_btn("🔊", "静音（M）", self._toggle_mute, width=32)
         cb.addWidget(self.vol_btn)
 
         self.vol_slider = QSlider(Qt.Horizontal)
@@ -358,6 +355,7 @@ class VideoView(QWidget):
         self.fs_btn.setFixedWidth(32)
         self.fs_btn.setToolTip("全屏（F）")
         self.fs_btn.clicked.connect(self._toggle_fullscreen)
+        self.fs_btn.setStyleSheet("padding: 0px;")
         cb.addWidget(self.fs_btn)
 
     def _build_settings_menu(self) -> None:
