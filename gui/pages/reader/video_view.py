@@ -161,7 +161,7 @@ class VideoView(QWidget):
         self._current_play = ""  # 单流播放地址（展示/复制）
         self._current_audio = ""  # DASH 音频轨（外接播放器 input-slave 挂入）
         self._current_title = ""  # 当前集标题（重开播放器/浮层提示）
-        self._source_list = []  # [{sid, name, ...}]
+        self._source_list = []  # [{sid, name, ...}]（同站多线路）
         self._current_sid = ""
         self._switching = False
         self._play_cache: dict = {}  # {ep_url: single_url}（展示/复制地址）
@@ -377,6 +377,18 @@ class VideoView(QWidget):
         self.speed_combo.activated.connect(lambda _: self._video_frame.setFocus())
         cb.addWidget(self.speed_combo)
 
+        # 换源按钮（⇄）：播放界面直接可见的换源入口，多源站显示、单源隐藏
+        self.source_btn = QToolButton()
+        self.source_btn.setText("⇄")
+        self.source_btn.setPopupMode(QToolButton.InstantPopup)
+        self.source_btn.setToolTip("切换播放源")
+        self.source_btn.setFixedWidth(32)
+        self.source_btn.setVisible(False)
+        self.source_menu = QMenu(self)
+        self.source_btn.setMenu(self.source_menu)
+        self.source_menu.aboutToHide.connect(self._video_frame.setFocus)
+        cb.addWidget(self.source_btn)
+
         # 设置菜单（⚙）：画质 + 复制地址 + 刷新 + 外部播放器 + 帮助
         self.settings_btn = QToolButton()
         self.settings_btn.setText("⚙")
@@ -451,8 +463,6 @@ class VideoView(QWidget):
         self.quality_menu = menu.addMenu("画质")
         # 选集菜单（全屏/非全屏均可切集，无需回到左侧列表）
         self.ep_menu = menu.addMenu("选集")
-        # 播放源菜单（换源入口，替代仅顶部可见的下拉框）
-        self.source_menu = menu.addMenu("播放源")
 
         menu.addSeparator()
         menu.addAction("📋 复制播放地址").triggered.connect(self._copy)
@@ -499,7 +509,10 @@ class VideoView(QWidget):
         self._refresh_ep_menu()
 
     def _refresh_source_menu(self) -> None:
-        """重建播放源菜单：当前源打勾，点击即换源（替代顶部下拉框）。"""
+        """重建播放源菜单：当前源打勾，点击即换源。
+
+        菜单挂独立换源按钮（⇄）；多源才显示按钮，单源隐藏。
+        """
         self.source_menu.clear()
         self._source_actions = []
         for i, item in enumerate(self._source_list):
@@ -511,7 +524,10 @@ class VideoView(QWidget):
             act.triggered.connect(
                 lambda _=False, _i=i: self._select_source(_i))
             self._source_actions.append(act)
-        self.source_menu.menuAction().setVisible(bool(self._source_list))
+        has = bool(self._source_list)
+        self.source_menu.menuAction().setVisible(has)
+        self.source_btn.setVisible(has)
+        self.source_btn.setToolTip("切换播放源" if has else "")
 
     def _select_source(self, idx: int) -> None:
         """播放器内换源：同步顶部下拉框触发换源流程。"""
@@ -721,7 +737,7 @@ class VideoView(QWidget):
         self._load_episode(idx)
 
     def reload_detail(self, new_detail: Detail) -> None:
-        """换源重载分集后调用：重建列表 + 加载第 0 集（不自动播）。"""
+        """换源重载分集后调用：重建列表 + 加载第 0 集（取流完成后自动播）。"""
         self._stop_player()  # 换源先停旧播放流
         self._detail = new_detail
         self._episodes = new_detail.chapters

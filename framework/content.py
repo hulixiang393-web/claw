@@ -1618,6 +1618,11 @@ class Content:
         seen: set = set()
         for i, node in enumerate(roots):
             sid = node.get(attr) if hasattr(node, "get") else None
+            # 无现成 sid 属性时：sid_regex 从属性值提取（如 li id="tab83" → sid=3）
+            if sid and switch.get("sid_regex"):
+                m_sid = _re.search(switch["sid_regex"], str(sid))
+                if m_sid:
+                    sid = m_sid.group(1) if m_sid.groups() else m_sid.group(0)
             if not sid or sid in seen:
                 continue
             seen.add(sid)

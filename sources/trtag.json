@@ -115,6 +115,12 @@
     },
     "content": {
       "episode": {
+        "source_switch": {
+          "list_selector": "div.playfrom.tab8 ul li",
+          "list_attr": "id",
+          "sid_regex": "tab8(\\d+)$",
+          "ep_list_selector": "div#vlink_{sid} ul li a"
+        },
         "list": {
           "root_selector": {
             "css": "div#vlink_1 ul li a"
