@@ -78,7 +78,8 @@ class _VideoFrame(QWidget):
     def mouseDoubleClickEvent(self, event):  # noqa: N802
         self._view._click_pending = False
         if event.button() == Qt.LeftButton:
-            self._view._toggle_fullscreen()
+            # 外部播放器方案：双击视频区 = 拉起外部播放器打开当前集
+            self._view._open_external()
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event):  # noqa: N802
@@ -161,6 +162,8 @@ class VideoView(QWidget):
         self._episodes = []
         self._current_idx = -1
         self._current_play = ""  # 单流播放地址（展示/复制）
+        self._current_audio = ""  # DASH 音频轨（外接播放器 input-slave 挂入）
+        self._current_title = ""  # 当前集标题（重开播放器/浮层提示）
         self._source_list = []  # [{sid, name, ...}]
         self._current_sid = ""
         self._switching = False
@@ -246,6 +249,9 @@ class VideoView(QWidget):
         body.addLayout(right, stretch=1)
         layout.addLayout(body, stretch=1)
         self._reposition_overlays()  # 初始定位控制条/覆盖层
+        # 外部播放器方案：播放画面在独立播放器进程内，App 内不再内嵌渲染 →
+        # 进度/音量/倍速/全屏等内嵌播放控件禁用（操作交给外部播放器自身）
+        self._disable_embedded_controls()
         # 全局事件过滤器：鼠标唤出控制条 + 全屏窗键盘/关闭兜底
         # （class 方法才进 Qt 事件分发；实例属性赋值在 PySide6 永不回调）
         app = QApplication.instance()
@@ -406,6 +412,21 @@ class VideoView(QWidget):
             (sid, self._detail.url, getattr(self._detail, "content_type", ""))
         )
 
+    def _disable_embedded_controls(self) -> None:
+        """禁用内嵌播放专属控件（外接方案下无内嵌状态可管）。
+
+        播放/下一集/选集/换源/画质/复制/下载仍有效——播放入口 = 拉起外部
+        播放器；进度/时间/音量/倍速/全屏由外部播放器接管，禁用并注明。
+        """
+        for w in (self.progress, self.time_label, self.vol_btn, self.vol_slider,
+                  self.speed_combo, self.fs_btn):
+            w.setEnabled(False)
+            w.setToolTip("外部播放器播放（VLC 桌面版）")
+        self.progress.setToolTip("进度/暂停由外部播放器接管")
+        self.time_label.setText("外部播放器")
+        self.play_btn.setToolTip("在外部播放器中打开当前集")
+        self.next_btn.setToolTip("在外部播放器中打开下一集")
+
     def _build_settings_menu(self) -> None:
         menu = self._settings_menu
         menu.clear()
@@ -525,38 +546,11 @@ class VideoView(QWidget):
             self.setCursor(Qt.BlankCursor)
 
     def _handle_key(self, event) -> None:
-        """键盘快捷键（焦点在视图/视频区时）。"""
+        """键盘快捷键（外部播放器方案：仅保留帮助；播放/暂停/快进等
+        由外部播放器自身快捷键接管，App 内不再重复绑定）。"""
         key = event.key()
-        if key == Qt.Key_Space:
-            self._toggle_play_pause()
-            event.accept()
-            return
-        if key == Qt.Key_F:
-            self._toggle_fullscreen()
-            event.accept()
-            return
-        if key == Qt.Key_M:
-            self._toggle_mute()
-            event.accept()
-            return
         if key == Qt.Key_Question or key == Qt.Key_Slash:
             self._toggle_help()
-            event.accept()
-            return
-        if key == Qt.Key_Left:
-            self._seek_relative(-5)
-            event.accept()
-            return
-        if key == Qt.Key_Right:
-            self._seek_relative(5)
-            event.accept()
-            return
-        if key == Qt.Key_Up:
-            self._set_volume(min(100, self.vol_slider.value() + 10))
-            event.accept()
-            return
-        if key == Qt.Key_Down:
-            self._set_volume(max(0, self.vol_slider.value() - 10))
             event.accept()
             return
         event.ignore()
@@ -678,11 +672,8 @@ class VideoView(QWidget):
         self._buffer_shown = False
         if restore_position is not None:
             self._pending_position = restore_position
-        # 换视频先停旧播放（不堆积缓存/后台占用），再预建播放器。
+        # 换视频先停旧播放（不堆积缓存/后台占用）。
         self._stop_player()
-        # 【播放加速】详情打开即预建 VLC 播放器：取流完成直接 play，
-        # 不再现场 import vlc + 建 MediaPlayer（约几百 ms，首播更跟手）。
-        self._ensure_player()
         self._episodes = detail.chapters
         self._play_cache.clear()
         self._stream_cache.clear()
@@ -960,34 +951,6 @@ class VideoView(QWidget):
         self._prefetch_next(self._current_idx)
 
     # ------------------------------------------------------------------ #
-    def _ensure_player(self) -> None:
-        """预建/复用 VLC 播放器（构造 MediaPlayer 是首播主要耗时之一）。
-
-        详情 load 即调用 → 取流完成直接 play，免现场构造。
-        构造失败（缺 vlc / 环境异常）保持 _player=None，_play 时仍会重试并报错，
-        不阻断详情加载。
-        """
-        if self._player is not None:
-            return
-        try:
-            from framework.vlc_player import VlcPlayer
-
-            referer = ""
-            ua = ""
-            _rh = getattr(self._source, "request_headers", None)
-            if callable(_rh):
-                hdrs = _rh() or {}
-                referer = hdrs.get("Referer", "") or ""
-                ua = hdrs.get("User-Agent", "") or ""
-            self._player = VlcPlayer(self._video_frame, referer=referer, user_agent=ua)
-            self._player.ended.connect(self._on_ended)
-            self._player.error.connect(self._on_play_error)
-            self._player.time_changed.connect(self._on_time_changed)
-            self._player.length_changed.connect(self._on_length_changed)
-            self._player.buffering.connect(self._on_buffering)
-        except Exception:  # noqa: BLE001 —— VLC 不可用时降级：播放时再试并报错
-            self._player = None
-
     def _request_play(self, video: str, audio: str, title: str) -> None:
         """请求播放：视图可见立即播；不可见（用户在别的 Tab）暂存，显示后再播。
 
@@ -1008,33 +971,29 @@ class VideoView(QWidget):
             self._play(video, audio, title)
 
     def _play(self, video: str, audio: str, title: str) -> None:
-        """创建/复用 VLC 播放器并播放。
+        """播放 = 调用外部播放器（VLC 桌面版优先，浏览器兜底）。
 
-        播放器构造失败（未装 VLC / 环境异常）时 _player 为 None：
-        不再调用 rehook 崩溃，提示用户走外部播放器（B1）。
+        外接方案：播放逻辑不再内嵌 libvlc（内嵌受 Qt 主线程/软解影响易卡），
+        交给独立播放器进程渲染；续读由 VLC 桌面版自带"恢复播放位置"接管，
+        分集/换源/画质/下载仍在 App 内操作，取流完成后打开播放器即播。
         """
-        self._ensure_player()
-        if self._player is None:
-            self._show_status(
-                "播放器不可用：未安装 VLC 或加载失败，可用「设置 → 外部播放器」打开"
-            )
-            self.play_btn.setText("▶")
-            self._sync_overlay_state(playing=False)
-            return
-        self._player.rehook()  # 确保 hwnd 已挂
-        self._player.play(video, audio, title=title)
         self._has_played = True
-        self.play_btn.setText("⏸")
-        self._sync_overlay_state(playing=True)
-        self._show_status("")  # 播放开始 → 清空状态行
-        self.buffer_spinner.show()  # 缓冲指示：首帧（time_changed）后隐藏
-        self._hide_timer.start()  # 开始自动隐藏计时
-        # 续读定位：播放开始后等缓冲就绪再 seek 到上次进度（VLC 缓冲前 set_position 无效）
-        if self._pending_position is not None:
-            pos = self._pending_position
-            self._pending_position = None
-            if pos > 0:
-                self._seek_with_retry(pos)
+        self._current_play = video
+        self._current_audio = audio  # DASH 音频轨（重开播放器时 input-slave 挂入）
+        self._current_title = title  # 状态浮层/重开提示用
+        referer = ua = ""
+        _rh = getattr(self._source, "request_headers", None)
+        if callable(_rh):
+            hdrs = _rh() or {}
+            referer = hdrs.get("Referer", "") or ""
+            ua = hdrs.get("User-Agent", "") or ""
+        from framework.external_player import open_with_player
+
+        msg = open_with_player(video, audio=audio, referer=referer, user_agent=ua)
+        self._show_status(f"{msg}：{title or video}")
+        self.play_btn.setText("▶")
+        self._sync_overlay_state(playing=False)
+        self.control_bar.show()  # 外部播放器接管画面 → 控制条常驻
 
     def _on_buffering(self, percent: int) -> None:
         """缓冲事件：播放中的再次缓冲（卡顿）显示浮层；封顶前自动加大缓存重播。
@@ -1186,19 +1145,6 @@ class VideoView(QWidget):
         except RuntimeError:
             pass
 
-    def _seek_with_retry(self, pos: float, tries: int = 5) -> None:
-        """播放开始后等缓冲就绪再 seek 到上次进度。
-
-        VLC 缓冲完成前 set_position 无效；每 900ms 重试一次直到总时长
-        已知（最多 5 次），此时再跳转才能精准落在上次播放位置。
-        """
-        if tries <= 0 or self._player is None:
-            return
-        if self._player.get_length() > 0:
-            self._player.set_position(pos)
-        else:
-            QTimer.singleShot(900, lambda: self._seek_with_retry(pos, tries - 1))
-
     def _on_progress_pressed(self) -> None:
         self._dragging = True
         self._hide_timer.stop()  # 拖动期间禁止自动隐藏
@@ -1222,20 +1168,14 @@ class VideoView(QWidget):
             self._player.set_volume(v)
 
     def _toggle_play_pause(self) -> None:
-        if self._player is None:
+        """播放/暂停（外部播放器方案）：播放按钮 = 在外部播放器中打开当前集。
+
+        暂停/进度/音量由外部播放器自身接管（VLC 桌面版）；这里再次点击
+        重新拉起播放器播放当前集（VLC 单实例会复用已有窗口播同 URL）。
+        """
+        if not self._current_play:
             return
-        if self._player.is_playing():
-            self._player.pause()
-            self.play_btn.setText("▶")
-            self._sync_overlay_state(playing=False)
-            self._emit_position()  # 暂停瞬间精确存盘当前进度
-            self._hide_timer.stop()  # 暂停时控制条常驻
-            self.control_bar.show()
-        else:
-            self._player.resume()
-            self.play_btn.setText("⏸")
-            self._sync_overlay_state(playing=True)
-            self._hide_timer.start()
+        self._play(self._current_play, self._current_audio, self._current_title)
 
     def _toggle_fullscreen(self) -> None:
         if self._fs_win is not None:
@@ -1387,22 +1327,38 @@ class VideoView(QWidget):
             QApplication.clipboard().setText(self._current_play)
 
     def _open_external(self) -> None:
+        """「设置 → 外部播放器」：把当前集交外部播放器（VLC 桌面版优先）。
+
+        Referer 保护的 CDN 直链（如 B 站 durl）：VLC 带 --http-referrer 播放
+        媒体直链；VLC 不可用时回退浏览器打开集页面（页面播放绕开防盗链）。
+        """
         if not self._current_play:
             return
-        # Referer 保护的 CDN 直链（如 B 站 durl）：裸 URL 在浏览器直接打开会 403
-        # （CDN 校验 Referer）。检测到「媒体域名 ≠ 源站域名 且 源配了 Referer」时，
-        # 改为打开该集页面 URL，让浏览器正常播放；否则打开原始媒体地址。
-        page_url = ""
-        if 0 <= self._current_idx < len(self._episodes):
-            page_url = self._episodes[self._current_idx].url or ""
-        elif self._detail_url_for_play:
-            page_url = self._detail_url_for_play
-        if page_url and self._media_needs_referer():
-            from urllib.parse import urljoin
+        audio = getattr(self, "_current_audio", "")
+        _rh = getattr(self._source, "request_headers", None)
+        referer = ua = ""
+        if callable(_rh):
+            hdrs = _rh() or {}
+            referer = hdrs.get("Referer", "") or ""
+            ua = hdrs.get("User-Agent", "") or ""
+        from framework.external_player import _locate_vlc, open_with_player
 
-            webbrowser.open(urljoin(self._source.base_url, page_url))
-            return
-        webbrowser.open(self._current_play)
+        if not _locate_vlc():
+            # 无 VLC：Referer 保护的媒体直链改开集页面（浏览器播放绕防盗链）
+            page_url = ""
+            if 0 <= self._current_idx < len(self._episodes):
+                page_url = self._episodes[self._current_idx].url or ""
+            elif self._detail_url_for_play:
+                page_url = self._detail_url_for_play
+            if page_url and self._media_needs_referer():
+                from urllib.parse import urljoin
+
+                webbrowser.open(urljoin(self._source.base_url, page_url))
+                return
+        msg = open_with_player(
+            self._current_play, audio=audio, referer=referer, user_agent=ua
+        )
+        self._show_status(msg)
 
     def _media_needs_referer(self) -> bool:
         """媒体直链是否被 Referer 保护：源配了 Referer 且媒体域名 ≠ 源站域名。"""
