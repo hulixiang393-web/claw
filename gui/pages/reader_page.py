@@ -83,6 +83,8 @@ class ReaderPage(BasePage):
         self._current_book_url = None
         self._current_content_type = ""  # 当前作品类型（收藏时记录）
         self._favorite_checker = None  # 可选回调: url -> bool（App 注入判断是否已收藏）
+        self._pending_position = None  # 打开书续读位置（0~1 比例），_on_detail 传给视图
+        self._pending_page = None  # 打开书续读翻页页索引（小说翻页模式）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -129,6 +131,10 @@ class ReaderPage(BasePage):
             self.video_view.episode_changed.connect(self._on_progress_signal)
             # epub 本地阅读：用文件路径作 key 续读
             self.epub_view.chapter_changed.connect(self._on_progress_signal)
+            # 章内位置续读（滚动/翻页/播放进度，节流后落盘）
+            self.novel_view.position_changed.connect(self._on_progress_signal)
+            self.comic_view.position_changed.connect(self._on_progress_signal)
+            self.video_view.position_changed.connect(self._on_progress_signal)
 
         # ---- 换源：VideoView 切源 → 重载分集 ----
         self.video_view.source_changed.connect(self._on_source_changed)
@@ -162,14 +168,18 @@ class ReaderPage(BasePage):
         self.video_view.set_source_sid(self.video_view._current_sid)
 
     def _on_progress_signal(self, payload) -> None:
-        """记录阅读进度（换章/换集触发）。payload=(detail, title, url)。
+        """记录阅读进度（换章/换集/滚动/翻页/播放触发）。
 
-        epub 本地书：payload=(epub_path, chapter_title)，用文件路径作 key。
+        payload=(detail, title, url, position, page)：
+        - 换章/换集：3 元组（无位置）；滚动/翻页/播放：5 元组。
+        - epub 本地书：payload=(epub_path, chapter_title)，用文件路径作 key。
         """
         if self._reading_progress is None or not isinstance(payload, (tuple, list)):
             return
         detail, title = payload[0], payload[1]
         url = payload[2] if len(payload) > 2 else ""
+        position = payload[3] if len(payload) > 3 else None
+        page = payload[4] if len(payload) > 4 else None
         if detail is None:
             return
         try:
@@ -185,18 +195,46 @@ class ReaderPage(BasePage):
                 detail.content_type,
                 url,
                 title,
+                position=position,
+                page=page,
             )
         except Exception:
             pass  # 记忆失败不影响阅读
 
+    def _flush_current_progress(self) -> None:
+        """切书/退出前落盘当前作品的章内位置（换书不丢最后几秒进度）。
+
+        只冲刷当前显示视图（其他视图残留上一本书的 _detail，会存错书）。
+        """
+        if self._reading_progress is None or not self._current_book_url:
+            return
+        view = self.stack.currentWidget()
+        if view in (self.novel_view, self.comic_view, self.video_view):
+            ctx = view.current_context()
+            if ctx is not None:
+                pos, page = view.position_snapshot()
+                self._on_progress_signal((*ctx, pos, page))
+
     # ------------------------------------------------------------------ #
     def open(self, source_id: str, book_url: str, content_type: str, start_chapter_url: str = "") -> None:
-        """打开一部作品。"""
+        """打开一部作品（续读：记忆的章节/位置优先于调用方传入）。"""
+        # 切书前落盘当前作品的最新位置（防换书丢失最后几秒进度）
+        self._flush_current_progress()
         try:
             source = self._manager.get(source_id)
         except Exception:
             self.title_label.setText(f"源不存在：{source_id}")
             return
+        # 续读恢复：记忆里有这本书 → 用记忆的章覆盖 start_chapter_url，并取位置
+        resume_pos, resume_page = None, None
+        if self._reading_progress is not None and book_url:
+            rec = self._reading_progress.resume(book_url)
+            if rec and rec.get("chapter_url"):
+                start_chapter_url = rec["chapter_url"]
+                resume_pos = rec.get("position")
+                resume_page = rec.get("page")
+        self._pending_position = resume_pos
+        self._pending_page = resume_page
         self._current_source_id = source_id
         self._current_source = source
         self._current_book_url = book_url
@@ -224,16 +262,28 @@ class ReaderPage(BasePage):
         self.video_view.stop_playback()
         self.title_label.setText(detail.title or "无标题")
         self.refresh_favorite_state()  # 按当前书 URL 刷新收藏按钮
-        # 按类型切视图
+        # 按类型切视图（续读位置随 load 传入，首次显示后定位到页）
+        pos, page = getattr(self, "_pending_position", None), getattr(self, "_pending_page", None)
+        self._pending_position = None
+        self._pending_page = None
         if content_type == "novel":
             self.stack.setCurrentWidget(self.novel_view)
-            self.novel_view.load(self._manager.get(self._current_source_id), detail, start_chapter_url)
+            self.novel_view.load(
+                self._manager.get(self._current_source_id), detail, start_chapter_url,
+                restore_position=pos, restore_page=page,
+            )
         elif content_type == "comic":
             self.stack.setCurrentWidget(self.comic_view)
-            self.comic_view.load(self._manager.get(self._current_source_id), detail, start_chapter_url)
+            self.comic_view.load(
+                self._manager.get(self._current_source_id), detail, start_chapter_url,
+                restore_position=pos,
+            )
         else:
             self.stack.setCurrentWidget(self.video_view)
-            self.video_view.load(self._manager.get(self._current_source_id), detail, start_chapter_url)
+            self.video_view.load(
+                self._manager.get(self._current_source_id), detail, start_chapter_url,
+                restore_position=pos,
+            )
 
     # ------------------------------------------------------------------ #
     def set_favorite_checker(self, cb) -> None:

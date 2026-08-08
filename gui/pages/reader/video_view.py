@@ -79,6 +79,7 @@ class VideoView(QWidget):
     """视频分集 + VLC 内嵌播放视图（支持多播放源换源）。"""
 
     episode_changed = Signal(object)  # (detail, 集标题, 集URL) → 进度记忆
+    position_changed = Signal(object)  # (detail, 标题, URL, 播放进度 0~1, None) 续读
     source_changed = Signal(object)  # (detail, new_sid) → ReaderPage 换源
 
     def __init__(self, content: Content, parent=None):
@@ -103,6 +104,9 @@ class VideoView(QWidget):
         self._fs_win = None  # 全屏顶层窗口
         self._cached_length = 0  # 缓存视频总时长（length_changed 更新，避免每次 get_length 阻塞）
         self._last_tick = 0.0  # time_changed 节流时间戳（长视频防信号堆积卡主线程）
+        self._last_pos_save_ts = 0.0  # 上次播放进度存盘时间戳（节流 2s 存一次）
+        self._pending_position = None  # 打开书续读播放位置（0~1），播放开始后 seek
+        self._has_played = False  # 是否真正开始过播放（未播放不落盘，防覆盖恢复进度）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -223,9 +227,11 @@ class VideoView(QWidget):
         layout.addWidget(self.play_label)
 
     # ------------------------------------------------------------------ #
-    def load(self, source, detail: Detail, start_ep_url: str = "") -> None:
+    def load(self, source, detail: Detail, start_ep_url: str = "", restore_position: float | None = None) -> None:
         self._source = source
         self._detail = detail
+        if restore_position is not None:
+            self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用），再预建播放器。
         self._stop_player()
         # 【播放加速】详情打开即预建 VLC 播放器：取流完成直接 play，
@@ -536,8 +542,15 @@ class VideoView(QWidget):
             return
         self._player.rehook()  # 确保 hwnd 已挂
         self._player.play(video, audio, title=title)
+        self._has_played = True
         self.play_btn.setText("⏸ 暂停")
         self.refresh_btn.hide()  # 成功播放 → 隐藏刷新入口
+        # 续读定位：播放开始后等缓冲就绪再 seek 到上次进度（VLC 缓冲前 set_position 无效）
+        if self._pending_position is not None:
+            pos = self._pending_position
+            self._pending_position = None
+            if pos > 0:
+                self._seek_with_retry(pos)
 
     def _on_ended(self) -> None:
         """播完自动续播下一集（缓存命中秒切）。"""
@@ -605,6 +618,10 @@ class VideoView(QWidget):
         if now - self._last_tick < 0.3:
             return
         self._last_tick = now
+        # 播放进度存盘：节流 2s 一次（视频恢复精准到秒）
+        if now - self._last_pos_save_ts >= 2.0:
+            self._last_pos_save_ts = now
+            self._emit_position()
         # 用缓存时长，不在每次回调里 get_length()（网络流该调用会阻塞）
         length = self._cached_length
         if length > 0:
@@ -620,6 +637,52 @@ class VideoView(QWidget):
             self.time_label.setText(
                 f"{_fmt_time(self._player.get_time() if self._player else 0)} / {_fmt_time(ms)}"
             )
+
+    # ------------------------------------------------------------------ #
+    def position_snapshot(self):
+        """当前播放进度：(0~1 比例, None)。未播放/未就绪返回 0。"""
+        if self._player is None:
+            return 0.0, None
+        return max(0.0, self._player.get_position()), None
+
+    def current_context(self):
+        """当前播放上下文 (detail, 集标题, 集URL)；未打开/未开始播放则 None。"""
+        if self._detail is None or not self._has_played:
+            return None  # 未真正播放不落盘，防覆盖恢复进度
+        title, url = "", ""
+        if 0 <= self._current_idx < len(self._episodes):
+            ep = self._episodes[self._current_idx]
+            title, url = ep.title, ep.url
+        else:
+            url = self._detail_url_for_play
+        return (self._detail, title, url)
+
+    def _emit_position(self) -> None:
+        if self._detail is None or not self._has_played:
+            return
+        ctx = self.current_context()
+        if ctx is None:
+            return
+        pos, _ = self.position_snapshot()
+        try:
+            self.position_changed.emit((ctx[0], ctx[1], ctx[2], pos, None))
+        except RuntimeError:
+            pass
+
+    def _seek_with_retry(self, pos: float, tries: int = 5) -> None:
+        """播放开始后等缓冲就绪再 seek 到上次进度。
+
+        VLC 缓冲完成前 set_position 无效；每 900ms 重试一次直到总时长
+        已知（最多 5 次），此时再跳转才能精准落在上次播放位置。
+        """
+        if tries <= 0 or self._player is None:
+            return
+        if self._player.get_length() > 0:
+            self._player.set_position(pos)
+        else:
+            from PySide6.QtCore import QTimer
+
+            QTimer.singleShot(900, lambda: self._seek_with_retry(pos, tries - 1))
 
     def _on_progress_pressed(self) -> None:
         self._dragging = True
@@ -639,6 +702,7 @@ class VideoView(QWidget):
         if self._player.is_playing():
             self._player.pause()
             self.play_btn.setText("▶ 播放")
+            self._emit_position()  # 暂停瞬间精确存盘当前进度
         else:
             self._player.resume()
             self.play_btn.setText("⏸ 暂停")

@@ -32,6 +32,7 @@ class NovelView(QWidget):
     """小说正文阅读视图。"""
 
     chapter_changed = Signal(object)  # 发出 (detail, chapter_title) 供续读
+    position_changed = Signal(object)  # (detail, title, url, position, page) 章内位置续读
 
     def __init__(self, content: Content, font_scale: float = 1.0, parent=None):
         super().__init__(parent)
@@ -47,6 +48,8 @@ class NovelView(QWidget):
         self._auto_prev_loading = False  # 防止向上自动翻章重复触发
         self._last_auto_nav_ts = 0.0  # 上次自动翻章时间戳（防循环：新章滚到顶部又触发翻章）
         self._prefetch_idx = -2  # 正在后台预加载的章节 idx（<0 表示空闲）
+        self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
+        self._pending_restore = None  # 打开书续读位置 (position, page)，首次显示章时定位
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -159,17 +162,32 @@ class NovelView(QWidget):
         self._apply_font()
         # 懒加载预取：滚动读到 70% → 后台预取下一章（仅预取，不自动翻章）
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_prefetch)
+        # 章内位置记忆：滚动节流存盘（精准到页）
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_position)
 
         # ---- 键盘导航 ----
         self.setFocusPolicy(Qt.StrongFocus)
 
     # ------------------------------------------------------------------ #
-    def load(self, source, detail: Detail, start_chapter_url: str = "") -> None:
-        """加载小说：设置目录 + 跳到指定章（或续读）。"""
+    def load(
+        self,
+        source,
+        detail: Detail,
+        start_chapter_url: str = "",
+        restore_position: float | None = None,
+        restore_page: int | None = None,
+    ) -> None:
+        """加载小说：设置目录 + 跳到指定章（或续读），并定位到章内位置。
+
+        restore_position：0~1 滚动比例；restore_page：翻页模式页索引（0 基）。
+        二者在首次显示章正文后应用（_display_chapter 读取 _pending_restore）。
+        """
         self._source = source
         self._detail = detail
         self._chapters = detail.chapters
         self._populate_toc()
+        if restore_position is not None or restore_page is not None:
+            self._pending_restore = (restore_position, restore_page)
 
         # 定位起始章
         idx = 0
@@ -247,6 +265,25 @@ class NovelView(QWidget):
             vbar.blockSignals(False)
         # 后台预加载下一章：翻章时命中缓存秒开，不用现场等网络
         self._prefetch_next(self._current_idx)
+        # 续读定位：首章显示后恢复到上次的章内位置（页索引/滚动比例）
+        if self._pending_restore is not None:
+            pos, page = self._pending_restore
+            self._pending_restore = None
+            if page is not None:
+                self._current_page = page
+                self._pager_show_page(page)
+            if pos is not None and pos > 0:
+                vbar = self.scroll.verticalScrollBar()
+                QTimer.singleShot(0, lambda: self._restore_scroll(pos))
+            # 强制落盘恢复后的位置（节流会吞掉恢复事件，防下次仍回顶部/第0页）
+            self._last_pos_save_ts = 0.0
+            QTimer.singleShot(0, self._emit_position)
+
+    def _restore_scroll(self, pos: float) -> None:
+        """按 0~1 比例恢复滚动位置（打开书续读）。"""
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() > 0:
+            vbar.setValue(int(pos * vbar.maximum()))
 
     def _scroll_to_bottom_silently(self) -> None:
         """无触发地滚到底（blockSignals 包住，防自动翻章循环）。"""
@@ -331,6 +368,42 @@ class NovelView(QWidget):
             return
         if value >= vbar.maximum() * 0.7:
             self._prefetch_next(self._current_idx)
+
+    # ------------------------------------------------------------------ #
+    def _on_scroll_position(self, value: int) -> None:
+        """滚动节流：距上次存盘 ≥1.5s 才落盘章内位置（避免高频写盘）。"""
+        if self._detail is None or self._current_idx < 0:
+            return
+        now = time.monotonic()
+        if now - self._last_pos_save_ts < 1.5:
+            return
+        self._last_pos_save_ts = now
+        self._emit_position()
+
+    def position_snapshot(self):
+        """当前章内位置：(滚动比例 float 或翻页页/总页 float, 页索引 int 或 None)。"""
+        if self._mode == "pager":
+            ratio = self._current_page / self._page_count if self._page_count > 0 else 0.0
+            return ratio, self._current_page
+        vbar = self.scroll.verticalScrollBar()
+        return (vbar.value() / vbar.maximum() if vbar.maximum() > 0 else 0.0), None
+
+    def current_context(self):
+        """当前阅读上下文 (detail, 章标题, 章URL)；未打开/未加载则 None。"""
+        if self._detail is None or not (0 <= self._current_idx < len(self._chapters)):
+            return None
+        ch = self._chapters[self._current_idx]
+        return (self._detail, ch.title, ch.url)
+
+    def _emit_position(self) -> None:
+        if self._detail is None or not (0 <= self._current_idx < len(self._chapters)):
+            return
+        ch = self._chapters[self._current_idx]
+        pos, page = self.position_snapshot()
+        try:
+            self.position_changed.emit((self._detail, ch.title, ch.url, pos, page))
+        except RuntimeError:
+            pass
 
     @staticmethod
     def _clamp_font(size: int) -> int:
@@ -426,6 +499,10 @@ class NovelView(QWidget):
         self.paged_label.setText(self._pages[page])
         self.paged_scroll.verticalScrollBar().setValue(0)
         self.pager_indicator.setText(f"{page + 1} / {self._page_count} 页")
+        # 翻页后节流存盘位置（精准到页）
+        if time.monotonic() - self._last_pos_save_ts >= 1.0:
+            self._last_pos_save_ts = time.monotonic()
+            self._emit_position()
         # 分页读到 70% → 预加载下一章（只下一章，防提前加载过多）
         if self._page_count > 0 and page >= self._page_count * 0.7:
             self._prefetch_next(self._current_idx)

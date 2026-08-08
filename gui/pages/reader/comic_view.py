@@ -41,6 +41,7 @@ class ComicView(QWidget):
     """漫画翻页阅读视图。"""
 
     chapter_changed = Signal(object)  # 发 (detail, chapter_title, chapter_url)
+    position_changed = Signal(object)  # (detail, title, url, position, None) 章内位置续读
 
     def __init__(self, content: Content, parent=None):
         super().__init__(parent)
@@ -61,6 +62,8 @@ class ComicView(QWidget):
         self._rendered_count = 0  # 已渲染图片数（边抓边显示增量用）
         self._rendered_header = False  # 话头 QLabel 是否已创建
         self._pending_swap = False  # 换话保留旧画面：新话首批图就绪后再清空替换
+        self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
+        self._pending_position = None  # 打开书续读位置（0~1 滚动比例），话加载后定位
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -124,6 +127,9 @@ class ComicView(QWidget):
         # 懒加载 + 读到 70% 预渲染下一话：监听滚动（不启用自动翻话，保留手动「下一话」按钮）
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_prefetch)
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_lazy)
+        # 章内位置记忆：纵向/横向滚动节流存盘（精准到页）
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_position)
+        self.scroll.horizontalScrollBar().valueChanged.connect(self._on_scroll_position)
         # Ctrl+滚轮缩放：用事件过滤器抢在 scroll area / 图片子控件之前捕获
         self.scroll.viewport().installEventFilter(self)
         self.scroll.installEventFilter(self)
@@ -131,11 +137,19 @@ class ComicView(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
 
     # ------------------------------------------------------------------ #
-    def load(self, source, detail: Detail, start_chapter_url: str = "") -> None:
+    def load(
+        self,
+        source,
+        detail: Detail,
+        start_chapter_url: str = "",
+        restore_position: float | None = None,
+    ) -> None:
         self._source = source
         self._detail = detail
         self._chapters = detail.chapters
         self._populate_toc()
+        if restore_position is not None:
+            self._pending_position = restore_position
         idx = 0
         if start_chapter_url:
             for i, ch in enumerate(detail.chapters):
@@ -225,6 +239,12 @@ class ComicView(QWidget):
             vbar.blockSignals(True)
             vbar.setValue(0)
             vbar.blockSignals(False)
+        # 续读定位：打开书恢复到上次滚动位置（重试链随懒加载高度增长逐步到位）
+        if self._pending_position is not None:
+            pos = self._pending_position
+            self._pending_position = None
+            if pos > 0:
+                self._restore_position_with_retry(pos)
         # 预加载不在加载后立即发起：等读到当前话 70% 再预渲染下一话
         # （_maybe_auto_next），避免提前占用 Playwright 资源拖慢当前话。
 
@@ -562,6 +582,59 @@ class ComicView(QWidget):
         threshold = int(vbar.maximum() * (self._rendered_count / total) * 0.85)
         if value >= threshold:
             self._render_incremental()
+
+    # ------------------------------------------------------------------ #
+    def _on_scroll_position(self, value: int) -> None:
+        """滚动节流：距上次存盘 ≥1.5s 才落盘章内位置（避免高频写盘）。"""
+        if self._detail is None or self._current_idx < 0:
+            return
+        now = time.monotonic()
+        if now - self._last_pos_save_ts < 1.5:
+            return
+        self._last_pos_save_ts = now
+        self._emit_position()
+
+    def position_snapshot(self):
+        """当前章内位置：(0~1 滚动比例, None)。画廊用纵向、横向翻页用横向。"""
+        if self._mode == "flip":
+            hbar = self.scroll.horizontalScrollBar()
+            return (hbar.value() / hbar.maximum() if hbar.maximum() > 0 else 0.0), None
+        vbar = self.scroll.verticalScrollBar()
+        return (vbar.value() / vbar.maximum() if vbar.maximum() > 0 else 0.0), None
+
+    def current_context(self):
+        """当前阅读上下文 (detail, 话标题, 话URL)；未打开/未加载则 None。"""
+        if self._detail is None or not (0 <= self._current_idx < len(self._chapters)):
+            return None
+        ch = self._chapters[self._current_idx]
+        return (self._detail, ch.title, ch.url)
+
+    def _emit_position(self) -> None:
+        if self._detail is None or not (0 <= self._current_idx < len(self._chapters)):
+            return
+        ch = self._chapters[self._current_idx]
+        pos, _ = self.position_snapshot()
+        try:
+            self.position_changed.emit((self._detail, ch.title, ch.url, pos, None))
+        except RuntimeError:
+            pass
+
+    def _restore_position_with_retry(self, pos: float, tries: int = 8) -> None:
+        """按 0~1 比例恢复滚动位置，重试链随懒加载高度增长逐步到位。
+
+        漫画懒加载：目标位置下方图片未渲染前 maximum 偏小，直接滚会停在
+        中间。每隔 500ms 重设一次（setValue 触发懒加载渲染补全），最多 8 次
+        （约 4s），图片通常已就绪，最终精准落在上次阅读的图。
+        """
+        vbar = self.scroll.verticalScrollBar()
+        hbar = self.scroll.horizontalScrollBar()
+        if self._mode == "flip":
+            if hbar.maximum() > 0:
+                hbar.setValue(int(pos * hbar.maximum()))
+        elif vbar.maximum() > 0:
+            vbar.setValue(int(pos * vbar.maximum()))
+        if tries > 1:
+            QTimer.singleShot(500, lambda: self._restore_position_with_retry(pos, tries - 1))
 
     # ------------------------------------------------------------------ #
     # Ctrl+滚轮缩放（事件过滤器，抢在子控件 wheelEvent 之前）

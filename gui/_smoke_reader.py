@@ -52,7 +52,7 @@ SRC = {
 
 
 class MockHttp(HttpClient):
-    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None):
+    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None, proxy_pool=None):
         if "1.html" in url or "2.html" in url:
             return CHAPTER_HTML
         return DETAIL_HTML
@@ -225,6 +225,29 @@ def main():
     nv._maybe_auto_next(vbar.maximum())
     assert nv._current_idx == 0, f"冷却期不应触发翻章，idx={nv._current_idx}"
     print(f"  [ok] 小说滚动模式向上翻章定位上一章末尾且时间冷却防反弹（value={vbar.value()}/{vbar.maximum()}）")
+
+    # ---- 续读记忆：重新打开恢复到上次章节 + 章内位置信号接线 ----
+    from framework.reading_progress import ReadingProgress
+    rp = ReadingProgress(base / "rp.json")
+    rp.save(
+        "demo", "http://example.com/book/1", "novel",
+        "http://example.com/book/1/2.html", "第二章", position=0.0, page=0,
+    )
+    reader2 = ReaderPage(mgr, content, reading_progress=rp)
+    reader2.open("demo", "http://example.com/book/1", "novel")  # 不带 start_chapter_url
+    _lp6 = _EL(); _T.singleShot(3000, _lp6.quit); _lp6.exec()
+    app.processEvents()
+    _lp7 = _EL(); _T.singleShot(3000, _lp7.quit); _lp7.exec()
+    app.processEvents()
+    assert reader2.novel_view._current_idx == 1, \
+        f"应恢复到上次章节（第二章），idx={reader2.novel_view._current_idx}"
+    # 位置信号接线：手动触发滚动存盘 → resume 应带位置
+    reader2.novel_view._last_pos_save_ts = 0.0
+    reader2.novel_view._emit_position()
+    rec = rp.resume("http://example.com/book/1")
+    assert rec["chapter_url"] == "http://example.com/book/1/2.html", rec
+    assert rec["position"] == 0.0, rec  # 滚动模式：位置为 0~1 比例，page 为 None
+    print("  [ok] 续读记忆：重新打开恢复第二章 + position_changed 落盘")
 
     print("\n=== 阅读器小说视图离屏测试通过 ===")
 

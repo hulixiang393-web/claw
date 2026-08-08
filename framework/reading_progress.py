@@ -68,16 +68,33 @@ class ReadingProgress:
         content_type: str,
         chapter_url: str,
         chapter_title: str,
+        position: float | None = None,
+        page: int | None = None,
     ) -> None:
-        """记录/更新一部作品的阅读进度（换章时调用）。"""
+        """记录/更新一部作品的阅读进度（换章/滚动/翻页/播放时调用）。
+
+        position：章内阅读位置——小说滚动/漫画滚动/视频播放用 0~1 比例；
+        page：小说翻页模式的页索引（0 基），非翻页模式为 None。
+        向后兼容：旧记录无这两个字段，恢复时按 None 处理（仅章级续读）。
+        """
         if not book_url:
             return
+        # 同章且本次无位置信息（章级信号先于滚动/播放落盘）：保留旧位置，
+        # 避免"打开续读的书 → 加载该章 → 章信号把存储位置刷成 None"丢失恢复点。
+        # 换到新章（chapter_url 不同）才重置为无位置（新章从顶部开始）。
+        if position is None and page is None:
+            old = self._data.get(book_url, {})
+            if old.get("chapter_url") == chapter_url:
+                position = old.get("position")
+                page = old.get("page")
         self._data[book_url] = {
             "source_id": source_id,
             "book_url": book_url,
             "content_type": content_type,
             "chapter_url": chapter_url,
             "chapter_title": chapter_title,
+            "position": position,
+            "page": page,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         self._save()
