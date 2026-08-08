@@ -66,6 +66,8 @@ class _VideoFrame(QWidget):
     def mousePressEvent(self, event):  # noqa: N802
         if event.button() == Qt.LeftButton:
             self._view._click_pending = True
+            self._view._wake_controls()  # 点击视频 → 唤出控制条（暂停后可操作）
+            self.setFocus()  # 焦点收拢 → 快捷键即时可用
             QTimer.singleShot(300, self._click_timer)
         super().mousePressEvent(event)
 
@@ -129,16 +131,21 @@ class VideoView(QWidget):
 
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
-        "快捷键\n"
+        "操作指南\n"
         "──────────────\n"
-        "空格    播放 / 暂停\n"
-        "← →     快退 / 快进 5 秒\n"
-        "↑ ↓     音量 + / -\n"
-        "M       静音切换\n"
-        "F       全屏 / 退出全屏\n"
-        "单击    播放 / 暂停\n"
-        "双击    全屏切换\n"
-        "?       显示 / 隐藏本帮助"
+        "播放中\n"
+        "  单击视频    播放 / 暂停\n"
+        "  双击视频    全屏 / 退出全屏\n"
+        "  移动鼠标    唤出控制条（3 秒无操作自动隐藏）\n"
+        "  空格        播放 / 暂停\n"
+        "  ← →         快退 / 快进 5 秒\n"
+        "  ↑ ↓         音量 + / -\n"
+        "  M           静音切换\n"
+        "  F           全屏 / 退出全屏\n"
+        "全屏时\n"
+        "  Esc         退出全屏\n"
+        "  ?           显示 / 隐藏本帮助\n"
+        "  （其余快捷键同上，控制条随鼠标移动唤出）"
     )
 
     def __init__(self, content: Content, parent=None):
@@ -231,17 +238,6 @@ class VideoView(QWidget):
         body.addLayout(right, stretch=1)
         layout.addLayout(body, stretch=1)
 
-        # 状态行（play_label 契约保留）：仅加载/错误时显示，成功后清空隐藏
-        self.play_label = QLabel("")
-        self.play_label.setWordWrap(True)
-        self.play_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.play_label.setStyleSheet(
-            "padding: 4px 8px; border: 1px solid palette(mid); border-radius: 6px;"
-            " color: palette(mid); font-size: 11px;"
-        )
-        self.play_label.hide()
-        layout.addWidget(self.play_label)
-
     def _build_overlays(self) -> None:
         """视频区覆盖层：中央播放钮 / 缓冲 spinner / 帮助浮层。"""
         frame = self._video_frame
@@ -269,6 +265,17 @@ class VideoView(QWidget):
         self.buffer_spinner.setTextVisible(False)
         self.buffer_spinner.hide()
 
+        # 状态浮层（play_label 契约保留）：仅加载/错误时显示，覆盖在视频区内
+        # —— 不占主布局，加载/错误不再引起控制条/分集列表布局跳动
+        self.play_label = QLabel(self._overlay_root)
+        self.play_label.setWordWrap(True)
+        self.play_label.setAlignment(Qt.AlignCenter)
+        self.play_label.setStyleSheet(
+            "background: rgba(0,0,0,170); color: white;"
+            " border-radius: 8px; padding: 8px 14px; font-size: 13px;"
+        )
+        self.play_label.hide()
+
         # 快捷键帮助浮层（? 键显示）
         self.help_overlay = QFrame(self._overlay_root)
         self.help_overlay.setStyleSheet(
@@ -282,11 +289,15 @@ class VideoView(QWidget):
         self.help_overlay.hide()
 
     def _icon_btn(self, text: str, tip: str, slot, width: int = 36) -> QPushButton:
-        """控制条图标按钮：覆写全局 QSS 的 8px 18px padding（窄按钮会挤掉文字）。"""
+        """控制条图标按钮：覆写全局 QSS 的 8px 18px padding（窄按钮会挤掉文字）。
+
+        点击后焦点归还视频区 → 快捷键（空格/F/M/方向键）始终可用。
+        """
         b = QPushButton(text)
         b.setFixedWidth(width)
         b.setToolTip(tip)
         b.clicked.connect(slot)
+        b.clicked.connect(self._video_frame.setFocus)
         b.setStyleSheet("padding: 0px;")
         return b
 
@@ -330,6 +341,7 @@ class VideoView(QWidget):
         self.vol_slider.setValue(80)
         self.vol_slider.setFixedWidth(80)
         self.vol_slider.valueChanged.connect(self._on_volume)
+        self.vol_slider.sliderReleased.connect(self._video_frame.setFocus)
         cb.addWidget(self.vol_slider)
 
         self.speed_combo = QComboBox()
@@ -338,6 +350,7 @@ class VideoView(QWidget):
         self.speed_combo.setFixedWidth(64)
         self.speed_combo.setToolTip("播放倍速")
         self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
+        self.speed_combo.activated.connect(lambda _: self._video_frame.setFocus())
         cb.addWidget(self.speed_combo)
 
         # 设置菜单（⚙）：画质 + 复制地址 + 刷新 + 外部播放器 + 帮助
@@ -349,12 +362,14 @@ class VideoView(QWidget):
         self._settings_menu = QMenu(self)
         self._build_settings_menu()
         self.settings_btn.setMenu(self._settings_menu)
+        self._settings_menu.aboutToHide.connect(self._video_frame.setFocus)
         cb.addWidget(self.settings_btn)
 
         self.fs_btn = QPushButton("⛶")
         self.fs_btn.setFixedWidth(32)
         self.fs_btn.setToolTip("全屏（F）")
         self.fs_btn.clicked.connect(self._toggle_fullscreen)
+        self.fs_btn.clicked.connect(self._video_frame.setFocus)
         self.fs_btn.setStyleSheet("padding: 0px;")
         cb.addWidget(self.fs_btn)
 
@@ -501,6 +516,10 @@ class VideoView(QWidget):
         self.help_overlay.adjustSize()
         self.help_overlay.move((w - self.help_overlay.width()) // 2,
                                (h - self.help_overlay.height()) // 2)
+        if self.play_label.isVisible():
+            self.play_label.adjustSize()
+            self.play_label.move((w - self.play_label.width()) // 2,
+                                 h - self.play_label.height() - 24)
 
     def _toggle_help(self) -> None:
         """? 键：显示/隐藏快捷键帮助浮层。"""
@@ -630,9 +649,11 @@ class VideoView(QWidget):
 
     # ------------------------------------------------------------------ #
     def _show_status(self, text: str) -> None:
-        """状态行显示（加载/错误提示；播放成功后自动清空）。"""
+        """状态浮层显示（加载/错误提示，覆盖在视频区内不占布局；成功后自动清空）。"""
         if text:
             self.play_label.setText(text)
+            self.play_label.adjustSize()
+            self._reposition_overlays()
             self.play_label.show()
         else:
             self.play_label.setText("")
@@ -681,6 +702,7 @@ class VideoView(QWidget):
         self._current_sid = str(sid)
         self._switching = True
         self.source_changed.emit((self._detail, str(sid)))
+        self._video_frame.setFocus()  # 换源后快捷键继续可用
 
     def _on_quality_changed(self, text: str) -> None:
         if not text or text == self._quality or self._current_idx < 0:
@@ -1010,6 +1032,7 @@ class VideoView(QWidget):
                 target=lambda: self._player.set_position(pos), daemon=True
             ).start()
         self._hide_timer.start()  # 拖动结束恢复自动隐藏计时
+        self._video_frame.setFocus()  # 焦点归还 → 方向键/空格继续可用
 
     def _on_volume(self, v: int) -> None:
         if self._player is not None:
@@ -1058,6 +1081,7 @@ class VideoView(QWidget):
             "QPushButton:hover { background: rgba(255,255,255,80); }"
         )
         fs_close.clicked.connect(self._exit_fullscreen)
+        fs_close.clicked.connect(self._video_frame.setFocus)
         tb.addWidget(fs_close)
         lay.addWidget(self._fs_titlebar)
         # 视频区 + 控制条一起进全屏：控制条带退出/进度/上下集/倍速，
