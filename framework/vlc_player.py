@@ -135,10 +135,10 @@ def shutdown_vlc() -> None:
 def _get_proxy_session():
     """模块级单例 requests.Session（本地代理转发复用连接，keep-alive 提速）。
 
-    显式挂系统代理（Clash）：app 双击启动通常无 HTTP(S)_PROXY 环境变量，
-    本地代理转发（VlcStreamProxy 救回）用 requests 拉被墙/海外 CDN 时
-    会直连失败 → 看门狗救回也失败 → VLC 播放出错。这里显式给 requests
-    指定探测到的 Clash 端口，保证救回路径稳定走代理。
+    统一直连（trust_env=False，不依赖环境变量）：是否走系统代理（Clash）
+    由 VlcStreamProxy 构造时按源探测决定（直连可达走直连，直连不通如 YouTube
+    被墙才走 Clash）——避免对 avgood 等直连可达的 CDN 强制走 Clash 反而被
+    代理出口 IP 拒绝（用户实测 avgood 强制走 Clash 后 VLC 出错）。
     """
     global _PROXY_SESSION
     if _PROXY_SESSION is None:
@@ -147,6 +147,7 @@ def _get_proxy_session():
                 import requests
 
                 _PROXY_SESSION = requests.Session()
+                _PROXY_SESSION.trust_env = False  # 直连，代理由按源探测决定
                 try:
                     from requests.adapters import HTTPAdapter
 
@@ -156,12 +157,6 @@ def _get_proxy_session():
                     _PROXY_SESSION.mount(
                         "https://", HTTPAdapter(pool_connections=16, pool_maxsize=64)
                     )
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    proxy = _detect_system_proxy()
-                    if proxy:
-                        _PROXY_SESSION.proxies = {"http": proxy, "https": proxy}
                 except Exception:  # noqa: BLE001
                     pass
     return _PROXY_SESSION
@@ -187,8 +182,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         range_h = self.headers.get("Range")
         if range_h:
             headers["Range"] = range_h
+        kw = {}
+        if t.get("use_clash"):
+            # 直连不通的源（如 YouTube 被墙）：转发时走系统代理（Clash）
+            p = _detect_system_proxy()
+            if p:
+                kw["proxies"] = {"http": p, "https": p}
         try:
-            r = _get_proxy_session().get(real, headers=headers, timeout=20, stream=True)
+            r = _get_proxy_session().get(real, headers=headers, timeout=20, stream=True, **kw)
         except Exception:  # noqa: BLE001
             self.send_response(502)
             self.end_headers()
@@ -294,12 +295,32 @@ class VlcStreamProxy:
         self._srv = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
         self._port = self._srv.server_address[1]
         self._proxy_base = f"http://127.0.0.1:{self._port}"
+        # 按源探测：直连 base 可达则走直连；直连不通（被墙/拒绝）才走系统代理
+        # （Clash）。avgood 等直连可达的 CDN 强制走 Clash 会被代理出口 IP 拒绝
+        # → VLC 出错；YouTube 直连被墙则必须走 Clash。
         self._srv.target = {
             "base": self._base,
             "headers": self._headers,
             "proxy": self._proxy_base,
+            "use_clash": not self._probe_direct(self._base, ua),
         }
         threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+
+    @staticmethod
+    def _probe_direct(base_url: str, ua: str) -> bool:
+        """直连 base 根路径是否可达（连接层成功即算可达，403/404 也算站点层可达）。"""
+        try:
+            r = _get_proxy_session().get(
+                base_url.rstrip("/") + "/",
+                headers={"User-Agent": ua},
+                timeout=3,
+                allow_redirects=False,
+                stream=True,
+            )
+            r.close()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def local(self, url: str) -> str:
         """真实 URL → 本地代理 URL。"""
@@ -395,11 +416,10 @@ class VlcPlayer(QObject):
     def play(self, video_url: str, audio_url: str = "", title: str = "") -> None:
         """播放。单流直接 set_mrl；DASH 双流用 input-slave 挂音频轨。
 
-        探测到系统代理（Clash）时**主动**走本地代理转发（requests/OpenSSL
-        拉流，VLC 播本地直连）：hanime1（VLC gnutls TLS 不兼容）、YouTube
-        （googlevideo 被墙）、B 站海外镜像等直连必卡/失败的源不再等 4s
-        看门狗救回，首播即秒开、少一次失败窗口。未探测到代理才走直连 +
-        看门狗兜底。
+        直连优先，看门狗（_start_play_watchdog）在 VLC 直连卡 Opening/Error
+        时救回为本地代理转发（_play_via_proxy，requests 拉流）。不做"主动
+        代理"：对 avgood 等直连可达的 CDN 直接播最稳（强制走 Clash 会被代理
+        出口 IP 拒绝），YouTube 等直连被墙的靠看门狗救回（按源探测走 Clash）。
         """
         if not video_url:
             self._bridge.error.emit("无播放地址")
@@ -419,11 +439,6 @@ class VlcPlayer(QObject):
             self._media = None
         self.stop()
         self._current_url = video_url
-        # 主动代理：系统代理（Clash）在 → 直接本地代理转发，绕开 libVLC 直连
-        # 的 TLS 不兼容/被墙/海外镜像不可达（VLC 播 127.0.0.1 本地直连）。
-        if _detect_system_proxy():
-            self._play_via_proxy(video_url, audio_url)
-            return
         opts = []
         if self._referer:
             opts.append("http-referrer=" + self._referer)
