@@ -256,10 +256,13 @@ class VideoView(QWidget):
         frame = self._video_frame
         self._overlay_root = QWidget(frame)
         self._overlay_root.setGeometry(frame.rect())
-        # 覆盖层自身穿透鼠标事件（点击/移动直达视频区 → 唤出控制条/单击播放），
-        # 子控件（控制条/中央按钮/浮层）照常接收交互。不要用实例属性赋值
-        # 挂事件——PySide6 里不进 Qt 虚表，事件永远不会回调（鼠标唤出失效根因）。
-        self._overlay_root.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # 覆盖层开 mouseTracking（官方语义：无按键也持续收 MouseMove）→
+        # 鼠标移动事件落在覆盖层上进入全局 eventFilter → 唤出控制条。
+        # 注意：**不能开 WA_TransparentForMouseEvents**——官方文档明确它对
+        # 子级同样禁用鼠标事件（"to the widget AND ITS CHILDREN"），会弄废
+        # 控制条按钮/中央播放键交互。也不要用实例属性赋值挂事件——
+        # PySide6 里不进 Qt 虚表永不回调（唤出失效根因之一）。
+        self._overlay_root.setMouseTracking(True)
 
         # 中央播放按钮（未播放时显示，点击播放）
         self.center_play_btn = QPushButton("▶", self._overlay_root)
@@ -1240,6 +1243,8 @@ class VideoView(QWidget):
         lay.setSpacing(0)
         # 全屏顶栏：标题 + 退出按钮（沉浸增强，随控制条自动隐藏）
         self._fs_titlebar = QWidget(fs)
+        # 顶栏开 mouseTracking：鼠标在顶栏移动 → 全局 eventFilter 唤出控制条
+        self._fs_titlebar.setMouseTracking(True)
         tb = QHBoxLayout(self._fs_titlebar)
         tb.setContentsMargins(16, 10, 16, 10)
         fs_title = QLabel(self._fs_title_text())
