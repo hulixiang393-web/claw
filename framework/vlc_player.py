@@ -619,6 +619,32 @@ class VlcPlayer(QObject):
         except Exception:  # noqa: BLE001
             pass
 
+    def toggle_mute(self) -> None:
+        """静音/取消静音切换（VLC audio_toggle_mute）。"""
+        try:
+            self._player.audio_toggle_mute()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def is_muted(self) -> bool:
+        try:
+            return bool(self._player.audio_get_mute())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def seek_relative(self, seconds: float) -> None:
+        """相对当前进度跳转 ±seconds 秒（set_position 网络流会阻塞 → 后台线程）。"""
+        try:
+            pos = self._player.get_position() or 0.0
+            length = self._player.get_length()
+            if length > 0:
+                target = max(0.0, min(1.0, pos + seconds / length))
+                threading.Thread(
+                    target=lambda: self._player.set_position(target), daemon=True
+                ).start()
+        except Exception:  # noqa: BLE001
+            pass
+
     def set_rate(self, rate: float) -> None:
         """倍速（0.5~3.0）。"""
         try:

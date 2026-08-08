@@ -1,18 +1,20 @@
 """书架（library_page.py）。
 
-本地已下载 epub + 手动收藏的聚合视图。对应 ui-library.md：
-- 书库列表：扫描 download.output_dir 的 .epub + 收藏元数据，按分组聚合
-- 类型筛选（全部/小说/漫画/视频）
-- 续读记忆：显示「读到第X章」，点击直接续读
-- 空状态
-数据源：Downloader.output_dir 扫描 + LibraryStore + ReadingProgress。
+本地已下载 + 手动收藏的聚合视图。数据全部经 ShelfService 统一 API
+（见 framework/shelf_service.py 与 refactor-shelf-player.md），
+本页不再直接操作文件/存储：
+- 本地扫描走后台线程（QThreadPool），完成信号回主线程重建（不卡 UI）
+- epub 类型检测由服务层缓存（mtime+size 失效）
+- 收藏/续读/隐藏/收藏夹均为服务层代理
+
+对应 ui-library.md：类型筛选、标签筛选、续读记忆、空状态。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -28,22 +30,36 @@ from PySide6.QtWidgets import (
 from .base_page import BasePage
 
 
-def _detect_epub_type(path: str) -> str:
-    """读 epub 判断类型：含图片的章节 → 漫画，否则小说。失败默认 epub。"""
-    try:
-        import ebooklib
-        from ebooklib import epub
+class _ScanSignals(QObject):
+    done = Signal(object)  # list[dict]（ShelfItem.to_rec）
 
-        book = epub.read_epub(path)
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-            content = item.get_content()
-            if not isinstance(content, bytes):
-                content = str(content).encode()
-            if b"<img" in content.lower():
-                return "comic"
-        return "novel"
-    except Exception:  # noqa: BLE001
-        return "epub"
+
+class _ScanTask(QRunnable):
+    """后台书架扫描：目录遍历 + 类型检测全部在 worker 线程。"""
+
+    def __init__(self, service, content_type: str, tag: str, folder: str):
+        super().__init__()
+        self.signals = _ScanSignals()
+        self._service = service
+        self._ctype = content_type
+        self._tag = tag
+        self._folder = folder
+
+    def run(self) -> None:
+        try:
+            items = self._service.list_items(
+                content_type=self._ctype, tag=self._tag, folder=self._folder
+            )
+            recs = [it.to_rec() for it in items]
+            try:
+                self.signals.done.emit(recs)
+            except RuntimeError:
+                pass
+        except Exception:  # noqa: BLE001 —— 扫描失败保持空书架，不崩溃
+            try:
+                self.signals.done.emit([])
+            except RuntimeError:
+                pass
 
 
 class _ShelfCard(QFrame):
@@ -178,15 +194,26 @@ class LibraryPage(BasePage):
         library_store=None,
         reading_progress=None,
         shelf_export_dir: str | Path = "library",
+        shelf_service=None,
         parent=None,
     ):
         super().__init__(parent)
-        self._output_dir = Path(output_dir)
-        self._store = library_store
-        self._progress = reading_progress
+        # 书架数据统一走服务层；未注入时内部自建（兼容旧构造与测试）
+        if shelf_service is not None:
+            self._shelf = shelf_service
+        else:
+            from framework.shelf_service import ShelfService
+
+            self._shelf = ShelfService(
+                output_dir=output_dir,
+                library_store=library_store,
+                reading_progress=reading_progress,
+            )
+        self._store = library_store  # 旧引用保留（无副作用）
         self._shelf_export_dir = Path(shelf_export_dir) if shelf_export_dir else Path("library")
         self._selected_folder = "全部"  # 选中收藏夹（_rebuild 刷新）
         self._selected_tag = "全部标签"  # 选中标签（_rebuild 刷新）
+        self._scan_task = None  # 后台扫描任务持有引用（防 GC，QThreadPool 陷阱）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -240,76 +267,85 @@ class LibraryPage(BasePage):
         self._rebuild()
 
     # ------------------------------------------------------------------ #
-    def _refresh_data(self) -> list[dict]:
-        """收集书库：本地 epub + 收藏，补充续读位置。"""
-        books: list[dict] = []
-        # 本地已下载内容（novel/comic → epub；video → mp4 集），排除主动隐藏的
-        hidden = self._hidden_local()
-        if self._output_dir.is_dir():
-            for sub in sorted(self._output_dir.iterdir()):
-                if not sub.is_dir():
-                    continue
-                if sub.name in hidden:
-                    continue  # 用户从书架移除的本地书不显示
-                epubs = list(sub.glob("*.epub"))
-                if epubs:
-                    path = str(epubs[0])
-                    ct = _detect_epub_type(path)
-                    rec = {
-                        "kind": "local",
-                        "title": sub.name,
-                        "path": path,
-                        "content_type": ct,
-                        "author": "",
-                    }
-                else:
-                    # 视频下载产物：{书名}/N 集 mp4 → 书架显示"共 N 集"
-                    vids = sorted(sub.glob("*.mp4"))
-                    if not vids:
-                        continue  # 非 epub 也非视频目录 → 跳过
-                    path = str(vids[0])
-                    rec = {
-                        "kind": "local",
-                        "title": sub.name,
-                        "path": path,
-                        "content_type": "video",
-                        "author": "",
-                        "episode_count": len(vids),
-                    }
-                # 续读位置（按文件路径 key）
-                if self._progress is not None:
-                    pres = self._progress.resume(path)
-                    if pres:
-                        rec["resume_title"] = pres.get("chapter_title", "")
-                books.append(rec)
-        # 收藏（在线作品元数据），按选中的收藏夹过滤
-        if self._store is not None:
-            folder_sel = getattr(self, "_selected_folder", "全部")
-            for fav in self._store.list_all():
-                if folder_sel != "全部" and (fav.get("folder") or "") != folder_sel:
-                    continue
-                rec = dict(fav)
-                rec["kind"] = "favorite"
-                if self._progress is not None:
-                    pres = self._progress.resume(fav.get("url", ""))
-                    if pres:
-                        rec["resume_title"] = pres.get("chapter_title", "")
-                books.append(rec)
-        return books
+    def _rebuild(self) -> None:
+        """重建列表：下拉刷新 + 后台扫描 → 主线程渲染。"""
+        self._clear_all()
+        self.count_label.setText("扫描中…")
+        self._sync_combos()
 
-    def _hidden_local(self) -> set:
-        """读取用户主动隐藏的本地书名单（从书架移除但保留文件）。"""
-        try:
-            hidden_file = Path(self._output_dir).parent / "data" / "hidden_local.json"
-            if hidden_file.exists():
-                import json
+        # 筛选条件快照（后台任务与 UI 时序解耦）
+        ctype = self.type_combo.currentText()
+        type_map = {"全部": "", "小说": "novel", "漫画": "comic", "视频": "video"}
+        want = type_map.get(ctype, "")
+        tag = self.tag_combo.currentText()
+        tag = "" if tag == "全部标签" else tag
+        folder = self.folder_combo.currentText()
+        # 任务快照：_render 校验当前状态是否仍匹配（防过期结果覆盖新筛选）
+        self._last_ctype = want
+        self._last_tag = tag
+        self._last_folder = folder
 
-                raw = json.loads(hidden_file.read_text(encoding="utf-8"))
-                if isinstance(raw, list):
-                    return set(str(x) for x in raw)
-        except (OSError, json.JSONDecodeError):
-            pass
-        return set()
+        task = _ScanTask(self._shelf, want, tag, folder)
+        task.signals.done.connect(self._render)
+        self._scan_task = task  # 列表持有引用防 GC（知识库经验）
+        QThreadPool.globalInstance().start(task)
+
+    def _sync_combos(self) -> None:
+        """刷新收藏夹/标签下拉（保持当前选择）。"""
+        if self._store is None:
+            return
+        cur = self.folder_combo.currentText()
+        self.folder_combo.blockSignals(True)
+        self.folder_combo.clear()
+        self.folder_combo.addItem("全部")
+        self.folder_combo.addItems(self._shelf.folders())
+        idx = self.folder_combo.findText(cur)
+        self.folder_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.folder_combo.blockSignals(False)
+        self._selected_folder = self.folder_combo.currentText()
+
+        cur_tag = self.tag_combo.currentText()
+        self.tag_combo.blockSignals(True)
+        self.tag_combo.clear()
+        self.tag_combo.addItem("全部标签")
+        self.tag_combo.addItems(self._shelf.all_tags())
+        idx = self.tag_combo.findText(cur_tag)
+        self.tag_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.tag_combo.blockSignals(False)
+        self._selected_tag = self.tag_combo.currentText()
+
+    def _render(self, books: list[dict]) -> None:
+        """主线程渲染扫描结果（按 kind 分组）。"""
+        if not self._visible_combo_state():
+            return  # 下拉状态已变化（并发场景）→ 旧结果丢弃，等新任务
+        locals_ = [b for b in books if b.get("kind") == "local"]
+        favorites = [b for b in books if b.get("kind") == "favorite"]
+
+        if not locals_ and not favorites:
+            self._add_empty()
+            self.count_label.setText("书架还空着")
+            return
+
+        self.count_label.setText(f"共 {len(locals_)} 本地 · {len(favorites)} 收藏")
+        if locals_:
+            self._add_group("本地已下载", locals_)
+        if favorites:
+            self._add_group("收藏", favorites)
+
+    def _visible_combo_state(self) -> bool:
+        """校验下拉当前状态是否与本次任务一致（防过期结果覆盖新筛选）。"""
+        ctype = self.type_combo.currentText()
+        type_map = {"全部": "", "小说": "novel", "漫画": "comic", "视频": "video"}
+        want = type_map.get(ctype, "")
+        tag = self.tag_combo.currentText()
+        tag = "" if tag == "全部标签" else tag
+        folder = self.folder_combo.currentText()
+        # 任务发起时快照（存于信号来源不可取）→ 用 _last_request 记录
+        return (
+            want == getattr(self, "_last_ctype", "")
+            and tag == getattr(self, "_last_tag", "")
+            and folder == getattr(self, "_last_folder", "")
+        )
 
     @staticmethod
     def _wipe(layout) -> None:
@@ -327,64 +363,6 @@ class LibraryPage(BasePage):
         LibraryPage._wipe(self.body)
 
     # ------------------------------------------------------------------ #
-    def _rebuild(self) -> None:
-        """重建列表（筛选后）。"""
-        self._clear_all()
-
-        # 刷新收藏夹下拉（保持当前选择）
-        if self._store is not None:
-            cur = self.folder_combo.currentText()
-            self.folder_combo.blockSignals(True)
-            self.folder_combo.clear()
-            self.folder_combo.addItem("全部")
-            self.folder_combo.addItems(self._store.list_folders())
-            idx = self.folder_combo.findText(cur)
-            self.folder_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            self.folder_combo.blockSignals(False)
-        # 记住选中夹（供 _refresh_data 筛选，避免 combo 时序差异）
-        self._selected_folder = self.folder_combo.currentText()
-
-        # 刷新标签下拉（聚合全部收藏 tags），保持当前选择
-        if self._store is not None:
-            cur_tag = self.tag_combo.currentText()
-            all_tags = set()
-            for fav in self._store.list_all():
-                for t in fav.get("tags") or []:
-                    all_tags.add(str(t))
-            self.tag_combo.blockSignals(True)
-            self.tag_combo.clear()
-            self.tag_combo.addItem("全部标签")
-            self.tag_combo.addItems(sorted(all_tags))
-            idx = self.tag_combo.findText(cur_tag)
-            self.tag_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            self.tag_combo.blockSignals(False)
-        self._selected_tag = self.tag_combo.currentText()
-
-        books = self._refresh_data()
-        type_filter = self.type_combo.currentText()
-        type_map = {"全部": "", "小说": "novel", "漫画": "comic", "视频": "video"}
-        want = type_map.get(type_filter, "")
-        if want:
-            books = [b for b in books if b.get("content_type") == want]
-        # 标签筛选（收藏记录 tags 命中）
-        if self._selected_tag and self._selected_tag != "全部标签":
-            books = [b for b in books if self._selected_tag in (b.get("tags") or [])]
-
-        locals_ = [b for b in books if b.get("kind") == "local"]
-        favorites = [b for b in books if b.get("kind") == "favorite"]
-
-        if not locals_ and not favorites:
-            self._add_empty()
-            self.count_label.setText("书架还空着")
-            return
-
-        self.count_label.setText(f"共 {len(locals_)} 本地 · {len(favorites)} 收藏")
-
-        if locals_:
-            self._add_group("本地已下载", locals_)
-        if favorites:
-            self._add_group("收藏", favorites)
-
     def _add_group(self, title: str, books: list[dict]) -> None:
         header = QLabel(title)
         header.setStyleSheet("font-size: 14px; font-weight: bold; color: palette(text);")
@@ -414,8 +392,7 @@ class LibraryPage(BasePage):
         if not ok or not name.strip():
             return
         name = name.strip()
-        if self._store is not None:
-            self._store.create_folder(name)
+        self._shelf.create_folder(name)
         idx = self.folder_combo.findText(name)
         if idx < 0:
             self.folder_combo.addItem(name)
@@ -423,22 +400,25 @@ class LibraryPage(BasePage):
         self.folder_combo.setCurrentIndex(idx)
 
     def _show_card_menu(self, rec: dict, pos) -> None:
-        """右键菜单：收藏卡 → 下载/移动到收藏夹/移除收藏/打开源详情；本地书 → 打开文件夹/删除。
+        """右键菜单：收藏卡 → 下载/移动到收藏夹/移除收藏/复制播放地址/打开源详情；
+        本地书 → 打开文件夹/删除/从书架移除。
 
-        pos 为 _ShelfCard 已转换的全局坐标，直接 exec（不再 mapToGlobal）。
+        pos 为 _ShelfCard 已转换的全局坐标，直接 exec。
         """
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
-        if rec.get("kind") == "favorite" and self._store is not None:
+        if rec.get("kind") == "favorite":
             if rec.get("url"):
-                # 在线收藏书 → 加入下载队列（小说/漫画产出 epub，视频产出 mp4）
                 menu.addAction("⬇ 下载到本地").triggered.connect(
                     lambda: self._request_download(rec)
                 )
+                menu.addAction("📋 复制播放地址").triggered.connect(
+                    lambda: self._copy_url(rec)
+                )
                 menu.addSeparator()
             sub = menu.addMenu("移动到收藏夹")
-            for f in self._store.list_folders():
+            for f in self._shelf.folders():
                 if f == rec.get("folder", ""):
                     continue
                 act = sub.addAction(f)
@@ -464,6 +444,14 @@ class LibraryPage(BasePage):
                 lambda: self._remove_local(rec)
             )
         menu.exec(pos)
+
+    def _copy_url(self, rec: dict) -> None:
+        """复制收藏条目 url 到剪贴板。"""
+        from PySide6.QtWidgets import QApplication
+
+        url = rec.get("url", "")
+        if url:
+            QApplication.clipboard().setText(url)
 
     def _request_download(self, rec: dict) -> None:
         """收藏在线书右键「下载到本地」→ 转交 App 层拉详情入下载队列。"""
@@ -520,41 +508,15 @@ class LibraryPage(BasePage):
         )
         if resp != QMessageBox.Yes:
             return
-        self._hide_local(rec)
-
-    def _hide_local(self, rec: dict) -> None:
-        """本地书隐藏：通过临时文件记录被隐藏的书名（不删文件）。"""
-        # 本地书列表来自扫描 download.output_dir，移除需持久化隐藏名单
-        hidden_file = Path(self._output_dir).parent / "data" / "hidden_local.json"
-        try:
-            hidden = []
-            if hidden_file.exists():
-                import json
-
-                hidden = json.loads(hidden_file.read_text(encoding="utf-8"))
-                if not isinstance(hidden, list):
-                    hidden = []
-            title = rec.get("title", "")
-            if title and title not in hidden:
-                hidden.append(title)
-            hidden_file.parent.mkdir(parents=True, exist_ok=True)
-            hidden_file.write_text(
-                json.dumps(hidden, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except OSError:
-            pass
+        self._shelf.hide_local(rec.get("title", ""))
         self._rebuild()
 
     def _move_favorite(self, rec: dict, folder: str) -> None:
-        if self._store is None:
-            return
-        self._store.set_folder(rec.get("url", ""), folder)
+        self._shelf.favorite_move(rec.get("url", ""), folder)
         self._rebuild()
 
     def _remove_favorite(self, rec: dict) -> None:
-        if self._store is None:
-            return
-        self._store.remove(rec.get("url", ""))
+        self._shelf.favorite_remove(rec.get("url", ""))
         self._rebuild()
 
     def _open_folder(self, rec: dict) -> None:
@@ -589,7 +551,7 @@ class LibraryPage(BasePage):
         if not path:
             return
         try:
-            out = self._store.export_backup(path)
+            out = self._shelf.export_backup(path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "导出书架", f"导出失败：{exc}")
             return
