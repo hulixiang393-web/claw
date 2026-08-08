@@ -590,6 +590,13 @@ class VideoView(QWidget):
     def _on_time_changed(self, ms: int) -> None:
         if self._dragging or not self.isVisible():
             return
+        # 播放确认后清除残留错误标签：直连瞬时失败（如 avgood TLS）会先弹
+        # 「VLC 播放出错」，看门狗 4s 后救回本地代理成功播放，但错误标签
+        # 不清除会一直挂屏误导。time_changed 代表真的在播 → 恢复地址标签。
+        if self._current_play and any(
+            kw in self.play_label.text() for kw in ("出错", "失败", "不可用")
+        ):
+            self.play_label.setText(f"播放地址（已解密）：\n{self._current_play}")
         # 节流：VLC time_changed 约 250ms 一次，长视频（如 MissAV 1-2h）时
         # 信号 queued 到主线程若每次更新 UI 会堆积卡死；限 300ms 更新一次。
         import time

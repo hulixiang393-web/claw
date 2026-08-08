@@ -76,15 +76,14 @@ def _detect_system_proxy():
 
 
 def _get_instance():
-    """模块级单例 vlc.Instance（含内嵌去标题、网络缓冲、系统代理选项）。
+    """模块级单例 vlc.Instance（内嵌去标题、网络缓冲）。
 
     加锁防竞态：App 启动预热（后台线程）与首次播放可能同时触发创建。
-    探测到系统代理（Clash）则追加 --http-proxy：libVLC 默认不读系统代理
-    （app 无 env HTTP_PROXY，Windows 系统代理也不生效），而 hanime1（VLC
-    gnutls 与该 CDN TLS 握手失败卡 Opening）与 YouTube（googlevideo 被墙）
-    都必须走代理才 Playing。显式喂 --http-proxy 让 libVLC 直连 Clash；
-    注意部分 libVLC 构建（本机 3.0.23 实测）不生效，仍走下方 VlcStreamProxy
-    watchdog 本地代理兜底（两者共存，取有效路径）。
+    注意：**不能加 --http-proxy**——VLC 会连本地代理（VlcStreamProxy 127.0.0.1）
+    都走 Clash 转发，Clash 拒绝/无法代理 localhost → 看门狗救回路径全断
+    （实测 avgood 报 `cannot connect to 127.0.0.1:7890`）。直连不通的源
+    （YouTube 被墙等）由看门狗救回为本地代理转发（VlcStreamProxy 内按源
+    探测走直连或 Clash），不再依赖 VLC 侧全局代理。
     """
     global _INSTANCE
     if _INSTANCE is None:
@@ -95,16 +94,10 @@ def _get_instance():
 
                 # --no-video-title-show：内嵌时不显示 VLC 标题条
                 # --network-caching=2000：HLS 网络流缓冲（防频繁卡顿）
-                # --http-proxy=<proxy>：VLC 直连 Clash（全局选项，本机代理
-                #   请求 127.0.0.1 多数 Clash 默认绕过 localhost，无影响）
-                opts = [
+                _INSTANCE = vlc.Instance([
                     "--no-video-title-show",
                     "--network-caching=2000",
-                ]
-                proxy = _detect_system_proxy()
-                if proxy:
-                    opts.append(f"--http-proxy={proxy}")
-                _INSTANCE = vlc.Instance(opts)
+                ])
     return _INSTANCE
 
 
