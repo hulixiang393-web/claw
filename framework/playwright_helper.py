@@ -28,7 +28,7 @@ import os
 import re
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -251,6 +251,36 @@ def _img_sort_key(url: str, fallback_idx: int) -> tuple:
     return (1, fallback_idx)
 
 
+def _drawn_key_page_num(key: str):
+    """从 drawn_pages 键提取页码整数（连续前缀判定用）。
+
+    '897144'（canvas cropped id）→ 897144；'0_000123' / '1_000456'（img 模式
+    页码 / DOM 索引）→ 123 / 456；非数字 → None（中断前缀判定）。
+    """
+    s = key.split("_", 1)[-1] if "_" in key else key
+    return int(s) if s.isdigit() else None
+
+
+def _continuous_prefix_len(sorted_items) -> int:
+    """求已收集项的连续前缀长度：sorted 键的数字部分从首个起连续 +1 则计入，
+    遇跳跃 / 非数字键停止。on_batch 增量回调用（保证回调始终是连续前缀，
+    GUI 侧 _rendered_count 去重后只渲染新增）。
+    """
+    nums = []
+    for key, _ in sorted_items:
+        n = _drawn_key_page_num(key)
+        if n is None:
+            break
+        nums.append(n)
+    if not nums:
+        return 0
+    start = nums[0]
+    for i, v in enumerate(nums):
+        if v != start + i:
+            return i
+    return len(nums)
+
+
 async def _wait_canvas_ready(page, selector: str, count: int, timeout_ms: int):
     """等待指定数量的 canvas 出现并绘制完成。
 
@@ -336,10 +366,14 @@ async def fetch_rendered_images(
     wheel_scroll: bool = False,
     img_selector: Optional[str] = None,
     img_js_path: Optional[str] = None,
+    on_batch: Optional[Callable[[List[str]], None]] = None,
 ) -> List[str]:
     """用 Playwright 渲染页面，提取内容。
 
     返回内容列表：base64 data URI / 图片 URL / 文本块，取决于 extract_mode。
+    on_batch：可选增量回调 on_batch(连续前缀列表)——滚动懒加载中边滚边把已就绪
+    的连续前缀回调出去（首图几秒内即出，后续边滚边补），GUI 可边收边渲染；
+    最终仍返回完整列表，on_batch 只是增量前置预览。
 
     参数（源配置 render_config 可覆盖全部）：
         wait_for:          渲染目标选择器（如 "canvas" / ".img"）
@@ -430,6 +464,22 @@ async def fetch_rendered_images(
                 # 滚到底后在底部深等（尾部 canvas 集中绘制），再补一轮收集。
                 drawn_pages: dict = {}  # {cropped_id: data_uri} 或 {idx: img_src}
                 if scroll_to_bottom:
+                    last_emitted_len = 0  # 已增量回调的连续前缀长度（on_batch 去重）
+
+                    def _emit_on_batch() -> None:
+                        """drawn_pages 连续前缀增长 → 增量回调（边滚边补，GUI 边收边渲染）。"""
+                        nonlocal last_emitted_len
+                        if not on_batch or not drawn_pages:
+                            return
+                        sorted_items = sorted(
+                            drawn_pages.items(),
+                            key=lambda kv: _page_sort_key(kv[0]),
+                        )
+                        prefix_len = _continuous_prefix_len(sorted_items)
+                        if prefix_len > last_emitted_len:
+                            on_batch([uri for _, uri in sorted_items[:prefix_len]])
+                            last_emitted_len = prefix_len
+
                     async def _collect_drawn() -> None:
                         if extract_mode == "img":
                             # img 模式（翻页式阅读器）：收集已加载正文图的 src。
@@ -494,14 +544,16 @@ async def fetch_rendered_images(
                         await _collect_drawn()
                         if len(drawn_pages) > prev_count:
                             no_new_pages = 0
+                            _emit_on_batch()  # 边滚边回调连续前缀
                         else:
                             no_new_pages += 1
                         # 连续 10 步无新页 → 已近末尾，提前结束滚动
                         if no_new_pages >= 10:
                             break
-                    # 到底/结束：短等尾部 canvas 集中绘制，再补一轮收集
+                    # 到底/结束：短等尾部 canvas 集中绘制，再补一轮收集 + 回调
                     await page.wait_for_timeout(2500)
                     await _collect_drawn()
+                    _emit_on_batch()
 
                 # 给 JS 绘制留时间
                 await page.wait_for_timeout(extra_delay_ms)
@@ -626,14 +678,15 @@ def fetch_rendered_images_sync(
     wheel_scroll: bool = False,
     img_selector: Optional[str] = None,
     img_js_path: Optional[str] = None,
+    on_batch: Optional[Callable[[List[str]], None]] = None,
 ) -> List[str]:
-    """同步版本的 fetch_rendered_images。"""
+    """同步版本的 fetch_rendered_images（on_batch 透传增量前缀回调）。"""
     return asyncio.run(
         fetch_rendered_images(
             url, wait_for, wait_until, timeout_ms, extra_delay_ms,
             click_selector, scroll_to_bottom, extract_mode, output_dir, proxy,
             page_container_selector, scroll_step_px, scroll_stale_rounds,
-            wheel_scroll, img_selector, img_js_path,
+            wheel_scroll, img_selector, img_js_path, on_batch,
         )
     )
 

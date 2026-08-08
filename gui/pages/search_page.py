@@ -29,6 +29,20 @@ from framework.source_manager import SourceManager
 from gui.components import WorkCard
 from .base_page import BasePage
 
+# 反爬挑战错误特征：错误文本（小写）命中任一 → 判定被站点反爬挑战拦截
+# （Cloudflare「Just a moment」Turnstile / WAF 403 / AntiScrapeError 等）。
+# 搜索结果加载失败是「一次性」无自动重试，命中时只在状态处给出明确提示。
+CHALLENGE_MARKERS = (
+    "反爬",
+    "blocked",
+    "just a moment",
+    "attention required",
+    "captcha",
+    "验证",
+    "challenge",
+    "http 403",
+)
+
 
 class _SearchSignals(QObject):
     finished = Signal(object, object, object, object)  # (source, results, err, epoch)
@@ -356,7 +370,15 @@ class SearchPage(BasePage):
         if epoch != self._search_epoch:
             return
         if err:
-            self._set_source_status(source, "failed", str(err))
+            if self._is_challenge_blocked(err):
+                # 站点反爬挑战拦截：给出明确提示（搜索是一次性，无自动重试）
+                self._set_source_status(source, "failed", "被站点反爬拦截（Cloudflare 验证）")
+                self.status_label.setText(
+                    f"{source.source_name} 被站点反爬拦截（Cloudflare 验证），"
+                    "请稍后再试或换源搜索。"
+                )
+            else:
+                self._set_source_status(source, "failed", str(err))
         else:
             self._set_source_status(source, "done")
             if source.source_id not in self._streamed:
@@ -373,6 +395,18 @@ class SearchPage(BasePage):
         self._pending_count -= 1
         if self._pending_count <= 0:
             self._on_all_done()
+
+    @staticmethod
+    def _is_challenge_blocked(err_text) -> bool:
+        """错误文本是否命中反爬挑战特征（Cloudflare 验证 / WAF 403 等）。
+
+        搜索结果加载失败是「一次性」无自动重试循环，命中时只在状态处
+        给出明确提示（不涉及重试调度）。普通网络超时/404 不含这些特征。
+        """
+        if not err_text:
+            return False
+        low = str(err_text).lower()
+        return any(marker in low for marker in CHALLENGE_MARKERS)
 
     @staticmethod
     def _needs_cover_decrypt(source) -> bool:

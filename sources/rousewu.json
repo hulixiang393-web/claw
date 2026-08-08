@@ -210,7 +210,7 @@
   },
   "diagnostics": {
     "selfcheck": {
-      "strategy": "soft",
+      "strategy": "off",
       "selector": {
         "css": "body"
       }

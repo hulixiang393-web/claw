@@ -162,6 +162,12 @@
                 "css": "a.a1 + a.a1",
                 "attr": "href"
               }
+            },
+            "parallel": {
+              "url_template": "{base}-{page}.html",
+              "first_page": 2,
+              "window": 6,
+              "max_pages": 100
             }
           }
         }

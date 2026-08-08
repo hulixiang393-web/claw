@@ -40,6 +40,20 @@ from .base_page import BasePage
 # 分类折叠栏默认显示的按钮数（其余收起，点展开显示全部）
 COLLAPSED_CATEGORY_COUNT = 6
 
+# 反爬挑战错误特征：错误文本（小写）命中任一 → 判定被站点反爬挑战拦截
+# （Cloudflare「Just a moment」Turnstile / WAF 403 / AntiScrapeError 等），
+# 用于停止对同一源的无脑自动重试（持续轰炸反而加剧 Cloudflare 拦截）。
+CHALLENGE_MARKERS = (
+    "反爬",
+    "blocked",
+    "just a moment",
+    "attention required",
+    "captcha",
+    "验证",
+    "challenge",
+    "http 403",
+)
+
 
 class DiscoverPage(BasePage):
     # 对外信号：开始阅读 → 跳阅读器 Tab（App 层接）
@@ -87,6 +101,9 @@ class DiscoverPage(BasePage):
         self._works: list = []  # 已加载作品全量（resize 自适应列宽时重排用）
         self._seen_urls: set = set()  # 已出现作品 URL（跨页去重，防分页异常重复显示）
         self._last_columns = 0
+        # 反爬挑战拦截：源级计数与停止标记（连续 ≥2 次命中挑战 → 停自动重试）
+        self._challenge_failures: dict = {}  # source_id → 连续挑战拦截失败次数
+        self._challenge_blocked_sources: set = set()  # 已因挑战拦截停止自动重试的源
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -313,6 +330,8 @@ class DiscoverPage(BasePage):
         if err:
             # 分类加载失败（网络/站点改版）→ 用作品列表入口兜底加载，
             # 避免出现"必须点一下分类才出作品"的空窗
+            if self._mark_challenge_blocked(self._current_source, err):
+                return  # 被站点挑战拦截：停止本次会话加载并提示
             disc = self._current_source.get_discovery_config()
             self._current_cat_url = (
                 disc.get("works_list_url")
@@ -446,6 +465,11 @@ class DiscoverPage(BasePage):
         self._cover_backfill_tasks = []  # 换源/切分类时清空旧回填任务引用
         self._cover_backfill_submitted = set()  # 新一轮会话可重新提交回填
         self._source_epoch += 1
+        # 换源/重选分类：解除该源挑战拦截标记，允许用户手动重新触发
+        if self._current_source is not None:
+            sid = self._current_source.source_id
+            self._challenge_blocked_sources.discard(sid)
+            self._challenge_failures.pop(sid, None)
         for p in range(1, 1 + self._preload_ahead + 1):
             self._load_next_page(page=p)
 
@@ -474,6 +498,46 @@ class DiscoverPage(BasePage):
                 w.deleteLater()
         self._work_count = 0
 
+    def _is_challenge_blocked(self, err_text) -> bool:
+        """错误文本是否命中反爬挑战特征（Cloudflare 验证 / WAF 403 等）。
+
+        只用于失败路径判定：命中任一特征即认为该请求被站点挑战拦截，
+        从而停止对同一源的无脑自动重试（避免轰炸反而加剧 Cloudflare 拦截）。
+        普通网络超时/404 等错误不含这些特征，不进入拦截判定。
+        """
+        if not err_text:
+            return False
+        low = str(err_text).lower()
+        return any(marker in low for marker in CHALLENGE_MARKERS)
+
+    def _mark_challenge_blocked(self, source, err) -> bool:
+        """连续 ≥2 次挑战拦截 → 标记该源停止自动重试（返回 True）。
+
+        首次命中只累计计数（保留一次重试观察）；连续再次命中才真正停止。
+        被标记的源在换源/重选分类（_reset_works）时解除，允许用户手动重试。
+        """
+        if source is None or not self._is_challenge_blocked(err):
+            return False
+        sid = source.source_id
+        count = self._challenge_failures.get(sid, 0) + 1
+        self._challenge_failures[sid] = count
+        if count < 2:
+            return False  # 首次命中不立即停，再重试一次确认
+        self._challenge_blocked_sources.add(sid)
+        self.status_label.setText(
+            f"{source.source_name} 被站点反爬拦截（Cloudflare 验证），"
+            "已停止自动重试。请稍后再试或换源。"
+        )
+        self.status_label.setVisible(True)
+        return True
+
+    def _is_challenge_stopped(self) -> bool:
+        """当前源是否已因挑战拦截停止自动重试（调度页面前先查）。"""
+        return (
+            self._current_source is not None
+            and self._current_source.source_id in self._challenge_blocked_sources
+        )
+
     def _load_next_page(self, page: int = -1) -> None:
         """异步加载某一页（后台线程）。page 为 -1 时自动取下一页（滚动加载用）。
 
@@ -481,6 +545,9 @@ class DiscoverPage(BasePage):
         防重复请求；_on_page_loaded 按 epoch 防旧源/旧分类结果污染。
         """
         if self._current_source is None or self._current_cat_url is None:
+            return
+        # 该源被站点反爬挑战拦截 → 本次会话停止调度任何新页面（不再轰炸）
+        if self._is_challenge_stopped():
             return
         if page < 1:
             # 滚动加载：取下一个未请求页 = 已请求最大页 + 1。
@@ -522,6 +589,9 @@ class DiscoverPage(BasePage):
         if err:
             # 单页失败不标记 _has_more=False（其他页可能成功，继续加载）
             log.warning("[discover] 第 %d 页失败：%s", page, err)
+            # 挑战拦截：连续命中即停止该源自动重试并提示；否则保持原有重试
+            if self._mark_challenge_blocked(self._current_source, err):
+                return
             self._maybe_preload()
             return
         if not works:
@@ -792,7 +862,13 @@ class DiscoverPage(BasePage):
 
     def _on_detail_loaded(self, detail, err) -> None:
         if err or detail is None:
-            self.status_label.setText(f"详情加载失败：{err}")
+            if self._is_challenge_blocked(err):
+                # 站点反爬挑战拦截（如 linovelib 个别书被 Cloudflare WAF 403 硬拦）
+                self.status_label.setText(
+                    "该作品被站点反爬拦截（Cloudflare 验证），请稍后再试或换源阅读。"
+                )
+            else:
+                self.status_label.setText(f"详情加载失败：{err}")
             return
         self.detail_drawer.show_detail(detail)
         self.status_label.setText("")

@@ -589,13 +589,36 @@ class ComicView(QWidget):
             super().wheelEvent(event)
 
     def _apply_zoom(self) -> None:
-        """按 _zoom 调整 gallery 宽度，图片宽度随动。"""
+        """按 _zoom 调整 gallery 宽度，图片宽度随动。
+
+        调整前记录当前阅读比例（滚动值/最大值），等图片重排稳定后按比例
+        恢复——否则懒加载下内容高度短暂小于视口时 scrollbar 最大值归零、
+        滚动值被强制清零，窗口 resize / Ctrl+滚轮缩放后跳回第一页。
+        """
+        ratio = self._scroll_ratio()
         base = self._current_base_width()
         target = max(200, int(base * self._zoom))
         self.gallery.setFixedWidth(target)
         # 通知每张图片按新宽度重新缩放
         self._update_zoom_indicator()
         QTimer.singleShot(0, self._relayout_gallery)
+        # 图片重排（已加载图按新宽度 _fit）约一个事件循环内完成，160ms 后恢复
+        QTimer.singleShot(160, lambda: self._restore_scroll_ratio(ratio))
+
+    def _scroll_ratio(self) -> float:
+        """当前阅读比例：滚动值 / 最大值（内容不足一屏返回 0）。"""
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() <= 0:
+            return 0.0
+        return vbar.value() / vbar.maximum()
+
+    def _restore_scroll_ratio(self, ratio: float) -> None:
+        """按阅读比例恢复滚动位置（resize/缩放后防跳回第一页）。"""
+        if ratio <= 0:
+            return
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() > 0:
+            vbar.setValue(int(ratio * vbar.maximum()))
 
     def _current_base_width(self) -> int:
         return max(300, self.scroll.viewport().width())

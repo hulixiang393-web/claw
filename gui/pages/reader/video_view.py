@@ -194,6 +194,11 @@ class VideoView(QWidget):
         self.copy_btn = QPushButton("复制地址")
         self.copy_btn.clicked.connect(self._copy)
         row2.addWidget(self.copy_btn)
+        # 刷新播放：播放失败（VLC 报错/取流失败）时显示，点击重新取流当前集重试
+        self.refresh_btn = QPushButton("🔄 刷新播放")
+        self.refresh_btn.clicked.connect(self._retry_play)
+        self.refresh_btn.setVisible(False)
+        row2.addWidget(self.refresh_btn)
         self.open_btn = QPushButton("外部播放器")
         self.open_btn.clicked.connect(self._open_external)
         row2.addWidget(self.open_btn)
@@ -323,6 +328,7 @@ class VideoView(QWidget):
         self.progress.setValue(0)
         self.time_label.setText("00:00 / 00:00")
         self.play_label.setText("请选择一集")
+        self.refresh_btn.hide()
 
     # ------------------------------------------------------------------ #
     def _populate_source_combo(self, detail: Detail) -> None:
@@ -403,6 +409,7 @@ class VideoView(QWidget):
             return
         self.play_label.setText(f"正在获取播放流：{ep.title}...")
         self._current_play = ""
+        self.refresh_btn.hide()  # 重新取流 → 隐藏旧的刷新入口
         task = _FetchStreamTask(self._content, self._source, ep.url, self._quality)
         task.signals.finished.connect(self._on_stream_loaded)
         self._stream_task = task  # 防 GC
@@ -466,6 +473,7 @@ class VideoView(QWidget):
         if err or not video:
             if self._is_current_stream(ep_url, quality):
                 self.play_label.setText(f"获取播放流失败：{err or '无播放地址'}")
+                self.refresh_btn.show()  # 取流失败 → 提供刷新重试入口
                 # 自动降级换源（多源站）
                 nxt = self._next_available_sid()
                 if nxt:
@@ -529,10 +537,12 @@ class VideoView(QWidget):
         self._player.rehook()  # 确保 hwnd 已挂
         self._player.play(video, audio, title=title)
         self.play_btn.setText("⏸ 暂停")
+        self.refresh_btn.hide()  # 成功播放 → 隐藏刷新入口
 
     def _on_ended(self) -> None:
         """播完自动续播下一集（缓存命中秒切）。"""
         self.play_btn.setText("▶ 播放")
+        self.refresh_btn.hide()
         nxt = self._current_idx + 1
         if 0 <= nxt < len(self._episodes):
             self.ep_list.setCurrentRow(nxt)
@@ -541,8 +551,41 @@ class VideoView(QWidget):
             self.play_label.setText("播放完毕")
 
     def _on_play_error(self, msg: str) -> None:
+        # VLC 可能在播放成功期间发瞬时 Error 事件（demux 警告等），画面仍在
+        # 播时不能覆盖标签（否则「VLC 播放出错」一直挂在屏幕）。只在确实没在
+        # 播时才显示错误提示。
+        if self._player is not None and self._player.is_playing():
+            return
         self.play_label.setText(f"{msg}（可复制地址用外部播放器）")
         self.play_btn.setText("▶ 播放")
+        self.refresh_btn.show()  # 播放失败 → 提供刷新重试入口
+
+    def _retry_play(self) -> None:
+        """刷新播放：清当前集取流缓存后重新取流播放（播放失败后的重试入口）。
+
+        分集源重拉当前集；无分集（season 页）重拉详情 URL。
+        """
+        self.refresh_btn.hide()
+        if self._source is None:
+            return
+        if 0 <= self._current_idx < len(self._episodes):
+            ep = self._episodes[self._current_idx]
+            key = (ep.url, self._quality)
+            self._stream_cache.pop(key, None)
+            self._play_cache.pop(ep.url, None)
+            self._current_play = ""
+            self.play_label.setText(f"正在重新获取播放流：{ep.title}...")
+            self._load_episode(self._current_idx)
+        elif self._detail_url_for_play:
+            # season 页：直接重拉详情 URL 的播放流
+            self._current_play = ""
+            self.play_label.setText("正在重新获取播放流...")
+            task = _FetchStreamTask(
+                self._content, self._source, self._detail_url_for_play, self._quality
+            )
+            task.signals.finished.connect(self._on_stream_loaded)
+            self._stream_task = task
+            QThreadPool.globalInstance().start(task)
 
     def _on_time_changed(self, ms: int) -> None:
         if self._dragging or not self.isVisible():
@@ -707,8 +750,40 @@ class VideoView(QWidget):
             QApplication.clipboard().setText(self._current_play)
 
     def _open_external(self) -> None:
-        if self._current_play:
-            webbrowser.open(self._current_play)
+        if not self._current_play:
+            return
+        # Referer 保护的 CDN 直链（如 B 站 durl）：裸 URL 在浏览器直接打开会 403
+        # （CDN 校验 Referer）。检测到「媒体域名 ≠ 源站域名 且 源配了 Referer」时，
+        # 改为打开该集页面 URL，让浏览器正常播放；否则打开原始媒体地址。
+        page_url = ""
+        if 0 <= self._current_idx < len(self._episodes):
+            page_url = self._episodes[self._current_idx].url or ""
+        elif self._detail_url_for_play:
+            page_url = self._detail_url_for_play
+        if page_url and self._media_needs_referer():
+            from urllib.parse import urljoin
+
+            webbrowser.open(urljoin(self._source.base_url, page_url))
+            return
+        webbrowser.open(self._current_play)
+
+    def _media_needs_referer(self) -> bool:
+        """媒体直链是否被 Referer 保护：源配了 Referer 且媒体域名 ≠ 源站域名。"""
+        try:
+            from urllib.parse import urlparse
+
+            hdrs = (
+                self._source.request_headers()
+                if callable(getattr(self._source, "request_headers", None))
+                else {}
+            )
+            if not (hdrs or {}).get("Referer"):
+                return False
+            media_host = urlparse(self._current_play).netloc.lower()
+            src_host = urlparse(self._source.base_url).netloc.lower()
+            return media_host != src_host
+        except Exception:  # noqa: BLE001
+            return False
 
 
 def _fmt_time(ms: int) -> str:

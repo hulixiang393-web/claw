@@ -27,6 +27,8 @@ _INSTANCE_LOCK = threading.Lock()  # 预热/首播可能并发创建，防竞态
 # 避免每段一次 TCP+TLS 握手（本地代理播放加速关键）。
 _PROXY_SESSION = None
 _PROXY_SESSION_LOCK = threading.Lock()
+# 系统代理（Clash）探测结果缓存：命中后复用，避免每次播放都重复 socket 探测
+_DETECTED_PROXY = None
 
 
 def _ensure_vlc_on_path() -> None:
@@ -41,10 +43,48 @@ def _ensure_vlc_on_path() -> None:
             break
 
 
+def _detect_system_proxy():
+    """探测系统代理（Clash 等）：环境变量优先，其次常见 Clash 默认端口。
+
+    环境变量读 HTTPS_PROXY/https_proxy/HTTP_PROXY/http_proxy；未配置时
+    快速 socket 探测 7890/7897/10809 常见 Clash 端口，取第一个开放的。
+    探测不到返回 None。探测结果命中后缓存（_DETECTED_PROXY），避免每次
+    播放都重复 socket 探测；未命中不缓存（Clash 可能在 app 启动后开启）。
+    """
+    global _DETECTED_PROXY
+    if _DETECTED_PROXY is not None:
+        return _DETECTED_PROXY
+    result = None
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        val = os.environ.get(var)
+        if val:
+            result = val
+            break
+    if result is None:
+        import socket
+
+        for port in (7890, 7897, 10809):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                    result = f"http://127.0.0.1:{port}"
+                    break
+            except OSError:
+                continue
+    if result:
+        _DETECTED_PROXY = result
+    return result
+
+
 def _get_instance():
-    """模块级单例 vlc.Instance（含内嵌去标题、网络缓冲选项）。
+    """模块级单例 vlc.Instance（含内嵌去标题、网络缓冲、系统代理选项）。
 
     加锁防竞态：App 启动预热（后台线程）与首次播放可能同时触发创建。
+    探测到系统代理（Clash）则追加 --http-proxy：libVLC 默认不读系统代理
+    （app 无 env HTTP_PROXY，Windows 系统代理也不生效），而 hanime1（VLC
+    gnutls 与该 CDN TLS 握手失败卡 Opening）与 YouTube（googlevideo 被墙）
+    都必须走代理才 Playing。显式喂 --http-proxy 让 libVLC 直连 Clash；
+    注意部分 libVLC 构建（本机 3.0.23 实测）不生效，仍走下方 VlcStreamProxy
+    watchdog 本地代理兜底（两者共存，取有效路径）。
     """
     global _INSTANCE
     if _INSTANCE is None:
@@ -55,10 +95,16 @@ def _get_instance():
 
                 # --no-video-title-show：内嵌时不显示 VLC 标题条
                 # --network-caching=2000：HLS 网络流缓冲（防频繁卡顿）
-                _INSTANCE = vlc.Instance([
+                # --http-proxy=<proxy>：VLC 直连 Clash（全局选项，本机代理
+                #   请求 127.0.0.1 多数 Clash 默认绕过 localhost，无影响）
+                opts = [
                     "--no-video-title-show",
                     "--network-caching=2000",
-                ])
+                ]
+                proxy = _detect_system_proxy()
+                if proxy:
+                    opts.append(f"--http-proxy={proxy}")
+                _INSTANCE = vlc.Instance(opts)
     return _INSTANCE
 
 
@@ -87,7 +133,13 @@ def shutdown_vlc() -> None:
 
 
 def _get_proxy_session():
-    """模块级单例 requests.Session（本地代理转发复用连接，keep-alive 提速）。"""
+    """模块级单例 requests.Session（本地代理转发复用连接，keep-alive 提速）。
+
+    显式挂系统代理（Clash）：app 双击启动通常无 HTTP(S)_PROXY 环境变量，
+    本地代理转发（VlcStreamProxy 救回）用 requests 拉被墙/海外 CDN 时
+    会直连失败 → 看门狗救回也失败 → VLC 播放出错。这里显式给 requests
+    指定探测到的 Clash 端口，保证救回路径稳定走代理。
+    """
     global _PROXY_SESSION
     if _PROXY_SESSION is None:
         with _PROXY_SESSION_LOCK:
@@ -104,6 +156,12 @@ def _get_proxy_session():
                     _PROXY_SESSION.mount(
                         "https://", HTTPAdapter(pool_connections=16, pool_maxsize=64)
                     )
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    proxy = _detect_system_proxy()
+                    if proxy:
+                        _PROXY_SESSION.proxies = {"http": proxy, "https": proxy}
                 except Exception:  # noqa: BLE001
                     pass
     return _PROXY_SESSION
@@ -335,7 +393,14 @@ class VlcPlayer(QObject):
     # 播放控制
     # ------------------------------------------------------------------ #
     def play(self, video_url: str, audio_url: str = "", title: str = "") -> None:
-        """播放。单流直接 set_mrl；DASH 双流用 input-slave 挂音频轨。"""
+        """播放。单流直接 set_mrl；DASH 双流用 input-slave 挂音频轨。
+
+        探测到系统代理（Clash）时**主动**走本地代理转发（requests/OpenSSL
+        拉流，VLC 播本地直连）：hanime1（VLC gnutls TLS 不兼容）、YouTube
+        （googlevideo 被墙）、B 站海外镜像等直连必卡/失败的源不再等 4s
+        看门狗救回，首播即秒开、少一次失败窗口。未探测到代理才走直连 +
+        看门狗兜底。
+        """
         if not video_url:
             self._bridge.error.emit("无播放地址")
             return
@@ -354,6 +419,11 @@ class VlcPlayer(QObject):
             self._media = None
         self.stop()
         self._current_url = video_url
+        # 主动代理：系统代理（Clash）在 → 直接本地代理转发，绕开 libVLC 直连
+        # 的 TLS 不兼容/被墙/海外镜像不可达（VLC 播 127.0.0.1 本地直连）。
+        if _detect_system_proxy():
+            self._play_via_proxy(video_url, audio_url)
+            return
         opts = []
         if self._referer:
             opts.append("http-referrer=" + self._referer)
@@ -411,8 +481,13 @@ class VlcPlayer(QObject):
 
         threading.Thread(target=_watch, daemon=True).start()
 
-    def _retry_with_proxy(self, url: str, audio_url: str) -> None:
-        """用本地代理重播（requests/OpenSSL 访问，VLC 播本地直连）。"""
+    def _play_via_proxy(self, url: str, audio_url: str) -> None:
+        """用本地代理播放：requests/OpenSSL 拉流，VLC 播本地直连。
+
+        代理用 VlcStreamProxy 转发（带源 Referer/UA；m3u8 分片重写相对路径；
+        DASH 音频也走代理），绕开 libVLC 直连 CDN 的 gnutls TLS 不兼容 /
+        被墙 / 海外镜像不可达。play() 主动路径与看门狗救回共用。
+        """
         proxy = None
         try:
             from urllib.parse import urlsplit
@@ -450,6 +525,10 @@ class VlcPlayer(QObject):
                 except Exception:  # noqa: BLE001
                     pass
             self._proxy = None
+
+    def _retry_with_proxy(self, url: str, audio_url: str) -> None:
+        """看门狗救回路径：直连卡 Opening/Error 后用本地代理重播。"""
+        self._play_via_proxy(url, audio_url)
 
     def pause(self) -> None:
         try:

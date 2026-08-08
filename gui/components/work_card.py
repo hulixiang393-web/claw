@@ -23,6 +23,8 @@ from .cover_loader import CoverLoader
 COVER_HEIGHT = 180
 # 标题区高度：限 2 行。13px 字 2 行约需 40px，38 会裁掉第 2 行下半截（标题被遮住）
 TITLE_HEIGHT = 44
+# 封面与标题之间的留白：图文分层的视觉间隔，让标题不再贴着封面
+COVER_TITLE_GAP = 8
 # 整卡固定高度：封面 180 + 标题 2 行 + 作者 + 来源 + 边距/间距
 CARD_HEIGHT = 292
 
@@ -66,6 +68,8 @@ class WorkCard(QFrame):
             # 放封面右上角，避免挡住封面
             cover_row.addWidget(self._checkbox, alignment=Qt.AlignTop | Qt.AlignRight)
         layout.addLayout(cover_row)
+        # 封面与标题间的留白：拉大图文间隔，标题不再贴着封面
+        layout.addSpacing(COVER_TITLE_GAP)
 
         # 标题：限 2 行，超出截断；固定高度保证卡片等高
         title = QLabel(work.title or "无标题")

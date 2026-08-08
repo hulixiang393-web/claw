@@ -179,9 +179,12 @@ class Content:
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         return utils.abs_url(source.base_url, url)
 
-    def _get(self, source: SourceConfig, url: str) -> str:
+    def _get(self, source: SourceConfig, url: str, http=None) -> str:
+        """抓取页面 HTML。http 可传独立 HttpClient（并行翻页时避免共享
+        self._http 的 requests.Session 跨线程竞态）；缺省用共享实例。"""
+        client = http or self._http
         abs_url = self._abs_url(source, url)
-        return self._http.get_text(
+        return client.get_text(
             abs_url,
             headers=self._headers(source),
             timeout=self._timeout(source),
@@ -995,6 +998,8 @@ class Content:
                     wheel_scroll=bool(rc.get("wheel_scroll", False)),
                     img_selector=rc.get("img_selector"),
                     img_js_path=rc.get("img_js_path"),
+                    # 边滚边分批回调：连续前缀提前给 GUI 渲染（首图秒出，后续边滚边补）
+                    on_batch=(lambda prefix: on_page(list(prefix))) if on_page else None,
                 )
                 if on_page and imgs:
                     on_page(list(imgs))
@@ -1087,13 +1092,17 @@ class Content:
     def _fetch_comic_page_imgs(
         self, source: SourceConfig, list_cfg: dict, chapter_url: str
     ) -> List[str]:
-        """从单话 HTML 提取全部图片 URL，支持图片列表翻页。
+        """从单话 HTML 提取全部图片 URL，支持图片列表翻页（含并行翻页加速）。
 
         对应 endpoints.content.page：
         - list.root_selector / list.fields.url   单图项与图片 URL 提取
         - list.paginator.next_link.selector     （可选）「下一页」链接，跨页拼全
           多页图片站（如每页固定 N 张、30P 需翻 3 页）。循环抓取直到：
             下一页链接缺失 / 已访问过（URL 去重防死循环）/ 达 max_pages 上限。
+        - list.paginator.parallel               （可选）并行翻页：站点分页 URL
+          可预测（如 {base}-2.html、{base}-3.html…）时按 wave 并发抓取，把每页
+          interval_ms 礼貌延迟从顺序累积压成每 wave 并行平摊。模板验证失败 /
+          并行异常 → 回退下方顺序循环（保证正确性）。
         - 图片 URL 用 data-src / data-original 懒加载属性时框架自动兜底
         """
         root_sel = list_cfg.get("root_selector")
@@ -1111,13 +1120,10 @@ class Content:
         urls: List[str] = []
         seen_url: set = set()   # 已访问的页面 URL（防死循环）
         seen_img: set = set()   # 已收集的图片 URL（跨页去重）
-        page_url = chapter_url
 
-        for _ in range(max_pages if max_pages else 1000):
-            if page_url in seen_url:
-                break
-            seen_url.add(page_url)
-            html = self._get(source, page_url)
+        # 共用小函数：抓单页 → (本页图片列表, 下一页链接)。顺序与并行翻页都复用。
+        def _fetch_page(page_url: str, http=None) -> tuple:
+            html = self._get(source, page_url, http=http)
             doc = self._parser.parse(html)
             # 在 root_selector 限定范围内提取图片 URL（复用 parse_items：
             # 每个 root 项内按 fields.url 取属性，自动 data-src 懒加载兜底）。
@@ -1127,15 +1133,115 @@ class Content:
             )
             page_imgs = [it.get("url") or "" for it in items]
             page_imgs = [u for u in page_imgs if u]
+            nxt = ""
+            if next_sel:
+                nxt = self._parser.extract_first(doc, next_sel, source.base_url) or ""
+            return page_imgs, nxt
+
+        def _add_imgs(page_imgs: List[str]) -> None:
+            """广告过滤 + 去重后并入最终列表（顺序/并行共用）。"""
             for u in self._filter_ad_images(page_imgs, source):
                 if u not in seen_img:
                     seen_img.add(u)
                     urls.append(u)
-            # 无下一页配置 → 单页即止
-            if not next_sel:
+
+        # 并行翻页（config-driven）：URL 可预测时按 wave 并发抓取，提速明显
+        # （acgxmh 实测顺序 55 页 ≈71s → 并行 ~20s，window 过大触发站点 429
+        # 限流丢页，window=6 为完整且最快档）。
+        parallel = paginator.get("parallel") or {}
+        if parallel and next_sel:
+            try:
+                # base：章节 URL 去 query 再 rsplit('.',1)[0] 去扩展名
+                base = chapter_url.split("?", 1)[0].rsplit(".", 1)[0]
+                tpl = str(parallel.get("url_template") or "")
+                first_page = int(parallel.get("first_page") or 2)
+                window = int(parallel.get("window") or 8)
+                p_max = int(parallel.get("max_pages") or 100)
+                if not base or not tpl or first_page < 2 or window < 1:
+                    raise ValueError("parallel 配置无效")
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def pred(n: int) -> str:
+                    """第 n 页 URL（第 1 页即章节 URL 本身，从 first_page 起预测）。"""
+                    return self._abs_url(source, tpl.format(base=base, page=n))
+
+                # 第 1 页：抓章节 URL，收集图片 + 取 next 链接 nxt1
+                p1_imgs, nxt1 = _fetch_page(chapter_url)
+                # 模板验证（安全网）：nxt1 必须等于 pred(2)，否则模板错 → 回退顺序
+                if not nxt1 or self._abs_url(source, nxt1) != pred(2):
+                    raise ValueError("parallel URL 模板与站点分页不符")
+                _add_imgs(p1_imgs)
+
+                def _fetch_page_retry(p: int) -> tuple:
+                    """抓第 p 页；独立 HttpClient（requests.Session 非线程安全，
+                    每页一个实例避免并发竞态），失败/图片为空重试 1 次，仍失败记空
+                    （保守：当页跳过，交给 wave 末页 next 判定是否继续）。"""
+                    page_http = self._http.__class__(
+                        sleeper=getattr(self._http, "_sleeper", None),
+                        defaults=self._http.defaults,
+                    )
+                    try:
+                        last = ([], "")
+                        for attempt in range(2):
+                            try:
+                                imgs, nxt = _fetch_page(pred(p), http=page_http)
+                            except Exception:  # noqa: BLE001
+                                last = ([], "")
+                                continue
+                            last = (imgs, nxt)
+                            if imgs:
+                                break  # 拿到图即成功
+                            # 图片为空：可能是瞬时失败（并发下偶发丢响应），再试 1 次
+                        return last
+                    finally:
+                        try:
+                            page_http.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                n = first_page
+                while n <= p_max:
+                    wave = list(range(n, min(n + window, p_max + 1)))
+                    # 每 wave 并发抓取（max_workers=min(window, 页数)）
+                    results: dict = {}
+                    with ThreadPoolExecutor(
+                        max_workers=min(window, len(wave))
+                    ) as pool:
+                        futs = {pool.submit(_fetch_page_retry, p): p for p in wave}
+                        for fut in as_completed(futs):
+                            results[futs[fut]] = fut.result()
+                    # 图片按页码顺序收集，与第 1 页拼接
+                    for p in wave:
+                        _add_imgs(results.get(p, ([], ""))[0])
+                    # 停止条件：wave 最后一页的 next 自环（== 自身）/为空/
+                    # ≠ pred(最后一页+1) → 章节结束停止；否则继续下一 wave。
+                    last_p = wave[-1]
+                    last_nxt = results.get(last_p, ([], ""))[1]
+                    if (
+                        not last_nxt
+                        or self._abs_url(source, last_nxt) == pred(last_p)
+                        or self._abs_url(source, last_nxt) != pred(last_p + 1)
+                    ):
+                        break
+                    n = last_p + 1
+                return urls
+            except Exception as exc:  # noqa: BLE001
+                # 模板验证失败 / 并行异常 → 清空并行阶段结果，回退顺序循环（保证正确性）
+                log.warning("[%s] 并行翻页回退顺序：%s", source.source_id, exc)
+                urls = []
+                seen_url = set()
+                seen_img = set()
+
+        # 顺序循环（fallback，未配置 parallel / 并行回退时走这里）
+        page_url = chapter_url
+        for _ in range(max_pages if max_pages else 1000):
+            if page_url in seen_url:
                 break
-            nxt = self._parser.extract_first(doc, next_sel, source.base_url)
-            if not nxt:
+            seen_url.add(page_url)
+            page_imgs, nxt = _fetch_page(page_url)
+            _add_imgs(page_imgs)
+            # 无下一页配置 → 单页即止
+            if not next_sel or not nxt:
                 break
             page_url = nxt
 
