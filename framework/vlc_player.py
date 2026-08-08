@@ -76,7 +76,7 @@ def _detect_system_proxy():
 
 
 def _get_instance():
-    """模块级单例 vlc.Instance（内嵌去标题、网络缓冲）。
+    """模块级单例 vlc.Instance（内嵌去标题、网络缓冲、硬件解码）。
 
     加锁防竞态：App 启动预热（后台线程）与首次播放可能同时触发创建。
     注意：**不能加 --http-proxy**——VLC 会连本地代理（VlcStreamProxy 127.0.0.1）
@@ -84,6 +84,14 @@ def _get_instance():
     （实测 avgood 报 `cannot connect to 127.0.0.1:7890`）。直连不通的源
     （YouTube 被墙等）由看门狗救回为本地代理转发（VlcStreamProxy 内按源
     探测走直连或 Clash），不再依赖 VLC 侧全局代理。
+
+    播放流畅性参数（通用优化，见 framework/media_tuner.py 的 media 级调优）：
+    - --avcodec-hw=any：硬件解码。1080p/4K 软解是播放卡顿首要原因
+      （无可用硬件/驱动异常时 VLC 自动回退软解，不报错）
+    - --network-caching=2000：HLS 网络流缓冲兜底（media 级按类型覆盖）
+    - --live-caching=3000：直播流缓冲（防直播抖动）
+    - --no-sub-autodetect-file：网络流上禁用字幕文件自动探测
+      （探测会发起额外文件请求，慢流上可能拖慢启动/触发卡顿）
     """
     global _INSTANCE
     if _INSTANCE is None:
@@ -92,11 +100,12 @@ def _get_instance():
                 _ensure_vlc_on_path()
                 import vlc
 
-                # --no-video-title-show：内嵌时不显示 VLC 标题条
-                # --network-caching=2000：HLS 网络流缓冲（防频繁卡顿）
                 _INSTANCE = vlc.Instance([
                     "--no-video-title-show",
+                    "--avcodec-hw=any",
                     "--network-caching=2000",
+                    "--live-caching=3000",
+                    "--no-sub-autodetect-file",
                 ])
     return _INSTANCE
 

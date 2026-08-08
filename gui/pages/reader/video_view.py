@@ -49,6 +49,8 @@ class _VideoFrame(QWidget):
         self._view = view
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setStyleSheet("background: #000;")
+        # 无按键移动也触发 mouseMoveEvent → 控制条隐藏后滑动即唤出
+        self.setMouseTracking(True)
 
     def showEvent(self, event):  # noqa: N802
         super().showEvent(event)
@@ -128,6 +130,7 @@ class VideoView(QWidget):
     episode_changed = Signal(object)  # (detail, 集标题, 集URL) → 进度记忆
     position_changed = Signal(object)  # (detail, 标题, URL, 播放进度 0~1, None) 续读
     source_changed = Signal(object)  # (detail, new_sid) → ReaderPage 换源
+    download_requested = Signal(object)  # (source_id, detail.url, content_type) → 下载当前作品
 
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
@@ -248,6 +251,10 @@ class VideoView(QWidget):
         self._overlay_root = QWidget(frame)
         self._overlay_root.setGeometry(frame.rect())
         self._overlay_root.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        # 覆盖层盖满视频区：鼠标在其上移动/进入也唤出控制条（转发到视图）
+        self._overlay_root.setMouseTracking(True)
+        self._overlay_root.mouseMoveEvent = lambda e: self._wake_controls()
+        self._overlay_root.enterEvent = lambda e: self._wake_controls()
 
         # 中央播放按钮（未播放时显示，点击播放）
         self.center_play_btn = QPushButton("▶", self._overlay_root)
@@ -376,6 +383,19 @@ class VideoView(QWidget):
         self.fs_btn.clicked.connect(self._video_frame.setFocus)
         self.fs_btn.setStyleSheet("padding: 0px;")
         cb.addWidget(self.fs_btn)
+
+        # 下载当前作品（⏬）：与顶部「下载」同链路，播放器内即可触发
+        self.dl_btn = self._icon_btn("⏬", "下载当前作品", self._on_download_clicked, width=32)
+        cb.addWidget(self.dl_btn)
+
+    def _on_download_clicked(self) -> None:
+        """播放器内「⏬ 下载」→ 转发 App 层下载当前作品（与顶部按钮同链路）。"""
+        if self._source is None or self._detail is None:
+            return
+        sid = getattr(self._source, "source_id", "") or self._current_sid
+        self.download_requested.emit(
+            (sid, self._detail.url, getattr(self._detail, "content_type", ""))
+        )
 
     def _build_settings_menu(self) -> None:
         menu = self._settings_menu
@@ -1157,6 +1177,9 @@ class VideoView(QWidget):
         fs.setAttribute(Qt.WA_NativeWindow, True)
         fs.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         fs.setStyleSheet("background: #000;")
+        # 全屏下鼠标移动唤出控制条（视频区外区域也触发）
+        fs.setMouseTracking(True)
+        fs.mouseMoveEvent = lambda e: self._wake_controls()
         lay = QVBoxLayout(fs)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)

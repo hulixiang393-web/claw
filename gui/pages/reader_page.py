@@ -144,6 +144,8 @@ class ReaderPage(BasePage):
 
         # ---- 换源：VideoView 切源 → 重载分集 ----
         self.video_view.source_changed.connect(self._on_source_changed)
+        # ---- 播放器内下载：转发 App 层下载链路（与顶部「下载」一致）----
+        self.video_view.download_requested.connect(self.download_requested)
 
     def _on_source_changed(self, payload) -> None:
         """换源：重新抓取该源详情 + 刷新 VideoView 分集。"""
