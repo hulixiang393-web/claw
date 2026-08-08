@@ -40,6 +40,8 @@ class _VideoFrame(QWidget):
         super().showEvent(event)
         if self._view._player is not None:
             self._view._player.rehook()
+        # 取流完成时用户在别的 Tab → 暂存的播放，回到阅读页补播
+        self._view._flush_pending_play()
 
 
 class _VideoSignals(QObject):
@@ -107,6 +109,7 @@ class VideoView(QWidget):
         self._last_pos_save_ts = 0.0  # 上次播放进度存盘时间戳（节流 2s 存一次）
         self._pending_position = None  # 打开书续读播放位置（0~1），播放开始后 seek
         self._has_played = False  # 是否真正开始过播放（未播放不落盘，防覆盖恢复进度）
+        self._pending_play = None  # 取流完成但视图不可见 → 暂存 (video, audio, title)，显示后再播
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -230,6 +233,7 @@ class VideoView(QWidget):
     def load(self, source, detail: Detail, start_ep_url: str = "", restore_position: float | None = None) -> None:
         self._source = source
         self._detail = detail
+        self._pending_play = None  # 换书清掉旧暂存播放
         if restore_position is not None:
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用），再预建播放器。
@@ -496,7 +500,7 @@ class VideoView(QWidget):
         title = ""
         if 0 <= self._current_idx < len(self._episodes):
             title = self._episodes[self._current_idx].title or ""
-        self._play(video, audio, title)
+        self._request_play(video, audio, title)
         self._prefetch_next(self._current_idx)
 
     # ------------------------------------------------------------------ #
@@ -526,6 +530,25 @@ class VideoView(QWidget):
             self._player.length_changed.connect(self._on_length_changed)
         except Exception:  # noqa: BLE001 —— VLC 不可用时降级：播放时再试并报错
             self._player = None
+
+    def _request_play(self, video: str, audio: str, title: str) -> None:
+        """请求播放：视图可见立即播；不可见（用户在别的 Tab）暂存，显示后再播。
+
+        取流完成时若用户已切走（视频页隐藏），主线程直接 _play 会在隐藏控件上
+        做 VLC/winId 等操作 → 切页卡死。暂存后由 _VideoFrame.showEvent 在回到
+        阅读页时补播（同时避免在别的页面后台出声）。
+        """
+        if self.isVisible():
+            self._play(video, audio, title)
+        else:
+            self._pending_play = (video, audio, title)
+
+    def _flush_pending_play(self) -> None:
+        """视图重新可见时补播暂存的取流结果。"""
+        if self._pending_play is not None:
+            video, audio, title = self._pending_play
+            self._pending_play = None
+            self._play(video, audio, title)
 
     def _play(self, video: str, audio: str, title: str) -> None:
         """创建/复用 VLC 播放器并播放。
@@ -610,6 +633,7 @@ class VideoView(QWidget):
             kw in self.play_label.text() for kw in ("出错", "失败", "不可用")
         ):
             self.play_label.setText(f"播放地址（已解密）：\n{self._current_play}")
+            self.refresh_btn.hide()  # 救回成功已开播 → 隐藏残留的刷新入口
         # 节流：VLC time_changed 约 250ms 一次，长视频（如 MissAV 1-2h）时
         # 信号 queued 到主线程若每次更新 UI 会堆积卡死；限 300ms 更新一次。
         import time
@@ -690,7 +714,14 @@ class VideoView(QWidget):
     def _on_progress_released(self) -> None:
         self._dragging = False
         if self._player is not None:
-            self._player.set_position(self.progress.value() / 1000.0)
+            pos = self.progress.value() / 1000.0
+            # VLC set_position 在网络流上会同步阻塞（等新位置缓冲）→ 主线程卡死。
+            # 挪到后台线程执行，拖拽进度条不冻结 UI。
+            import threading
+
+            threading.Thread(
+                target=lambda: self._player.set_position(pos), daemon=True
+            ).start()
 
     def _on_volume(self, v: int) -> None:
         if self._player is not None:

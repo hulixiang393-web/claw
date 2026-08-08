@@ -158,6 +158,17 @@
     "content": {
       "episode": {
         "single_chapter": true,
+        "series": {
+          "enabled": true,
+          "base_from_title": [
+            "(.+?)\\s*第(\\d+)[話话].*",
+            "(.+?)\\s*第(\\d+)[集話话].*",
+            "(.+?)\\s*(?:前編|後編).*",
+            "(.+?)\\s*(?:上篇|下篇|上卷|下卷).*"
+          ],
+          "part_map": {"前編": 1, "後編": 2, "上篇": 1, "下篇": 2, "上卷": 1, "下卷": 2},
+          "min_parts": 2
+        },
         "play_url": {
           "selector": {
             "fallback": [

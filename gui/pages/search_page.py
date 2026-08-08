@@ -144,6 +144,7 @@ class SearchPage(BasePage):
         self._cover_decrypt_submitted: set = set()  # 已提交封面解密的结果 url（防逐页/done 重复触发）
         self._streamed: set = set()  # 已边抓边渲染的源（finished 不重复追加）
         self._search_epoch = 0  # 搜索会话标记：换源/换关键词自增，过期任务结果丢弃
+        self._results_display = None  # 合并模式渲染列表；None 时用 _results（新搜索须重置）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -260,13 +261,16 @@ class SearchPage(BasePage):
         self.status_label.setText("搜索中...")
         self._clear_grid()
         self._results = []
+        # 重置渲染列表：前一次合并搜索设过 _results_display，换源/换关键词再搜时
+        # 不重置会继续渲染旧内容（_current_display 优先读它）→ 一直显示多源旧结果。
+        self._results_display = None
         self._shown_count = 0
         self._cover_decrypt_submitted = set()
         self._selected = {}
         self.batch_bar.setVisible(False)
         self.select_all_check.setChecked(False)
 
-        # 选择目标源
+        # 选择目标源：源范围下拉选中具体源则只搜该源，否则全部源+类型筛选
         selected_type = self.type_combo.currentData()
         selected_src = self.src_combo.currentData()
         if selected_src:

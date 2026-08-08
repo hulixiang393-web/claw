@@ -291,11 +291,114 @@ class Content:
         detail.chapters = self._fetch_chapters(
             source, doc, book_title=detail.title, detail_url=url
         )
+        # 视频系列聚合：内容配置 content.episode.series.enabled 且标题含系列标记
+        # （如「第N話」）→ 搜同系列基底，把其他分部并入分集列表（hanime1 类站
+        # 每个分部是独立视频，站内无分集列表，靠标题系列名聚合）。
+        if source.content_type == "video":
+            detail.chapters = self._maybe_expand_video_series(
+                source, detail, detail.chapters
+            )
 
         # 播放源列表（换源站）：解析 source_switch 配置的可用源
         detail.source_list = self._parse_source_list(source, html)
 
         return detail
+
+    def _maybe_expand_video_series(self, source, detail, chapters) -> list:
+        """把同系列的独立分部并入视频分集列表（配置 content.episode.series 驱动）。
+
+        - base_from_title：提取系列基底的正则（字符串或正则列表，如
+          `(.+?)第(\\d+)[話话]`、`(.+?)(?:前編|後編)`——base=捕获组1，话数=捕获组2
+          数字或 part_map 文本标记映射）
+        - part_map：文本分部标记 → 话数（如 {"前編":1,"後編":2}）
+        - min_parts：分部数 ≥ 该值才聚合（防误把普通视频当系列）
+        返回章节列表：当前集置首，其余分部按话数正序在后。
+        """
+        block = self._content_block(source) or {}
+        s_cfg = (block.get("episode") or {}).get("series") or {}
+        if not s_cfg.get("enabled"):
+            return chapters
+        patterns = self._series_patterns(s_cfg)
+        if not patterns:
+            return chapters
+        match = self._series_match(detail.title or "", patterns, s_cfg.get("part_map") or {})
+        if not match:
+            return chapters  # 标题无系列标记 → 非系列作品
+        base, _ = match
+        # 搜系列基底，收集分部 {话数: (标题, url)}（不限精确基底——站点可能以
+        # 中文/日文不同标题展示同系列，如 hanime1 详情日文、搜索中文）
+        parts = self._search_video_series_parts(source, base, patterns, s_cfg.get("part_map") or {})
+        min_parts = int(s_cfg.get("min_parts") or 2)
+        if len(parts) < min_parts:
+            return chapters  # 分部太少，保持单集
+        # 确认同一系列：当前视频 URL 出现在搜索结果中（标题语言可能不同，
+        # 用 URL 判定最可靠）。
+        cur_url = detail.url
+        if cur_url not in {u for _, u in parts.values()}:
+            return chapters  # 搜索没命中当前集，可能是误判系列
+        cur = chapters[0] if chapters else None
+        merged = [cur] if cur is not None else []
+        for n in sorted(parts):
+            title, url = parts[n]
+            if url == cur_url:
+                continue  # 当前集已置首
+            merged.append(Chapter(title=title, url=url))
+        return merged
+
+    @staticmethod
+    def _series_patterns(s_cfg: dict) -> list:
+        """规范化 series.base_from_title 为正则列表。"""
+        raw = s_cfg.get("base_from_title") or ""
+        if isinstance(raw, str):
+            raw = [raw]
+        return [p for p in raw if p]
+
+    def _series_match(self, title: str, patterns: list, part_map: dict):
+        """在标题上尝试系列模式，返回 (base, part) 或 None。"""
+        import re as _re
+
+        for pat in patterns:
+            m = _re.search(pat, title or "")
+            if not m:
+                continue
+            base = (m.group(1) or "").strip()
+            if not base:
+                continue
+            part = None
+            if m.lastindex and m.lastindex >= 2:
+                g2 = (m.group(2) or "").strip()
+                if g2.isdigit():
+                    part = int(g2)
+            if part is None:
+                # 文本分部标记（前編/後編/上篇/下篇…）→ part_map
+                for k, v in (part_map or {}).items():
+                    if k in (title or ""):
+                        part = v
+                        break
+            if part is not None:
+                return base, part
+        return None
+
+    def _search_video_series_parts(self, source, base: str, patterns: list, part_map: dict) -> dict:
+        """搜系列基底，返回分部 {话数: (标题, URL)}。失败返回 {}。
+
+        不限精确基底匹配（同一系列在 hanime1 详情/搜索用不同语言标题），
+        由调用方用「当前 URL 命中」确认系列。
+        """
+        try:
+            from .search import Search
+
+            results = Search(self._http, self._parser, self._checker).search_one(source, base)
+        except Exception:  # noqa: BLE001
+            return {}
+        parts = {}
+        for r in results:
+            match = self._series_match(r.title or "", patterns, part_map)
+            if not match:
+                continue
+            _, rpart = match
+            parts.setdefault(rpart, (r.title or "", r.url or ""))
+        return parts
 
     def _fetch_detail_ytdlp(self, source: SourceConfig, url: str, cfg: dict) -> Detail:
         """yt-dlp 引擎：详情元数据 + 章节列表。"""

@@ -288,6 +288,8 @@ class MainWindow(QMainWindow):
         )
         # 阅读器「收藏」→ 写书架收藏库（与发现详情抽屉同一入口 _on_favorite）
         self.reader.favorite_requested.connect(self._on_favorite)
+        # 阅读器「⬇ 下载」→ 拉详情入下载队列（复用书架下载入口）
+        self.reader.download_requested.connect(self._download_from_shelf)
         # 收藏判断回调：LibraryStore.has(url)（书架库未构建时先构建）
         self.reader.set_favorite_checker(self._favorite_has)
         # 启动即应用阅读区独立背景/字号（ui-reader #12）
@@ -528,6 +530,8 @@ class MainWindow(QMainWindow):
         self.library_page.open_epub_requested.connect(self._open_epub)
         # 点收藏在线书 → 在线阅读器打开
         self.library_page.open_online_requested.connect(self._open_online_from_shelf)
+        # 收藏在线书右键「下载到本地」→ 加入下载队列
+        self.library_page.download_requested.connect(self._download_from_shelf)
         return self.library_page
 
     def _open_online_from_shelf(self, payload) -> None:
@@ -546,6 +550,20 @@ class MainWindow(QMainWindow):
         self.reader.open(source_id, url, content_type)
         # 跳转阅读 Tab
         self.tabs.setCurrentIndex(self._tab_index["reader"])
+
+    def _download_from_shelf(self, payload) -> None:
+        """书架收藏在线书右键「下载到本地」→ 后台拉详情 → 加入下载队列。
+
+        复用 _on_batch_download 的单条任务机制（拉详情拿章节列表后 add_task）。
+        """
+        if not isinstance(payload, (tuple, list)) or len(payload) < 2:
+            return
+        source_id, url = payload[0], payload[1]
+        if not url:
+            return
+        from types import SimpleNamespace
+
+        self._on_batch_download([SimpleNamespace(source_id=source_id, url=url)])
 
     def _build_settings(self):
         """设置页：分区 Tab 覆盖 app_config 全量字段。"""

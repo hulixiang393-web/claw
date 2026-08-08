@@ -161,7 +161,8 @@ class _ShelfCard(QFrame):
         super().mousePressEvent(event)
 
     def _on_menu(self, pos) -> None:
-        self.menu_requested.emit(self.rec, pos)
+        # pos 是卡片相对坐标，转全局再发（否则菜单以页面为参照系会跑到左上角）
+        self.menu_requested.emit(self.rec, self.mapToGlobal(pos))
 
 
 class LibraryPage(BasePage):
@@ -169,6 +170,7 @@ class LibraryPage(BasePage):
 
     open_epub_requested = Signal(object)   # epub 文件路径 → reader.open_epub
     open_online_requested = Signal(object)  # 收藏在线书 (source_id, url, content_type) → reader.open
+    download_requested = Signal(object)  # 收藏在线书 (source_id, url, content_type) → 加入下载队列
 
     def __init__(
         self,
@@ -421,11 +423,20 @@ class LibraryPage(BasePage):
         self.folder_combo.setCurrentIndex(idx)
 
     def _show_card_menu(self, rec: dict, pos) -> None:
-        """右键菜单：收藏卡 → 移动到收藏夹/移除收藏/打开源详情；本地书 → 打开文件夹/删除。"""
+        """右键菜单：收藏卡 → 下载/移动到收藏夹/移除收藏/打开源详情；本地书 → 打开文件夹/删除。
+
+        pos 为 _ShelfCard 已转换的全局坐标，直接 exec（不再 mapToGlobal）。
+        """
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
         if rec.get("kind") == "favorite" and self._store is not None:
+            if rec.get("url"):
+                # 在线收藏书 → 加入下载队列（小说/漫画产出 epub，视频产出 mp4）
+                menu.addAction("⬇ 下载到本地").triggered.connect(
+                    lambda: self._request_download(rec)
+                )
+                menu.addSeparator()
             sub = menu.addMenu("移动到收藏夹")
             for f in self._store.list_folders():
                 if f == rec.get("folder", ""):
@@ -452,7 +463,16 @@ class LibraryPage(BasePage):
             menu.addAction("从书架移除").triggered.connect(
                 lambda: self._remove_local(rec)
             )
-        menu.exec(self.mapToGlobal(pos))
+        menu.exec(pos)
+
+    def _request_download(self, rec: dict) -> None:
+        """收藏在线书右键「下载到本地」→ 转交 App 层拉详情入下载队列。"""
+        url = rec.get("url", "")
+        if not url:
+            return
+        self.download_requested.emit(
+            (rec.get("source_id", ""), url, rec.get("content_type", ""))
+        )
 
     def _open_online(self, rec: dict) -> None:
         """收藏卡：打开在线源详情页（浏览器）。"""

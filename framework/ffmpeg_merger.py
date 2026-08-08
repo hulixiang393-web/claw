@@ -54,10 +54,17 @@ class FFmpegMerger:
         "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     )
 
-    def __init__(self, ffmpeg_path: Optional[str] = None, referer: str = ""):
+    def __init__(self, ffmpeg_path: Optional[str] = None, headers: Optional[dict] = None):
         self._ffmpeg = ffmpeg_path or _find_ffmpeg()
-        # referer 由调用方从源配置传入（如 transports.headers.Referer）；默认空
-        self._referer = referer or ""
+        # 通用请求头：由调用方从源配置传入（transports.headers + cookie 合并后的
+        # request_headers()）。CDN 校验 Referer/UA/Cookie 的源（B站、HLS 站等）
+        # 都靠它通过校验；缺 UA 时兜底用内置 UA。
+        h = dict(headers or {})
+        if not h.get("User-Agent"):
+            h["User-Agent"] = self.UA
+        self._header_str = "\r\n".join(
+            f"{k}: {v}" for k, v in h.items() if v
+        ) + "\r\n"
 
     def merge(
         self,
@@ -85,10 +92,13 @@ class FFmpegMerger:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         is_remote = video_url.startswith(("http://", "https://"))
-        # Referer 头：有 referer 才附带（无则只带 UA）
-        _h = f"Referer: {self._referer}\r\nUser-Agent: {self.UA}\r\n" if self._referer \
-            else f"User-Agent: {self.UA}\r\n"
-        headers = _h
+        # HLS 多连接提速：http_multiple/http_persistent 是 HLS demuxer 选项，
+        # 仅 m3u8 输入有效（直接 mp4/flv 传了会报 "Option not found" → 合并失败）。
+        # 多连接分段并发拉取，CDN 支持时显著提速（avgood 等实测 ~1.5x）。
+        is_hls = ".m3u8" in video_url.lower() or "m3u8" in video_url.lower()
+        # 通用请求头串（源配置传入；无则仅 UA）
+        headers = self._header_str
+        hls_opts = ["-http_multiple", "1", "-http_persistent", "1"] if (is_remote and is_hls) else []
 
         # 远程 URL 才加 -headers（本地文件路径加了会报 Option headers not found）
         cmd = [self._ffmpeg, "-y"]
@@ -98,24 +108,23 @@ class FFmpegMerger:
             cmd += ["-protocol_whitelist", "file,crypto,data,http,https,tcp,tls"]
         if is_remote:
             cmd += ["-headers", headers]
-            # 多连接拉流：HLS/DASH 分段并发下载（等价于源配置 media.hls.workers 意图），
-            # CDN 支持时从单连接串行拉段提速为多连接并行，下载速率显著提升。
-            # 置于 -i 前作为输入选项；ffmpeg 8 http_multiple 默认 auto，显式置 1 兜底。
-            cmd += ["-http_multiple", "1", "-http_persistent", "1"]
+        cmd += hls_opts
         cmd += ["-i", video_url]
         if audio_url:
             if is_remote:
-                cmd += ["-headers", headers, "-http_multiple", "1", "-http_persistent", "1"]
+                cmd += ["-headers", headers] + hls_opts
             cmd += ["-i", audio_url]
         cmd += ["-c:v", "copy", "-c:a", "aac", "-shortest", str(out_path)]
         if not audio_url:
-            # 仅视频轨：去掉音频编码参数和 -shortest
+            # 单流（无分离音轨）：完整文件自带音轨（hanime1/avgood 等），
+            # -c copy 保留全部流——若加 -an 会把内置音频丢光（下载无声）。
+            # 源是纯视频轨时 -c copy 也只复制视频，行为一致。
             cmd = [self._ffmpeg, "-y"]
             if not is_remote:
                 cmd += ["-protocol_whitelist", "file,crypto,data,http,https,tcp,tls"]
             if is_remote:
-                cmd += ["-headers", headers, "-http_multiple", "1", "-http_persistent", "1"]
-            cmd += ["-i", video_url, "-c:v", "copy", "-an", str(out_path)]
+                cmd += ["-headers", headers] + hls_opts
+            cmd += ["-i", video_url, "-c", "copy", str(out_path)]
 
         try:
             # capture_output=True 在 Windows 有管道缓冲死锁：ffmpeg stderr 持续输出

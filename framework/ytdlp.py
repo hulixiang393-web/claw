@@ -245,3 +245,135 @@ class Ytdlp:
             url,
         ])
         return output
+
+    def download_file(
+        self,
+        url: str,
+        out_path: str,
+        fmt: str = "bestvideo+bestaudio/best",
+        progress_cb=None,
+        cancel_evt=None,
+        pause_evt=None,
+    ) -> str:
+        """yt-dlp 直接下载并合并成 mp4，支持进度上报/取消/暂停（与 FFmpegMerger 同 UX）。
+
+        yt-dlp 下载期写临时文件（{out}.f*.xxx / {out}.part），合并后产出 {out}；
+        进度按目录内临时文件+产物总大小上报，合并阶段快速收敛到最终大小。
+        取消/暂停：kill 进程并清理残留临时文件，抛 MergeCancelled/MergePaused。
+        """
+        from .ffmpeg_merger import MergeCancelled, MergePaused
+        import os
+        import subprocess
+        import tempfile
+        import threading
+        import time
+
+        out_path = os.fspath(out_path)
+        cmd = [
+            self._bin, "-f", fmt, "--no-warnings", "--newline",
+            "-o", out_path, "--merge-output-format", "mp4",
+            url,
+        ]
+        log_fd, log_path = tempfile.mkstemp(suffix=".ytdlp.log")
+        os.close(log_fd)
+        stop = threading.Event()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=open(log_path, "w", encoding="utf-8", errors="replace"),
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+
+        def _tmp_size() -> int:
+            total = 0
+            base = os.path.dirname(out_path)
+            stem = os.path.basename(out_path)
+            prefix = stem.rsplit(".", 1)[0]  # yt-dlp 临时文件是 {名}.f137.mp4 / {名}.part
+            try:
+                for name in os.listdir(base):
+                    if name == stem or name.startswith(prefix + "."):
+                        try:
+                            total += os.path.getsize(os.path.join(base, name))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            return total
+
+        def _monitor():
+            while proc.poll() is None and not stop.is_set():
+                if cancel_evt is not None and cancel_evt.is_set():
+                    return
+                if pause_evt is not None and pause_evt.is_set():
+                    return
+                if progress_cb is not None:
+                    try:
+                        progress_cb(_tmp_size())
+                    except Exception:
+                        pass
+                time.sleep(0.3)
+
+        mon = threading.Thread(target=_monitor, daemon=True)
+        mon.start()
+        try:
+            while proc.poll() is None:
+                if cancel_evt is not None and cancel_evt.is_set():
+                    proc.kill()
+                    stop.set()
+                    self._cleanup_partials(out_path)
+                    raise MergeCancelled("下载已取消")
+                if pause_evt is not None and pause_evt.is_set():
+                    proc.kill()
+                    stop.set()
+                    self._cleanup_partials(out_path)
+                    raise MergePaused("下载已暂停")
+                time.sleep(0.2)
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        finally:
+            stop.set()
+            mon.join(timeout=2)
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
+        if proc.returncode != 0:
+            err = ""
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    err = f.read()[-300:]
+            except OSError:
+                pass
+            self._cleanup_partials(out_path)
+            raise RuntimeError(f"yt-dlp 下载失败（{proc.returncode}）：{err}")
+        return out_path
+
+    @staticmethod
+    def _cleanup_partials(out_path: str) -> None:
+        """清理 yt-dlp 残留临时文件（{out}.part / {out}.f*.xxx）。
+
+        kill 进程后 Windows 句柄可能短暂占用，重试 3 次（0.3s 间隔）确保删掉。
+        """
+        import os
+        import time
+
+        base = os.path.dirname(out_path)
+        stem = os.path.basename(out_path)
+        prefix = stem.rsplit(".", 1)[0]  # {名}.f*.xxx / {名}.part 临时文件
+        for _ in range(3):
+            try:
+                names = os.listdir(base)
+            except OSError:
+                return
+            pending = [n for n in names if n == stem or n.startswith(prefix + ".")]
+            if not pending:
+                return
+            for name in pending:
+                try:
+                    os.unlink(os.path.join(base, name))
+                except OSError:
+                    pass
+            time.sleep(0.3)

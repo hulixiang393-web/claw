@@ -182,7 +182,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             if p:
                 kw["proxies"] = {"http": p, "https": p}
         try:
-            r = _get_proxy_session().get(real, headers=headers, timeout=20, stream=True, **kw)
+            r = _get_proxy_session().get(real, headers=headers, timeout=120, stream=True, **kw)
         except Exception:  # noqa: BLE001
             self.send_response(502)
             self.end_headers()
@@ -291,13 +291,21 @@ class VlcStreamProxy:
         # 按源探测：直连 base 可达则走直连；直连不通（被墙/拒绝）才走系统代理
         # （Clash）。avgood 等直连可达的 CDN 强制走 Clash 会被代理出口 IP 拒绝
         # → VLC 出错；YouTube 直连被墙则必须走 Clash。
+        # 探测放后台线程：慢 CDN（如 hanime1 的 vdownload）TCP/HTTP 探测可达数秒，
+        # 同步探测会阻塞主线程（看门狗救回路径冻结 6-8s）并推迟代理开播。
+        # 先按直连（use_clash=False）启动，探测完成后由 _probe_direct_async 更新。
         self._srv.target = {
             "base": self._base,
             "headers": self._headers,
             "proxy": self._proxy_base,
-            "use_clash": not self._probe_direct(self._base, ua),
+            "use_clash": False,
         }
         threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+        threading.Thread(
+            target=self._probe_direct_async,
+            args=(self._srv.target, self._base, ua),
+            daemon=True,
+        ).start()
 
     @staticmethod
     def _probe_direct(base_url: str, ua: str) -> bool:
@@ -314,6 +322,16 @@ class VlcStreamProxy:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def _probe_direct_async(self, target: dict, base_url: str, ua: str) -> None:
+        """后台完成直连探测并更新 use_clash（不阻塞构造/播放启动）。
+
+        _probe_direct 对慢 CDN（如 hanime1 的 vdownload）可能耗时数秒；
+        构造时先按直连开播，探测完成后按结果翻转——直连不通的源
+        （被墙/拒绝）后续请求自动切系统代理（Clash）。
+        """
+        use_clash = not self._probe_direct(base_url, ua)
+        target["use_clash"] = use_clash
 
     def local(self, url: str) -> str:
         """真实 URL → 本地代理 URL。"""
@@ -387,6 +405,11 @@ class VlcPlayer(QObject):
         """winId()+set_hwnd 挂内嵌窗口。每次可见后都应重挂（HWND 可能变化）。"""
         w = self._video_widget
         if w is None:
+            return
+        if not w.isVisible():
+            # 未显示时 winId() 会强制创建原生窗口，隐藏态可阻塞主线程（切页卡死）。
+            # 由 _VideoFrame.showEvent → rehook 在可见时重挂。
+            self._attached = False
             return
         try:
             hwnd = int(w.winId())
@@ -478,10 +501,13 @@ class VlcPlayer(QObject):
                 if self._current_url != url:
                     return  # 已切换/释放到其他播放，旧看门狗失效（防切走后复活）
                 s2 = p.get_state()
-                # VLC state: 1=Opening, 2=Buffering, 3=Playing, 7=Error
-                # 两次采样（2s/4s）都在 Opening/Error 才触发：状态在推进说明启动
-                # 正常，避免 DASH 双流启动慢被误杀；总等待仍为 4s
-                if s1 in (1, 7) and s2 in (1, 7):
+                # VLC state: 0=Nothing 1=Opening 2=Buffering 3=Playing
+                # 4=Paused 5=Stopped 6=Ended 7=Error
+                # 两次采样都"未进入播放进程"（非 Buffering/Playing/Paused/Ended）才触发。
+                # 比原来的"两次都在 Opening/Error"更稳：hanime1 等 TLS 直连失败的
+                # mp4 可能在 4s 内走到 Error(7) 后回落 Nothing(0)，s2 采样到 0 会被
+                # 漏救回；仍在 Buffering/Playing 说明启动正常，不误杀慢启动的 DASH 双流。
+                if s1 not in (2, 3, 4, 6) and s2 not in (2, 3, 4, 6):
                     # 调度回主线程：winId/set_hwnd 等 Qt 操作必须主线程，否则内嵌黑屏
                     self._proxy_retry.emit(url, audio_url)
             except Exception:  # noqa: BLE001
@@ -498,6 +524,13 @@ class VlcPlayer(QObject):
         """
         proxy = None
         try:
+            # 重复降级/重试时先释放旧代理（防端口/线程泄漏）
+            if self._proxy is not None:
+                try:
+                    self._proxy.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._proxy = None
             from urllib.parse import urlsplit
 
             parts = urlsplit(url)

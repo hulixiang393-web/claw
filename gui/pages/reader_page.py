@@ -65,6 +65,8 @@ class _SwitchSourceTask(QRunnable):
 class ReaderPage(BasePage):
     # 收藏/取消收藏 → App 层写书架收藏库（ui-reader.md #2 通用外壳「收藏」）
     favorite_requested = Signal(object)
+    # 「下载」→ App 层拉详情入下载队列（小说/漫画产 epub，视频产 mp4）
+    download_requested = Signal(object)
 
     def __init__(
         self,
@@ -99,6 +101,10 @@ class ReaderPage(BasePage):
         self.source_label.setStyleSheet("color: palette(dark);")
         info.addWidget(self.source_label)
         info.addStretch(1)
+        self.dl_btn = QPushButton("⬇ 下载")
+        self.dl_btn.setFixedWidth(80)
+        self.dl_btn.clicked.connect(self._on_download_clicked)
+        info.addWidget(self.dl_btn)
         self.fav_btn = QPushButton("☆ 收藏")
         self.fav_btn.setCheckable(True)
         self.fav_btn.setFixedWidth(86)
@@ -239,6 +245,7 @@ class ReaderPage(BasePage):
         self._current_source = source
         self._current_book_url = book_url
         self._current_content_type = content_type
+        self.dl_btn.setEnabled(True)
         self.title_label.setText(f"加载中...")
         self.source_label.setText(source.source_name)
         self.refresh_favorite_state()  # 打开新作品即刷新收藏按钮
@@ -290,6 +297,15 @@ class ReaderPage(BasePage):
         """注入收藏判断回调：cb(url) -> bool。App 层接 LibraryStore.has。"""
         self._favorite_checker = cb
         self.refresh_favorite_state()
+
+    def _on_download_clicked(self) -> None:
+        """点「⬇ 下载」→ 转发给 App 层拉详情入下载队列（当前书整本）。"""
+        if not self._current_book_url:
+            return
+        self.download_requested.emit(
+            (self._current_source_id or "", self._current_book_url,
+             self._current_content_type or "")
+        )
 
     def _on_favorite_clicked(self) -> None:
         """点收藏/取消收藏 → 转发给 App 层写收藏库。"""
@@ -348,6 +364,7 @@ class ReaderPage(BasePage):
         self.source_label.setText(path)
         self.fav_btn.setEnabled(False)  # epub 本地书不收藏
         self.fav_btn.setText("☆ 收藏")
+        self.dl_btn.setEnabled(False)  # epub 本地书已在本机，无需下载
         self.video_view.stop_playback()  # 切 epub 前也释放视频播放资源
         self.stack.setCurrentWidget(self.epub_view)
         if self.epub_view.open(path, start_idx=0):
