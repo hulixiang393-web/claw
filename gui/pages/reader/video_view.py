@@ -226,21 +226,21 @@ class VideoView(QWidget):
         # ---- 覆盖层：中央播放按钮 / 缓冲 spinner / 帮助浮层 ----
         self._build_overlays()
 
-        # ---- 控制条（自动隐藏）----
-        self.control_bar = QWidget()
+        # ---- 沉浸式控制条：悬浮叠加在视频画面内部（随视频走，不动自动隐藏）----
+        self.control_bar = QWidget(self._overlay_root)
         self.control_bar.setObjectName("videoControlBar")
         self.control_bar.setStyleSheet(
-            "QWidget#videoControlBar { background: palette(base);"
-            " border: 1px solid palette(mid); border-radius: 8px; }"
+            "QWidget#videoControlBar { background: rgba(0,0,0,150);"
+            " border-radius: 8px; }"
         )
         cb = QHBoxLayout(self.control_bar)
         cb.setContentsMargins(8, 4, 8, 4)
         cb.setSpacing(6)
         self._build_control_bar(cb)
-        right.addWidget(self.control_bar)
 
         body.addLayout(right, stretch=1)
         layout.addLayout(body, stretch=1)
+        self._reposition_overlays()  # 初始定位控制条/覆盖层
 
     def _build_overlays(self) -> None:
         """视频区覆盖层：中央播放钮 / 缓冲 spinner / 帮助浮层。"""
@@ -571,6 +571,11 @@ class VideoView(QWidget):
             self.play_label.adjustSize()
             self.play_label.move((w - self.play_label.width()) // 2,
                                  h - self.play_label.height() - 24)
+        # 沉浸控制条：悬浮在视频画面底部中央（YouTube/B站 风格）
+        self.control_bar.adjustSize()
+        cb_w = min(w - 32, 920)
+        self.control_bar.resize(cb_w, self.control_bar.height())
+        self.control_bar.move((w - cb_w) // 2, h - self.control_bar.height() - 12)
 
     def _toggle_help(self) -> None:
         """? 键：显示/隐藏快捷键帮助浮层。"""
@@ -682,6 +687,8 @@ class VideoView(QWidget):
             self.play_btn.setText("▶")
         self._sync_overlay_state(playing=False)
         self.buffer_spinner.hide()
+        self.control_bar.show()  # 停播后未播放状态 → 控制条常驻
+        self._hide_timer.stop()
 
     def stop_playback(self) -> None:
         """离开视频视图时释放资源：停播放 + 清空播放缓存（不堆积）。
@@ -979,6 +986,7 @@ class VideoView(QWidget):
         self.play_btn.setText("▶")
         self._sync_overlay_state(playing=False)
         self.buffer_spinner.hide()
+        self.control_bar.show()  # 播完未播放状态 → 控制条常驻
         nxt = self._current_idx + 1
         if 0 <= nxt < len(self._episodes):
             self.ep_list.setCurrentRow(nxt)
@@ -1132,6 +1140,7 @@ class VideoView(QWidget):
             self._sync_overlay_state(playing=False)
             self._emit_position()  # 暂停瞬间精确存盘当前进度
             self._hide_timer.stop()  # 暂停时控制条常驻
+            self.control_bar.show()
         else:
             self._player.resume()
             self.play_btn.setText("⏸")
@@ -1169,12 +1178,10 @@ class VideoView(QWidget):
         fs_close.clicked.connect(self._video_frame.setFocus)
         tb.addWidget(fs_close)
         lay.addWidget(self._fs_titlebar)
-        # 视频区 + 控制条一起进全屏：控制条带退出/进度/上下集/倍速，
+        # 视频区进全屏（覆盖层/沉浸控制条是其子控件，自动跟随）；
         # 全屏状态下也能操作，不再被主窗口盖住
         self._video_frame.setParent(fs)
         lay.addWidget(self._video_frame, stretch=1)
-        self.control_bar.setParent(fs)
-        lay.addWidget(self.control_bar)
         self.fs_btn.setText("⛶")
         self._fs_win = fs
         # 退出途径：Esc / 双击 / 控制栏按钮 / 关闭窗口
@@ -1204,11 +1211,9 @@ class VideoView(QWidget):
             return
         fs = self._fs_win
         self._fs_win = None
-        # 视频区 + 控制条 reparent 回主视图（关闭全屏窗后视频不丢失）
+        # 视频区 reparent 回主视图（覆盖层/沉浸控制条是其子控件，自动跟随）
         self._video_frame.setParent(self)
         self._right_layout.insertWidget(0, self._video_frame)
-        self.control_bar.setParent(self)
-        self._right_layout.addWidget(self.control_bar)
         try:
             fs.close()
             fs.deleteLater()
