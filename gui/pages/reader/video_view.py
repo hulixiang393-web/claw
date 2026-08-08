@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import webbrowser
 
-from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject, QTimer
+from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -244,17 +245,21 @@ class VideoView(QWidget):
         body.addLayout(right, stretch=1)
         layout.addLayout(body, stretch=1)
         self._reposition_overlays()  # 初始定位控制条/覆盖层
+        # 全局事件过滤器：鼠标唤出控制条 + 全屏窗键盘/关闭兜底
+        # （class 方法才进 Qt 事件分发；实例属性赋值在 PySide6 永不回调）
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def _build_overlays(self) -> None:
         """视频区覆盖层：中央播放钮 / 缓冲 spinner / 帮助浮层。"""
         frame = self._video_frame
         self._overlay_root = QWidget(frame)
         self._overlay_root.setGeometry(frame.rect())
-        self._overlay_root.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-        # 覆盖层盖满视频区：鼠标在其上移动/进入也唤出控制条（转发到视图）
-        self._overlay_root.setMouseTracking(True)
-        self._overlay_root.mouseMoveEvent = lambda e: self._wake_controls()
-        self._overlay_root.enterEvent = lambda e: self._wake_controls()
+        # 覆盖层自身穿透鼠标事件（点击/移动直达视频区 → 唤出控制条/单击播放），
+        # 子控件（控制条/中央按钮/浮层）照常接收交互。不要用实例属性赋值
+        # 挂事件——PySide6 里不进 Qt 虚表，事件永远不会回调（鼠标唤出失效根因）。
+        self._overlay_root.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
         # 中央播放按钮（未播放时显示，点击播放）
         self.center_play_btn = QPushButton("▶", self._overlay_root)
@@ -554,6 +559,58 @@ class VideoView(QWidget):
 
     def keyPressEvent(self, event):  # noqa: N802
         self._handle_key(event)
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        """全局兜底事件：鼠标唤出控制条 + 全屏窗键盘/关闭/双击。"""
+        try:
+            return self._event_filter_impl(obj, event)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _event_filter_impl(self, obj, event) -> bool:
+        """（实现）见 eventFilter 注释。
+
+        此前用实例属性赋值（fs.mouseMoveEvent = lambda ...）挂事件——
+        PySide6 里这种赋值不进 Qt 虚表，事件分发永不回调（鼠标唤出失效
+        根因）。全部收敛到这里（class 方法，可靠）。
+        注意：鼠标事件可能直接发给原生 QWindow（非 QWidget），此时跳过
+        widget 链判断（isAncestorOf 不接受 QWindow，异常会被 eventFilter
+        吞掉导致整个分支失效——真机唤出失效的第二个根因）。
+        - MouseMove/Enter 落在视频区或全屏窗内 → 唤出控制条
+          （视频区 MouseMove 是高频事件，仅两次 isAncestorOf 判定，开销可忽略）
+        - 全屏窗内 KeyPress：Esc 退出全屏，其余转 _handle_key 快捷键
+        - 全屏窗被关闭（Alt+F4）→ 回主视图
+        - 全屏窗非视频区双击 → 退出全屏（视频区双击由 _VideoFrame 处理 toggle）
+        """
+        if not isinstance(obj, QWidget):
+            return False
+        if event.type() in (QEvent.MouseMove, QEvent.Enter):
+            if obj is self._video_frame or self._video_frame.isAncestorOf(obj):
+                self._wake_controls()
+                return False
+            fs = self._fs_win
+            if fs is not None and (obj is fs or fs.isAncestorOf(obj)):
+                self._wake_controls()
+                return False
+            return False
+        fs = self._fs_win
+        if fs is None:
+            return False
+        if event.type() == QEvent.KeyPress and (obj is fs or fs.isAncestorOf(obj)):
+            if event.key() == Qt.Key_Escape:
+                self._exit_fullscreen()
+            else:
+                self._handle_key(event)
+            return True
+        if event.type() == QEvent.Close and obj is fs:
+            self._exit_fullscreen()
+            return True
+        if (event.type() == QEvent.MouseButtonDblClick and obj is not self._video_frame
+                and not self._video_frame.isAncestorOf(obj)
+                and (obj is fs or fs.isAncestorOf(obj))):
+            self._exit_fullscreen()
+            return True
+        return False
 
     def _set_volume(self, v: int) -> None:
         self.vol_slider.setValue(v)
@@ -1177,9 +1234,7 @@ class VideoView(QWidget):
         fs.setAttribute(Qt.WA_NativeWindow, True)
         fs.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         fs.setStyleSheet("background: #000;")
-        # 全屏下鼠标移动唤出控制条（视频区外区域也触发）
-        fs.setMouseTracking(True)
-        fs.mouseMoveEvent = lambda e: self._wake_controls()
+        # 鼠标唤出由全局事件过滤器兜底（fs 内任意位置移动/进入视频区即唤出）
         lay = QVBoxLayout(fs)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
@@ -1208,9 +1263,8 @@ class VideoView(QWidget):
         self.fs_btn.setText("⛶")
         self._fs_win = fs
         # 退出途径：Esc / 双击 / 控制栏按钮 / 关闭窗口
-        fs.keyPressEvent = self._on_fs_key
-        fs.closeEvent = self._on_fs_close
-        fs.mouseDoubleClickEvent = lambda e: self._exit_fullscreen()
+        # （键盘/关闭/双击均在全局 eventFilter 里兜底——实例属性赋值在
+        #   PySide6 不进 Qt 虚表永不回调，属无效代码，见 eventFilter 注释）
         fs.showFullScreen()
         self._reposition_overlays()
         if self._player is not None:
