@@ -134,5 +134,12 @@
 - [x] `python -m pytest` 既有单测全绿（45 passed）
 
 ### 回归记录（2026-08-08）
-- pytest 45 passed；_smoke_library/_smoke_settings/_smoke_reader/_smoke_regression/_smoke_download 通过
+- pytest 62 passed（45 旧 + media_tuner 17 项新）；_smoke_library/_smoke_settings/_smoke_reader/_smoke_regression/_smoke_download 通过
 - _smoke_search/_smoke_discover/_smoke_app 失败为预存网络依赖问题（git stash 基线验证同款失败，与本次改动无关）
+
+## 七、播放优化通用框架（media_tuner.py）
+
+- 按媒体类型自动选初始网络缓存：HLS 3500ms / DASH 4000ms / 直播 2500ms / MP4 1500ms / 未知 2500ms（media 级覆盖实例级）
+- 卡顿自适应：播放中重复缓冲 → 逐级提高 network-caching（2000→4000→6000→8000，按类型封顶），自动重播当前流，最多 3 级
+- libVLC MediaPlayerBuffering 事件 → buffering 信号（0~100）→ UI 缓冲浮层 + 统计
+- 所有操作内嵌播放器：⚙ 菜单新增「选集」「播放源」子菜单（全屏/非全屏均可切集换源）

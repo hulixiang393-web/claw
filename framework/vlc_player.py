@@ -352,6 +352,7 @@ class _VlcBridge(QObject):
     error = Signal(str)
     time_changed = Signal(int)
     length_changed = Signal(int)
+    buffering = Signal(int)  # 0~100；100 表示缓冲完成恢复播放
 
 
 class VlcPlayer(QObject):
@@ -362,6 +363,7 @@ class VlcPlayer(QObject):
     error = Signal(str)
     time_changed = Signal(int)
     length_changed = Signal(int)
+    buffering = Signal(int)  # 缓冲百分比 0~100（100=恢复播放）
     # 内部：watchdog 子线程 → 主线程调度代理重播（winId/set_hwnd 必须主线程）
     _proxy_retry = Signal(str, str)
 
@@ -376,6 +378,7 @@ class VlcPlayer(QObject):
         self._player = vlc.MediaPlayer(_get_instance())
         self._media = None
         self._current_url = ""
+        self._current_audio = ""  # 卡顿升级重播需还原 DASH 音频轨
         self._attached = False
         self._proxy = None  # 本地代理（TLS 兼容问题自动降级用）
         # 事件桥接（持引用防 GC，回调只 emit 信号）
@@ -384,6 +387,7 @@ class VlcPlayer(QObject):
         self._bridge.error.connect(self.error)
         self._bridge.time_changed.connect(self.time_changed)
         self._bridge.length_changed.connect(self.length_changed)
+        self._bridge.buffering.connect(self.buffering)
         self._proxy_retry.connect(self._retry_with_proxy)
         self._install_events()
         # 构造即强制 native 窗口（winId 返回真实 HWND）
@@ -436,6 +440,9 @@ class VlcPlayer(QObject):
         时救回为本地代理转发（_play_via_proxy，requests 拉流）。不做"主动
         代理"：对 avgood 等直连可达的 CDN 直接播最稳（强制走 Clash 会被代理
         出口 IP 拒绝），YouTube 等直连被墙的靠看门狗救回（按源探测走 Clash）。
+
+        缓冲调优：按媒体类型（HLS/DASH/MP4/直播）经 MediaTuner.classify
+        选择初始 network-caching（media 级覆盖实例级），见 media_tuner.py。
         """
         if not video_url:
             self._bridge.error.emit("无播放地址")
@@ -455,7 +462,13 @@ class VlcPlayer(QObject):
             self._media = None
         self.stop()
         self._current_url = video_url
-        opts = []
+        self._current_audio = audio_url
+
+        from framework.media_tuner import classify
+
+        profile = classify(video_url)
+        # media 级网络缓存：对分片流（HLS/DASH）抗网络抖动，卡顿自愈时逐级提高
+        opts = [f"network-caching={profile.buffer_ms}"]
         if self._referer:
             opts.append("http-referrer=" + self._referer)
         if self._user_agent:
@@ -470,8 +483,11 @@ class VlcPlayer(QObject):
                     self._media.add_option(o)
                 self._player.set_media(self._media)
             else:
-                # HLS/MP4/单流
-                self._player.set_mrl(video_url, *opts)
+                # HLS/MP4/单流：统一 media 路径（options 才能带 network-caching）
+                self._media = _get_instance().media_new(video_url)
+                for o in opts:
+                    self._media.add_option(o)
+                self._player.set_media(self._media)
             self._attach_window()
             self._player.play()
             self._start_play_watchdog(video_url, audio_url)
@@ -540,7 +556,9 @@ class VlcPlayer(QObject):
             )
             local = proxy.local(url)
             # 与 play() 相同的 media 级选项：referer/UA 对 input-slave 同样生效
-            opts = []
+            from framework.media_tuner import classify
+
+            opts = [f"network-caching={classify(url).buffer_ms}"]
             if self._referer:
                 opts.append("http-referrer=" + self._referer)
             if self._user_agent:
@@ -570,6 +588,26 @@ class VlcPlayer(QObject):
     def _retry_with_proxy(self, url: str, audio_url: str) -> None:
         """看门狗救回路径：直连卡 Opening/Error 后用本地代理重播。"""
         self._play_via_proxy(url, audio_url)
+
+    def increase_buffer(self) -> bool:
+        """卡顿自愈：按 MediaTuner 阶梯加大网络缓存并重播当前流。
+
+        返回 True 表示已升级重播；False 表示已达缓存上限（或当前无流），
+        调用方（UI 层）据此决定是否提示用户/换源。升级阶梯与封顶见
+        framework/media_tuner.py。
+        """
+        url = self._current_url
+        if not url:
+            return False
+        from framework.media_tuner import MediaTuner
+
+        tuner = MediaTuner()
+        ms = tuner.next_buffer_ms(url)
+        if ms is None:
+            return False
+        self._bridge.buffering.emit(100)  # 重播前复位缓冲状态
+        self.play(url, self._current_audio)
+        return True
 
     def pause(self) -> None:
         try:
@@ -612,6 +650,7 @@ class VlcPlayer(QObject):
         except Exception:  # noqa: BLE001
             pass
         self._current_url = ""
+        self._current_audio = ""
 
     def set_volume(self, v: int) -> None:
         try:
@@ -729,6 +768,7 @@ class VlcPlayer(QObject):
         em.event_attach(vlc.EventType.MediaPlayerEncounteredError, self._cb_error)
         em.event_attach(vlc.EventType.MediaPlayerTimeChanged, self._cb_time)
         em.event_attach(vlc.EventType.MediaPlayerLengthChanged, self._cb_length)
+        em.event_attach(vlc.EventType.MediaPlayerBuffering, self._cb_buffering)
 
     def _cb_ended(self, event):
         self._bridge.ended.emit()
@@ -745,5 +785,12 @@ class VlcPlayer(QObject):
     def _cb_length(self, event):
         try:
             self._bridge.length_changed.emit(int(event.u.new_length))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _cb_buffering(self, event):
+        """缓冲百分比事件（0~100）：UI 显示缓冲浮层/驱动卡顿自愈。"""
+        try:
+            self._bridge.buffering.emit(int(event.u.new_cache))
         except Exception:  # noqa: BLE001
             pass

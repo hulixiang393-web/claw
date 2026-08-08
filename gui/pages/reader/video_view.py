@@ -177,6 +177,10 @@ class VideoView(QWidget):
         self._muted = False  # M 键静音状态（恢复音量用）
         self._last_volume = 80  # 静音前的音量
         self._click_pending = False  # 单击/双击判定
+        self._buffer_shown = False  # 是否正显示"缓冲中"浮层
+        from framework.media_tuner import MediaTuner
+
+        self._tuner = MediaTuner()  # 卡顿统计/缓冲升级（每次 load 重置）
         self._hide_timer = QTimer(self)  # 控制条自动隐藏
         self._hide_timer.setInterval(3000)
         self._hide_timer.timeout.connect(self._hide_controls)
@@ -381,6 +385,10 @@ class VideoView(QWidget):
         self.quality_label = QLabel("画质：")  # 兼容旧引用（不再显示于控制条）
         self.quality_combo = QComboBox()  # 兼容旧引用（选择在菜单内）
         self.quality_menu = menu.addMenu("画质")
+        # 选集菜单（全屏/非全屏均可切集，无需回到左侧列表）
+        self.ep_menu = menu.addMenu("选集")
+        # 播放源菜单（换源入口，替代仅顶部可见的下拉框）
+        self.source_menu = menu.addMenu("播放源")
 
         menu.addSeparator()
         menu.addAction("📋 复制播放地址").triggered.connect(self._copy)
@@ -391,6 +399,8 @@ class VideoView(QWidget):
 
         self._quality_actions = []  # 防止菜单项被 GC
         self._refresh_quality_menu()
+        self._refresh_ep_menu()
+        self._refresh_source_menu()
 
     def _refresh_quality_menu(self) -> None:
         """按源配置重建画质菜单项（无画质选项 → 菜单隐藏）。"""
@@ -403,6 +413,47 @@ class VideoView(QWidget):
             act.triggered.connect(lambda _=False, _q=q: self._on_quality_changed(_q))
             self._quality_actions.append(act)
         self.quality_menu.menuAction().setVisible(bool(self._quality_options))
+
+    def _refresh_ep_menu(self) -> None:
+        """重建选集菜单：当前集打勾，点击即切换（播放器内操作，全屏可用）。"""
+        self.ep_menu.clear()
+        self._ep_actions = []
+        for i, ep in enumerate(self._episodes):
+            act = self.ep_menu.addAction(ep.title or f"第{i + 1}集")
+            act.setCheckable(True)
+            act.setChecked(i == self._current_idx)
+            act.triggered.connect(lambda _=False, _i=i: self._select_episode(_i))
+            self._ep_actions.append(act)
+        self.ep_menu.menuAction().setVisible(bool(self._episodes))
+
+    def _select_episode(self, idx: int) -> None:
+        """播放器内选集：同步左侧列表并加载该集。"""
+        if not (0 <= idx < len(self._episodes)) or idx == self._current_idx:
+            return
+        self.ep_list.setCurrentRow(idx)
+        self._load_episode(idx)
+        self._refresh_ep_menu()
+
+    def _refresh_source_menu(self) -> None:
+        """重建播放源菜单：当前源打勾，点击即换源（替代顶部下拉框）。"""
+        self.source_menu.clear()
+        self._source_actions = []
+        for i, item in enumerate(self._source_list):
+            name = item.get("name") if isinstance(item, dict) else str(item)
+            sid = item.get("sid") if isinstance(item, dict) else str(item)
+            act = self.source_menu.addAction(str(name))
+            act.setCheckable(True)
+            act.setChecked(str(sid) == self._current_sid)
+            act.triggered.connect(
+                lambda _=False, _i=i: self._select_source(_i))
+            self._source_actions.append(act)
+        self.source_menu.menuAction().setVisible(bool(self._source_list))
+
+    def _select_source(self, idx: int) -> None:
+        """播放器内换源：同步顶部下拉框触发换源流程。"""
+        if not (0 <= idx < self.source_combo.count()):
+            return
+        self.source_combo.setCurrentIndex(idx)  # → currentIndexChanged → _on_source_switch
 
     # ------------------------------------------------------------------ #
     def _toggle_mute(self) -> None:
@@ -537,6 +588,8 @@ class VideoView(QWidget):
         self._source = source
         self._detail = detail
         self._pending_play = None  # 换书清掉旧暂存播放
+        self._tuner.reset()  # 新播放会话重置卡顿统计
+        self._buffer_shown = False
         if restore_position is not None:
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用），再预建播放器。
@@ -563,6 +616,7 @@ class VideoView(QWidget):
                     break
         self.ep_list.setCurrentRow(idx)
         self._sync_overlay_state(playing=False)
+        self._refresh_ep_menu()
         if not detail.chapters:
             # 无分集（season 页）→ 直接取详情页播放地址自动播放
             self._show_status("正在获取播放流...")
@@ -592,6 +646,7 @@ class VideoView(QWidget):
         self.ep_list.setCurrentRow(0)
         self._switching = False
         self._sync_overlay_state(playing=False)
+        self._refresh_ep_menu()
         if new_detail.chapters:
             self._load_episode(0)
 
@@ -608,6 +663,7 @@ class VideoView(QWidget):
                 self.source_combo.setCurrentIndex(i)
                 self.source_combo.currentIndexChanged.connect(self._on_source_switch)
                 break
+        self._refresh_source_menu()  # 播放源菜单打勾跟随
 
     def shutdown_video(self) -> None:
         """App 退出释放 VLC 播放器。"""
@@ -682,6 +738,7 @@ class VideoView(QWidget):
                     break
             self.source_combo.setCurrentIndex(idx)
         self.source_combo.currentIndexChanged.connect(self._on_source_switch)
+        self._refresh_source_menu()  # 播放器内换源菜单同步
 
     def _populate_quality_combo(self, source) -> None:
         """画质选项：读 api_endpoints.episode.quality.options，无则隐藏。"""
@@ -722,6 +779,7 @@ class VideoView(QWidget):
         if self._source is None or not (0 <= idx < len(self._episodes)):
             return
         self._current_idx = idx
+        self._refresh_ep_menu()  # 选集菜单当前集打勾跟随
         ep = self._episodes[idx]
         self.episode_changed.emit((self._detail, ep.title, ep.url))  # 进度记忆
         key = (ep.url, self._quality)
@@ -838,6 +896,7 @@ class VideoView(QWidget):
             self._player.error.connect(self._on_play_error)
             self._player.time_changed.connect(self._on_time_changed)
             self._player.length_changed.connect(self._on_length_changed)
+            self._player.buffering.connect(self._on_buffering)
         except Exception:  # noqa: BLE001 —— VLC 不可用时降级：播放时再试并报错
             self._player = None
 
@@ -888,6 +947,32 @@ class VideoView(QWidget):
             self._pending_position = None
             if pos > 0:
                 self._seek_with_retry(pos)
+
+    def _on_buffering(self, percent: int) -> None:
+        """缓冲事件：播放中的再次缓冲（卡顿）显示浮层；封顶前自动加大缓存重播。
+
+        通用调优策略来自 framework/media_tuner.py：按媒体类型选初始缓存，
+        频繁缓冲时逐级提高 network-caching（最多 3 级，封顶后交给用户）。
+        """
+        if percent >= 100:
+            self._tuner.on_buffering(100)  # 通知 tuner 已恢复（否则后续缓冲被当成同一轮）
+            self.buffer_spinner.hide()
+            # 仅清"缓冲中"提示；取流中/播放成功等其它状态浮层不受影响
+            if self._buffer_shown:
+                self._buffer_shown = False
+                if self.play_label.text().startswith("缓冲中"):
+                    self._show_status("")
+            return
+        self._tuner.on_buffering(percent)
+        if self._has_played and not self._buffer_shown:
+            # 已进入过播放 → 本次是中途缓冲（卡顿），浮层提示
+            self._buffer_shown = True
+            self._show_status(f"缓冲中 {percent}%…")
+        self.buffer_spinner.show()
+        if self._has_played and self._tuner.should_upgrade():
+            if self._player is not None and self._player.increase_buffer():
+                self._buffer_shown = False
+                self._show_status("网络不佳，已自动加大缓冲…")
 
     def _on_ended(self) -> None:
         """播完自动续播下一集（缓存命中秒切）。"""
