@@ -477,7 +477,13 @@ class VlcPlayer(QObject):
 
         profile = classify(video_url)
         # media 级网络缓存：对分片流（HLS/DASH）抗网络抖动，卡顿自愈时逐级提高
-        opts = [f"network-caching={profile.buffer_ms}"]
+        # media 级硬件解码：--avcodec-hw 是 media 级变量——**实例级参数不生效**
+        # （libvlc 老帖/Qt Forum 实测确认），必须在 media_new 后 add_option。
+        # d3d11va 直连 GPU 解码（RTX/核显均支持），软解 1080p+ 是全程掉帧根因。
+        opts = [
+            f"network-caching={profile.buffer_ms}",
+            "avcodec-hw=d3d11va",
+        ]
         if self._referer:
             opts.append("http-referrer=" + self._referer)
         if self._user_agent:
