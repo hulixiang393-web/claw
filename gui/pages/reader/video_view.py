@@ -40,24 +40,46 @@ from PySide6.QtWidgets import (
 from framework.content import Content, Detail
 
 
-class _VideoFrame(QWidget):
-    """VLC 内嵌容器：showEvent 重挂 hwnd（切页/全屏后 HWND 变化）。
+class _PlayPanel(QWidget):
+    """外部播放器方案的播放面板（原视频窗口占位）。
 
-    同时负责视频区交互：单击播放/暂停、双击全屏（300ms 判定区分）。
+    不再内嵌 VLC 渲染——独立播放器进程接管画面，这里只提供：
+    - 深色占位 + 当前集标题 + "点击播放"提示
+    - 交互：单击面板/中央播放键 → 拉起外部播放器；双击 → 打开播放器；
+      移动鼠标 → 唤出控制条（选集/下载/设置仍有效）
     """
 
     def __init__(self, view, parent=None):
         super().__init__(parent)
         self._view = view
-        self.setAttribute(Qt.WA_NativeWindow, True)
-        self.setStyleSheet("background: #000;")
+        self.setStyleSheet("background: #101010; border-radius: 8px;")
         # 无按键移动也触发 mouseMoveEvent → 控制条隐藏后滑动即唤出
         self.setMouseTracking(True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(8)
+        self._panel_title = QLabel("在外部播放器中播放")
+        self._panel_title.setStyleSheet(
+            "background: transparent; color: rgba(255,255,255,180);"
+            " font-size: 15px; font-weight: bold;"
+        )
+        self._panel_title.setAlignment(Qt.AlignCenter)
+        self._panel_hint = QLabel(
+            "点击播放，将在 VLC 播放器中打开当前集\n"
+            "（进度 / 暂停 / 音量 / 倍速 / 全屏均由播放器接管）"
+        )
+        self._panel_hint.setStyleSheet(
+            "background: transparent; color: rgba(255,255,255,110);"
+            " font-size: 12px;"
+        )
+        self._panel_hint.setAlignment(Qt.AlignCenter)
+        lay.addStretch(1)
+        lay.addWidget(self._panel_title)
+        lay.addWidget(self._panel_hint)
+        lay.addStretch(1)
 
     def showEvent(self, event):  # noqa: N802
         super().showEvent(event)
-        if self._view._player is not None:
-            self._view._player.rehook()
         # 取流完成时用户在别的 Tab → 暂存的播放，回到阅读页补播
         self._view._flush_pending_play()
 
@@ -70,15 +92,15 @@ class _VideoFrame(QWidget):
     def mousePressEvent(self, event):  # noqa: N802
         if event.button() == Qt.LeftButton:
             self._view._click_pending = True
-            self._view._wake_controls()  # 点击视频 → 唤出控制条（暂停后可操作）
-            self.setFocus()  # 焦点收拢 → 快捷键即时可用
+            self._view._wake_controls()  # 点击面板 → 唤出控制条
+            self.setFocus()  # 焦点收拢
             QTimer.singleShot(300, self._click_timer)
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event):  # noqa: N802
         self._view._click_pending = False
         if event.button() == Qt.LeftButton:
-            # 外部播放器方案：双击视频区 = 拉起外部播放器打开当前集
+            # 外部播放器方案：双击面板 = 拉起外部播放器打开当前集
             self._view._open_external()
         super().mouseDoubleClickEvent(event)
 
@@ -139,19 +161,15 @@ class VideoView(QWidget):
     _HELP_TEXT = (
         "操作指南\n"
         "──────────────\n"
-        "播放中\n"
-        "  单击视频    播放 / 暂停\n"
-        "  双击视频    全屏 / 退出全屏\n"
-        "  移动鼠标    唤出控制条（3 秒无操作自动隐藏）\n"
-        "  空格        播放 / 暂停\n"
-        "  ← →         快退 / 快进 5 秒\n"
-        "  ↑ ↓         音量 + / -\n"
-        "  M           静音切换\n"
-        "  F           全屏 / 退出全屏\n"
-        "全屏时\n"
-        "  Esc         退出全屏\n"
-        "  ?           显示 / 隐藏本帮助\n"
-        "  （其余快捷键同上，控制条随鼠标移动唤出）"
+        "播放\n"
+        "  单击面板 / 中央播放键    在外部播放器中打开当前集\n"
+        "  双击面板                  打开外部播放器（VLC）\n"
+        "  设置 → 外部播放器         手动重新拉起播放器\n"
+        "  ?                        显示 / 隐藏本帮助\n"
+        "──────────────\n"
+        "播放器内操作（VLC 桌面版）\n"
+        "  空格 / ← → / ↑ ↓ / M / F  播放、快进快退、音量、静音、全屏\n"
+        "  播放器自带「恢复播放位置」，下次打开自动续播\n"
     )
 
     def __init__(self, content: Content, parent=None):
@@ -225,8 +243,8 @@ class VideoView(QWidget):
         right.setSpacing(6)
         self._right_layout = right  # 全屏退出后把视频区插回
 
-        # VLC 内嵌播放区（固定比例 16:9 高度由容器撑）
-        self._video_frame = _VideoFrame(self)
+        # 播放面板（外部播放器方案：不再内嵌视频渲染，只做播放入口占位）
+        self._video_frame = _PlayPanel(self)
         self._video_frame.setMinimumHeight(220)
         self._video_frame.setFocusPolicy(Qt.StrongFocus)
         right.addWidget(self._video_frame, stretch=1)
@@ -271,16 +289,17 @@ class VideoView(QWidget):
         # PySide6 里不进 Qt 虚表永不回调（唤出失效根因之一）。
         self._overlay_root.setMouseTracking(True)
 
-        # 中央播放按钮（未播放时显示，点击播放）
-        self.center_play_btn = QPushButton("▶", self._overlay_root)
-        self.center_play_btn.setFixedSize(72, 72)
+        # 中央播放按钮（未播放时显示，点击在外部播放器中打开当前集）
+        self.center_play_btn = QPushButton("▶ 播放", self._overlay_root)
+        self.center_play_btn.setFixedSize(96, 96)
         self.center_play_btn.setCursor(Qt.PointingHandCursor)
-        self.center_play_btn.setToolTip("播放（单击）")
+        self.center_play_btn.setToolTip("在外部播放器中播放当前集（双击面板亦可）")
         self.center_play_btn.setStyleSheet(
             "QPushButton { background: rgba(0,0,0,150); color: white;"
-            " border: 2px solid rgba(255,255,255,120); border-radius: 36px;"
-            " font-size: 30px; padding: 0px; }"
-            "QPushButton:hover { background: rgba(40,40,40,180); }"
+            " border: 2px solid rgba(255,255,255,120); border-radius: 48px;"
+            " font-size: 22px; padding: 0px; }"
+            "QPushButton:hover { background: rgba(40,40,40,200);"
+            " border-color: rgba(255,255,255,200); }"
         )
         self.center_play_btn.clicked.connect(self._toggle_play_pause)
 
@@ -426,6 +445,13 @@ class VideoView(QWidget):
         self.time_label.setText("外部播放器")
         self.play_btn.setToolTip("在外部播放器中打开当前集")
         self.next_btn.setToolTip("在外部播放器中打开下一集")
+
+    def _update_panel(self, ep_title: str) -> None:
+        """播放面板标题：显示当前集名（外接方案下替代视频画面占位）。"""
+        try:
+            self._video_frame._panel_title.setText(ep_title or "在外部播放器中播放")
+        except (RuntimeError, AttributeError):
+            pass
 
     def _build_settings_menu(self) -> None:
         menu = self._settings_menu
@@ -637,7 +663,7 @@ class VideoView(QWidget):
         w, h = frame.width(), frame.height()
         if w <= 0 or h <= 0:
             return
-        self.center_play_btn.move((w - 72) // 2, (h - 72) // 2)
+        self.center_play_btn.move((w - 96) // 2, (h - 96) // 2)
         self.buffer_spinner.move((w - 56) // 2, (h - 56) // 2)
         self.help_overlay.adjustSize()
         self.help_overlay.move((w - self.help_overlay.width()) // 2,
@@ -860,6 +886,7 @@ class VideoView(QWidget):
         self._current_idx = idx
         self._refresh_ep_menu()  # 选集菜单当前集打勾跟随
         ep = self._episodes[idx]
+        self._update_panel(ep.title or f"第{idx + 1}集")
         self.episode_changed.emit((self._detail, ep.title, ep.url))  # 进度记忆
         key = (ep.url, self._quality)
         cached = self._stream_cache.get(key)
@@ -981,6 +1008,7 @@ class VideoView(QWidget):
         self._current_play = video
         self._current_audio = audio  # DASH 音频轨（重开播放器时 input-slave 挂入）
         self._current_title = title  # 状态浮层/重开提示用
+        self._update_panel(title)
         referer = ua = ""
         _rh = getattr(self._source, "request_headers", None)
         if callable(_rh):
