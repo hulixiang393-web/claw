@@ -418,12 +418,13 @@ class MainWindow(QMainWindow):
             done = Signal(object)  # (list[(result, detail_or_None)])
 
         class _FetchDetailTask(QRunnable):
-            def __init__(self, content, source, url):
+            def __init__(self, content, source, url, item):
                 super().__init__()
                 self.signals = _ShelfDlSignals()
                 self._content = content
                 self._source = source
                 self._url = url
+                self._item = item
 
             def run(self) -> None:
                 detail = None
@@ -432,7 +433,7 @@ class MainWindow(QMainWindow):
                 except Exception:  # noqa: BLE001
                     detail = None
                 try:
-                    self.signals.done.emit((self._source, self._url, detail))
+                    self.signals.done.emit((self._item, self._source, self._url, detail))
                 except RuntimeError:
                     pass
 
@@ -447,23 +448,31 @@ class MainWindow(QMainWindow):
             if source is None:
                 self._dl_pending -= 1
                 continue
-            task = _FetchDetailTask(self.content, source, getattr(r, "url", ""))
+            task = _FetchDetailTask(self.content, source, getattr(r, "url", ""), r)
             task.signals.done.connect(self._on_batch_dl_detail)
             self._dl_tasks.append(task)
             QThreadPool.globalInstance().start(task)
 
     def _on_batch_dl_detail(self, payload) -> None:
         """批量下载：一条详情就绪，累计；全部就绪后入队。"""
-        source, url, detail = payload
-        self._dl_results.append((source, url, detail))
+        item, source, url, detail = payload
+        self._dl_results.append((item, source, url, detail))
         self._dl_pending -= 1
         if self._dl_pending > 0:
             return
-        # 全部就绪：对每个有章节的结果入队
+        # 全部就绪：对每个有章节的结果入队（可只下载前 N 集）
         ok = 0
-        for source, url, detail in self._dl_results:
+        for r, source, url, detail in self._dl_results:
             if detail is None or not getattr(detail, "chapters", None):
                 continue
+            ep_count = getattr(r, "ep_count", 0) or 0
+            if ep_count > 0 and len(detail.chapters) > ep_count:
+                from types import SimpleNamespace
+
+                detail = SimpleNamespace(
+                    **{k: v for k, v in vars(detail).items() if k != "chapters"},
+                    chapters=detail.chapters[:ep_count],
+                )
             self.download_queue.add_task(detail)
             ok += 1
         from PySide6.QtWidgets import QMessageBox
@@ -554,6 +563,7 @@ class MainWindow(QMainWindow):
     def _download_from_shelf(self, payload) -> None:
         """书架收藏在线书右键「下载到本地」→ 后台拉详情 → 加入下载队列。
 
+        播放页下载可携带第 4 项 ep_count（>0 时只下载前 N 集）。
         复用 _on_batch_download 的单条任务机制（拉详情拿章节列表后 add_task）。
         """
         if not isinstance(payload, (tuple, list)) or len(payload) < 2:
@@ -563,7 +573,9 @@ class MainWindow(QMainWindow):
             return
         from types import SimpleNamespace
 
-        self._on_batch_download([SimpleNamespace(source_id=source_id, url=url)])
+        item = SimpleNamespace(source_id=source_id, url=url,
+                               ep_count=payload[3] if len(payload) > 3 else 0)
+        self._on_batch_download([item])
 
     def _build_settings(self):
         """设置页：分区 Tab 覆盖 app_config 全量字段。"""

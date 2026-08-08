@@ -41,42 +41,21 @@ from framework.content import Content, Detail
 
 
 class _PlayPanel(QWidget):
-    """外部播放器方案的播放面板（原视频窗口占位）。
+    """外部播放器方案的播放面板（占位几何区，不做视觉占位）。
 
-    不再内嵌 VLC 渲染——独立播放器进程接管画面，这里只提供：
-    - 深色占位 + 当前集标题 + "点击播放"提示
-    - 交互：单击面板/中央播放键 → 拉起外部播放器；双击 → 打开播放器；
-      移动鼠标 → 唤出控制条（选集/下载/设置仍有效）
+    独立播放器进程接管画面，本区不显示任何内容——播放入口 =
+    覆盖层中央「▶ 播放」按钮。这里只承接交互：
+    - 单击/双击面板 → 拉起外部播放器；移动鼠标 → 唤出控制条
+    - 保持布局占位与键盘焦点（快捷键仍生效）
     """
 
     def __init__(self, view, parent=None):
         super().__init__(parent)
         self._view = view
-        self.setStyleSheet("background: #101010; border-radius: 8px;")
+        # 无视觉占位：透明，画面区只显示中央播放按钮
+        self.setStyleSheet("background: transparent;")
         # 无按键移动也触发 mouseMoveEvent → 控制条隐藏后滑动即唤出
         self.setMouseTracking(True)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 20, 24, 20)
-        lay.setSpacing(8)
-        self._panel_title = QLabel("在外部播放器中播放")
-        self._panel_title.setStyleSheet(
-            "background: transparent; color: rgba(255,255,255,180);"
-            " font-size: 15px; font-weight: bold;"
-        )
-        self._panel_title.setAlignment(Qt.AlignCenter)
-        self._panel_hint = QLabel(
-            "点击播放，将在 VLC 播放器中打开当前集\n"
-            "（进度 / 暂停 / 音量 / 倍速 / 全屏均由播放器接管）"
-        )
-        self._panel_hint.setStyleSheet(
-            "background: transparent; color: rgba(255,255,255,110);"
-            " font-size: 12px;"
-        )
-        self._panel_hint.setAlignment(Qt.AlignCenter)
-        lay.addStretch(1)
-        lay.addWidget(self._panel_title)
-        lay.addWidget(self._panel_hint)
-        lay.addStretch(1)
 
     def showEvent(self, event):  # noqa: N802
         super().showEvent(event)
@@ -423,12 +402,28 @@ class VideoView(QWidget):
         cb.addWidget(self.dl_btn)
 
     def _on_download_clicked(self) -> None:
-        """播放器内「⏬ 下载」→ 转发 App 层下载当前作品（与顶部按钮同链路）。"""
+        """播放器内「⏬ 下载」→ 选择下载集数 → App 层批量入队。
+
+        弹窗默认全部集数（无分集信息时直接全部），集数上限 = 当前源返回的分集数。
+        """
         if self._source is None or self._detail is None:
             return
         sid = getattr(self._source, "source_id", "") or self._current_sid
+        total = len(self._episodes) if self._episodes else 0
+        ep_count = 0  # 0 = 全部
+        if total > 0:
+            from PySide6.QtWidgets import QInputDialog
+
+            ep_count, ok = QInputDialog.getInt(
+                self, "选择下载集数",
+                f"本作共 {total} 集\n下载集数（1 ~ {total}，默认全部）：",
+                total, 1, total, 1,
+            )
+            if not ok:
+                return
         self.download_requested.emit(
-            (sid, self._detail.url, getattr(self._detail, "content_type", ""))
+            (sid, self._detail.url,
+             getattr(self._detail, "content_type", ""), ep_count)
         )
 
     def _disable_embedded_controls(self) -> None:
@@ -445,13 +440,6 @@ class VideoView(QWidget):
         self.time_label.setText("外部播放器")
         self.play_btn.setToolTip("在外部播放器中打开当前集")
         self.next_btn.setToolTip("在外部播放器中打开下一集")
-
-    def _update_panel(self, ep_title: str) -> None:
-        """播放面板标题：显示当前集名（外接方案下替代视频画面占位）。"""
-        try:
-            self._video_frame._panel_title.setText(ep_title or "在外部播放器中播放")
-        except (RuntimeError, AttributeError):
-            pass
 
     def _build_settings_menu(self) -> None:
         menu = self._settings_menu
@@ -886,7 +874,6 @@ class VideoView(QWidget):
         self._current_idx = idx
         self._refresh_ep_menu()  # 选集菜单当前集打勾跟随
         ep = self._episodes[idx]
-        self._update_panel(ep.title or f"第{idx + 1}集")
         self.episode_changed.emit((self._detail, ep.title, ep.url))  # 进度记忆
         key = (ep.url, self._quality)
         cached = self._stream_cache.get(key)
@@ -1008,7 +995,6 @@ class VideoView(QWidget):
         self._current_play = video
         self._current_audio = audio  # DASH 音频轨（重开播放器时 input-slave 挂入）
         self._current_title = title  # 状态浮层/重开提示用
-        self._update_panel(title)
         referer = ua = ""
         _rh = getattr(self._source, "request_headers", None)
         if callable(_rh):
