@@ -72,6 +72,7 @@ class DownloadTask:
     done: int = 0
     total: int = 0
     failed: List[str] = field(default_factory=list)   # 失败章节标题
+    failed_idx: List[int] = field(default_factory=list)  # 失败章节索引（重试记忆用）
     error: str = ""                                    # 最近一次错误信息
     bytes_written: int = 0
     done_chapters: List[int] = field(default_factory=list)  # 已完成章节索引（resume 重跑时跳过）
@@ -128,10 +129,6 @@ class DownloadQueue:
         self._concurrent = max(
             1, int(settings.get("download", "max_concurrent_downloads", 6))
         )
-        # 同作品章节并发路数（默认 3，可在设置里调）
-        self._parallel_chapters = max(
-            1, int(settings.get("download", "max_parallel_chapters", 3))
-        )
         self._active_workers = 0
 
     # ------------------------------------------------------------------ #
@@ -172,7 +169,10 @@ class DownloadQueue:
                 total=sum(selected),
             )
             task.out_dir = str(self._downloader.book_dir(task))
-            task.parallel = self._parallel_chapters
+            # 同作品章节并发路数：实时读设置（设置界面改后新任务即生效）
+            task.parallel = max(
+                1, int(self._settings.get("download", "max_parallel_chapters", 3))
+            )
             self._tasks.append(task)
         self._emit(
             EVENT_DOWNLOAD_STARTED,
@@ -320,18 +320,29 @@ class DownloadQueue:
         )
 
     def retry_task(self, task_id: str) -> None:
-        """失败任务清零计数重新入队。"""
+        """重试失败任务：有失败章节记录时**只重下失败章节**（记忆已完成章节），
+        无记录（早期整体失败）才整本重下。"""
         with self._lock:
             t = self._find(task_id)
             if t is None or t.status != TaskStatus.FAILED:
                 return
-            t.status = TaskStatus.WAITING
+            bad = [i for i in t.failed_idx if 0 <= i < len(t.selected)]
+            if bad:
+                # 只重试失败章节：已完成章节保留（done/epub_chapters/done_chapters 记忆）
+                for i in range(len(t.selected)):
+                    t.selected[i] = i in bad
+                t.done = len([i for i in t.done_chapters if i not in bad])
+                # total 保持原值（done 从已完成处继续 → 最终到 100%）
+            else:
+                # 无失败索引（早期整体失败）：整本重下，清空记忆
+                t.done = 0
+                t.bytes_written = 0
+                t.epub_chapters = []
+                t.done_chapters = []
             t.failed = []
+            t.failed_idx = []
             t.error = ""
-            t.done = 0
-            t.bytes_written = 0
-            t.epub_chapters = []      # 重试前清空累积，避免重下后内容翻倍
-            t.done_chapters = []      # 全新下载：清空已完成记录，避免跳过章节
+            t.status = TaskStatus.WAITING
             t.start_time = 0.0
             t.end_time = 0.0
             t.cancel_evt = threading.Event()
@@ -608,6 +619,7 @@ class DownloadQueue:
             # 重试耗尽
             with self._lock:
                 task.failed.append(title)
+                task.failed_idx.append(idx)
                 task.error = last_err
             self._emit_progress(task)
         finally:
@@ -700,6 +712,7 @@ class DownloadQueue:
                     for idx in batch_indices:
                         ch = task.chapters[idx]
                         task.failed.append(ch.title or f"第{idx + 1}话")
+                    task.failed_idx.extend(batch_indices)
                     task.error = last_err
 
             # 发进度
@@ -781,6 +794,7 @@ class DownloadQueue:
             else:
                 with self._lock:
                     task.failed.append(ch.title or f"第{i + 1}话")
+                    task.failed_idx.append(i)
                     task.error = last_err
                 i += 1
 

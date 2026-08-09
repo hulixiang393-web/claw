@@ -263,6 +263,7 @@ class SettingsPage(BasePage):
         self._dl_merge = sec._check("合并章节为一个文件", "merge_chapters_into_one_file")
         self._dl_skip = sec._check("跳过已存在", "skip_existing")
         self._dl_concurrent = sec._spin("并发下载数", "max_concurrent_downloads", 1, 16)
+        self._dl_parallel = sec._spin("同源章节并发", "max_parallel_chapters", 1, 8, " 路")
         self.tabs.addTab(sec, "下载")
 
     def _build_library(self) -> None:
@@ -313,6 +314,7 @@ class SettingsPage(BasePage):
         self._dl_merge.setChecked(bool(g("download", "merge_chapters_into_one_file", False)))
         self._dl_skip.setChecked(bool(g("download", "skip_existing", True)))
         self._dl_concurrent.setValue(int(g("download", "max_concurrent_downloads", 6)))
+        self._dl_parallel.setValue(int(g("download", "max_parallel_chapters", 3)))
 
         self._lib_dir.setText(g("library", "shelf_export_dir", "library"))
         self._lib_webdav.setText(g("library", "webdav_url") or "")
@@ -349,6 +351,7 @@ class SettingsPage(BasePage):
         s.set("download", "merge_chapters_into_one_file", self._dl_merge.isChecked())
         s.set("download", "skip_existing", self._dl_skip.isChecked())
         s.set("download", "max_concurrent_downloads", self._dl_concurrent.value())
+        s.set("download", "max_parallel_chapters", self._dl_parallel.value())
 
         s.set("library", "shelf_export_dir", self._lib_dir.text().strip() or "library")
         s.set("library", "webdav_url", self._lib_webdav.text().strip() or None)
