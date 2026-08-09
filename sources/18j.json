@@ -134,20 +134,8 @@
     },
     "content": {
       "episode": {
-        "list": {
-          "root_selector": {
-            "css": "h1"
-          },
-          "fields": {
-            "title": {
-              "css": "h1"
-            },
-            "url": {
-              "css": "link[rel='canonical']",
-              "attr": "href"
-            }
-          }
-        },
+        "single_chapter": true,
+        "note": "详情页即播放页（内嵌 const source='...m3u8' 直链），无分集列表；单集结构直接用详情 URL 作为唯一章节，play_url.regex 提取 m3u8。",
         "play_url": {
           "regex": "(https?://[^\"'\\s]*m3u8[^\"'\\s]*)"
         }

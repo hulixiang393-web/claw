@@ -119,7 +119,10 @@
           "list_selector": "div.playfrom.tab8 ul li",
           "list_attr": "id",
           "sid_regex": "tab8(\\d+)$",
-          "ep_list_selector": "div#vlink_{sid} ul li a"
+          "ep_list_selector": "div#vlink_{sid} ul li a",
+          "ep_href_contains": "/play-",
+          "detail_url_regex": "^(.*?/)[^/]*play-[^?]*",
+          "max_switch_attempts": 3
         },
         "list": {
           "root_selector": {

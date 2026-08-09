@@ -89,7 +89,17 @@
       "render": "playwright",
       "item": {
         "root_selector": {
-          "css": "a[href*='/yu-']"
+          "css": "a[href*='/tv/']"
+        },
+        "fields": {
+          "title": {
+            "css": "a[href*='/tv/']",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a[href*='/tv/']",
+            "attr": "href"
+          }
         },
         "render_config": {
           "interact": true,
@@ -97,17 +107,38 @@
           "input_selector": "input[name='wd']",
           "wait_until": "networkidle",
           "extra_delay_ms": 3000,
-          "timeout_ms": 30000
+          "timeout_ms": 30000,
+          "filter_keyword": false
         }
       }
     },
     "detail": {
       "url_pattern": "/tv/[\\w-]+",
+      "url_suffix": ".html",
+      "note": "列表 href 不带 .html 时访问会返回反爬落地页（landing.js 探测），详情页必须带 .html 后缀（fetch_detail 按 url_suffix 自动补全）。",
       "fields": {
         "title": {
           "css": "meta[property='og:title']",
           "attr": "content"
         },
+        "title_clean": [
+          [
+            "免费在线观看",
+            ""
+          ],
+          [
+            "_高清电视剧完整版",
+            ""
+          ],
+          [
+            "_高清电影完整版",
+            ""
+          ],
+          [
+            "在线观看",
+            ""
+          ]
+        ],
         "cover": {
           "css": "meta[property='og:image']",
           "attr": "content"

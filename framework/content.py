@@ -28,6 +28,11 @@ from typing import List, Optional
 
 log = logging.getLogger(__name__)
 
+# 精确广告特征：路径段或明确广告词（不用宽泛的 ad_，防误杀正常 URL）
+_AD_IMAGE_RE = _re.compile(
+    r"(?:/ads?/|/ad-|_ad\.|/advert|/banner|/promo|/ad\.|/ad/|\.ads\.)"
+)
+
 from .config import SourceConfig
 from .errors import ContentMissingError
 from .http import HttpClient
@@ -36,7 +41,6 @@ from .selfcheck import StructureChecker
 from . import utils
 from .chapter_sort import chapter_label, _extract_chapter_number, _sort_chapters
 from .health import report_bg_check
-from .decrypter import Decrypter  # noqa: F401  (类型提示用)
 
 
 def _strip_html_tags(text: str) -> str:
@@ -248,6 +252,16 @@ class Content:
                 return self._fetch_detail_ytdlp(source, url, detail_api)
             return self._fetch_detail_api(source, url, detail_api)
 
+        # 详情 URL 规范化：endpoints.detail.url_suffix 配置为 URL 尾缀补全
+        # （如 MacCMS 变体列表 href 不带 .html 但详情页必须 .html，否则返回
+        # 反爬落地页）。仅路径末尾补，保留 query；URL 已带后缀则跳过。
+        detail_cfg0 = source.get_detail_config()
+        suffix = (detail_cfg0 or {}).get("url_suffix") or ""
+        if suffix and url:
+            path, _, query = url.partition("?")
+            if not path.endswith(suffix):
+                url = path + suffix + ("?" + query if query else "")
+
         abs_url = self._abs_url(source, url)
         self._bg_check(source, abs_url)
         html = self._get_detail_html(source, url, abs_url)
@@ -262,6 +276,10 @@ class Content:
         detail_cfg = source.get_detail_config()
         fields = detail_cfg.get("fields") or {}
         title = self._parser.extract_first(doc, fields.get("title"))
+        # 标题清理：fields.title_clean 为 [["在线观看", ""], ...] 替换对列表
+        for _pat, _repl in (fields.get("title_clean") or []):
+            if _pat:
+                title = title.replace(_pat, _repl)
         # 书名修正：若 title 像是站点名（短/非书名），尝试 og:novel:book_name
         book_fields = fields.get("book_name")
         if book_fields:
@@ -287,9 +305,10 @@ class Content:
         tags = self._parser.extract(doc, fields.get("tags"))
         detail.tags = tags
 
-        # 章节列表（按类型取 content 配置，传书名用于标题清理）
+        # 章节列表（按类型取 content 配置，传书名用于标题清理；
+        # html 供目录页 id 从详情页 HTML 提取，如 dm5 COMIC_MID）
         detail.chapters = self._fetch_chapters(
-            source, doc, book_title=detail.title, detail_url=url
+            source, doc, book_title=detail.title, detail_url=url, html=html
         )
         # 视频系列聚合：内容配置 content.episode.series.enabled 且标题含系列标记
         # （如「第N話」）→ 搜同系列基底，把其他分部并入分集列表（hanime1 类站
@@ -433,7 +452,7 @@ class Content:
             title / number 每项标题/序号字段名
             url_template   章节 URL 模板（可用 {cid} / {page} / {part} 占位）
         """
-        from urllib.parse import urlencode, urljoin, quote
+        from urllib.parse import urlencode, urljoin
 
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
@@ -603,6 +622,7 @@ class Content:
         doc,
         book_title: str = "",
         detail_url: str = "",
+        html: str = "",
     ) -> List[Chapter]:
         """从详情页提取章节列表。按 content_type 读 content 配置。
 
@@ -643,13 +663,22 @@ class Content:
             return []
 
         # 独立目录页：content.chapter.list.chapters_url 为模板（如 /other/chapters/id/{id}.html），
-        # 从详情 URL 提取 book id 并二次抓取，在该页提取完整章节列表
+        # 从详情 URL 提取 book id 并二次抓取，在该页提取完整章节列表。
+        # id 来源两级：详情 URL（/{id}/ 段）→ 详情页 HTML 正则（chapters_id_regex，
+        # 别名 URL 站如 dm5 /manhua-xxx/ 的 JS 变量 COMIC_MID）。
         chapters_url_tpl = list_cfg.get("chapters_url") or ""
         if chapters_url_tpl and detail_url:
             m_id = _re.search(r"/(?:novel|book|comic|detail)/(\w+)", detail_url)
-            if m_id:
+            book_id = m_id.group(1) if m_id else ""
+            if not book_id:
+                id_regex = list_cfg.get("chapters_id_regex")
+                if id_regex and html:
+                    m_id2 = _re.search(str(id_regex), html)
+                    if m_id2:
+                        book_id = m_id2.group(1) if m_id2.groups() else m_id2.group(0)
+            if book_id:
                 try:
-                    cat_url = chapters_url_tpl.replace("{id}", m_id.group(1))
+                    cat_url = chapters_url_tpl.replace("{id}", book_id)
                     cat_html = self._get(source, cat_url)
                     cat_doc = self._parser.parse(cat_html)
                     doc = cat_doc  # 用目录页 doc 提取章节
@@ -946,6 +975,15 @@ class Content:
             # 字符映射解密（番茄小说字体混淆等）：decryption.targets.chapter.strategy=translit
             if self._decrypter is not None:
                 text = self._decrypter.decrypt(source, text, "chapter")
+        # 正文广告行过滤（ad_block 引擎：剔除「广告/推广/点击领取」等特征行）
+        try:
+            from .adblock import adblock_for
+
+            ad = adblock_for(source)
+            if ad.enabled:
+                text = ad.filter_text(text)
+        except Exception:
+            pass  # 广告过滤是增强能力，失败不影响正文
         return text, nxt
 
     @staticmethod
@@ -1207,7 +1245,13 @@ class Content:
           interval_ms 礼貌延迟从顺序累积压成每 wave 并行平摊。模板验证失败 /
           并行异常 → 回退下方顺序循环（保证正确性）。
         - 图片 URL 用 data-src / data-original 懒加载属性时框架自动兜底
+        - image_api（可选）：图片 URL 来自 AJAX 文本接口 + JS Packer 解包的源
+          （如 dm5 chapterfun.ashx）。配置见 _fetch_comic_image_api。命中即
+          走该路径，不解析页面 HTML 图片。
         """
+        image_api = list_cfg.get("image_api") or {}
+        if image_api:
+            return self._fetch_comic_image_api(source, image_api, chapter_url)
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
         if not root_sel or not fields.get("url"):
@@ -1350,6 +1394,185 @@ class Content:
 
         return urls
 
+    # ------------------------------------------------------------------ #
+    def _fetch_comic_image_api(
+        self, source: SourceConfig, cfg: dict, chapter_url: str
+    ) -> List[str]:
+        """漫画图片来自 AJAX 文本接口的源（配置驱动，如 dm5 chapterfun.ashx）。
+
+        站点阅读页的图片 URL 不在 HTML 里，而是前端 JS 按页调用文本接口拿
+        （接口返回 JS Packer 混淆脚本，内含图片地址）。完整流程（全部规则
+        外置到源配置，本方法只做通用执行）：
+
+        1. 抓阅读页（chapter_url）HTML，按 cfg.vars 的 {名: 正则} 提取 JS 变量
+           （如 dm5 的 DM5_CID / DM5_MID / DM5_VIEWSIGN / DM5_VIEWSIGN_DT /
+           DM5_IMAGE_COUNT），其中 count 为总页数；
+        2. 对第 1..count 页：把 cfg.url 里的 {变量}/{page} 占位替换成提取值，
+           逐个 GET（间隔走 transports.interval_ms）；
+        3. cfg.packer=true 时对响应做 JS Packer（Dean Edwards packer）解包，
+           否则原文使用；
+        4. 按 cfg.pix_regex / cfg.paths_regex / cfg.key_regex 从解包文本提取
+           图片 CDN 基址 / 路径数组 / 签名 key；
+        5. 按 cfg.url_template（{pix} {path} {key} 及 JS 变量占位）拼出图片 URL，
+           去重合并。
+
+        配置示例（dm5）：
+        ```json
+        "body": {
+          "image_api": {
+            "url": "/chapterfun.ashx",
+            "params": {
+              "cid": "{cid}", "page": "{page}", "key": "",
+              "language": 1, "gtk": 6,
+              "_cid": "{cid}", "_mid": "{mid}", "_dt": "{sign_dt}", "_sign": "{sign}"
+            },
+            "vars": {
+              "cid": "DM5_CID\\\\s*=\\\\s*(\\\\d+)",
+              "mid": "DM5_MID\\\\s*=\\\\s*(\\\\d+)",
+              "sign": "DM5_VIEWSIGN\\\\s*=\\\\s*\"([^\"]+)\"",
+              "sign_dt": "DM5_VIEWSIGN_DT\\\\s*=\\\\s*\"([^\"]+)\"",
+              "count": "DM5_IMAGE_COUNT\\\\s*=\\\\s*(\\\\d+)"
+            },
+            "packer": true,
+            "pix_regex": "pix=\\\"([^\\\"]+)\\\"",
+            "paths_regex": "pvalue=\\\\[([^\\\\]]*)\\\\]",
+            "key_regex": "key='([^']+)'",
+            "url_template": "{pix}{path}?cid={cid}&key={key}",
+            "max_pages": 500
+          }
+        }
+        ```
+
+        注意：接口 query 参数用 `params` 对象声明（自动 urlencode，空格→`+`）比
+        手拼 URL 更稳——手拼 URL 里含空格的变量（如 `_dt` 时间戳）经 requests
+        会变 `%20`，dm5 这类对签名串敏感的接口会据此生成失效 key（图片 404）。
+        """
+        import time as _time
+        from urllib.parse import urlencode
+
+        # 1) 阅读页 JS 变量
+        html = self._get(source, chapter_url)
+        v: dict = {}
+        for name, pattern in (cfg.get("vars") or {}).items():
+            m = _re.search(str(pattern), html)
+            if m:
+                v[name] = m.group(1) if m.groups() else m.group(0)
+        try:
+            count = int(v.get("count") or cfg.get("count") or 1)
+        except Exception:  # noqa: BLE001
+            count = 1
+        count = min(count, int(cfg.get("max_pages") or 500))
+        if count <= 0:
+            return []
+
+        params_cfg = cfg.get("params") or {}
+        api_url = str(cfg.get("url") or "")
+        url_tpl = str(cfg.get("url_template") or "")
+        pix_re = str(cfg.get("pix_regex") or r'pix="([^"]+)"')
+        paths_re = str(cfg.get("paths_regex") or r"pvalue=\[([^\]]*)\]")
+        key_re = str(cfg.get("key_regex") or "")
+        use_packer = bool(cfg.get("packer"))
+        # 接口专用请求头（合并覆盖源头）——部分站点接口要求特定 Referer/Cookie
+        api_headers = dict(self._headers(source))
+        for k, val in (cfg.get("headers") or {}).items():
+            api_headers[k] = val
+        interval = (
+            float(source.transports().get("interval_ms") or self._http.defaults.interval_ms)
+            / 1000.0
+        )
+
+        def _fill(tpl: str, page: int) -> str:
+            for name, val in v.items():
+                tpl = tpl.replace("{" + name + "}", str(val))
+            return tpl.replace("{page}", str(page))
+
+        def _api_url(page: int) -> str:
+            if params_cfg:
+                filled = {}
+                for k, val in params_cfg.items():
+                    filled[k] = _fill(str(val), page)
+                sep = "&" if "?" in api_url else "?"
+                return api_url + sep + urlencode(filled)
+            return _fill(api_url, page)
+
+        def _fetch_api(page: int) -> str:
+            """接口请求：走独立 headers，遇失败抛异常由调用方跳过该页。"""
+            abs_url = self._abs_url(source, _api_url(page))
+            return self._http.get_text(
+                abs_url,
+                headers=api_headers,
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+                interval_ms=self._interval_ms(source),
+                encoding=source.transports().get("charset"),
+                proxy_pool=source.proxy_pool(),
+            )
+
+        urls: List[str] = []
+        seen: set = set()
+        for page in range(1, count + 1):
+            try:
+                resp_text = _fetch_api(page)
+            except Exception:  # noqa: BLE001
+                continue  # 单页接口失败跳过（不整话失败）
+            plain = self._unpack_js_packer(resp_text) if use_packer else resp_text
+            m = _re.search(pix_re, plain)
+            pix = m.group(1) if m else ""
+            mp = _re.search(paths_re, plain)
+            paths = _re.findall(r'"([^"]+)"', mp.group(1)) if mp else []
+            key = ""
+            if key_re:
+                mk = _re.search(key_re, plain)
+                if mk:
+                    key = (mk.group(1) if mk.groups() else mk.group(0)).rstrip("\\")
+            for p in paths:
+                full = url_tpl.replace("{pix}", pix).replace("{path}", p)
+                full = _fill(full, page).replace("{key}", key)
+                if full and full not in seen:
+                    seen.add(full)
+                    urls.append(full)
+            if interval > 0 and page < count:
+                _time.sleep(interval)
+        return urls
+
+    @staticmethod
+    def _unpack_js_packer(code: str) -> str:
+        """解 JS Packer（Dean Edwards packer）混淆脚本，返回解包后的 JS 文本。
+
+        形态：eval(function(p,a,c,k,e,d){...}('密文',N,N,'词表'.split('|'),0,{}))
+        解不开（非 packer / 已变形）→ 原样返回。解包后把 JS 字符串转义
+        （\\' → '、\\" → "）还原，方便下游正则直接提取值。
+        """
+        import string as _string
+
+        m = _re.search(
+            r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\),0,\{\}\)\)",
+            code,
+            _re.S,
+        )
+        if not m:
+            return code
+        s, a, c, k = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4).split("|")
+
+        def _b36(n: int) -> str:
+            return str(n) if n < 10 else _string.ascii_lowercase[n - 10]
+
+        def _enc(n: int, base: int) -> str:
+            if n < base:
+                x = n % base
+                return chr(x + 29) if x > 35 else _b36(x)
+            return _enc(n // base, base) + _enc(n % base, base)
+
+        out = s
+        for i in range(c - 1, -1, -1):
+            if i < len(k) and k[i]:
+                out = _re.sub(
+                    r"\b" + _enc(i, a) + r"\b",
+                    k[i].replace("\\", "\\\\").replace("$", "\\$"),
+                    out,
+                )
+        return out.replace("\\'", "'").replace('\\"', '"')
+
     def comic_page_urls(self, source: SourceConfig, chapter_url: str) -> List[str]:
         """纯 HTTP 提取一话的图片 URL 列表（不渲染，供预加载计数）。
 
@@ -1460,6 +1683,9 @@ class Content:
 
         优先 api_endpoints.episode（JSON API，可选 sign 签名）；
         否则 endpoints.content.episode HTML 解析（play_url.selector）。
+        换源站（content.episode.source_switch）：默认线路取流失败
+        （空 / ContentMissingError / 网络异常 / 播放 URL 403/404/超时）时
+        自动尝试其他线路，全部失败才抛错。
         """
         # JSON API 播放地址（api_endpoints.episode）
         api = source.raw.get("api_endpoints") or {}
@@ -1473,6 +1699,17 @@ class Content:
             if play:
                 return play
 
+        # 换源站：默认线路失败 → 自动轮换其他线路
+        if self._get_source_switch_cfg(source):
+            return self._fetch_play_url_auto_switch(source, episode_url)
+
+        return self._fetch_play_url_once(source, episode_url)
+
+    def _fetch_play_url_once(self, source: SourceConfig, episode_url: str) -> str:
+        """按单条分集 URL 提取播放地址（fetch_video_episode 的 HTML 解析部分）。
+
+        独立成方法供线路自动轮换按 URL 复用：每条线路各抓一次播放页再提取。
+        """
         abs_ep = self._abs_url(source, episode_url)
         self._bg_check(source, abs_ep)
         # single_chapter 视频源：取流 URL == 详情 URL，复用 fetch_detail 已取回的
@@ -1506,11 +1743,15 @@ class Content:
                 )
             return vurl
 
-        # 换源站：从 player_aaaa JS 配置提取真实播放地址（ps=0 直接用 / ps=1 走 parse 转码）
+        # 换源站：从 player_aaaa JS 配置提取真实播放地址（ps=0 直接用 / ps=1 走 parse 转码）。
+        # 播放页无 player_aaaa（MacCMS 变体：var now 直链等）→ 回退下方 play_url.regex 规则
         if switch_cfg:
-            return self._fetch_play_url_from_player(
-                html, switch_cfg, episode_url, source=source
-            )
+            try:
+                return self._fetch_play_url_from_player(
+                    html, switch_cfg, episode_url, source=source
+                )
+            except ContentMissingError:
+                pass  # player_aaaa 缺失 → 走 play_url.regex
 
         # 正则提取（JS 里的转义 URL，如 _detail_.url m3u8）
         play_regex = play_cfg.get("regex")
@@ -1544,6 +1785,167 @@ class Content:
         if self._decrypter is not None:
             return self._decrypter.decrypt(source, play, "video_url")
         return play
+
+    # ------------------------------------------------------------------ #
+    # 换源站线路自动轮换（source_switch）
+    # ------------------------------------------------------------------ #
+    def _fetch_play_url_auto_switch(
+        self, source: SourceConfig, episode_url: str
+    ) -> str:
+        """换源站取流：默认线路失败时自动尝试其他线路，全部失败才抛错。
+
+        失败判定：取流抛错 / 返回空 / 播放 URL 不可访问（HTTP>=400 / 空内容 /
+        超时，见 _play_url_probe）。换线路复用 switch_source 重取详情拿新线路
+        分集 URL（如 play-{sid}-x.html）后重新取流。
+        max_switch_attempts：最多尝试线路数（含默认线路），缺省 3，避免太慢。
+        """
+        switch_cfg = self._get_source_switch_cfg(source)
+        max_attempts = max(1, int(switch_cfg.get("max_switch_attempts") or 3))
+        attempted: set = set()
+        candidates: list = []
+        current = episode_url
+        last_err: Exception | None = None
+        for _ in range(max_attempts):
+            key = self._episode_key(current)
+            if key in attempted:
+                break
+            attempted.add(key)
+            try:
+                play = self._fetch_play_url_once(source, current)
+                if play and self._play_url_probe(source, play):
+                    return play
+                last_err = ContentMissingError(
+                    f"播放地址不可访问（{current} → {str(play)[:80]}），"
+                    f"已尝试 {len(attempted)} 条线路",
+                    source_id=source.source_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                log.info("[%s] 线路取流失败 %s：%s", source.source_id, current, exc)
+            if not candidates:
+                try:
+                    candidates = self._switch_candidate_episode_urls(source, current)
+                except Exception as exc:  # noqa: BLE001
+                    log.info("[%s] 构造候选线路失败：%s", source.source_id, exc)
+                    candidates = []
+            if not candidates:
+                break
+            current = candidates.pop(0)
+        if last_err is None:
+            last_err = ContentMissingError("未取到播放地址", source_id=source.source_id)
+        raise ContentMissingError(
+            f"全部线路取流失败（{source.source_id}）：{last_err}",
+            source_id=source.source_id,
+        )
+
+    def _play_url_probe(self, source: SourceConfig, url: str) -> bool:
+        """轻量探测播放 URL 是否可访问：HTTP<400 且响应非空即视为可用。
+
+        403/404/空内容/超时 → False（触发换线路）。非 http(s) URL（如 data:）
+        无法探测，直接视为可用（保持原行为，不误换线路）。
+        """
+        if not url or not url.startswith(("http://", "https://")):
+            return True
+        import urllib.request as _ur
+
+        headers = dict(self._headers(source))
+        timeout = max(5.0, min(float(self._timeout(source)) or 10.0, 10.0))
+        try:
+            req = _ur.Request(url, headers=headers)
+            with _ur.urlopen(req, timeout=timeout) as resp:
+                if resp.status >= 400:
+                    return False
+                return bool(resp.read(4096))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _switch_candidate_episode_urls(
+        self, source: SourceConfig, episode_url: str
+    ) -> list:
+        """构造同集其他线路的分集 URL 列表（供失败自动换线路）。
+
+        依赖 source_switch 配置 detail_url_regex（+可选 detail_url_template）
+        从分集 URL 推导详情页 URL，再走 switch_source 取各线路分集列表，
+        按当前集的位置/集数号匹配出同集在新线路上的 URL。
+        """
+        switch = self._get_source_switch_cfg(source)
+        detail_url = self._detail_url_from_episode(source, episode_url)
+        if not detail_url:
+            return []
+        m_sid = _re.search(r"sid=(\d+)", episode_url)
+        cur_sid = m_sid.group(1) if m_sid else str(switch.get("default_sid") or "1")
+        try:
+            base_detail, base_chs = self.switch_source(source, detail_url, cur_sid)
+        except Exception as exc:  # noqa: BLE001
+            log.info("[%s] 换源基线详情失败：%s", source.source_id, exc)
+            return []
+        # 当前集在新线路分集列表中的位置（精确 URL 匹配，回退 URL 末段集数号）
+        idx = self._episode_index_in_chapters(episode_url, base_chs)
+        out: list = []
+        seen: set = set()
+        for line in base_detail.source_list or []:
+            cand_sid = str(line.get("sid") or "")
+            if not cand_sid or cand_sid == cur_sid:
+                continue
+            try:
+                _, chs = self.switch_source(source, detail_url, cand_sid)
+            except Exception as exc:  # noqa: BLE001
+                log.info("[%s] 换源 sid=%s 失败：%s", source.source_id, cand_sid, exc)
+                continue
+            if not chs:
+                continue
+            u = chs[idx].url if idx is not None and idx < len(chs) else chs[0].url
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _detail_url_from_episode(self, source: SourceConfig, episode_url: str) -> str:
+        """从分集 URL 推导详情页 URL（source_switch 配置驱动）。
+
+        detail_url_regex：正则作用于分集 URL；detail_url_template：可选，
+        用 {1}/{2} 引用捕获组重建详情 URL，缺省直接用捕获组 1。
+        无法推导返回 ""。
+        """
+        switch = self._get_source_switch_cfg(source)
+        regex = switch.get("detail_url_regex") or ""
+        if not regex:
+            return ""
+        m = _re.search(regex, episode_url)
+        if not m:
+            return ""
+        tpl = switch.get("detail_url_template")
+        if tpl:
+            out = tpl
+            for i in range(len(m.groups())):
+                out = out.replace("{%d}" % (i + 1), m.group(i + 1) or "")
+            return out
+        return m.group(1) or ""
+
+    @staticmethod
+    def _episode_key(url: str) -> str:
+        """归一化分集 URL（去 fragment、去尾斜杠），用于去重/定位。"""
+        return _re.sub(r"#.*$", "", url).rstrip("/")
+
+    def _episode_index_in_chapters(self, episode_url: str, chapters: List[Chapter]):
+        """在分集列表中定位当前集的位置：先精确 URL 匹配，回退按 URL 末段数字。"""
+        target = self._episode_key(episode_url)
+        for i, ch in enumerate(chapters):
+            if self._episode_key(ch.url) == target:
+                return i
+        cur_n = self._episode_ordinal(episode_url)
+        if cur_n is not None:
+            for i, ch in enumerate(chapters):
+                if self._episode_ordinal(ch.url) == cur_n:
+                    return i
+        return None
+
+    @staticmethod
+    def _episode_ordinal(url: str):
+        """URL 路径末段数字（分集号/集索引），用于跨线路定位同一集。"""
+        path = url.split("?", 1)[0].rstrip("/")
+        m = _re.search(r"(\d+)$", path)
+        return int(m.group(1)) if m else None
 
     def _fetch_streams_ytdlp(self, source: SourceConfig, episode_url: str, cfg: dict,
                              quality: str = "", merged: bool = False) -> tuple:
@@ -1623,6 +2025,18 @@ class Content:
                 m_sid = _re.search(switch["sid_regex"], str(sid))
                 if m_sid:
                     sid = m_sid.group(1) if m_sid.groups() else m_sid.group(0)
+            # 属性无 sid 时：sid_regex 从节点 html 提取
+            # （如 div.video_list_li 内含 /v/56673-2-1/ 的线路分集块）
+            if not sid and switch.get("sid_regex"):
+                try:
+                    from lxml import etree as _etree
+
+                    html_repr = _etree.tostring(node, encoding="unicode")
+                    m_sid = _re.search(switch["sid_regex"], html_repr)
+                    if m_sid:
+                        sid = m_sid.group(1) if m_sid.groups() else m_sid.group(0)
+                except Exception:
+                    pass
             if not sid or sid in seen:
                 continue
             seen.add(sid)
@@ -1732,6 +2146,8 @@ class Content:
         ep_sel_tpl = switch.get("ep_list_selector")
         if not ep_sel_tpl:
             return []
+        ep_sid_re = switch.get("ep_sid_regex")
+        href_needle = switch.get("ep_href_contains", "/tv/")
         # 分集列表选择器：{sid} → 当前源
         ep_sel = ep_sel_tpl.replace("{sid}", str(sid))
         nodes = self._parser._query(doc, ep_sel, None)
@@ -1739,8 +2155,18 @@ class Content:
         seen: set = set()
         for node in nodes:
             href = node.get("href") if hasattr(node, "get") else None
-            if not href or "/tv/" not in href:
+            if not href or href_needle not in href:
                 continue
+            # 多线路同页：ep_sid_regex 从 href 提取线路号，非当前 sid 跳过
+            if ep_sid_re:
+                m_es = _re.search(ep_sid_re, href)
+                link_sid = (
+                    m_es.group(1)
+                    if m_es and m_es.groups()
+                    else (m_es.group(0) if m_es else "")
+                )
+                if str(link_sid) != str(sid):
+                    continue
             if href in seen:
                 continue
             seen.add(href)
@@ -1803,8 +2229,7 @@ class Content:
         quality: 画质名（"best"/"1080p"/...），经 cfg["quality"]["map"] 映射为
         请求参数值（如 B 站 qn）；缺省用 quality.map 的默认值。
         """
-        import copy
-        from urllib.parse import urlencode, urljoin, quote
+        from urllib.parse import urlencode, urljoin
 
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
@@ -1821,12 +2246,17 @@ class Content:
         # 占位符同样替换进 URL 路径（如 avgood /play/ajax/{id}.html）。
         # 原实现只在 params 值里替换，URL 路径里的 {id} 会原样发出 → 接口返回"不存在"
         api_url = api_url.replace("{id}", ep_id)
+        # 从 episode_url 提取一次 bvid/cid，路径与 params 值共用（避免每参数重复 re.search）
+        bvid = ""
         m_bv = _re.search(r"(BV[0-9A-Za-z]+)", episode_url)
         if m_bv:
-            api_url = api_url.replace("{bvid}", m_bv.group(1))
+            bvid = m_bv.group(1)
+            api_url = api_url.replace("{bvid}", bvid)
+        cid = ""
         m_cid = _re.search(r"(?:cid|p)=(\d+)", episode_url)
         if m_cid:
-            api_url = api_url.replace("{cid}", m_cid.group(1))
+            cid = m_cid.group(1)
+            api_url = api_url.replace("{cid}", cid)
         api_url = api_url.replace("{" + q_param + "}", str(q_value))
         api_url = api_url.replace("{quality}", str(q_value))
         filled = {}
@@ -1834,13 +2264,11 @@ class Content:
         for k, v in params.items():
             val = str(v)
             val = val.replace("{id}", ep_id)
-            # 从 episode_url 尝试提取 bvid / cid
-            m_bv = _re.search(r"(BV[0-9A-Za-z]+)", episode_url)
-            if m_bv:
-                val = val.replace("{bvid}", m_bv.group(1))
-            m_cid = _re.search(r"(?:cid|p)=(\d+)", episode_url)
-            if m_cid:
-                val = val.replace("{cid}", m_cid.group(1))
+            # 从 episode_url 提取 bvid / cid（复用上面已提取的局部变量）
+            if bvid:
+                val = val.replace("{bvid}", bvid)
+            if cid:
+                val = val.replace("{cid}", cid)
             val = val.replace("{" + q_param + "}", str(q_value))
             # 兼容通用占位符 {quality}（不论 param 名是什么都替换）
             val = val.replace("{quality}", str(q_value))
@@ -1910,25 +2338,31 @@ class Content:
     def _filter_ad_images(images: List[str], source: SourceConfig) -> List[str]:
         """剔除广告图（URL 路径含广告标记）。
 
-        仅检查 URL 路径部分（? 前），且用路径段边界匹配，避免
-        auth_key/upload_01 等正常参数被 ad_ 子串误伤。
+        优先走 ad_block 引擎的 is_ad_image_url（含域名黑名单/query 特征/
+        源级配置），        再保留旧版路径段特征与 .gif 广告动图剔除作为兜底。
         """
-        import re as _re
         from urllib.parse import urlparse
 
-        # 精确广告特征：路径段或明确广告词（不用宽泛的 ad_，防误杀正常 URL）
-        ad_re = _re.compile(
-            r"(?:/ads?/|/ad-|_ad\.|/advert|/banner|/promo|/ad\.|/ad/|\.ads\.)"
-        )
         gif_marker = ".gif"
+        # ad_block 引擎（含源级配置；无配置时用内置规则）
+        try:
+            from .adblock import adblock_for
+
+            ad = adblock_for(source)
+        except Exception:
+            ad = None
         filtered = []
         for url in images:
             low = url.lower()
             path = urlparse(low).path
-            # gif 仍按路径判断（gif 常是广告动图）
+            # gif 广告动图（旧版规则，保留）
             if gif_marker in path:
                 continue
-            if ad_re.search(path):
+            # ad_block 引擎判定（域名黑名单/路径/query/源级）
+            if ad is not None and ad.enabled and ad.is_ad_image_url(url):
+                continue
+            # 旧版路径段特征（引擎未命中时兜底）
+            if _AD_IMAGE_RE.search(path):
                 continue
             filtered.append(url)
         return filtered

@@ -36,7 +36,8 @@
     },
     "interval_ms": 800,
     "charset": "utf-8",
-    "follow_redirects": true
+    "follow_redirects": true,
+    "cookie": "user_uuid=fb8e0d5b-9d77-4723-a9a6-13dbfe136b65; _ga=GA1.1.2060417865.1786006079; search_history=[%22%25E6%25A1%2583%25E4%25B9%2583%25E6%259C%25A8%25E9%25A6%2599%22]; _ga_9FFNX13PHD=GS2.1.s1786159656$o4$g1$t1786159666$j50$l0$h0; _ga_WVQPWV98M1=GS2.1.s1786159656$o4$g1$t1786159666$j50$l0$h0; cf_clearance=cKazM0RJY70hpCzf0s3TK.o4OG6spFvzwVOI4XzBUwo-1786254214-1.2.1.1-ZzMUEAfyEqp7a8GKFDdlwm93CXg_wM68m7EBqVZ3DaNEK1nJNMXD_McasUr3svL4WAj0uF7gTUSlKyOruHQoKcPAfrXfj.dnLGRc51Mng_GMRHTem3HDI1SDWt3HKKj3NMa9inrG3dRbqvo5VUD8aA70rltlKDuZse66n0cPqbI1AlwabbFXxFXrJS1fO0yWs0aKhvMeqxe5VPI.DtbXVsgQ1WCcW.YXZk5o6HPlnqi6XkXxDVH1vDNNNtG2FzDqZcxKICQU.9peWAfsrOEvYuj4xhoz5mnBdQmyOt6YWiEI9oPX6TS3B6IW99O3fxwjXtn.7XtDJQiH_Q.dd_4ciBK_0Cvtfj7UDcGY9frtE7B4iB5lmb.MKiLovbQ8zdNIBpQlT3tjyNSQYxIfwAP84FKS3v8wCzCBDjCukHkGaOEuDfsAeiF1MqLMNqk_HYoqPhQ5kfHVNfbHFW.ihCURyTlcsjQAg4.4iI8r2Is01zyXy7tySiHRUC4PVVSy.eIKk7xoXy4ZMQI549reUmVltw"
   },
   "endpoints": {
     "discovery": {
@@ -139,16 +140,13 @@
       "url_pattern": "(?:/ja/|/dm\\d+/ja/)[a-z0-9-]+",
       "fields": {
         "title": {
-          "css": "meta[property='og:title']",
-          "attr": "content"
+          "css": "meta[property='og:title']"
         },
         "cover": {
-          "css": "meta[property='og:image']",
-          "attr": "content"
+          "css": "meta[property='og:image']"
         },
         "summary": {
-          "css": "meta[property='og:description']",
-          "attr": "content"
+          "css": "meta[property='og:description']"
         },
         "status": {
           "css": "meta[property='og:video:duration']",
@@ -168,6 +166,9 @@
         "play_url": {
           "regex": "https:\\\\/\\\\/[a-z0-9.-]+\\\\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\\\/",
           "suffix": "/playlist.m3u8"
+        },
+        "list": {
+          "fields": {}
         }
       }
     }
@@ -212,5 +213,8 @@
         "css": "div.thumbnail.group"
       }
     }
+  },
+  "ad_block": {
+    "enabled": true
   }
 }

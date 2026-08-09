@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import time
 import webbrowser
 
 from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
@@ -164,25 +163,18 @@ class VideoView(QWidget):
         self._source_list = []  # [{sid, name, ...}]（同站多线路）
         self._current_sid = ""
         self._switching = False
-        self._play_cache: dict = {}  # {ep_url: single_url}（展示/复制地址）
         self._stream_cache: dict = {}  # {(ep_url, quality): (video, audio)} 播放用
         self._prefetch_idx = -2  # 正在预拉下一集（<0 空闲）
         self._quality = "best"
         self._quality_options: list = []
         self._detail_url_for_play = ""  # 无分集时记录详情 URL
         self._player = None
-        self._dragging = False
         self._fs_win = None  # 全屏顶层窗口
-        self._cached_length = 0  # 缓存视频总时长（length_changed 更新，避免每次 get_length 阻塞）
-        self._last_tick = 0.0  # time_changed 节流时间戳（长视频防信号堆积卡主线程）
         self._last_pos_save_ts = 0.0  # 上次播放进度存盘时间戳（节流 2s 存一次）
         self._pending_position = None  # 打开书续读播放位置（0~1），播放开始后 seek
         self._has_played = False  # 是否真正开始过播放（未播放不落盘，防覆盖恢复进度）
         self._pending_play = None  # 取流完成但视图不可见 → 暂存 (video, audio, title)，显示后再播
-        self._muted = False  # M 键静音状态（恢复音量用）
-        self._last_volume = 80  # 静音前的音量
         self._click_pending = False  # 单击/双击判定
-        self._buffer_shown = False  # 是否正显示"缓冲中"浮层
         from framework.media_tuner import MediaTuner
 
         self._tuner = MediaTuner()  # 卡顿统计/缓冲升级（每次 load 重置）
@@ -338,8 +330,6 @@ class VideoView(QWidget):
 
         self.progress = QSlider(Qt.Horizontal)
         self.progress.setRange(0, 1000)
-        self.progress.sliderPressed.connect(self._on_progress_pressed)
-        self.progress.sliderReleased.connect(self._on_progress_released)
         # 细进度条 hover 变粗（现代播放器模式 P6）
         self.progress.setStyleSheet(
             "QSlider::groove:horizontal { height: 4px; background: palette(mid);"
@@ -357,14 +347,13 @@ class VideoView(QWidget):
         self.time_label.setStyleSheet("color: palette(dark); font-size: 11px;")
         cb.addWidget(self.time_label)
 
-        self.vol_btn = self._icon_btn("🔊", "静音（M）", self._toggle_mute, width=32)
+        self.vol_btn = self._icon_btn("🔊", "静音由外部播放器接管", lambda: None, width=32)
         cb.addWidget(self.vol_btn)
 
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(80)
         self.vol_slider.setFixedWidth(80)
-        self.vol_slider.valueChanged.connect(self._on_volume)
         self.vol_slider.sliderReleased.connect(self._video_frame.setFocus)
         cb.addWidget(self.vol_slider)
 
@@ -533,23 +522,7 @@ class VideoView(QWidget):
         """播放器内换源：同步顶部下拉框触发换源流程。"""
         if not (0 <= idx < self.source_combo.count()):
             return
-        self.source_combo.setCurrentIndex(idx)  # → currentIndexChanged → _on_source_switch
-
-    # ------------------------------------------------------------------ #
-    def _toggle_mute(self) -> None:
-        """M 键/喇叭按钮：静音切换（记住静音前音量用于恢复）。"""
-        if self._player is None:
-            return
-        if self._muted:
-            self._player.set_volume(self._last_volume)
-            self.vol_slider.setValue(self._last_volume)
-            self.vol_btn.setText("🔊")
-            self._muted = False
-        else:
-            self._last_volume = self.vol_slider.value()
-            self._player.set_volume(0)
-            self.vol_btn.setText("🔇")
-            self._muted = True
+            self.source_combo.setCurrentIndex(idx)  # → currentIndexChanged → _on_source_switch
 
     # ------------------------------------------------------------------ #
     # 控制条自动隐藏
@@ -565,8 +538,8 @@ class VideoView(QWidget):
             self.setCursor(Qt.ArrowCursor)
 
     def _hide_controls(self) -> None:
-        """3s 无操作 → 隐藏控制条（仅播放中隐藏；拖动/菜单打开时除外）。"""
-        if self._dragging or self.settings_btn.menu().isVisible():
+        """3s 无操作 → 隐藏控制条（仅播放中隐藏；菜单打开时除外）。"""
+        if self.settings_btn.menu().isVisible():
             self._hide_timer.start()
             return
         if self._player is not None and self._player.is_playing():
@@ -640,18 +613,6 @@ class VideoView(QWidget):
             return True
         return False
 
-    def _set_volume(self, v: int) -> None:
-        self.vol_slider.setValue(v)
-        self._on_volume(v)
-        if self._muted and v > 0:
-            self._muted = False
-            self.vol_btn.setText("🔊")
-
-    def _seek_relative(self, seconds: float) -> None:
-        if self._player is not None:
-            self._player.seek_relative(seconds)
-            self._wake_controls()
-
     # ------------------------------------------------------------------ #
     # 覆盖层（中央按钮 / spinner / 帮助）
     # ------------------------------------------------------------------ #
@@ -699,13 +660,11 @@ class VideoView(QWidget):
         self._detail = detail
         self._pending_play = None  # 换书清掉旧暂存播放
         self._tuner.reset()  # 新播放会话重置卡顿统计
-        self._buffer_shown = False
         if restore_position is not None:
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用）。
         self._stop_player()
         self._episodes = detail.chapters
-        self._play_cache.clear()
         self._stream_cache.clear()
         self._prefetch_idx = -2
         self._populate_source_combo(detail)
@@ -741,7 +700,6 @@ class VideoView(QWidget):
         self._stop_player()  # 换源先停旧播放流
         self._detail = new_detail
         self._episodes = new_detail.chapters
-        self._play_cache.clear()
         self._stream_cache.clear()
         self._prefetch_idx = -2
         self._detail_url_for_play = ""
@@ -804,9 +762,7 @@ class VideoView(QWidget):
         self._current_play = ""
         self._detail_url_for_play = ""
         self._prefetch_idx = -2
-        self._play_cache.clear()
         self._stream_cache.clear()
-        self._cached_length = 0
         self.progress.setValue(0)
         self.time_label.setText("00:00 / 00:00")
         self.play_label.hide()
@@ -968,9 +924,6 @@ class VideoView(QWidget):
                     self.source_changed.emit((self._detail, nxt))
             return
         self._stream_cache[(ep_url, quality)] = (video, audio)
-        # 单流地址写展示缓存
-        if not audio:
-            self._play_cache[ep_url] = video
         if not self._is_current_stream(ep_url, quality):
             return  # 旧任务/旧画质后到：不覆盖当前播放（B2）
         self._current_play = video
@@ -1011,78 +964,21 @@ class VideoView(QWidget):
         self._current_play = video
         self._current_audio = audio  # DASH 音频轨（重开播放器时 input-slave 挂入）
         self._current_title = title  # 状态浮层/重开提示用
-        referer = ua = ""
+        hdrs = {}
         _rh = getattr(self._source, "request_headers", None)
         if callable(_rh):
             hdrs = _rh() or {}
-            referer = hdrs.get("Referer", "") or ""
-            ua = hdrs.get("User-Agent", "") or ""
         from framework.external_player import open_with_player
 
-        msg = open_with_player(video, audio=audio, referer=referer, user_agent=ua)
+        msg = open_with_player(
+            video, audio=audio,
+            referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
+            headers=hdrs,
+        )
         self._show_status(f"{msg}：{title or video}")
         self.play_btn.setText("▶")
         self._sync_overlay_state(playing=False)
         self.control_bar.show()  # 外部播放器接管画面 → 控制条常驻
-
-    def _on_buffering(self, percent: int) -> None:
-        """缓冲事件：播放中的再次缓冲（卡顿）显示浮层；封顶前自动加大缓存重播。
-
-        通用调优策略来自 framework/media_tuner.py：按媒体类型选初始缓存，
-        频繁缓冲时逐级提高 network-caching（最多 3 级，封顶后交给用户）。
-        """
-        if percent >= 100:
-            self._tuner.on_buffering(100)  # 通知 tuner 已恢复（否则后续缓冲被当成同一轮）
-            self.buffer_spinner.hide()
-            # 仅清"缓冲中"提示；取流中/播放成功等其它状态浮层不受影响
-            if self._buffer_shown:
-                self._buffer_shown = False
-                if self.play_label.text().startswith("缓冲中"):
-                    self._show_status("")
-            return
-        self._tuner.on_buffering(percent)
-        if self._has_played and not self._buffer_shown:
-            # 已进入过播放 → 本次是中途缓冲（卡顿），浮层提示
-            self._buffer_shown = True
-            self._show_status(f"缓冲中 {percent}%…")
-        elif self._has_played and self._buffer_shown:
-            # 浮层已显示：百分比文本节流 1s 更新一次——
-            # VLC buffering 事件约 100ms 一发，逐次 adjustSize+几何重排
-            # 会拖慢主线程（缓冲越久越卡），1s 刷新感知无差
-            if not hasattr(self, "_buffer_label_ts"):
-                self._buffer_label_ts = 0.0
-            if time.monotonic() - self._buffer_label_ts >= 1.0:
-                self._buffer_label_ts = time.monotonic()
-                self._show_status(f"缓冲中 {percent}%…")
-        self.buffer_spinner.show()
-        if self._has_played and self._tuner.should_upgrade():
-            if self._player is not None and self._player.increase_buffer():
-                self._buffer_shown = False
-                self._show_status("网络不佳，已自动加大缓冲…")
-
-    def _on_ended(self) -> None:
-        """播完自动续播下一集（缓存命中秒切）。"""
-        self.play_btn.setText("▶")
-        self._sync_overlay_state(playing=False)
-        self.buffer_spinner.hide()
-        self.control_bar.show()  # 播完未播放状态 → 控制条常驻
-        nxt = self._current_idx + 1
-        if 0 <= nxt < len(self._episodes):
-            self.ep_list.setCurrentRow(nxt)
-            self._load_episode(nxt)
-        else:
-            self._show_status("播放完毕")
-
-    def _on_play_error(self, msg: str) -> None:
-        # VLC 可能在播放成功期间发瞬时 Error 事件（demux 警告等），画面仍在
-        # 播时不能覆盖标签（否则「VLC 播放出错」一直挂在屏幕）。只在确实没在
-        # 播时才显示错误提示。
-        if self._player is not None and self._player.is_playing():
-            return
-        self._show_status(f"{msg}（可复制地址用外部播放器）")
-        self.play_btn.setText("▶")
-        self._sync_overlay_state(playing=False)
-        self.buffer_spinner.hide()
 
     def _retry_play(self) -> None:
         """刷新播放：清当前集取流缓存后重新取流播放（播放失败后的重试入口）。
@@ -1095,7 +991,6 @@ class VideoView(QWidget):
             ep = self._episodes[self._current_idx]
             key = (ep.url, self._quality)
             self._stream_cache.pop(key, None)
-            self._play_cache.pop(ep.url, None)
             self._current_play = ""
             self._show_status(f"正在重新获取播放流：{ep.title}...")
             self._load_episode(self._current_idx)
@@ -1109,40 +1004,6 @@ class VideoView(QWidget):
             task.signals.finished.connect(self._on_stream_loaded)
             self._stream_task = task
             QThreadPool.globalInstance().start(task)
-
-    def _on_time_changed(self, ms: int) -> None:
-        if self._dragging or not self.isVisible():
-            return
-        # 首帧到达 → 缓冲 spinner 隐藏
-        if self.buffer_spinner.isVisible():
-            self.buffer_spinner.hide()
-        # 节流：VLC time_changed 约 250ms 一次，长视频（如 MissAV 1-2h）时
-        # 信号 queued 到主线程若每次更新 UI 会堆积卡死；限 300ms 更新一次。
-        import time
-
-        now = time.monotonic()
-        if now - self._last_tick < 0.3:
-            return
-        self._last_tick = now
-        # 播放进度存盘：节流 2s 一次（视频恢复精准到秒）
-        if now - self._last_pos_save_ts >= 2.0:
-            self._last_pos_save_ts = now
-            self._emit_position()
-        # 用缓存时长，不在每次回调里 get_length()（网络流该调用会阻塞）
-        length = self._cached_length
-        if length > 0:
-            self.progress.setValue(int(ms / length * 1000))
-            self.time_label.setText(f"{_fmt_time(ms)} / {_fmt_time(length)}")
-        else:
-            self.progress.setValue(0)
-            self.time_label.setText(f"{_fmt_time(ms)} / --:--")
-
-    def _on_length_changed(self, ms: int) -> None:
-        if ms > 0:
-            self._cached_length = ms
-            self.time_label.setText(
-                f"{_fmt_time(self._player.get_time() if self._player else 0)} / {_fmt_time(ms)}"
-            )
 
     # ------------------------------------------------------------------ #
     def position_snapshot(self):
@@ -1174,28 +1035,6 @@ class VideoView(QWidget):
             self.position_changed.emit((ctx[0], ctx[1], ctx[2], pos, None))
         except RuntimeError:
             pass
-
-    def _on_progress_pressed(self) -> None:
-        self._dragging = True
-        self._hide_timer.stop()  # 拖动期间禁止自动隐藏
-
-    def _on_progress_released(self) -> None:
-        self._dragging = False
-        if self._player is not None:
-            pos = self.progress.value() / 1000.0
-            # VLC set_position 在网络流上会同步阻塞（等新位置缓冲）→ 主线程卡死。
-            # 挪到后台线程执行，拖拽进度条不冻结 UI。
-            import threading
-
-            threading.Thread(
-                target=lambda: self._player.set_position(pos), daemon=True
-            ).start()
-        self._hide_timer.start()  # 拖动结束恢复自动隐藏计时
-        self._video_frame.setFocus()  # 焦点归还 → 方向键/空格继续可用
-
-    def _on_volume(self, v: int) -> None:
-        if self._player is not None:
-            self._player.set_volume(v)
 
     def _toggle_play_pause(self) -> None:
         """播放/暂停（外部播放器方案）：播放按钮 = 在外部播放器中打开当前集。
@@ -1333,8 +1172,6 @@ class VideoView(QWidget):
             return
         # 预拉缓存 key 用发起时 quality（与任务一致，防切画质错位）
         self._stream_cache[(ep_url, quality)] = (video, audio)
-        if not audio:
-            self._play_cache[ep_url] = video
 
     def _next_available_sid(self) -> str:
         """返回当前源之后的第一个可用源 sid（无则空）。"""
@@ -1365,12 +1202,10 @@ class VideoView(QWidget):
         if not self._current_play:
             return
         audio = getattr(self, "_current_audio", "")
+        hdrs = {}
         _rh = getattr(self._source, "request_headers", None)
-        referer = ua = ""
         if callable(_rh):
             hdrs = _rh() or {}
-            referer = hdrs.get("Referer", "") or ""
-            ua = hdrs.get("User-Agent", "") or ""
         from framework.external_player import _locate_vlc, open_with_player
 
         if not _locate_vlc():
@@ -1386,7 +1221,9 @@ class VideoView(QWidget):
                 webbrowser.open(urljoin(self._source.base_url, page_url))
                 return
         msg = open_with_player(
-            self._current_play, audio=audio, referer=referer, user_agent=ua
+            self._current_play, audio=audio,
+            referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
+            headers=hdrs,
         )
         self._show_status(msg)
 

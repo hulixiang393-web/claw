@@ -171,5 +171,12 @@
         "css": "a[href*='/video/']"
       }
     }
+  },
+  "ad_block": {
+    "enabled": true,
+    "block_domains": ["360zyx.vip"],
+    "block_url_regex": [
+      "/1AS9nSvi/"
+    ]
   }
 }

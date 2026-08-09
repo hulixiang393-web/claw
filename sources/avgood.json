@@ -7,7 +7,7 @@
   "$weight": 1.0,
   "$metadata": {
     "homepage": "https://avgood.com/t/",
-    "description": "AvGood - 成人影片资源库（線上影片，HLS m3u8，无登录）。站点分『線上影片』（详情页带 iframe 播放器）与『AV番号/磁力』两类，本源仅覆盖線上影片。播放地址提取链：详情页 iframe#video-player src=/remote_play/video/play/{id}.html → 播放页含 ajax_url=/remote_play/index.php/play/ajax/{id}.html → 该 JSON 接口返回 playlink（相对 /remote_m3u8/... m3u8，urljoin 后为绝对地址）。m3u8 无防盗链（不需 Referer/UA 也可取流）。",
+    "description": "AvGood - 成人影片资源库（線上影片，HLS m3u8，无登录）。站点分『線上影片』（详情页带 iframe 播放器，URL 为 /t/{id}.html 或在 /c/ 下带播放器的条目）与『AV番号/磁力』两类，本源仅覆盖線上影片。⚠ 站点搜索接口 /t/s/（typeid=1 資源庫）返回『資源庫』条目（/c/{id}.html），其中混有磁力下载页（无线上播放器、chapters 为空、无法播放）与在线可播条目（详情页带 iframe#video-player）——搜索前几条多为磁力页，点开无法播放属站点结构，非源 bug；本源可播放内容以发现界面分类浏览（/t/664/ 等 15 个分类）为主。播放地址提取链：详情页 iframe#video-player src=/remote_play/video/play/{id}.html（或 /share/{token}）→ 播放页含 ajax_url=/remote_play/index.php/play/ajax/{id}.html → 该 JSON 接口返回 playlink（相对 /remote_m3u8/... m3u8，urljoin 后为绝对地址；m3u8 带 AES-128 key 文件，播放器原生支持）。m3u8/分片/key 均无防盗链（不需 Referer/UA 也可取流，实测 200）。",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -17,7 +17,7 @@
       "hls",
       "線上影片"
     ],
-    "last_verified": "2026-08-07"
+    "last_verified": "2026-08-09"
   },
   "transports": {
     "base_url": "https://avgood.com",
@@ -128,7 +128,7 @@
       "method": "GET",
       "keyword_param": "q",
       "paginator": {
-        "url_template": "/t/s/?q={keyword}&m=&f=_all&syn=&s=pubdate_DESC&typeid=&p={page}"
+        "url_template": "/t/s/?q={keyword}&m=&f=_all&syn=&s=pubdate_DESC&typeid=1&p={page}"
       },
       "item": {
         "root_selector": {
@@ -222,8 +222,8 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 10,
-      "max_results": 200
+      "max_pages": 3,
+      "max_results": 72
     },
     "detail": {
       "max_pages": 1

@@ -1,0 +1,193 @@
+{
+  "$schema_version": 2,
+  "$id": "ttdm",
+  "$type": "video",
+  "$name": "TT动漫(ttdm)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://ttdm.org.cn",
+    "description": "TT动漫(天天动漫) - 日漫/国漫/美漫/动漫剧场在线视频源（WordPress + maccms 播放器，多线路 m3u8）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "动漫",
+      "免费"
+    ]
+  },
+  "transports": {
+    "base_url": "https://ttdm.org.cn",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://ttdm.org.cn/"
+    },
+    "timeout": 12,
+    "retries": 2,
+    "interval_ms": 200,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/h/1-{page}/",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "日漫",
+            "url": "/h/1-{page}/"
+          },
+          {
+            "title": "国漫",
+            "url": "/h/2-{page}/"
+          },
+          {
+            "title": "美漫",
+            "url": "/h/3-{page}/"
+          },
+          {
+            "title": "动漫剧场",
+            "url": "/h/20-{page}/"
+          }
+        ],
+        "root_selector": {
+          "css": "article.u-movie"
+        },
+        "fields": {
+          "title": {
+            "css": "a",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.thumb",
+            "attr": "data-original"
+          },
+          "status": {
+            "css": "div.zhuangtai span"
+          },
+          "update": {
+            "css": "div.meta span.tags"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/u/",
+      "keyword_param": "wd",
+      "item": {
+        "root_selector": {
+          "css": "article.u-movie"
+        },
+        "fields": {
+          "title": {
+            "css": "a",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.thumb",
+            "attr": "data-original"
+          },
+          "status": {
+            "css": "div.zhuangtai span"
+          },
+          "update": {
+            "css": "div.meta span.tags"
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "css": "h1.article-title"
+        },
+        "title_clean": [
+          [
+            "在线观看",
+            ""
+          ]
+        ],
+        "cover": {
+          "css": "div.video_img img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": "p.jianjie"
+        },
+        "author": {
+          "css": "div.video_info h4"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "source_switch": {
+          "param": "sid",
+          "default_sid": "1",
+          "list_selector": "div.video_list_li",
+          "sid_regex": "v/\\d+-(\\d+)-\\d+/",
+          "name_selector": "h4.ctitle",
+          "ep_list_selector": "div.video_list_li a",
+          "ep_sid_regex": "-(\\d+)-\\d+/$",
+          "ep_href_contains": "/v/",
+          "play_regex": "var player_aaaa=(\\{.*?\\})\\s*</script>",
+          "play_url_path": "url",
+          "detail_url_regex": "^(https?://[^/]+)/v/(\\d+)-\\d+-\\d+/",
+          "detail_url_template": "{1}/p/{2}/",
+          "max_switch_attempts": 3
+        },
+        "list": {
+          "root_selector": {
+            "css": "div.video_list_li a"
+          },
+          "chapter_order": "asc",
+          "fields": {
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 5,
+      "max_results": 200
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 2000
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "article.u-movie"
+      }
+    }
+  }
+}
