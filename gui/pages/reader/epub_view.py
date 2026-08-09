@@ -60,21 +60,32 @@ def _chapter_title(item, html: str) -> str:
 
 
 class _Chapter:
-    """epub 单章：标题 + 文本（novel）或图片列表（comic）。"""
+    """epub 单章：标题 + 文本（novel）或图片资源名列表（comic，懒加载）。
 
-    def __init__(self, title: str, text: str = "", images: list[bytes] | None = None):
+    img_srcs 只记 epub 内图片资源名，打开时**不读图字节**；渲染该章时才
+    从 book 懒读，大漫画 epub 打开快、内存省。
+    """
+
+    def __init__(
+        self,
+        title: str,
+        text: str = "",
+        img_srcs: list[str] | None = None,
+        images: list[bytes] | None = None,
+    ):
         self.title = title or "未命名章节"
         self.text = text
-        self.images = images or []  # 漫画：本话图片字节
-        self.is_comic = bool(images)
+        self.img_srcs = list(img_srcs or [])  # 图片资源名（懒加载）
+        self.images = list(images or [])  # 兼容旧字段（已读字节）
+        self.is_comic = bool(self.img_srcs or self.images)
 
 
 class _OpenSignals(QObject):
-    done = Signal(object, object, object)  # (path, chapters, err)
+    done = Signal(object, object, object, object, object)  # (path, chapters, err, book, image_index)
 
 
 class _OpenTask(QRunnable):
-    """后台解析 epub（read_epub + 提取章节）。大文件/漫画图多时避免卡死 UI。"""
+    """后台解析 epub：只读章节结构 + 文本，图片字节懒加载（大 epub 打开快）。"""
 
     def __init__(self, path: str):
         super().__init__()
@@ -82,14 +93,15 @@ class _OpenTask(QRunnable):
         self._path = path
 
     def run(self) -> None:
-        err, chapters = "", []
+        err, chapters, book, index = "", [], None, {}
         try:
             book = epub.read_epub(self._path)
+            index = EpubView._build_image_index(book)
             chapters = EpubView._extract_chapters_static(book)
         except Exception as exc:  # noqa: BLE001
             err = str(exc)
         try:
-            self.signals.done.emit(self._path, chapters, err)
+            self.signals.done.emit(self._path, chapters, err, book, index)
         except RuntimeError:
             pass
 
@@ -107,6 +119,8 @@ class EpubView(QWidget):
         self._is_comic = False
         self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
+        self._book = None          # epub 解析对象（懒读图用，本地文件长期持有）
+        self._image_index = {}     # 图片资源名 → ebooklib item
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -187,7 +201,9 @@ class EpubView(QWidget):
         QThreadPool.globalInstance().start(task)
         return True
 
-    def _on_open_done(self, path: str, chapters: list, err: str) -> None:
+    def _on_open_done(
+        self, path: str, chapters: list, err: str, book=None, image_index=None
+    ) -> None:
         """后台解析完成（主线程回调）。过期结果（已切书）丢弃。"""
         if path != self._path:
             return
@@ -195,6 +211,8 @@ class EpubView(QWidget):
             self.text.setText(f"epub 读取失败：{err or '无可用章节内容'}")
             return
         self._chapters = chapters
+        self._book = book
+        self._image_index = image_index or {}
         self._is_comic = any(ch.is_comic for ch in chapters)
         # 漫画视图：切画廊模式
         if self._is_comic:
@@ -262,12 +280,11 @@ class EpubView(QWidget):
                 from pathlib import Path
 
                 title = Path(name).stem  # 无标题时用文件名兜底（比"未命名"可读）
-            # 检测本话图片
+            # 检测本话图片：只记录资源名，字节等渲染该章时再懒读（大 epub 打开快）
             img_refs = re.findall(r'src="([^"]+)"', html, flags=re.IGNORECASE)
-            imgs = [EpubView._image_bytes(book, ref) for ref in img_refs]
-            imgs = [b for b in imgs if b]
-            if imgs:
-                chapters.append(_Chapter(title, images=imgs))
+            img_refs = [r for r in img_refs if r]
+            if img_refs:
+                chapters.append(_Chapter(title, img_srcs=img_refs))
             else:
                 chapters.append(_Chapter(title, text=_html_to_text(html)))
         return chapters
@@ -276,17 +293,37 @@ class EpubView(QWidget):
         return EpubView._extract_chapters_static(book)
 
     @staticmethod
-    def _image_bytes(book, ref: str) -> bytes | None:
-        """按 epub 内资源名取图片字节。"""
-        # 去掉可能的相对路径前缀
-        name = ref
+    def _build_image_index(book) -> dict:
+        """图片资源名 → item 索引（含去前缀/带路径两种键），渲染时 O(1) 查找。"""
+        index: dict = {}
         for item in book.get_items():
+            if item.get_type() != ebooklib.ITEM_IMAGE:
+                continue
             n = item.get_name() or ""
-            if n == name or n.endswith("/" + name) or name.endswith("/" + n):
-                if item.get_type() == ebooklib.ITEM_IMAGE:
-                    c = item.get_content()
-                    return bytes(c) if isinstance(c, (bytes, bytearray)) else None
-        return None
+            if not n:
+                continue
+            index[n] = item
+            index[n.rsplit("/", 1)[-1]] = item  # basename 也挂一份，兼容 href 写法
+        return index
+
+    def _read_image(self, src: str) -> bytes | None:
+        """懒读单张图片字节（渲染该章时调用）。先精确名，再 basename 匹配。"""
+        item = self._image_index.get(src)
+        if item is None:
+            leaf = src.rsplit("/", 1)[-1]
+            item = self._image_index.get(leaf)
+            if item is None:
+                for k, v in self._image_index.items():
+                    if k.endswith("/" + leaf):
+                        item = v
+                        break
+        if item is None:
+            return None
+        try:
+            c = item.get_content()
+            return bytes(c) if isinstance(c, (bytes, bytearray)) else None
+        except Exception:  # noqa: BLE001 —— 单图读取失败跳过
+            return None
 
     def _switch_gallery(self) -> None:
         """漫画模式：改用图片流容器（setWidget 会删除旧 widget，被删则重建）。"""
@@ -363,14 +400,15 @@ class EpubView(QWidget):
             child = self._gallery_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
-        for raw in ch.images:
+        for src in ch.img_srcs:
+            raw = self._read_image(src)  # 懒加载：仅渲染本章时才读图字节
             lbl = QLabel()
             lbl.setAlignment(Qt.AlignCenter)
             pix = QPixmap()
-            if pix.loadFromData(raw):
+            if raw and pix.loadFromData(raw):
                 lbl.setPixmap(pix.scaledToWidth(self.scroll.width() or 600, Qt.SmoothTransformation))
             else:
-                lbl.setText("图片解码失败")
+                lbl.setText("图片加载失败")
             self._gallery_layout.addWidget(lbl)
 
     @staticmethod
