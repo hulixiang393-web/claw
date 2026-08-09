@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+import threading
 
 from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QPixmap
@@ -32,6 +33,9 @@ try:
     HAS_EBOOKLIB = True
 except Exception:  # noqa: BLE001
     HAS_EBOOKLIB = False
+
+# ebooklib 的 zip 文件句柄跨线程读取非线程安全：所有章节内容读取串行加锁
+_READ_LOCK = threading.Lock()
 
 
 def _html_to_text(html: str) -> str:
@@ -60,32 +64,24 @@ def _chapter_title(item, html: str) -> str:
 
 
 class _Chapter:
-    """epub 单章：标题 + 文本（novel）或图片资源名列表（comic，懒加载）。
+    """epub 单章索引：标题 + xhtml 资源名。
 
-    img_srcs 只记 epub 内图片资源名，打开时**不读图字节**；渲染该章时才
-    从 book 懒读，大漫画 epub 打开快、内存省。
+    打开只建索引（不读任何内容）→ 秒开；渲染该章时才后台读 xhtml
+    提取文本（novel）或懒读图片字节（comic，限宽解码）。
     """
 
-    def __init__(
-        self,
-        title: str,
-        text: str = "",
-        img_srcs: list[str] | None = None,
-        images: list[bytes] | None = None,
-    ):
+    def __init__(self, title: str, src: str = ""):
         self.title = title or "未命名章节"
-        self.text = text
-        self.img_srcs = list(img_srcs or [])  # 图片资源名（懒加载）
-        self.images = list(images or [])  # 兼容旧字段（已读字节）
-        self.is_comic = bool(self.img_srcs or self.images)
+        self.src = src  # 章节 xhtml 在 epub 内的资源名（读内容用）
+        self.is_comic = False  # 渲染该章后由实际内容判定
 
 
 class _OpenSignals(QObject):
-    done = Signal(object, object, object, object, object)  # (path, chapters, err, book, image_index)
+    done = Signal(object, object, object, object)  # (path, chapters, err, item_index)
 
 
 class _OpenTask(QRunnable):
-    """后台解析 epub：只读章节结构 + 文本，图片字节懒加载（大 epub 打开快）。"""
+    """后台只读 epub 元数据建章节索引（不读章节内容）→ 大 epub 秒开。"""
 
     def __init__(self, path: str):
         super().__init__()
@@ -93,15 +89,54 @@ class _OpenTask(QRunnable):
         self._path = path
 
     def run(self) -> None:
-        err, chapters, book, index = "", [], None, {}
+        err, chapters, index = "", [], {}
         try:
             book = epub.read_epub(self._path)
-            index = EpubView._build_image_index(book)
-            chapters = EpubView._extract_chapters_static(book)
+            index = EpubView._build_item_index(book)
+            chapters = EpubView._index_chapters(book)
         except Exception as exc:  # noqa: BLE001
             err = str(exc)
         try:
-            self.signals.done.emit(self._path, chapters, err, book, index)
+            self.signals.done.emit(self._path, chapters, err, index)
+        except RuntimeError:
+            pass
+
+
+class _LoadSignals(QObject):
+    done = Signal(object, object, object, object)  # (idx, kind, text, imgs)
+
+
+class _LoadChapterTask(QRunnable):
+    """后台加载某一章内容：读 xhtml → 判类型 → 提取文本或读全部图片字节。
+
+    慢的部分（zip 读取/正则/图字节）在后台线程，UI 不卡；图解码在 UI 限宽做。
+    """
+
+    def __init__(self, idx: int, src: str, item_index: dict):
+        super().__init__()
+        self.signals = _LoadSignals()
+        self._idx = idx
+        self._src = src
+        self._index = item_index
+
+    def run(self) -> None:
+        kind, text, imgs = "novel", "", []
+        with _READ_LOCK:  # ebooklib zip 句柄跨线程读需串行
+            try:
+                html = EpubView._read_document(self._index, self._src)
+                if "<img" in (html or "").lower():
+                    kind = "comic"
+                    for ref in re.findall(r'src="([^"]+)"', html or "", flags=re.IGNORECASE):
+                        raw = EpubView._read_resource(self._index, ref)
+                        if raw:
+                            imgs.append(raw)
+                else:
+                    kind = "novel"
+                    text = _html_to_text(html or "")
+            except Exception:  # noqa: BLE001
+                kind, text = "novel", ""
+        try:
+            self.signals.done.emit(self._idx, kind, text, imgs)
         except RuntimeError:
             pass
 
@@ -119,8 +154,7 @@ class EpubView(QWidget):
         self._is_comic = False
         self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
-        self._book = None          # epub 解析对象（懒读图用，本地文件长期持有）
-        self._image_index = {}     # 图片资源名 → ebooklib item
+        self._item_index = {}  # epub 资源名(小写/basename) → item，章节懒读用
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -201,22 +235,16 @@ class EpubView(QWidget):
         QThreadPool.globalInstance().start(task)
         return True
 
-    def _on_open_done(
-        self, path: str, chapters: list, err: str, book=None, image_index=None
-    ) -> None:
-        """后台解析完成（主线程回调）。过期结果（已切书）丢弃。"""
+    def _on_open_done(self, path: str, chapters: list, err: str, item_index=None) -> None:
+        """后台建索引完成（主线程回调）。过期结果（已切书）丢弃。"""
         if path != self._path:
             return
         if err or not chapters:
             self.text.setText(f"epub 读取失败：{err or '无可用章节内容'}")
             return
         self._chapters = chapters
-        self._book = book
-        self._image_index = image_index or {}
-        self._is_comic = any(ch.is_comic for ch in chapters)
-        # 漫画视图：切画廊模式
-        if self._is_comic:
-            self._switch_gallery()
+        self._item_index = item_index or {}
+        self._is_comic = False
         self._populate_toc()
         idx = max(0, min(self._start_idx, len(self._chapters) - 1))
         self._load_chapter(idx)
@@ -251,8 +279,8 @@ class EpubView(QWidget):
         return titles
 
     @staticmethod
-    def _extract_chapters_static(book) -> list[_Chapter]:
-        """静态提取章节（后台线程用，无 UI 依赖）。"""
+    def _index_chapters(book) -> list[_Chapter]:
+        """只读元数据建章节索引（spine + 标题），不读章节内容 → 大 epub 秒开。"""
         chapters: list[_Chapter] = []
         toc_titles = EpubView._toc_titles(book)
         items = {i.get_id(): i for i in book.get_items()}
@@ -266,12 +294,7 @@ class EpubView(QWidget):
             # 跳过导航/封面等非正文文档
             if idref in ("nav", "ncx") or "nav" in name:
                 continue
-            content = item.get_content()
-            if isinstance(content, (bytes, bytearray)):
-                html = bytes(content).decode("utf-8", errors="replace")
-            else:
-                html = str(content)
-            title = _chapter_title(item, html)
+            title = (getattr(item, "title", "") or "").strip()
             if not title:
                 # toc 映射：完整路径或文件名匹配
                 leaf = name.rsplit("/", 1)[-1]
@@ -279,51 +302,58 @@ class EpubView(QWidget):
             if not title:
                 from pathlib import Path
 
-                title = Path(name).stem  # 无标题时用文件名兜底（比"未命名"可读）
-            # 检测本话图片：只记录资源名，字节等渲染该章时再懒读（大 epub 打开快）
-            img_refs = re.findall(r'src="([^"]+)"', html, flags=re.IGNORECASE)
-            img_refs = [r for r in img_refs if r]
-            if img_refs:
-                chapters.append(_Chapter(title, img_srcs=img_refs))
-            else:
-                chapters.append(_Chapter(title, text=_html_to_text(html)))
+                title = Path(name).stem  # 无标题时用文件名兜底
+            chapters.append(_Chapter(title=title or f"第{len(chapters)+1}章", src=name))
         return chapters
 
-    def _extract_chapters(self, book) -> list[_Chapter]:
-        return EpubView._extract_chapters_static(book)
-
     @staticmethod
-    def _build_image_index(book) -> dict:
-        """图片资源名 → item 索引（含去前缀/带路径两种键），渲染时 O(1) 查找。"""
+    def _build_item_index(book) -> dict:
+        """epub 资源名(小写, 含 basename) → item，章节/图片 O(1) 懒读。"""
         index: dict = {}
         for item in book.get_items():
-            if item.get_type() != ebooklib.ITEM_IMAGE:
-                continue
-            n = item.get_name() or ""
+            n = (item.get_name() or "").lower()
             if not n:
                 continue
             index[n] = item
             index[n.rsplit("/", 1)[-1]] = item  # basename 也挂一份，兼容 href 写法
         return index
 
-    def _read_image(self, src: str) -> bytes | None:
-        """懒读单张图片字节（渲染该章时调用）。先精确名，再 basename 匹配。"""
-        item = self._image_index.get(src)
+    @staticmethod
+    def _read_document(item_index: dict, src: str) -> str:
+        """按 xhtml 资源名读文档文本（后台线程用）。"""
+        item = EpubView._find_item(item_index, src)
         if item is None:
-            leaf = src.rsplit("/", 1)[-1]
-            item = self._image_index.get(leaf)
-            if item is None:
-                for k, v in self._image_index.items():
-                    if k.endswith("/" + leaf):
-                        item = v
-                        break
+            return ""
+        content = item.get_content()
+        if isinstance(content, (bytes, bytearray)):
+            return bytes(content).decode("utf-8", errors="replace")
+        return str(content or "")
+
+    @staticmethod
+    def _read_resource(item_index: dict, ref: str) -> bytes | None:
+        """按图片资源名懒读字节（后台线程用）。先精确名再 basename/后缀匹配。"""
+        item = EpubView._find_item(item_index, ref)
         if item is None:
             return None
         try:
             c = item.get_content()
             return bytes(c) if isinstance(c, (bytes, bytearray)) else None
-        except Exception:  # noqa: BLE001 —— 单图读取失败跳过
+        except Exception:  # noqa: BLE001 —— 单资源读取失败跳过
             return None
+
+    @staticmethod
+    def _find_item(item_index: dict, ref: str):
+        ref = (ref or "").lower()
+        item = item_index.get(ref)
+        if item is None:
+            leaf = ref.rsplit("/", 1)[-1]
+            item = item_index.get(leaf)
+            if item is None:
+                for k, v in item_index.items():
+                    if k.endswith("/" + leaf):
+                        item = v
+                        break
+        return item
 
     def _switch_gallery(self) -> None:
         """漫画模式：改用图片流容器（setWidget 会删除旧 widget，被删则重建）。"""
@@ -377,37 +407,68 @@ class EpubView(QWidget):
 
     # ------------------------------------------------------------------ #
     def _load_chapter(self, idx: int) -> None:
+        """加载章节：后台读该章内容（文本/图字节），UI 不阻塞；旧章内容保留到新内容就绪。"""
         if not (0 <= idx < len(self._chapters)):
             return
         self._current_idx = idx
         ch = self._chapters[idx]
         self.toc_list.setCurrentRow(idx)
         self.progress_label.setText(f"第{idx+1}/{len(self._chapters)}章 · {ch.title}")
-        if ch.is_comic:
-            self._render_comic_chapter(ch)
+        task = _LoadChapterTask(idx, ch.src, self._item_index)
+        task.signals.done.connect(self._on_chapter_loaded)
+        self._load_task = task  # 持有引用防 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_chapter_loaded(self, idx: int, kind: str, text: str, imgs: list) -> None:
+        """章节内容就绪（主线程）。过期结果（已切章）丢弃。"""
+        if idx != self._current_idx:
+            return
+        ch = self._chapters[idx]
+        self._is_comic = kind == "comic"
+        if kind == "comic":
+            self._switch_gallery()
+            self._render_comic_imgs(imgs)
         else:
             self._ensure_text_label()  # 漫画章后正文 QLabel 可能已被 setWidget 删除
             self.scroll.setWidget(self.text)
-            self.text.setText(f"【{ch.title}】\n\n{ch.text}")
+            self.text.setText(f"【{ch.title}】\n\n{text}")
             self.scroll.verticalScrollBar().setValue(0)
         self.chapter_changed.emit((self._path, ch.title))
 
-    def _render_comic_chapter(self, ch: _Chapter) -> None:
-        # 小说章后点漫画章：scroll 当前 widget 仍是 text → 必须 setWidget 切回画廊，
-        # 否则漫画内容画在 text 上不显示（空白/残留旧小说正文）。
-        self._switch_gallery()
+    def _render_comic_imgs(self, imgs: list) -> None:
+        """漫画章：逐张限宽解码（QImageReader 不解码全尺寸，省内存、不卡 UI）。"""
+        from PySide6.QtCore import QBuffer, QIODevice, QSize
+        from PySide6.QtGui import QImageReader
+
         while self._gallery_layout.count():
             child = self._gallery_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
-        for src in ch.img_srcs:
-            raw = self._read_image(src)  # 懒加载：仅渲染本章时才读图字节
+        if not imgs:
+            lbl = QLabel("本话无图片")
+            lbl.setAlignment(Qt.AlignCenter)
+            self._gallery_layout.addWidget(lbl)
+            return
+        target_w = self.scroll.width() or 600
+        for raw in imgs:
             lbl = QLabel()
             lbl.setAlignment(Qt.AlignCenter)
-            pix = QPixmap()
-            if raw and pix.loadFromData(raw):
-                lbl.setPixmap(pix.scaledToWidth(self.scroll.width() or 600, Qt.SmoothTransformation))
-            else:
+            try:
+                buf = QBuffer()
+                buf.setData(raw)
+                buf.open(QIODevice.ReadOnly)
+                reader = QImageReader(buf)
+                size = reader.size()
+                if size.isValid() and size.width() > target_w:
+                    h = max(1, round(size.height() * target_w / size.width()))
+                    reader.setScaledSize(QSize(target_w, h))
+                qimg = reader.read()
+                buf.close()
+                if qimg is not None and not qimg.isNull():
+                    lbl.setPixmap(QPixmap.fromImage(qimg))
+                else:
+                    lbl.setText("图片加载失败")
+            except Exception:  # noqa: BLE001 —— 单图解码失败跳过，不拖垮整章
                 lbl.setText("图片加载失败")
             self._gallery_layout.addWidget(lbl)
 
