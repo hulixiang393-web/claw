@@ -1,0 +1,243 @@
+{
+  "$schema_version": 2,
+  "$id": "haoduoman",
+  "$type": "comic",
+  "$name": "好多漫",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.haoduoman.com/",
+    "icon": "https://www.haoduoman.com/favicon.ico",
+    "description": "好多漫 - 免费漫画在线阅读平台（正文图片 URL 经 AES-CBC 加密藏在页面 JS 变量 params 中，需 Playwright 渲染解密后从全局数组 params.chapter_images 提取）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "漫画",
+      "免费",
+      "在线"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.haoduoman.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9"
+    },
+    "timeout": 12,
+    "retries": 3,
+    "interval_ms": 600,
+    "follow_redirects": true
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/manhua",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "全部漫画",
+            "url": "/manhua"
+          },
+          {
+            "title": "最近更新",
+            "url": "/new"
+          },
+          {
+            "title": "排行榜",
+            "url": "/top"
+          },
+          {
+            "title": "国内",
+            "url": "/manhua/area/guonei"
+          },
+          {
+            "title": "日本",
+            "url": "/manhua/area/riben"
+          },
+          {
+            "title": "韩国",
+            "url": "/manhua/area/hanguo"
+          },
+          {
+            "title": "欧美",
+            "url": "/manhua/area/oumei"
+          },
+          {
+            "title": "热血",
+            "url": "/manhua/theme/rexue"
+          },
+          {
+            "title": "仙侠",
+            "url": "/manhua/theme/xianxia"
+          },
+          {
+            "title": "玄幻",
+            "url": "/manhua/theme/xuanhuan"
+          },
+          {
+            "title": "都市",
+            "url": "/manhua/theme/dushi"
+          },
+          {
+            "title": "校园",
+            "url": "/manhua/theme/xiaoyuan"
+          },
+          {
+            "title": "恋爱",
+            "url": "/manhua/theme/lianai"
+          },
+          {
+            "title": "百合",
+            "url": "/manhua/theme/baihe"
+          },
+          {
+            "title": "耽美",
+            "url": "/manhua/theme/danmei"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.column.is-4 div.media"
+        },
+        "fields": {
+          "title": {
+            "css": "a.title"
+          },
+          "url": {
+            "css": "a.image.lazy",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a.image.lazy",
+            "attr": "data-original"
+          },
+          "status": {
+            "css": "li"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search",
+      "method": "GET",
+      "keyword_param": "q",
+      "max_results": 100,
+      "item": {
+        "root_selector": {
+          "css": "div.column.is-4 div.media"
+        },
+        "fields": {
+          "title": {
+            "css": "a.title"
+          },
+          "url": {
+            "css": "a.image.lazy",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a.image.lazy",
+            "attr": "data-original"
+          },
+          "status": {
+            "css": "li"
+          }
+        }
+      },
+      "paginator": {
+        "url_template": "/search?q={keyword}&page={page}"
+      }
+    },
+    "detail": {
+      "url_pattern": "/manhua/\\d+",
+      "fields": {
+        "title": {
+          "css": "h1.metas-title"
+        },
+        "author": {
+          "css": ".metas-body span.author:nth-of-type(1)"
+        },
+        "cover": {
+          "css": "div.metas-image img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": "div.metas-desc p"
+        },
+        "status": {
+          "css": ".metas-body span.author:nth-of-type(2)"
+        },
+        "tags": {
+          "css": ".metas-body span.author a"
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": {
+            "css": "ul.comic-chapters li a"
+          },
+          "chapter_order": "asc",
+          "title_clean": true,
+          "fields": {
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "render": "playwright",
+          "render_config": {
+            "wait_for": ".chapter-images",
+            "wait_until": "domcontentloaded",
+            "extra_delay_ms": 2500,
+            "timeout_ms": 30000,
+            "extract_mode": "img",
+            "img_js_path": "params.chapter_images.map(v => v.indexOf('http') === 0 || v.indexOf('//') === 0 ? v : (params.images_hosts[0] || '') + (v.charAt(0) === '/' ? v : '/' + v))"
+          },
+          "root_selector": {
+            "css": ".chapter-images img"
+          },
+          "fields": {
+            "url": {
+              "css": "img",
+              "attr": "src"
+            }
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 100
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 3,
+      "max_items": 600
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "div.column.is-4 div.media"
+      }
+    }
+  }
+}

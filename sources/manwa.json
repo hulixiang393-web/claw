@@ -1,0 +1,184 @@
+{
+  "$schema_version": 2,
+  "$id": "manwa",
+  "$type": "comic",
+  "$name": "漫蛙漫画(ManWa)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://manwa.me/",
+    "description": "漫蛙漫画-ManWa腐宅漫画网（漫画源；分类走 getBooks JSON API，正文图片 AES-CBC 加密，图源 mwappimgs.cc 无防盗链）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "漫画",
+      "免费",
+      "在线"
+    ]
+  },
+  "transports": {
+    "base_url": "https://manwa.me",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://manwa.me/",
+      "X-Requested-With": "XMLHttpRequest"
+    },
+    "timeout": 12,
+    "retries": 3,
+    "retry_backoff": {
+      "base": 1.0,
+      "max": 6.0,
+      "jitter": 0.3
+    },
+    "interval_ms": 800
+  },
+  "api_endpoints": {
+    "discovery": {
+      "url": "/getBooks",
+      "params": {
+        "page": "{page}",
+        "tag": "{tag}"
+      },
+      "response_path": "books",
+      "item_fields": {
+        "title": "book_name",
+        "url": "/book/{id}",
+        "cover": "cover_url",
+        "update": "last_chapter"
+      },
+      "list_categories_url": "/booklist",
+      "list_item": {
+        "fields": {
+          "title": {
+            "css": ".panel-tag[data-val]:not([data-val=\"\"])"
+          },
+          "data_val": {
+            "css": ".panel-tag[data-val]:not([data-val=\"\"])",
+            "attr": "data-val"
+          }
+        },
+        "tag_url_template": "/booklist?tag={tag}"
+      }
+    }
+  },
+  "endpoints": {
+    "search": {
+      "base_url": "/search/{keyword}",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "paginator": {
+        "url_template": "/search?keyword={keyword}&page={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "ul.book-list li"
+        },
+        "fields": {
+          "title": {
+            "css": "p.book-list-info-title"
+          },
+          "url": {
+            "css": "a[href*='/book/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.book-list-cover-img",
+            "attr": "data-original"
+          },
+          "author": {
+            "css": "span.book-list-info-bottom-item"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/book/\\d+",
+      "fields": {
+        "title": {
+          "css": "h1"
+        },
+        "author": {
+          "css": "div.detail-main-info span.detail-main-info-value"
+        },
+        "cover": {
+          "css": "div.detail-main-cover img",
+          "attr": "data-original"
+        },
+        "summary": {
+          "css": "div.detail-desc"
+        },
+        "status": {
+          "css": "div.detail-main-info p.detail-main-info-author:nth-of-type(2) span.detail-main-info-value"
+        },
+        "tags": {
+          "css": "a.info-tag"
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": {
+            "css": "ul.detail-list-1 li a.chapteritem"
+          },
+          "fields": {
+            "title": {
+              "css": "a.chapteritem"
+            },
+            "url": {
+              "css": "a.chapteritem",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "root_selector": {
+            "css": "img.content-img"
+          },
+          "fields": {
+            "url": {
+              "css": "img.content-img",
+              "attr": "data-r-src"
+            }
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 20,
+      "max_results": 700
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 200,
+      "max_items": 600
+    }
+  },
+  "ad_block": {
+    "enabled": true
+  },
+  "decryption": {
+    "targets": {
+      "image": {
+        "strategy": "aes_cbc",
+        "key": "my2ecret782ecret",
+        "iv": "my2ecret782ecret",
+        "padding": "pkcs7"
+      }
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "a[href*='/book/']"
+      }
+    }
+  }
+}

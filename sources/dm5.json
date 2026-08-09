@@ -1,0 +1,208 @@
+{
+  "$schema_version": 2,
+  "$id": "dm5",
+  "$type": "comic",
+  "$name": "动漫屋(DM5)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.dm5.com/",
+    "description": "动漫屋(DM5) - 免费漫画在线阅读，支持日漫/国漫/港台漫画。正文图片经 chapterfun.ashx 接口 + JS Packer 解包获取",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["漫画", "免费", "日漫", "国漫", "港台"],
+    "last_verified": "2026-08-09T00:00:00+08:00"
+  },
+  "transports": {
+    "base_url": "https://www.dm5.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 900
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/manhua-list-p{page}/",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          { "title": "全部", "url": "/manhua-list-p{page}/" },
+          { "title": "最新", "url": "/manhua-new/" },
+          { "title": "排行", "url": "/manhua-rank/" },
+          { "title": "日漫", "url": "/manhua-jp/" },
+          { "title": "完结", "url": "/manhua-completed/" },
+          { "title": "热血", "url": "/manhua-rexue/" },
+          { "title": "冒险", "url": "/manhua-maoxian/" },
+          { "title": "魔法", "url": "/manhua-mofa/" },
+          { "title": "科幻", "url": "/manhua-kehuan/" },
+          { "title": "奇幻", "url": "/manhua-qihuan/" },
+          { "title": "竞技", "url": "/manhua-jingji/" },
+          { "title": "历史", "url": "/manhua-lishi/" },
+          { "title": "战争", "url": "/manhua-zhanzheng/" },
+          { "title": "爱情", "url": "/manhua-aiqing/" },
+          { "title": "后宫", "url": "/manhua-hougong/" },
+          { "title": "校园", "url": "/manhua-xiaoyuan/" },
+          { "title": "悬疑", "url": "/manhua-xuanyi/" },
+          { "title": "搞笑", "url": "/manhua-gaoxiao/" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "ul.mh-list li"
+        },
+        "fields": {
+          "title": {
+            "css": "h2.title a",
+            "attr": "title"
+          },
+          "url": {
+            "css": "h2.title a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.manga-info",
+            "attr": "tc"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search",
+      "method": "GET",
+      "keyword_param": "title",
+      "extra_params": {
+        "language": 1
+      },
+      "paginator": {
+        "url_template": "/search?title={keyword}&language=1&page={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.mh-item"
+        },
+        "fields": {
+          "title": {
+            "css": "h2.title a",
+            "attr": "title"
+          },
+          "url": {
+            "css": "h2.title a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.manga-info",
+            "attr": "tc"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "^https://www\\.dm5\\.com/manhua-[a-z0-9-]+/?$",
+      "fields": {
+        "title": {
+          "xpath": "//div[contains(@class,'banner_detail_form')]//p[contains(@class,'title')]/text()[normalize-space(.)]"
+        },
+        "author": {
+          "xpath": "//div[contains(@class,'banner_detail_form')]//p[contains(@class,'subtitle')]/a/text()"
+        },
+        "cover": {
+          "css": "div.banner_detail_form div.cover img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": "div.banner_detail_form p.content"
+        },
+        "status": {
+          "css": "div.banner_detail_form p.tip > span.block > span"
+        },
+        "tags": {
+          "css": "div.banner_detail_form p.tip a span"
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "chapters_url": "/template-{id}-s2/",
+          "chapters_id_regex": "COMIC_MID\\s*=\\s*(\\d+)",
+          "root_selector": {
+            "css": "ul.view-win-list li"
+          },
+          "chapter_order": "asc",
+          "fields": {
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "image_api": {
+            "url": "/chapterfun.ashx",
+            "headers": {
+              "Referer": "https://www.dm5.com/",
+              "X-Requested-With": "XMLHttpRequest"
+            },
+            "params": {
+              "cid": "{cid}",
+              "page": "{page}",
+              "key": "",
+              "language": 1,
+              "gtk": 6,
+              "_cid": "{cid}",
+              "_mid": "{mid}",
+              "_dt": "{sign_dt}",
+              "_sign": "{sign}"
+            },
+            "vars": {
+              "cid": "DM5_CID\\s*=\\s*(\\d+)",
+              "mid": "DM5_MID\\s*=\\s*(\\d+)",
+              "sign": "DM5_VIEWSIGN\\s*=\\s*\"([^\"]+)\"",
+              "sign_dt": "DM5_VIEWSIGN_DT\\s*=\\s*\"([^\"]+)\"",
+              "count": "DM5_IMAGE_COUNT\\s*=\\s*(\\d+)"
+            },
+            "packer": true,
+            "pix_regex": "pix=\"([^\"]+)\"",
+            "paths_regex": "pvalue=\\[([^\\]]*)\\]",
+            "key_regex": "key='([^']+)'",
+            "url_template": "{pix}{path}?cid={cid}&key={key}",
+            "max_pages": 500
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 60
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 500,
+      "max_items": 2000
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "div.mh-item"
+      }
+    }
+  }
+}
