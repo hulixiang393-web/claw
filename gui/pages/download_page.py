@@ -103,6 +103,13 @@ class _TaskCard(QFrame):
         self.progress_bar.setTextVisible(False)
         layout.addWidget(self.progress_bar)
 
+        # 行2.5：并发下载中的章节标题（如有多章并行）
+        self.active_label = QLabel("")
+        self.active_label.setStyleSheet("font-size: 11px; color: palette(accent);")
+        self.active_label.setWordWrap(True)
+        self.active_label.setVisible(False)
+        layout.addWidget(self.active_label)
+
         # 行3：失败信息（如有）
         self.error_label = QLabel("")
         self.error_label.setStyleSheet("font-size: 11px; color: #D32F2F;")
@@ -131,10 +138,15 @@ class _TaskCard(QFrame):
             TaskStatus.DONE: "已完成",
             TaskStatus.FAILED: "失败",
         }.get(t.status, t.status)
-        # 视频下载中：合并 ffmpeg 期间显示已合并字节（否则全程 0/1 无变化）
-        if t.status == TaskStatus.DOWNLOADING and t.content_type == "video" and t.merge_progress > 0:
-            mb = t.merge_progress / 1048576.0
-            return f"{t.done}/{t.total} 章节  正在合并 {mb:.1f} MB"
+        # 并发下载：下载中显示并发路数（如 3 路）
+        if t.status == TaskStatus.DOWNLOADING:
+            parallel = getattr(t, "parallel", 1) or 1
+            suffix = f"（{parallel}路并发）" if parallel > 1 else ""
+            # 视频下载中：合并 ffmpeg 期间显示已合并字节（否则全程 0/1 无变化）
+            if t.content_type == "video" and t.merge_progress > 0:
+                mb = t.merge_progress / 1048576.0
+                return f"{t.done}/{t.total} 章节  正在合并 {mb:.1f} MB{suffix}"
+            return f"{t.done}/{t.total} 章节  {status_text}{suffix}"
         return f"{t.done}/{t.total} 章节  {status_text}"
 
     def _build_buttons(self) -> None:
@@ -224,6 +236,15 @@ class _TaskCard(QFrame):
             self.time_label.setText(f"已用{int(t.elapsed)}秒 剩余{int(t.remaining_s)}秒")
         else:
             self.time_label.setText("")
+        # 并发下载中的章节（章节级进度展示）
+        active = list(getattr(t, "active_titles", []) or [])
+        if active and t.status == TaskStatus.DOWNLOADING:
+            shown = active[:4]
+            more = f" 等{len(active)}章" if len(active) > 4 else ""
+            self.active_label.setText("正在下载：" + " / ".join(shown) + more)
+            self.active_label.setVisible(True)
+        else:
+            self.active_label.setVisible(False)
         self._apply_status_style()
         # 状态变化 → 重建按钮行（暂停/继续/取消/重试随状态切换）
         if prev_status is not None and prev_status != t.status:
