@@ -459,28 +459,52 @@ class Content:
         filled = {}
         m_bv = _re.search(r"(BV[0-9A-Za-z]+)", url)
         bvid = m_bv.group(1) if m_bv else url.split("/")[-1]
-        for k, v in params.items():
-            filled[k] = str(v).replace("{bvid}", bvid).replace("{id}", bvid)
-        sign_cfg = cfg.get("sign") or {}
-        strategy = sign_cfg.get("strategy")
-        if strategy:
-            from .signers import get_signer
+        method = (cfg.get("method") or "GET").upper()
+        if method == "POST":
+            # JSON API（GraphQL 等）：POST body 递归替换 {id}/{bvid}
+            body_filled = utils.fill_json(
+                cfg.get("body") or {}, id=bvid, bvid=bvid
+            )
+            for k, v in params.items():
+                body_filled.setdefault(k, utils.fill_json(v, id=bvid, bvid=bvid))
+            sign_cfg = cfg.get("sign") or {}
+            strategy = sign_cfg.get("strategy")
+            if strategy:
+                from .signers import get_signer
 
-            signer = get_signer(strategy, self._http)
-            filled = signer.sign(filled)
-        qs = urlencode(filled)
-        abs_url = urljoin(source.base_url, api_url)
-        if "?" in api_url:
-            abs_url = f"{abs_url}&{qs}"
+                signer = get_signer(strategy, self._http)
+                body_filled = signer.sign(body_filled)
+            resp = self._http.post_json(
+                urljoin(source.base_url, api_url),
+                json_body=body_filled,
+                headers=self._endpoint_headers(source, cfg),
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
+            )
         else:
-            abs_url = f"{abs_url}?{qs}"
-        resp = self._http.get_json(
-            abs_url,
-            headers=self._endpoint_headers(source, cfg),
-            timeout=self._timeout(source),
-            retries=self._retries(source),
-            proxy_pool=source.proxy_pool(),
-        )
+            for k, v in params.items():
+                filled[k] = str(v).replace("{bvid}", bvid).replace("{id}", bvid)
+            sign_cfg = cfg.get("sign") or {}
+            strategy = sign_cfg.get("strategy")
+            if strategy:
+                from .signers import get_signer
+
+                signer = get_signer(strategy, self._http)
+                filled = signer.sign(filled)
+            qs = urlencode(filled)
+            abs_url = urljoin(source.base_url, api_url)
+            if "?" in api_url:
+                abs_url = f"{abs_url}&{qs}"
+            else:
+                abs_url = f"{abs_url}?{qs}"
+            resp = self._http.get_json(
+                abs_url,
+                headers=self._endpoint_headers(source, cfg),
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
+            )
         if not isinstance(resp, dict):
             return Detail(source_id=source.source_id, content_type=source.content_type, url=url)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
@@ -785,7 +809,7 @@ class Content:
         """
         from urllib.parse import urlencode, urljoin
 
-        m_id = _re.search(r"/(?:novel|book|comic|detail|bookinfo)/(\w+)", detail_url)
+        m_id = _re.search(r"/(?:novel|book|comic|detail|bookinfo|program)/(\w+)", detail_url)
         if not m_id:
             return None
         book_id = m_id.group(1)
@@ -793,7 +817,7 @@ class Content:
         abs_url = urljoin(source.base_url, api_url)
         headers = dict(self._headers(source))
         body = cfg.get("body") or {}
-        filled = {k: str(v).replace("{id}", book_id) for k, v in body.items()}
+        filled = utils.fill_json(body, id=book_id)
 
         method = (cfg.get("method") or "GET").upper()
         if method == "POST":
@@ -1843,19 +1867,24 @@ class Content:
 
         403/404/空内容/超时 → False（触发换线路）。非 http(s) URL（如 data:）
         无法探测，直接视为可用（保持原行为，不误换线路）。
+
+        用 requests（同播放/代理路径）而非 urllib：urllib 用系统/OpenSSL 证书
+        库，对证书不规范的 CDN 会 SSL 校验失败 → probe 误判地址不可用，触发
+        不必要的换线路（重抓详情页拖慢加载）。requests 走 certifi CA + 源
+        headers，与播放一致。超时取源配置但上限 5s（探测只是可达性判断，
+        不必等满 10s；慢 CDN 尽快失败换线路比白等更流畅）。
         """
         if not url or not url.startswith(("http://", "https://")):
             return True
-        import urllib.request as _ur
-
         headers = dict(self._headers(source))
-        timeout = max(5.0, min(float(self._timeout(source)) or 10.0, 10.0))
+        timeout = max(3.0, min(float(self._timeout(source)) or 10.0, 5.0))
         try:
-            req = _ur.Request(url, headers=headers)
-            with _ur.urlopen(req, timeout=timeout) as resp:
-                if resp.status >= 400:
+            import requests as _req
+
+            with _req.get(url, headers=headers, timeout=timeout, stream=True) as resp:
+                if resp.status_code >= 400:
                     return False
-                return bool(resp.read(4096))
+                return bool(resp.raw.read(4096))
         except Exception:  # noqa: BLE001
             return False
 

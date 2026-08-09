@@ -271,6 +271,11 @@ class AdblockEngine:
         self._extra_domains = []
         raw = getattr(source, "raw", None) or {}
         ad = raw.get("ad_block") or {}
+        # 源未配置 ad_block → 默认关闭（源作者没声明要去广告，不走过滤路径，
+        # 减少无谓开销；仅显式配置了 ad_block 的源才按 enabled 启用）。
+        if not raw.get("ad_block"):
+            self._enabled = False
+            return
         self._enabled = bool(ad.get("enabled", True))
         if not self._enabled:
             return

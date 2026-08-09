@@ -19,6 +19,7 @@ from .health import report_bg_check
 from .http import HttpClient
 from .parser import Parser
 from .selfcheck import StructureChecker
+from .utils import fill_json
 
 
 @dataclass
@@ -545,14 +546,29 @@ class Discovery:
             rpath = cfg.get("response_path")
             item_fields = cfg.get("item_fields") or {}
 
-        # GET JSON
-        resp_json = self._http.get_json(
-            abs_url,
-            headers=self._headers(source),
-            timeout=self._timeout(source),
-            retries=self._retries(source),
-            proxy_pool=source.proxy_pool(),
-        )
+        # GET / POST JSON
+        method = (cfg.get("method") or "GET").upper()
+        if method == "POST":
+            # JSON API（GraphQL 等）：POST body 递归替换 {page}，params 并入 body
+            body_filled = fill_json(cfg.get("body") or {}, page=str(page))
+            for k, v in params.items():
+                body_filled.setdefault(k, fill_json(v, page=str(page)))
+            resp_json = self._http.post_json(
+                abs_url,
+                json_body=body_filled,
+                headers=self._headers(source),
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
+            )
+        else:
+            resp_json = self._http.get_json(
+                abs_url,
+                headers=self._headers(source),
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
+            )
 
         # 提取列表项
         items = resp_json

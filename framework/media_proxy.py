@@ -28,10 +28,38 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, unquote
-from urllib.request import Request, urlopen
+
+import requests
+from requests.adapters import HTTPAdapter
 
 _IDLE_TIMEOUT = 60.0  # 无任何请求 N 秒后自动关闭（避免残留进程/端口）
 _READ_CHUNK = 64 * 1024
+
+# 转发到 CDN 的连接池单例：VLC 经本地代理逐个拉 m3u8 分片时复用 keep-alive
+# 连接，避免每个分片都重新对 CDN 握手（urllib.urlopen 无连接池，几十个分片
+# 几十次 TCP/TLS 握手是播放卡顿/加载慢的常见根因）。
+_PROXY_SESSION = None
+_PROXY_SESSION_LOCK = threading.Lock()
+
+
+def _get_session() -> requests.Session:
+    """模块级单例 requests.Session（连接复用，keep-alive 提速）。"""
+    global _PROXY_SESSION
+    if _PROXY_SESSION is None:
+        with _PROXY_SESSION_LOCK:
+            if _PROXY_SESSION is None:
+                s = requests.Session()
+                try:
+                    s.mount(
+                        "http://", HTTPAdapter(pool_connections=16, pool_maxsize=64)
+                    )
+                    s.mount(
+                        "https://", HTTPAdapter(pool_connections=16, pool_maxsize=64)
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                _PROXY_SESSION = s
+    return _PROXY_SESSION
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -146,46 +174,60 @@ class MediaProxy:
         rng = handler.headers.get("Range")
         if rng:
             req_headers["Range"] = rng
-        req = Request(target, headers=req_headers)
-        resp = urlopen(req, timeout=30)
+        # 连接池复用：requests.Session 保持到 CDN 的 keep-alive 连接，
+        # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
+        # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
+        resp = _get_session().get(
+            target, headers=req_headers, timeout=30, stream=True
+        )
+        try:
+            # 上游错误（403/404/5xx）不发 body 给播放器：原 urllib 会抛
+            # HTTPError，这里等价处理（播放器收到 502 会提示换线路/重试，
+            # 而不是把错误页当媒体流播放黑屏）。
+            if resp.status_code >= 400:
+                handler.send_error(resp.status_code, "upstream error")
+                return
+            # 先读一小块判断是不是 HLS 播放列表
+            first = resp.raw.read(65536)
+            is_m3u8 = first.startswith(b"#EXTM3U") or (resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
 
-        # 先读一小块判断是不是 HLS 播放列表
-        first = resp.read(65536)
-        is_m3u8 = first.startswith(b"#EXTM3U") or (resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
+            if is_m3u8:
+                # 读完整文本，重写内部 URL（分片/KEY/变体）为本地代理
+                rest = resp.raw.read()
+                text = (first + rest).decode("utf-8", "replace")
+                rewritten = self._rewrite_m3u8(text, target, headers)
+                body = rewritten.encode("utf-8")
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                handler.send_header("Content-Length", str(len(body)))
+                handler.send_header("Connection", "close")
+                handler.end_headers()
+                handler.wfile.write(body)
+                return
 
-        if is_m3u8:
-            # 读完整文本，重写内部 URL（分片/KEY/变体）为本地代理
-            rest = resp.read()
-            text = (first + rest).decode("utf-8", "replace")
-            rewritten = self._rewrite_m3u8(text, target, headers)
-            body = rewritten.encode("utf-8")
-            handler.send_response(200)
-            handler.send_header("Content-Type", "application/vnd.apple.mpegurl")
-            handler.send_header("Content-Length", str(len(body)))
+            # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
+            handler.send_response(resp.status_code)
+            for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                v = resp.headers.get(h)
+                if v:
+                    handler.send_header(h, v)
             handler.send_header("Connection", "close")
             handler.end_headers()
-            handler.wfile.write(body)
-            return
-
-        # 普通媒体：透传响应头 + 流式转发
-        status = 206 if rng else 200
-        handler.send_response(status)
-        for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
-            v = resp.headers.get(h)
-            if v:
-                handler.send_header(h, v)
-        handler.send_header("Connection", "close")
-        handler.end_headers()
-        try:
-            if first:
-                handler.wfile.write(first)
-            while True:
-                chunk = resp.read(_READ_CHUNK)
-                if not chunk:
-                    break
-                handler.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # 播放器提前关闭连接（拖动/停止）属正常
+            try:
+                if first:
+                    handler.wfile.write(first)
+                while True:
+                    chunk = resp.raw.read(_READ_CHUNK)
+                    if not chunk:
+                        break
+                    handler.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # 播放器提前关闭连接（拖动/停止）属正常
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------ #
     def _rewrite_m3u8(self, text: str, base: str, headers: dict) -> str:

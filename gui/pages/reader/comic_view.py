@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from framework.content import Content, Detail
 
 # 预加载后续话数：只预加载下一话（读到 70% 才触发，不加载过多）
-PREFETCH_COUNT = 1
+PREFETCH_COUNT = 2  # 预渲染后续话数：连看时下一话已就绪、再下一话开始预渲染，切话更顺
 # 懒加载：首屏渲染页数 / 滚动增量渲染每批页数
 INITIAL_RENDER_COUNT = 10
 LAZY_BATCH = 12
@@ -181,6 +181,13 @@ class ComicView(QWidget):
         # 切换话：重置增量渲染计数（gallery 将清空重建，防旧计数错乱）
         self._rendered_count = 0
         self._rendered_header = False
+        # 换话清理已消费/过期的预取缓存：当前话之前的话不会再被预取命中，
+        # 留着只占内存（长漫画每话几十张图 URL 列表持续累积）。保留当前话
+        # 与向后 PREFETCH_COUNT 话（预取仍会用到），其余丢弃。
+        keep = {self._chapters[idx].url}
+        for j in range(idx + 1, min(idx + 1 + PREFETCH_COUNT, len(self._chapters))):
+            keep.add(self._chapters[j].url)
+        self._prefetched = {k: v for k, v in self._prefetched.items() if k in keep}
         ch = self._chapters[idx]
         self.toc_list.setCurrentRow(idx)  # 目录高亮当前话
         self._scroll_on_load = 1 if scroll_to_end else 0
@@ -778,6 +785,7 @@ class _ComicImageLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self._loading = True
         self._orig: QPixmap | None = None  # 原始像素图（缩放基准）
+        self._fit_w = -1  # 上次缩放用的容器宽（容器未变则跳过重缩放）
         self.setText("加载中...")
         self.setMinimumWidth(200)
         # 懒加载占位：图片加载前先撑起估算高度，减少批量加载高度跳动/换话闪屏
@@ -813,7 +821,11 @@ class _ComicImageLabel(QLabel):
                 return
         from gui.components.cover_loader import CoverLoader
 
-        CoverLoader.instance().load(self.url, self._on_image, referer=self._referer or None)
+        # cache=False：漫画正文长图不进共享封面 LRU（流式阅读重看概率低，
+        # 且一张长图几个 MB，会挤掉封面缓存；正文图内存由页面随滚动释放）
+        CoverLoader.instance().load(
+            self.url, self._on_image, referer=self._referer or None, cache=False
+        )
 
     def _decode_async(self, data: bytes) -> None:
         """把图片字节交给后台线程解码，完成后主线程转 QPixmap。"""
@@ -840,14 +852,22 @@ class _ComicImageLabel(QLabel):
         self.loaded.emit()  # 通知宿主：图片就绪，重排 gallery
 
     def _fit(self) -> None:
-        """按当前容器宽度重绘（缩放/窗口变化时调用）。"""
+        """按当前容器宽度重绘（缩放/窗口变化时调用）。
+
+        优化：容器宽未变（_fit_w 命中）跳过重缩放——滚动/resizeEvent 反复
+        触发时不做全图 scaledToWidth（长图 1000×5000 每次重算极卡）。仅在
+        原始图比容器宽才缩小（容器变宽时不放大原图，防像素化 + 省 CPU）。
+        """
         if self._orig is None:
             return
         # 容器未布局时宽度可能是 -1，兜底 600
         avail = self.width() if self.width() > 100 else 600
+        if avail == self._fit_w:
+            return  # 容器宽未变，无需重缩放
         pix = self._orig
-        if pix.width() > avail or pix.width() < avail:
+        if pix.width() > avail:
             pix = pix.scaledToWidth(avail, Qt.SmoothTransformation)
+        self._fit_w = avail
         self.setPixmap(pix)
         self.setMinimumHeight(min(pix.height() + 8, 4096))
 

@@ -177,26 +177,30 @@ class _CoverLoader(QObject):
         url: str,
         callback: Callable[[Optional[QPixmap]], None],
         referer: Optional[str] = None,
+        cache: bool = True,
     ) -> None:
         """异步加载图片。
 
         referer: 可选，精确 Referer（漫画正文图 = 章节页 URL，图床校验精确页）。
         为空时按图片域名从 _REFERER_RULES 推导兜底。
+        cache: 是否进 LRU 内存缓存。封面默认 True；漫画正文长图传 False——
+        正文图流式阅读、重看概率低，进共享 LRU 会挤掉封面缓存且内存占用大。
         """
         if not url:
             callback(None)
             return
-        cached = self._cache_get(url)
-        if cached is not None:
-            callback(cached)
-            return
-        self._queue.append((url, callback, referer, MAX_RETRIES))
+        if cache:
+            cached = self._cache_get(url)
+            if cached is not None:
+                callback(cached)
+                return
+        self._queue.append((url, callback, referer, MAX_RETRIES, cache))
         self._pump()
 
     def _pump(self) -> None:
         self._ensure_proxy()
         while self._active < MAX_CONCURRENT and self._queue:
-            url, callback, referer, retries_left = self._queue.pop(0)
+            url, callback, referer, retries_left, cache = self._queue.pop(0)
             request = QNetworkRequest(QUrl(url))
             request.setHeader(QNetworkRequest.UserAgentHeader, _BROWSER_UA)
             request.setTransferTimeout(REQUEST_TIMEOUT_MS)  # 超时，防卡队列
@@ -207,11 +211,11 @@ class _CoverLoader(QObject):
             # 用属性存回调 + 代理标记，reply 完成后取出
             reply = self._manager.get(request)
             used_proxy = self._proxy_url is not None
-            self._pending[reply] = (callback, url, used_proxy, referer, retries_left)
+            self._pending[reply] = (callback, url, used_proxy, referer, retries_left, cache)
 
     def _on_reply(self, reply: QNetworkReply) -> None:
-        callback, url, used_proxy, referer, retries_left = self._pending.pop(
-            reply, (None, "", False, None, 0)
+        callback, url, used_proxy, referer, retries_left, cache = self._pending.pop(
+            reply, (None, "", False, None, 0, True)
         )
         self._active -= 1
         pixmap = None
@@ -234,15 +238,15 @@ class _CoverLoader(QObject):
                 if referer:
                     req2.setRawHeader(b"Referer", referer.encode("utf-8"))
                 r2 = self._manager_direct.get(req2)
-                self._direct_pending[r2] = (callback, url, referer, retries_left)
+                self._direct_pending[r2] = (callback, url, referer, retries_left, cache)
             self._pump()
             return
         # 未走代理也失败 → 同样短退避重试（有上限），重试耗尽才判失败
         if pixmap is None and url and callback is not None and retries_left > 0:
-            self._retry_later(url, callback, referer, retries_left - 1)
+            self._retry_later(url, callback, referer, retries_left - 1, cache)
             self._pump()
             return
-        if pixmap is not None and url:
+        if pixmap is not None and url and cache:
             self._cache_put(url, pixmap)
         if callback:
             callback(pixmap)
@@ -250,8 +254,8 @@ class _CoverLoader(QObject):
 
     def _on_direct_reply(self, reply: QNetworkReply) -> None:
         """无代理 fallback 完成。"""
-        callback, url, referer, retries_left = self._direct_pending.pop(
-            reply, (None, "", None, 0)
+        callback, url, referer, retries_left, cache = self._direct_pending.pop(
+            reply, (None, "", None, 0, True)
         )
         pixmap = None
         try:
@@ -265,7 +269,7 @@ class _CoverLoader(QObject):
         reply.deleteLater()
         # 直连也失败 → 短退避后重新走代理路径重试（图床延迟抖动大，个别超时不代表永久失败）
         if pixmap is None and url and callback is not None and retries_left > 0:
-            self._retry_later(url, callback, referer, retries_left - 1)
+            self._retry_later(url, callback, referer, retries_left - 1, cache)
             self._pump()
             return
         # 保守不缓存 direct fallback（低频）。仅调回。
@@ -273,13 +277,13 @@ class _CoverLoader(QObject):
             callback(pixmap)
         self._pump()
 
-    def _retry_later(self, url, callback, referer, retries_left) -> None:
+    def _retry_later(self, url, callback, referer, retries_left, cache=True) -> None:
         """失败重试：短退避(RETRY_DELAY_MS)后把 URL 重新入队，仍在 MAX_CONCURRENT 限流内。
 
         主线程安全：QTimer.singleShot 在主线程事件循环触发，重试调度匹配现有结构。
         """
         def _do() -> None:
-            self._queue.append((url, callback, referer, retries_left))
+            self._queue.append((url, callback, referer, retries_left, cache))
             self._pump()
         QTimer.singleShot(RETRY_DELAY_MS, _do)
 

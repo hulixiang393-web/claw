@@ -20,7 +20,7 @@ from .discovery import Discovery
 from .errors import SourceError
 from .http import HttpClient
 from .parser import Parser
-from .utils import fill_template, jsonpath
+from .utils import fill_json, fill_template, jsonpath
 
 log = logging.getLogger(__name__)
 
@@ -476,6 +476,8 @@ class Search:
             return []
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
+        method = (cfg.get("method") or "GET").upper()
+        body = cfg.get("body") or {}
 
         # 翻页：读 constraints.search.max_pages（默认 1），多页合并去重
         constraints = source.raw.get("constraints") or {}
@@ -484,7 +486,26 @@ class Search:
         results: List[SearchResult] = []
         seen_urls: set = set()
         for page in range(1, max_pages + 1):
-            if params:
+            if method == "POST":
+                # JSON API（GraphQL 等）：POST body 递归替换占位符
+                body_filled = fill_json(body, keyword=keyword, page=str(page))
+                for k, v in params.items():
+                    body_filled.setdefault(k, fill_json(v, keyword=keyword, page=str(page)))
+                sign_cfg = cfg.get("sign") or {}
+                strategy = sign_cfg.get("strategy")
+                if strategy:
+                    from .signers import get_signer
+
+                    signer = get_signer(strategy, http)
+                    body_filled = signer.sign(body_filled)
+                resp = http.post_json(
+                    urljoin(source.base_url, api_url),
+                    json_body=body_filled,
+                    headers=source.request_headers(),
+                    timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+                    proxy_pool=source.proxy_pool(),
+                )
+            elif params:
                 filled = {}
                 for k, v in params.items():
                     val = str(v).replace("{keyword}", keyword).replace("{page}", str(page))
@@ -676,4 +697,10 @@ class Search:
             return ""
         if isinstance(spec, str) and "{" in spec:
             return fill_template(spec, item)
-        return item.get(spec, "") if isinstance(spec, str) else ""
+        if isinstance(spec, str):
+            val = item.get(spec, "")
+            # 嵌套路径（如 images.posterZhHans）：平铺键取不到时按点路径取值
+            if not val and "." in spec:
+                val = jsonpath(item, spec)
+            return val if val is not None else ""
+        return ""

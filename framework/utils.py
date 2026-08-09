@@ -37,7 +37,7 @@ def jsonpath(data: Any, path: str) -> Any:
 
 
 def fill_template(tpl: str, mapping: dict) -> str:
-    """把模板里的 {占位符}（\\w+）替换为 mapping 的值。
+    """把模板里的 {占位符}（\w+）替换为 mapping 的值。
 
     mapping 缺失的占位符替换为空字符串（保持模板结构）。
     """
@@ -48,6 +48,24 @@ def fill_template(tpl: str, mapping: dict) -> str:
         key = m.group(1)
         result = result.replace("{" + key + "}", str(mapping.get(key, "")))
     return result
+
+
+def fill_json(obj: Any, **placeholders) -> Any:
+    """递归替换 dict/list 中所有字符串的 {占位符}（如 {keyword}/{id}/{page}）。
+
+    用于 GraphQL / JSON POST body：variables 嵌套层里的占位符也替换。
+    非 str 值原样返回。
+    """
+    if isinstance(obj, dict):
+        return {k: fill_json(v, **placeholders) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [fill_json(x, **placeholders) for x in obj]
+    if isinstance(obj, str):
+        out = obj
+        for k, v in placeholders.items():
+            out = out.replace("{" + k + "}", str(v))
+        return out
+    return obj
 
 
 def guess_image_mime(header: bytes) -> str:
