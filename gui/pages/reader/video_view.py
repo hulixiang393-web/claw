@@ -117,6 +117,11 @@ class _FetchStreamTask(QRunnable):
             video, audio = self._content.fetch_video_streams(
                 self._source, self._url, quality=self._quality, merged=True
             )
+            if video and self._is_image_stream(video):
+                # HLS 图片预览流（分片全是 jpeg/png，如 ttdm 部分作品）：
+                # VLC 无法渲染 → 视为取流失败，触发自动换线路（或明确提示）
+                video, audio = "", ""
+                err = "该线路为图片预览流，VLC 无法播放，已尝试切换线路"
         except Exception as exc:  # noqa: BLE001
             err = str(exc)
         try:
@@ -125,6 +130,33 @@ class _FetchStreamTask(QRunnable):
             self.signals.finished.emit(self._url, video, audio, err, self._quality)
         except RuntimeError:
             pass
+
+    def _is_image_stream(self, url: str) -> bool:
+        """HLS 播放列表是否「图片预览流」（分片全是 jpeg/png）。
+
+        VLC 3.x 无法把纯图片序列当视频渲染（黑屏/转圈），需检测后换线路。
+        仅对 .m3u8 检测；master 清单（含子流）不算图片流。
+        """
+        if not url or not url.lower().endswith(".m3u8"):
+            return False
+        try:
+            hdrs = {}
+            rh = getattr(self._source, "request_headers", None)
+            if callable(rh):
+                hdrs = rh() or {}
+            text = self._content._http.get_text(
+                url, headers=hdrs, timeout=10, retries=1,
+            )
+        except Exception:  # noqa: BLE001 —— 探测失败不阻断（按可播处理）
+            return False
+        lines = [l for l in (text or "").splitlines() if l and not l.startswith("#")]
+        if not lines:
+            return False
+        exts = set()
+        for l in lines[:10]:
+            p = l.split("?", 1)[0].lower()
+            exts.add(p.rsplit(".", 1)[-1] if "." in p else "")
+        return bool(exts) and exts <= {"jpeg", "jpg", "png"}
 
 
 class VideoView(QWidget):
