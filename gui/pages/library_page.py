@@ -79,17 +79,17 @@ class _ShelfCard(QFrame):
         self.setCursor(Qt.PointingHandCursor)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_menu)
-        self.setFixedWidth(190)
-        self.setFixedHeight(204)  # 卡片尺寸固定：封面/书名/作者/来源/状态各占独立行
+        self.setFixedWidth(210)
+        self.setFixedHeight(268)  # 卡片尺寸固定：封面/书名(3行)/作者/来源/状态各占独立行
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
 
         # 封面（独立区域，与下方书名/作者/来源分离，不并排）
         cover = QLabel("📚")
         cover.setAlignment(Qt.AlignCenter)
-        cover.setFixedHeight(80)
+        cover.setFixedHeight(90)
         cover.setStyleSheet(
             "background: palette(midlight); border-radius: 8px; font-size: 36px;"
         )
@@ -97,13 +97,13 @@ class _ShelfCard(QFrame):
         self._cover = cover
         self._load_cover(rec.get("cover") or "")
 
-        # 书名（独立行，完整显示可换行最多 2 行，超长裁剪但 tooltip 可见全名）
+        # 书名（独立行，完整显示可换行最多 3 行，超长裁剪但 tooltip 可见全名）
         title_text = rec.get("title") or "无题"
         title = QLabel(title_text)
         title.setWordWrap(True)
-        title.setFixedHeight(36)
+        title.setFixedHeight(66)
         title.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        title.setStyleSheet("font-size: 15px; font-weight: bold;")
         title.setToolTip(title_text)
         layout.addWidget(title)
 
@@ -112,7 +112,7 @@ class _ShelfCard(QFrame):
         if author_text:
             author = QLabel(author_text)
             author.setWordWrap(False)
-            author.setFixedHeight(15)
+            author.setFixedHeight(16)
             author.setStyleSheet("color: palette(dark); font-size: 11px;")
             author.setToolTip(author_text)
             layout.addWidget(author)
@@ -123,7 +123,7 @@ class _ShelfCard(QFrame):
             src = "本地"
         source = QLabel(f"来源：{src}")
         source.setWordWrap(False)
-        source.setFixedHeight(15)
+        source.setFixedHeight(16)
         source.setStyleSheet("color: palette(dark); font-size: 11px;")
         source.setToolTip(src)
         layout.addWidget(source)
@@ -142,7 +142,7 @@ class _ShelfCard(QFrame):
         meta_text = self._meta_text()
         meta = QLabel()
         meta.setWordWrap(False)
-        meta.setFixedHeight(15)
+        meta.setFixedHeight(16)
         meta.setStyleSheet("color: palette(dark); font-size: 10px;")
         meta.setText(meta_text)
         meta.setToolTip(meta_text)
@@ -182,11 +182,11 @@ class _ShelfCard(QFrame):
         from PySide6.QtCore import Qt as _Qt
 
         scaled = pixmap.scaled(
-            190, 80, _Qt.KeepAspectRatioByExpanding, _Qt.SmoothTransformation
+            210, 90, _Qt.KeepAspectRatioByExpanding, _Qt.SmoothTransformation
         )
-        sx = max(0, (scaled.width() - 190) // 2)
-        sy = max(0, (scaled.height() - 80) // 2)
-        cropped = scaled.copy(sx, sy, min(190, scaled.width()), min(80, scaled.height()))
+        sx = max(0, (scaled.width() - 210) // 2)
+        sy = max(0, (scaled.height() - 90) // 2)
+        cropped = scaled.copy(sx, sy, min(210, scaled.width()), min(90, scaled.height()))
         self._cover.setPixmap(cropped)
         from gui.components.cover_loader import fade_in
 
@@ -423,7 +423,7 @@ class LibraryPage(BasePage):
             card = _ShelfCard(rec)
             card.clicked.connect(self._on_card_clicked)
             card.menu_requested.connect(self._show_card_menu)
-            row, col = divmod(i, 4)
+            row, col = divmod(i, 3)
             grid.addWidget(card, row, col)
         self.body.addLayout(grid)
 
