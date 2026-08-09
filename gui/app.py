@@ -203,6 +203,8 @@ class MainWindow(QMainWindow):
             source_manager=self.source_manager,
             event_bus=self.event_bus,
         )
+        # 下载完成/新增 → 刷新书架（新下载的书出现在本地组）；收藏变化在 _on_favorite 刷新
+        self.event_bus.subscribe(self._on_download_event)
         # 封面缓存预算接线（cover_cache_size_mb）
         from gui.components.cover_loader import CoverLoader
 
@@ -373,6 +375,18 @@ class MainWindow(QMainWindow):
             self.reader.refresh_favorite_state()
 
     # ------------------------------------------------------------------ #
+    def _on_download_event(self, event) -> None:
+        """下载事件（后台线程回调）：完成/失败后刷新书架，让新下载的书出现在本地组。"""
+        try:
+            etype = getattr(event, "type", "")
+            if etype in ("DOWNLOAD_COMPLETED", "DOWNLOAD_FAILED", "DOWNLOAD_STARTED"):
+                page = getattr(self, "library_page", None)
+                if page is not None and hasattr(page, "refresh"):
+                    page.refresh()
+        except Exception:  # noqa: BLE001 —— 书架刷新失败不影响下载
+            pass
+
+    # ------------------------------------------------------------------ #
     def _on_batch_add_shelf(self, items) -> None:
         """搜索页勾选批量 → 加入书架（写收藏库）。"""
         store = self._ensure_library_store()
@@ -538,7 +552,31 @@ class MainWindow(QMainWindow):
         self.library_page.open_online_requested.connect(self._open_online_from_shelf)
         # 收藏在线书右键「下载到本地」→ 加入下载队列
         self.library_page.download_requested.connect(self._download_from_shelf)
+        # 点本地视频书 → 弹集选择播本地 mp4（离线）
+        self.library_page.play_local_video_requested.connect(self._play_local_video)
         return self.library_page
+
+    def _play_local_video(self, rec: dict) -> None:
+        """播本地视频：单集直接播，多集弹选择；本地文件无需防盗链头。"""
+        paths = list(rec.get("episode_paths") or [])
+        if not paths:
+            return
+        target = paths[0]
+        if len(paths) > 1:
+            from pathlib import Path
+
+            names = [Path(p).name for p in paths]
+            from PySide6.QtWidgets import QInputDialog
+
+            item, ok = QInputDialog.getItem(
+                self, "选择集数", "选择要播放的集：", names, 0, False
+            )
+            if not ok or not item:
+                return
+            target = paths[names.index(item)]
+        from framework.external_player import open_with_player
+
+        open_with_player(target)
 
     def _open_online_from_shelf(self, payload) -> None:
         """书架点收藏在线书 → 打开在线阅读器。payload=(source_id, url, content_type)。

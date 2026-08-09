@@ -1,13 +1,12 @@
-"""书架（library_page.py）。
+"""书架（library_page.py）v2。
 
-本地已下载 + 手动收藏的聚合视图。数据全部经 ShelfService 统一 API
-（见 framework/shelf_service.py 与 refactor-shelf-player.md），
-本页不再直接操作文件/存储：
-- 本地扫描走后台线程（QThreadPool），完成信号回主线程重建（不卡 UI）
-- epub 类型检测由服务层缓存（mtime+size 失效）
-- 收藏/续读/隐藏/收藏夹均为服务层代理
+本地已下载 + 手动收藏的聚合视图，数据全部经 ShelfService 统一 API：
+- **本地优先**：本地已下载且收藏的书合并成一条（online 标记），点开直接读本地（零网络）
+- **本地视频可播**：点本地视频书 → 弹集选择 → 播本地 mp4（经 play_local_video_requested）
+- **搜索 / 排序**：标题模糊搜索 + 最近阅读/添加/书名排序
+- 本地扫描后台线程（不卡 UI），epub 类型检测服务层缓存
 
-对应 ui-library.md：类型筛选、标签筛选、续读记忆、空状态。
+对应需求：本地书籍直接加载本地、本地/收藏合并去重、收藏分类、搜索排序。
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -35,20 +35,24 @@ class _ScanSignals(QObject):
 
 
 class _ScanTask(QRunnable):
-    """后台书架扫描：目录遍历 + 类型检测全部在 worker 线程。"""
+    """后台书架扫描：目录遍历 + 类型检测 + 合并去重全部在 worker 线程。"""
 
-    def __init__(self, service, content_type: str, tag: str, folder: str):
+    def __init__(self, service, content_type: str, tag: str, folder: str,
+                 keyword: str, sort: str):
         super().__init__()
         self.signals = _ScanSignals()
         self._service = service
         self._ctype = content_type
         self._tag = tag
         self._folder = folder
+        self._kw = keyword
+        self._sort = sort
 
     def run(self) -> None:
         try:
             items = self._service.list_items(
-                content_type=self._ctype, tag=self._tag, folder=self._folder
+                content_type=self._ctype, tag=self._tag, folder=self._folder,
+                keyword=self._kw, sort=self._sort,
             )
             recs = [it.to_rec() for it in items]
             try:
@@ -63,7 +67,7 @@ class _ScanTask(QRunnable):
 
 
 class _ShelfCard(QFrame):
-    """书架单张卡片：标题 + 类型/作者 + 续读位置。点击触发。"""
+    """书架单张卡片：封面 + 标题 + 类型/作者/集数/续读 + 本地徽章。点击触发。"""
 
     clicked = Signal(object)  # 发记录 dict
     menu_requested = Signal(object, object)  # (rec, pos) 右键菜单
@@ -82,7 +86,7 @@ class _ShelfCard(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
 
-        # 封面占位
+        # 封面（本地书无封面用占位；收藏封面异步加载）
         cover = QLabel("📚")
         cover.setAlignment(Qt.AlignCenter)
         cover.setFixedHeight(80)
@@ -93,10 +97,20 @@ class _ShelfCard(QFrame):
         self._cover = cover
         self._load_cover(rec.get("cover") or "")
 
+        # 标题 + 本地徽章
+        title_row = QHBoxLayout()
         title = QLabel(rec.get("title") or "无题")
         title.setWordWrap(True)
         title.setStyleSheet("font-size: 14px; font-weight: bold;")
-        layout.addWidget(title)
+        title_row.addWidget(title, stretch=1)
+        if rec.get("kind") == "local":
+            badge = QLabel("本地")
+            badge.setStyleSheet(
+                "font-size: 10px; padding: 1px 5px; border-radius: 3px;"
+                "background: palette(highlight); color: palette(highlighted-text);"
+            )
+            title_row.addWidget(badge, alignment=Qt.AlignTop)
+        layout.addLayout(title_row)
 
         meta = QLabel(self._meta_text())
         meta.setStyleSheet("color: palette(dark); font-size: 11px;")
@@ -147,22 +161,38 @@ class _ShelfCard(QFrame):
         fade_in(self._cover)
 
     def _meta_text(self) -> str:
-        ctype = self.rec.get("content_type", "")
+        rec = self.rec
+        ctype = rec.get("content_type", "")
         type_label = {"novel": "小说", "comic": "漫画", "video": "视频", "epub": "epub"}.get(ctype, "")
         parts = []
         if type_label:
             parts.append(type_label)
-        if self.rec.get("episode_count"):
-            parts.append(f"共 {self.rec['episode_count']} 集")
-        if self.rec.get("author"):
-            parts.append(self.rec["author"])
-        tags = self.rec.get("tags") or []
+        if rec.get("episode_count"):
+            parts.append(f"共 {rec['episode_count']} 集")
+        if rec.get("author"):
+            parts.append(rec["author"])
+        if rec.get("online"):
+            parts.append("可离线")
+        size = rec.get("size_bytes") or 0
+        if size > 0:
+            parts.append(self._fmt_size(size))
+        tags = rec.get("tags") or []
         if tags:
             parts.append(" ".join(f"#{t}" for t in tags[:3]))
-        resume = self.rec.get("resume_title")
+        resume = rec.get("resume_title")
         if resume:
             parts.append(f"读到 {resume}")
         return " · ".join(parts) or ctype
+
+    @staticmethod
+    def _fmt_size(n: int) -> str:
+        if n >= 1073741824:
+            return f"{n / 1073741824:.1f} GB"
+        if n >= 1048576:
+            return f"{n / 1048576:.1f} MB"
+        if n >= 1024:
+            return f"{n / 1024:.0f} KB"
+        return f"{n} B"
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -177,16 +207,16 @@ class _ShelfCard(QFrame):
         super().mousePressEvent(event)
 
     def _on_menu(self, pos) -> None:
-        # pos 是卡片相对坐标，转全局再发（否则菜单以页面为参照系会跑到左上角）
         self.menu_requested.emit(self.rec, self.mapToGlobal(pos))
 
 
 class LibraryPage(BasePage):
-    """书架页。"""
+    """书架页 v2。"""
 
-    open_epub_requested = Signal(object)   # epub 文件路径 → reader.open_epub
-    open_online_requested = Signal(object)  # 收藏在线书 (source_id, url, content_type) → reader.open
-    download_requested = Signal(object)  # 收藏在线书 (source_id, url, content_type) → 加入下载队列
+    open_epub_requested = Signal(object)      # epub 文件路径 → reader.open_epub
+    open_online_requested = Signal(object)    # 收藏在线书 (source_id, url, content_type) → reader.open
+    download_requested = Signal(object)       # 收藏在线书 (source_id, url, content_type) → 下载队列
+    play_local_video_requested = Signal(object)  # 本地视频书 rec → 弹集选择播本地 mp4
 
     def __init__(
         self,
@@ -198,7 +228,6 @@ class LibraryPage(BasePage):
         parent=None,
     ):
         super().__init__(parent)
-        # 书架数据统一走服务层；未注入时内部自建（兼容旧构造与测试）
         if shelf_service is not None:
             self._shelf = shelf_service
         else:
@@ -209,29 +238,21 @@ class LibraryPage(BasePage):
                 library_store=library_store,
                 reading_progress=reading_progress,
             )
-        self._store = library_store  # 旧引用保留（无副作用）
+        self._store = library_store
         self._shelf_export_dir = Path(shelf_export_dir) if shelf_export_dir else Path("library")
-        self._selected_folder = "全部"  # 选中收藏夹（_rebuild 刷新）
-        self._selected_tag = "全部标签"  # 选中标签（_rebuild 刷新）
-        self._scan_task = None  # 后台扫描任务持有引用（防 GC，QThreadPool 陷阱）
+        self._scan_task = None  # 后台扫描任务持有引用（防 GC）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(8)
 
-        # ---- 顶栏：类型筛选 + 标签筛选 + 收藏夹 ----
+        # ---- 顶栏：类型 / 收藏夹 / 搜索 / 排序 / 操作 ----
         top = QHBoxLayout()
         top.addWidget(QLabel("类型"))
         self.type_combo = QComboBox()
         self.type_combo.addItems(["全部", "小说", "漫画", "视频"])
         self.type_combo.currentTextChanged.connect(lambda _: self._rebuild())
         top.addWidget(self.type_combo)
-
-        top.addSpacing(12)
-        top.addWidget(QLabel("标签"))
-        self.tag_combo = QComboBox()
-        self.tag_combo.currentTextChanged.connect(lambda _: self._rebuild())
-        top.addWidget(self.tag_combo)
 
         top.addSpacing(12)
         top.addWidget(QLabel("收藏夹"))
@@ -243,6 +264,18 @@ class LibraryPage(BasePage):
         self.new_folder_btn.clicked.connect(self._new_folder)
         top.addWidget(self.new_folder_btn)
 
+        top.addSpacing(12)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索书架…")
+        self.search_edit.setFixedWidth(160)
+        self.search_edit.returnPressed.connect(self._rebuild)
+        top.addWidget(self.search_edit)
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["最近阅读", "最近添加", "书名"])
+        self.sort_combo.currentTextChanged.connect(lambda _: self._rebuild())
+        top.addWidget(self.sort_combo)
+
         self.export_btn = QPushButton("导出书架")
         self.export_btn.clicked.connect(self._export_shelf)
         top.addWidget(self.export_btn)
@@ -253,7 +286,7 @@ class LibraryPage(BasePage):
         top.addWidget(self.count_label)
         layout.addLayout(top)
 
-        # ---- 滚动区：本地 + 收藏两组 ----
+        # ---- 滚动区 ----
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -268,30 +301,30 @@ class LibraryPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def _rebuild(self) -> None:
-        """重建列表：下拉刷新 + 后台扫描 → 主线程渲染。"""
+        """重建列表：后台扫描（含搜索/排序/合并）→ 主线程渲染。"""
         self._clear_all()
         self.count_label.setText("扫描中…")
         self._sync_combos()
 
-        # 筛选条件快照（后台任务与 UI 时序解耦）
         ctype = self.type_combo.currentText()
         type_map = {"全部": "", "小说": "novel", "漫画": "comic", "视频": "video"}
         want = type_map.get(ctype, "")
-        tag = self.tag_combo.currentText()
-        tag = "" if tag == "全部标签" else tag
         folder = self.folder_combo.currentText()
-        # 任务快照：_render 校验当前状态是否仍匹配（防过期结果覆盖新筛选）
+        keyword = self.search_edit.text().strip()
+        sort_map = {"最近阅读": "recent", "最近添加": "added", "书名": "name"}
+        sort = sort_map.get(self.sort_combo.currentText(), "recent")
         self._last_ctype = want
-        self._last_tag = tag
         self._last_folder = folder
+        self._last_kw = keyword
+        self._last_sort = sort
 
-        task = _ScanTask(self._shelf, want, tag, folder)
+        task = _ScanTask(self._shelf, want, "", folder, keyword, sort)
         task.signals.done.connect(self._render)
-        self._scan_task = task  # 列表持有引用防 GC（知识库经验）
+        self._scan_task = task
         QThreadPool.globalInstance().start(task)
 
     def _sync_combos(self) -> None:
-        """刷新收藏夹/标签下拉（保持当前选择）。"""
+        """刷新收藏夹下拉（保持当前选择）。"""
         if self._store is None:
             return
         cur = self.folder_combo.currentText()
@@ -302,49 +335,36 @@ class LibraryPage(BasePage):
         idx = self.folder_combo.findText(cur)
         self.folder_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.folder_combo.blockSignals(False)
-        self._selected_folder = self.folder_combo.currentText()
-
-        cur_tag = self.tag_combo.currentText()
-        self.tag_combo.blockSignals(True)
-        self.tag_combo.clear()
-        self.tag_combo.addItem("全部标签")
-        self.tag_combo.addItems(self._shelf.all_tags())
-        idx = self.tag_combo.findText(cur_tag)
-        self.tag_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.tag_combo.blockSignals(False)
-        self._selected_tag = self.tag_combo.currentText()
 
     def _render(self, books: list[dict]) -> None:
-        """主线程渲染扫描结果（按 kind 分组）。"""
+        """主线程渲染扫描结果（本地在前）。"""
         if not self._visible_combo_state():
-            return  # 下拉状态已变化（并发场景）→ 旧结果丢弃，等新任务
-        locals_ = [b for b in books if b.get("kind") == "local"]
-        favorites = [b for b in books if b.get("kind") == "favorite"]
-
-        if not locals_ and not favorites:
+            return  # 筛选/搜索/排序已变化 → 旧结果丢弃，等新任务
+        if not books:
             self._add_empty()
             self.count_label.setText("书架还空着")
             return
-
-        self.count_label.setText(f"共 {len(locals_)} 本地 · {len(favorites)} 收藏")
+        locals_ = [b for b in books if b.get("kind") == "local"]
+        favorites = [b for b in books if b.get("kind") == "favorite"]
+        self.count_label.setText(f"共 {len(books)} 本 · 本地{len(locals_)} / 收藏{len(favorites)}")
         if locals_:
-            self._add_group("本地已下载", locals_)
+            self._add_group("本地", locals_)
         if favorites:
             self._add_group("收藏", favorites)
 
     def _visible_combo_state(self) -> bool:
-        """校验下拉当前状态是否与本次任务一致（防过期结果覆盖新筛选）。"""
         ctype = self.type_combo.currentText()
         type_map = {"全部": "", "小说": "novel", "漫画": "comic", "视频": "video"}
         want = type_map.get(ctype, "")
-        tag = self.tag_combo.currentText()
-        tag = "" if tag == "全部标签" else tag
         folder = self.folder_combo.currentText()
-        # 任务发起时快照（存于信号来源不可取）→ 用 _last_request 记录
+        keyword = self.search_edit.text().strip()
+        sort_map = {"最近阅读": "recent", "最近添加": "added", "书名": "name"}
+        sort = sort_map.get(self.sort_combo.currentText(), "recent")
         return (
             want == getattr(self, "_last_ctype", "")
-            and tag == getattr(self, "_last_tag", "")
             and folder == getattr(self, "_last_folder", "")
+            and keyword == getattr(self, "_last_kw", "")
+            and sort == getattr(self, "_last_sort", "")
         )
 
     @staticmethod
@@ -354,7 +374,7 @@ class LibraryPage(BasePage):
             item = layout.takeAt(0)
             if item.widget():
                 w = item.widget()
-                w.setParent(None)  # 立即从对象树摘除（deleteLater 排队在 offscreen 下不可靠）
+                w.setParent(None)
                 w.deleteLater()
             elif item.layout():
                 LibraryPage._wipe(item.layout())
@@ -378,14 +398,13 @@ class LibraryPage(BasePage):
         self.body.addLayout(grid)
 
     def _add_empty(self) -> None:
-        empty = QLabel("书架还空着，去发现里找点好东西吧")
+        empty = QLabel("书架还空着，去发现里找点好东西吧\n（可搜索、可分类、本地书可直接离线阅读）")
         empty.setAlignment(Qt.AlignCenter)
         empty.setStyleSheet("color: palette(mid); font-size: 14px; padding: 60px;")
         self.body.addWidget(empty)
 
     # ------------------------------------------------------------------ #
     def _new_folder(self) -> None:
-        """创建收藏夹（输入名字），并选中它。"""
         from PySide6.QtWidgets import QInputDialog
 
         name, ok = QInputDialog.getText(self, "新建收藏夹", "收藏夹名称：")
@@ -400,23 +419,38 @@ class LibraryPage(BasePage):
         self.folder_combo.setCurrentIndex(idx)
 
     def _show_card_menu(self, rec: dict, pos) -> None:
-        """右键菜单：收藏卡 → 下载/移动到收藏夹/移除收藏/复制播放地址/打开源详情；
-        本地书 → 打开文件夹/删除/从书架移除。
-
-        pos 为 _ShelfCard 已转换的全局坐标，直接 exec。
-        """
+        """右键菜单：本地书 + 收藏操作（合并条目两者都提供）。"""
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
-        if rec.get("kind") == "favorite":
-            if rec.get("url"):
+        is_local = rec.get("kind") == "local"
+        is_online = rec.get("online") or rec.get("kind") == "favorite"
+
+        if is_local:
+            menu.addAction("📂 打开所在文件夹").triggered.connect(
+                lambda: self._open_folder(rec)
+            )
+            menu.addAction("🗑 删除本地文件").triggered.connect(
+                lambda: self._delete_local(rec)
+            )
+            menu.addAction("从书架移除").triggered.connect(
+                lambda: self._remove_local(rec)
+            )
+        if is_online:
+            if is_local:
+                menu.addSeparator()
+            url = rec.get("url", "")
+            if url:
                 menu.addAction("⬇ 下载到本地").triggered.connect(
                     lambda: self._request_download(rec)
                 )
-                menu.addAction("📋 复制播放地址").triggered.connect(
+                menu.addAction("📋 复制地址").triggered.connect(
                     lambda: self._copy_url(rec)
                 )
-                menu.addSeparator()
+                menu.addAction("打开源详情页").triggered.connect(
+                    lambda: self._open_online(rec)
+                )
+            menu.addSeparator()
             sub = menu.addMenu("移动到收藏夹")
             for f in self._shelf.folders():
                 if f == rec.get("folder", ""):
@@ -429,24 +463,9 @@ class LibraryPage(BasePage):
             menu.addAction("移除收藏").triggered.connect(
                 lambda: self._remove_favorite(rec)
             )
-            if rec.get("url"):
-                menu.addAction("打开源详情页").triggered.connect(
-                    lambda: self._open_online(rec)
-                )
-        elif rec.get("kind") == "local":
-            menu.addAction("打开所在文件夹").triggered.connect(
-                lambda: self._open_folder(rec)
-            )
-            menu.addAction("删除本地文件").triggered.connect(
-                lambda: self._delete_local(rec)
-            )
-            menu.addAction("从书架移除").triggered.connect(
-                lambda: self._remove_local(rec)
-            )
         menu.exec(pos)
 
     def _copy_url(self, rec: dict) -> None:
-        """复制收藏条目 url 到剪贴板。"""
         from PySide6.QtWidgets import QApplication
 
         url = rec.get("url", "")
@@ -463,7 +482,6 @@ class LibraryPage(BasePage):
         )
 
     def _open_online(self, rec: dict) -> None:
-        """收藏卡：打开在线源详情页（浏览器）。"""
         import webbrowser
 
         url = rec.get("url", "")
@@ -520,7 +538,6 @@ class LibraryPage(BasePage):
         self._rebuild()
 
     def _open_folder(self, rec: dict) -> None:
-        """本地书：打开所在文件夹。"""
         import os
         import subprocess
 
@@ -534,7 +551,6 @@ class LibraryPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def _export_shelf(self) -> None:
-        """导出书架全部数据（收藏 + 收藏夹）到 JSON。"""
         from PySide6.QtWidgets import QFileDialog, QMessageBox
 
         if self._store is None:
@@ -559,13 +575,13 @@ class LibraryPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def _on_card_clicked(self, rec: dict) -> None:
-        if rec.get("kind") == "local" and rec.get("path"):
-            if rec.get("content_type") == "video":
-                self._open_folder(rec)  # 视频不内置播放本地文件，打开所在文件夹
-            else:
+        """点击：本地优先加载（视频播本地、epub 读本地），无本地才走网络。"""
+        if rec.get("kind") == "local":
+            if rec.get("content_type") == "video" and rec.get("episode_paths"):
+                self.play_local_video_requested.emit(rec)
+            elif rec.get("path"):
                 self.open_epub_requested.emit(rec["path"])
         elif rec.get("url"):
-            # 收藏在线书：打开在线阅读器
             self.open_online_requested.emit(
                 (rec.get("source_id", ""), rec.get("url", ""), rec.get("content_type", ""))
             )

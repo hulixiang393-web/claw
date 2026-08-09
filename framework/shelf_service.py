@@ -1,17 +1,22 @@
 """书架服务层（shelf_service.py）。
 
 统一书架 API：聚合 本地已下载扫描 + 在线收藏 + 续读记忆 + 隐藏名单。
-UI 层只调本服务，不再直接操作文件/存储。对应 refactor-shelf-player.md S1-S4。
+UI 层只调本服务，不再直接操作文件/存储。
 
-- ShelfItem：统一条目模型（本地/收藏同一结构，消除 UI 层 kind 分支散落）
-- 本地扫描：epub 类型检测带缓存（mtime+size 失效，避免每次全量 read_epub）
-- 隐藏名单：从书架移除的本地书统一管理
-- 纯 Python 无 Qt 依赖：可在后台线程调用，可单元测试
+v2 重写要点：
+- **本地优先 + 合并去重**：同一本书本地已下载且也收藏 → 合并成一条
+  （kind=local，附在线 source_id/url/cover），点开直接读本地（零网络）。
+- **本地视频可播**：本地视频条目带集文件列表（episode_paths），供 UI 直接播放本地 mp4。
+- **搜索 / 排序**：按关键词过滤，按 最近阅读/最近添加/书名 排序。
+- 保留既有能力：epub 类型检测缓存、隐藏名单、收藏/收藏夹操作。
+
+纯 Python 无 Qt 依赖：可在后台线程调用，可单元测试。
 """
 
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -20,6 +25,8 @@ from typing import Callable, Optional
 
 # epub 类型检测函数（注入便于测试/替换）：path -> str
 EpubTypeDetector = Callable[[str], str]
+
+VIDEO_EXTS = (".mp4", ".flv", ".webm", ".mkv", ".mov", ".m4v", ".ts", ".m4a")
 
 
 def _default_epub_detector(path: str) -> str:
@@ -42,10 +49,10 @@ def _default_epub_detector(path: str) -> str:
 
 @dataclass
 class ShelfItem:
-    """书架统一条目模型。
+    """书架统一条目模型（本地优先，可带在线对应信息）。
 
-    key：唯一键（本地=文件路径，收藏=url）。kind：local | favorite。
-    missing：收藏条目但本地文件不存在（仅收藏场景可扩展）。
+    key：唯一键（本地=epub 文件路径或首个视频路径，收藏=url）。
+    kind：local | favorite。kind=local 且 online=True 表示本地+收藏合并。
     """
 
     key: str
@@ -55,12 +62,18 @@ class ShelfItem:
     path: str = ""
     url: str = ""
     source_id: str = ""
+    source_name: str = ""
     author: str = ""
     cover: str = ""
     tags: list = field(default_factory=list)
     folder: str = ""
     episode_count: int = 0
+    episode_paths: list = field(default_factory=list)  # 本地视频集文件列表
     resume_title: str = ""
+    online: bool = False          # 本地条目是否有在线收藏对应
+    size_bytes: int = 0
+    mtime: float = 0.0            # 本地文件最近修改时间（下载时间近似）
+    updated_at: str = ""          # 最近阅读/收藏时间（排序用）
     missing: bool = False
 
     def to_rec(self) -> dict:
@@ -70,8 +83,19 @@ class ShelfItem:
         return rec
 
 
+def _norm_title(s: str) -> str:
+    """书名归一化（去空白/全半角/大小写），用于本地与收藏合并匹配。"""
+    s = re.sub(r"\s+", "", s or "")
+    s = s.strip()
+    low = s.lower()
+    full = {"　": " ", "：": ":", "（": "(", "）": ")"}
+    for a, b in full.items():
+        low = low.replace(a, b)
+    return low
+
+
 class ShelfService:
-    """书架统一服务：本地扫描 + 收藏 + 续读 + 隐藏名单聚合。"""
+    """书架统一服务：本地扫描 + 收藏 + 续读 + 隐藏名单聚合（v2）。"""
 
     def __init__(
         self,
@@ -84,7 +108,6 @@ class ShelfService:
         meta_file_name: str = "shelf_meta.json",
     ):
         self._output_dir = Path(output_dir)
-        # 数据目录默认与隐藏名单同位置（output_dir 父目录 / data），保持既有数据不迁移
         self._data_dir = (
             Path(data_dir) if data_dir is not None
             else Path(output_dir).parent / "data"
@@ -94,9 +117,8 @@ class ShelfService:
         self._detect = epub_detector
         self._hidden_file = self._data_dir / hidden_file_name
         self._meta_file = self._data_dir / meta_file_name
-        # epub 类型缓存：{str(path): {"type": str, "mtime": float, "size": int}}
         self._type_cache: dict = {}
-        self._lock = threading.Lock()  # 扫描可能来自后台线程
+        self._lock = threading.Lock()
         self._load_meta()
 
     # ------------------------------------------------------------------ #
@@ -107,19 +129,83 @@ class ShelfService:
         content_type: str = "",
         tag: str = "",
         folder: str = "全部",
+        keyword: str = "",
+        sort: str = "recent",
     ) -> list[ShelfItem]:
-        """书架全部条目：本地 + 收藏，附续读位置，按收藏时间/书名排序。
+        """书架全部条目：本地 + 收藏，**本地/收藏同名合并成一条（本地优先）**。
 
-        筛选参数与旧 UI 行为一致：content_type 空=全部；tag 空=全部标签；
-        folder="全部"=不过滤收藏夹（本地条目不受收藏夹影响）。
+        - content_type 空=全部；tag 空=全部标签；folder="全部"=不过滤收藏夹
+        - keyword 非空 → 标题模糊匹配（书架搜索）
+        - sort：recent（最近阅读/添加）/ added（最近添加）/ name（书名）
         """
-        items = self.scan_local()
-        items.extend(self.favorites(folder=folder))
+        locals_ = self.scan_local()
+        favs = self.favorites(folder=folder)
+        merged = self._merge(locals_, favs)
+
+        # 收藏夹筛选（合并条目已带收藏夹；本地未收藏的书在具体收藏夹下不显示）
+        if folder != "全部":
+            merged = [i for i in merged if (i.folder or "") == folder]
         if content_type:
-            items = [i for i in items if i.content_type == content_type]
+            merged = [i for i in merged if i.content_type == content_type]
         if tag:
-            items = [i for i in items if tag in i.tags]
-        return items
+            merged = [i for i in merged if tag in i.tags]
+        if keyword:
+            kw = _norm_title(keyword)
+            merged = [i for i in merged if kw in _norm_title(i.title)]
+        return self._sort_items(merged, sort)
+
+    def _merge(self, locals_: list, favs: list) -> list:
+        """本地优先合并：同名（归一化）本地+收藏 → 一条本地条目带在线信息。"""
+        local_by_norm: dict = {}
+        for l in locals_:
+            local_by_norm.setdefault(_norm_title(l.title), l)
+        fav_by_norm: dict = {}
+        for f in favs:
+            fav_by_norm.setdefault(_norm_title(f.title), f)
+
+        out: list = []
+        seen: set = set()
+        for l in locals_:
+            key = _norm_title(l.title)
+            f = fav_by_norm.get(key)
+            if f is not None:
+                # 合并在线信息到本地条目（本地优先：读本地）
+                l.online = True
+                l.url = f.url or l.url
+                l.source_id = f.source_id or l.source_id
+                l.folder = f.folder or l.folder
+                l.author = l.author or f.author
+                l.cover = l.cover or f.cover
+                if not l.tags:
+                    l.tags = list(f.tags)
+                l.updated_at = f.updated_at or l.updated_at
+            out.append(l)
+            seen.add(key)
+        # 纯收藏（无本地文件）
+        for f in favs:
+            key = _norm_title(f.title)
+            if key not in seen:
+                out.append(f)
+        return out
+
+    def _sort_items(self, items: list, sort: str) -> list:
+        if sort == "name":
+            return sorted(items, key=lambda i: (_norm_title(i.title), i.kind))
+        if sort == "added":
+            return sorted(
+                items,
+                key=lambda i: (i.mtime or 0, i.updated_at or ""),
+                reverse=True,
+            )
+        # recent：按最近阅读/收藏/下载时间倒序
+        def _recency(i: ShelfItem) -> float:
+            if i.updated_at:
+                try:
+                    return time.mktime(time.strptime(i.updated_at, "%Y-%m-%dT%H:%M:%S"))
+                except (ValueError, OSError):
+                    pass
+            return i.mtime or 0.0
+        return sorted(items, key=_recency, reverse=True)
 
     # ------------------------------------------------------------------ #
     # 本地扫描
@@ -127,8 +213,8 @@ class ShelfService:
     def scan_local(self) -> list[ShelfItem]:
         """扫描本地已下载目录（epub + 视频目录），排除隐藏名单。
 
-        - {书名}/*.epub → 小说/漫画（类型走缓存检测）
-        - {书名}/N 个 mp4 → 视频（episode_count=N）
+        - {书名}/*.epub → 小说/漫画（类型走缓存检测），记录大小/mtime
+        - {书名}/*.mp4|mkv|... → 视频（episode_count + 集文件列表）
         - 其余目录跳过。目录不存在返回空列表。
         """
         hidden = self.hidden_local()
@@ -142,32 +228,45 @@ class ShelfService:
             epubs = list(sub.glob("*.epub"))
             if epubs:
                 path = str(epubs[0])
+                try:
+                    st = Path(path).stat()
+                    size, mtime = st.st_size, st.st_mtime
+                except OSError:
+                    size, mtime = 0, 0.0
                 items.append(ShelfItem(
                     key=path,
                     kind="local",
                     title=sub.name,
                     content_type=self.epub_type(path),
                     path=path,
+                    size_bytes=size,
+                    mtime=mtime,
                 ))
                 continue
-            vids = sorted(sub.glob("*.mp4"))
+            vids = sorted(
+                f for f in sub.iterdir()
+                if f.is_file() and f.suffix.lower() in VIDEO_EXTS
+            )
             if not vids:
                 continue
-            path = str(vids[0])
             items.append(ShelfItem(
-                key=path,
+                key=str(sub),          # 视频书 key=目录路径（代表整本，续读/去重用）
                 kind="local",
                 title=sub.name,
                 content_type="video",
-                path=path,
+                path=str(sub),         # 视频书路径=目录
                 episode_count=len(vids),
+                episode_paths=[str(v) for v in vids],
+                size_bytes=sum((v.stat().st_size if v.is_file() else 0) for v in vids),
+                mtime=max((v.stat().st_mtime if v.is_file() else 0.0) for v in vids),
             ))
-        # 补续读位置（按本地文件路径 key）
+        # 补续读位置（本地=epub 路径 key；视频=目录路径 key）
         if self._progress is not None:
             for it in items:
                 pres = self._progress.resume(it.key)
                 if pres:
                     it.resume_title = pres.get("chapter_title", "")
+                    it.updated_at = pres.get("updated_at", "")
         return items
 
     def epub_type(self, path: str) -> str:
@@ -213,11 +312,13 @@ class ShelfService:
                 cover=fav.get("cover", ""),
                 tags=list(fav.get("tags") or []),
                 folder=fav.get("folder", ""),
+                updated_at=fav.get("favorited_at", ""),
             )
             if self._progress is not None:
                 pres = self._progress.resume(it.key)
                 if pres:
                     it.resume_title = pres.get("chapter_title", "")
+                    it.updated_at = pres.get("updated_at", "") or it.updated_at
             items.append(it)
         return items
 
