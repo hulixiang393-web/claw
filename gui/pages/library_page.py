@@ -80,13 +80,13 @@ class _ShelfCard(QFrame):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_menu)
         self.setFixedWidth(190)
-        self.setFixedHeight(160)  # 卡片尺寸固定：长书名不撑大，内容区网格恒定
+        self.setFixedHeight(204)  # 卡片尺寸固定：封面/书名/作者/来源/状态各占独立行
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
 
-        # 封面（本地书无封面用占位；收藏封面异步加载）
+        # 封面（独立区域，与下方书名/作者/来源分离，不并排）
         cover = QLabel("📚")
         cover.setAlignment(Qt.AlignCenter)
         cover.setFixedHeight(80)
@@ -97,38 +97,57 @@ class _ShelfCard(QFrame):
         self._cover = cover
         self._load_cover(rec.get("cover") or "")
 
-        # 标题 + 本地徽章（书名单行省略，超长横向裁剪不换行，tooltip 显示全名）
-        title_row = QHBoxLayout()
+        # 书名（独立行，完整显示可换行最多 2 行，超长裁剪但 tooltip 可见全名）
         title_text = rec.get("title") or "无题"
-        title = QLabel()
-        title.setWordWrap(False)
-        title.setFixedHeight(20)
+        title = QLabel(title_text)
+        title.setWordWrap(True)
+        title.setFixedHeight(36)
+        title.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         title.setStyleSheet("font-size: 14px; font-weight: bold;")
-        fm = title.fontMetrics()
-        badge_w = 44 if rec.get("kind") == "local" else 0
-        elided = fm.elidedText(title_text, Qt.ElideRight, 190 - 24 - badge_w - 4)
-        title.setText(elided)
         title.setToolTip(title_text)
-        title_row.addWidget(title, stretch=1)
+        layout.addWidget(title)
+
+        # 作者（独立行；本地书无元数据则不显示）
+        author_text = (rec.get("author") or "").strip()
+        if author_text:
+            author = QLabel(author_text)
+            author.setWordWrap(False)
+            author.setFixedHeight(15)
+            author.setStyleSheet("color: palette(dark); font-size: 11px;")
+            author.setToolTip(author_text)
+            layout.addWidget(author)
+
+        # 来源（独立行：源站名/源 id，纯本地书显示「本地」）
+        src = (rec.get("source_name") or rec.get("source_id") or "").strip()
+        if not src:
+            src = "本地"
+        source = QLabel(f"来源：{src}")
+        source.setWordWrap(False)
+        source.setFixedHeight(15)
+        source.setStyleSheet("color: palette(dark); font-size: 11px;")
+        source.setToolTip(src)
+        layout.addWidget(source)
+
+        # 状态行（独立：本地徽章 + 类型/集数/大小/续读）
+        state = QHBoxLayout()
         if rec.get("kind") == "local":
             badge = QLabel("本地")
-            badge.setFixedWidth(40)
+            badge.setFixedWidth(36)
             badge.setAlignment(Qt.AlignCenter)
             badge.setStyleSheet(
                 "font-size: 10px; padding: 1px 0px; border-radius: 3px;"
                 "background: palette(highlight); color: palette(highlighted-text);"
             )
-            title_row.addWidget(badge, alignment=Qt.AlignTop)
-        layout.addLayout(title_row)
-
+            state.addWidget(badge)
         meta_text = self._meta_text()
         meta = QLabel()
         meta.setWordWrap(False)
-        meta.setFixedHeight(16)
-        meta.setStyleSheet("color: palette(dark); font-size: 11px;")
-        meta.setText(fm.elidedText(meta_text, Qt.ElideRight, 190 - 24))
+        meta.setFixedHeight(15)
+        meta.setStyleSheet("color: palette(dark); font-size: 10px;")
+        meta.setText(meta_text)
         meta.setToolTip(meta_text)
-        layout.addWidget(meta)
+        state.addWidget(meta, stretch=1)
+        layout.addLayout(state)
 
         self._apply_style()
 
@@ -182,8 +201,6 @@ class _ShelfCard(QFrame):
             parts.append(type_label)
         if rec.get("episode_count"):
             parts.append(f"共 {rec['episode_count']} 集")
-        if rec.get("author"):
-            parts.append(rec["author"])
         if rec.get("online"):
             parts.append("可离线")
         size = rec.get("size_bytes") or 0
