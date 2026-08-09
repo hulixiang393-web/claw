@@ -528,6 +528,9 @@ class MainWindow(QMainWindow):
         """下载页「打开阅读」→ 用内置 epub 阅读器打开。"""
         if self.reader is None or not path:
             return
+        import os
+
+        path = os.path.abspath(path)  # 统一绝对路径，与书架/进度 key 一致（否则续读匹配不上）
         self.reader.open_epub(path)
         self.tabs.setCurrentIndex(self._tab_index["reader"])
 

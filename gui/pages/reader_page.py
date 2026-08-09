@@ -137,6 +137,7 @@ class ReaderPage(BasePage):
             self.video_view.episode_changed.connect(self._on_progress_signal)
             # epub 本地阅读：用文件路径作 key 续读
             self.epub_view.chapter_changed.connect(self._on_progress_signal)
+            self.epub_view.position_changed.connect(self._on_epub_position)
             # 章内位置续读（滚动/翻页/播放进度，节流后落盘）
             self.novel_view.position_changed.connect(self._on_progress_signal)
             self.comic_view.position_changed.connect(self._on_progress_signal)
@@ -194,7 +195,8 @@ class ReaderPage(BasePage):
             # epub 本地文件：payload[0] 是路径字符串，用路径作 book_url
             if isinstance(detail, str):
                 self._reading_progress.save(
-                    "", detail, "epub", detail, title or ""
+                    "", detail, "epub", detail, title or "",
+                    position=position,
                 )
                 return
             self._reading_progress.save(
@@ -205,6 +207,23 @@ class ReaderPage(BasePage):
                 title,
                 position=position,
                 page=page,
+            )
+        except Exception:
+            pass  # 记忆失败不影响阅读
+
+    def _on_epub_position(self, payload) -> None:
+        """本地 epub 章内滚动位置记忆（保留当前章节标题）。"""
+        if self._reading_progress is None or not isinstance(payload, (tuple, list)):
+            return
+        path, ratio = payload[0], payload[1]
+        if not path:
+            return
+        try:
+            rec = self._reading_progress.resume(path) or {}
+            self._reading_progress.save(
+                "", path, "epub", path,
+                rec.get("chapter_title", "") or "",
+                position=ratio,
             )
         except Exception:
             pass  # 记忆失败不影响阅读
@@ -378,21 +397,25 @@ class ReaderPage(BasePage):
 
         # 先读续读记录再打开：_load_chapter(start) 会触发 chapter_changed 把进度
         # 刷成当前章，若延后到回调里再 resume 会拿到被覆盖的起点而丢失续读位。
-        last_title = ""
+        last_title, last_pos = "", 0.0
         if self._reading_progress is not None:
             rec = self._reading_progress.resume(path)
-            last_title = (rec or {}).get("chapter_title", "")
+            if rec:
+                last_title = rec.get("chapter_title", "") or ""
+                last_pos = float(rec.get("position") or 0)
 
         def _on_loaded(chapters) -> None:
-            # 续读：按上次章节标题定位
+            # 续读：按上次章节标题定位，标题栏同步显示该章。
+            # 章内滚动位置在定位到目标章时才设（起始章先加载，不能提前设否则被消耗）。
+            show = chapters[0].title if chapters else "epub"
             if last_title:
                 for i, ch in enumerate(chapters):
                     if ch.title == last_title:
+                        self.epub_view._pending_pos = last_pos
                         self.epub_view._load_chapter(i)
+                        show = ch.title
                         break
-            self.title_label.setText(
-                chapters[0].title if chapters else "epub"
-            )
+            self.title_label.setText(show)
 
         self.epub_view.open(path, start_idx=0, on_loaded=_on_loaded)
 

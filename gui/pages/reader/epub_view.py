@@ -44,6 +44,12 @@ _READ_LOCK = threading.Lock()
 _SPLIT_CACHE: dict = {}
 
 
+def _now() -> float:
+    import time
+
+    return time.time()
+
+
 def _cache_key(path: str) -> tuple:
     import os
 
@@ -145,6 +151,7 @@ class EpubView(QWidget):
     """epub 阅读视图（本地文件）。"""
 
     chapter_changed = Signal(object)  # 发 (epub_path, chapter_title) 供续读
+    position_changed = Signal(object)  # 发 (epub_path, 章内滚动比例 0~1)，节流
 
     def __init__(self, font_scale: float = 1.0, parent=None):
         super().__init__(parent)
@@ -155,6 +162,8 @@ class EpubView(QWidget):
         self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
         self._epub: FastEpub | None = None  # 当前书读取器（zip 按需读取）
+        self._last_pos_emit = 0.0  # 章内位置节流
+        self._pending_pos = 0.0  # 待恢复的章内滚动比例（续读定位用，恢复后清零）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -203,6 +212,7 @@ class EpubView(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         # 正文容器：小说用 QLabel，漫画用垂直图流
         self.text = QLabel()
@@ -221,11 +231,15 @@ class EpubView(QWidget):
         on_loaded 在主线程执行，可在此做续读定位（按章节标题）等收尾。
         """
         self._ensure_text_label()  # 上次打开混排 epub 可能已删掉正文 QLabel
+        import os
+
+        path = os.path.abspath(path)  # 统一绝对路径（进度/续读 key 一致）
         self._path = path
         self._start_idx = max(0, int(start_idx or 0))
         self._on_loaded = on_loaded
         self._chapters = []
         self._is_comic = False
+        self._pending_pos = 0.0
         self.text.setText("正在打开 epub，请稍候…")
         self.scroll.setWidget(self.text)
         task = _OpenTask(path)
@@ -396,12 +410,37 @@ class EpubView(QWidget):
         if kind == "comic":
             self._switch_gallery()
             self._render_comic_imgs(imgs)
+            self.scroll.verticalScrollBar().setValue(0)
         else:
             self._ensure_text_label()  # 漫画章后正文 QLabel 可能已被 setWidget 删除
             self.scroll.setWidget(self.text)
             self.text.setText(f"【{ch.title}】\n\n{text}")
             self.scroll.verticalScrollBar().setValue(0)
+            # 续读：恢复上次章内滚动位置（延迟到文本布局完成后）
+            if self._pending_pos > 0:
+                pos = self._pending_pos
+                self._pending_pos = 0.0
+                from PySide6.QtCore import QTimer
+
+                QTimer.singleShot(0, lambda p=pos: self.scroll.verticalScrollBar().setValue(
+                    int(p * self.scroll.verticalScrollBar().maximum())
+                ))
         self.chapter_changed.emit((self._path, ch.title))
+
+    def _on_scroll(self, value: int) -> None:
+        """章内滚动 → 节流记录阅读比例（记住读到哪）。"""
+        if not self._path:
+            return
+        max_v = self.scroll.verticalScrollBar().maximum()
+        ratio = (value / max_v) if max_v > 0 else 0.0
+        now = _now()
+        if now - self._last_pos_emit < 0.4:
+            return
+        self._last_pos_emit = now
+        try:
+            self.position_changed.emit((self._path, round(ratio, 4)))
+        except RuntimeError:
+            pass
 
     def _render_comic_imgs(self, imgs: list) -> None:
         """漫画章：逐张限宽解码（QImageReader 不解码全尺寸，省内存、不卡 UI）。"""
