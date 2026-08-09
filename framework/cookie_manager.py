@@ -41,20 +41,26 @@ class CookieManager:
         logged_at: Optional[int] = None,
     ) -> None:
         """保存 cookie 列表。cookies_list 是 QWebEngineCookie 序列化后的 dict 列表。"""
-        # 去重：同名同域取最后
+        # 去重：同名同域取最后；同名不同域都保留（raw_list），互不覆盖
         merged: Dict[str, str] = {}
         raw_list = []
+        seen: set = set()
         for c in cookies_list:
             name = c.get("name") or ""
             value = c.get("value") or ""
+            domain = c.get("domain") or ""
             if not name:
                 continue
             merged[name] = value
+            key = (name, domain)
+            if key in seen:
+                continue  # 同名同域已记录，仅刷新 merged 值（取最后）
+            seen.add(key)
             raw_list.append(
                 {
                     "name": name,
                     "value": value,
-                    "domain": c.get("domain") or "",
+                    "domain": domain,
                     "path": c.get("path") or "",
                     "secure": bool(c.get("secure")),
                 }

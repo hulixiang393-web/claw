@@ -294,6 +294,8 @@ class NovelView(QWidget):
 
     def _on_chapter_loaded(self, ch, text, err) -> None:
         if err:
+            self._auto_loading = False  # 加载失败也要解锁，防死锁
+            self._auto_prev_loading = False
             self.text.setText(f"加载失败：{err}")
             return
         ch._cached_text = text
@@ -471,8 +473,9 @@ class NovelView(QWidget):
             return
         # 当前章缓存命中 → 直接复用
         cur_ch = self._chapters[self._current_idx] if 0 <= self._current_idx < len(self._chapters) else None
-        if cur_ch is not None and getattr(cur_ch, "_cached_pages", None) == text:
-            self._pages = cur_ch._cached_pages["pages"]
+        cache = getattr(cur_ch, "_cached_pages", None) if cur_ch is not None else None
+        if cache is not None and cache.get("text") == text:
+            self._pages = cache["pages"]
             self._page_count = len(self._pages)
             if self._current_page >= self._page_count:
                 self._current_page = 0
@@ -487,7 +490,7 @@ class NovelView(QWidget):
             self._current_page = 0
         # 写缓存
         if cur_ch is not None:
-            cur_ch._cached_pages = {"pages": self._pages}
+            cur_ch._cached_pages = {"pages": self._pages, "text": text}
 
     def _pager_show_page(self, page: int) -> None:
         """跳到第 page 页（0 基）。"""

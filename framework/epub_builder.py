@@ -64,7 +64,7 @@ class EpubBuilder:
             return ".gif"
         if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
             return ".webp"
-        if raw[:2] in (b"\xff\xd8", b"\xff\xd9"):
+        if raw[:2] == b"\xff\xd8":  # JPEG SOI（ff d9 是尾部 EOI，此处永不命中）
             return ".jpg"
         return ".jpg"  # 兜底
 

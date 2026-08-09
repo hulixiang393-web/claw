@@ -125,7 +125,23 @@ class DetailDrawer(QFrame):
         self.title.setText(detail.title or "无标题")
         self.author.setText(detail.author or "")
         self.status.setText(detail.status or "")
-        self.chapters_label.setText(f"共 {len(detail.chapters)} 章节" if detail.chapters else "无章节信息")
+        # 视频源磁力/番号页（如 avgood 搜索结果的 /c/{id}）：无在线播放，提示用户
+        import re as _re
+
+        is_magnet_page = bool(
+            detail.content_type == "video"
+            and not detail.chapters
+            and _re.search(r"/c/\d+\.html", detail.url or "")
+        )
+        if is_magnet_page:
+            self.chapters_label.setText(
+                "磁力/番号页（仅下载，不可在线播放）\n"
+                "该站搜索接口只返回磁力库条目，線上影片请用「发现」分类浏览"
+            )
+        else:
+            self.chapters_label.setText(
+                f"共 {len(detail.chapters)} 章节" if detail.chapters else "无章节信息"
+            )
         self.summary.setText(detail.summary or "（无简介）")
         self._load_cover(detail.cover)
         self.setVisible(True)

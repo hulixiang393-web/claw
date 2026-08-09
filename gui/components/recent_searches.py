@@ -19,6 +19,26 @@ from PySide6.QtWidgets import (
 from framework.search_history import SearchHistory
 
 
+class _ClickableRow(QWidget):
+    """可点击词条行：覆写 mousePressEvent 触发重搜。
+
+    实例属性赋值（container.mousePressEvent = lambda ...）在 PySide6 里
+    不进 Qt 虚表，事件分发永不回调 → 词条空白区点击不生效。
+    改类方法覆写才可靠（与 video_view.py 同坑注释一致）。
+    """
+
+    clicked = Signal(str)
+
+    def __init__(self, word: str, parent=None):
+        super().__init__(parent)
+        self._word = word
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self._word)
+        super().mousePressEvent(event)
+
+
 class RecentSearches(QWidget):
     """最近搜索列表（最近 20 条）。"""
 
@@ -75,10 +95,10 @@ class RecentSearches(QWidget):
             btn.clicked.connect(lambda _, w=word: self.search_clicked.emit(w))
             row.addWidget(btn, alignment=Qt.AlignRight)
 
-            container = QWidget()
+            container = _ClickableRow(word)
             container.setLayout(row)
             container.setStyleSheet("border-radius: 6px; padding: 2px 6px;")
-            container.mousePressEvent = lambda _, w=word: self.search_clicked.emit(w)
+            container.clicked.connect(self.search_clicked.emit)
             container.setCursor(Qt.PointingHandCursor)
             self._list_layout.addWidget(container)
 

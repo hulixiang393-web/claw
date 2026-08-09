@@ -89,7 +89,7 @@ class _SearchTask(QRunnable):
 
 
 class _SearchCoverDecryptSignals(QObject):
-    finished = Signal(object, object)  # (source, {result.url: data_uri})
+    finished = Signal(object, object, object)  # (source, {result.url: data_uri}, epoch)
 
 
 class _SearchCoverDecryptTask(QRunnable):
@@ -98,14 +98,18 @@ class _SearchCoverDecryptTask(QRunnable):
     搜索返回时封面是加密 URL 直接加载不出图，后台复用 discovery 的
     AES 解密（decrypt_search_covers）后，GUI 把 data URI 回填刷新。
     非加密源不启动此任务（decrypt_search_covers 返回 {}）。
+
+    epoch：发起时搜索会话标记。旧搜索的解密结果后到（epoch 过期）会被
+    _on_covers_decrypted 丢弃，避免回填到新搜索的 _results/卡片。
     """
 
-    def __init__(self, search_obj, source, results):
+    def __init__(self, search_obj, source, results, epoch=0):
         super().__init__()
         self.signals = _SearchCoverDecryptSignals()
         self._search = search_obj
         self._source = source
         self._results = results
+        self._epoch = epoch
 
     def run(self) -> None:
         covers = {}
@@ -114,7 +118,7 @@ class _SearchCoverDecryptTask(QRunnable):
         except Exception:  # noqa: BLE001
             covers = {}
         try:
-            self.signals.finished.emit(self._source, covers)
+            self.signals.finished.emit(self._source, covers, self._epoch)
         except RuntimeError:
             pass
 
@@ -422,13 +426,15 @@ class SearchPage(BasePage):
         except Exception:  # noqa: BLE001
             return False
 
-    def _on_covers_decrypted(self, source, covers) -> None:
+    def _on_covers_decrypted(self, source, covers, epoch) -> None:
         """封面解密完成：回写 SearchResult.cover + 刷新对应卡片。
 
         covers = {result.url: data_uri}。合并模式下卡片 work 是合并代表
         （url 与原始结果一致），按 url 匹配刷新。
+        epoch 不匹配（已被新搜索替代）→ 旧结果直接丢弃，避免回填到
+        新搜索的 _results/卡片（同 url 串封面）。
         """
-        if not covers:
+        if epoch != self._search_epoch or not covers:
             return
         for r in self._results:
             uri = covers.get(r.url)
@@ -463,7 +469,9 @@ class SearchPage(BasePage):
             return
         for r in pending:
             self._cover_decrypt_submitted.add(r.url)
-        task = _SearchCoverDecryptTask(self._search, source, pending)
+        task = _SearchCoverDecryptTask(
+            self._search, source, pending, epoch=self._search_epoch
+        )
         task.signals.finished.connect(self._on_covers_decrypted)
         self._cover_tasks.append(task)  # 持引用防 GC
         QThreadPool.globalInstance().start(task)

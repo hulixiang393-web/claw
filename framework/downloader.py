@@ -23,17 +23,6 @@ from .ffmpeg_merger import MergeCancelled, MergePaused
 # 文件名非法字符（Windows + 通用）
 _ILLEGAL_FILENAME = re.compile(r'[\\/:*?"<>|\r\n\t\x00-\x1f]')
 
-# data URI mime → 扩展名
-_MIME_EXT = {
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/bmp": ".bmp",
-}
-_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-
 
 def sanitize_filename(name: str) -> str:
     """把文件名中的非法字符替换为 _，去首尾空白与点。"""
@@ -123,7 +112,7 @@ class Downloader:
         # 用 index→bytes 字典占位，保持图片顺序（as_completed 完成序会打乱页序）。
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        img_map = {i: b"" for i in range(len(images))}
+        img_map: dict = {}
         progress_cb = getattr(task, "image_progress_cb", None)
         with ThreadPoolExecutor(max_workers=8) as pool:
             # 防盗链：以章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
@@ -133,11 +122,13 @@ class Downloader:
                 try:
                     b = fut.result()
                 except Exception:
-                    b = b""
+                    continue  # 失败图片跳过，不入集合（避免 epub 内 0 字节碎图）
+                if not b:
+                    continue
                 img_map[idx] = b
                 if progress_cb is not None:
                     progress_cb(len(b))
-        img_bytes = [img_map[i] for i in range(len(images))]
+        img_bytes = [img_map[i] for i in sorted(img_map)]
         task.epub_chapters.append((chapter.title or f"第{index+1}话", img_bytes))
         return sum(len(b) for b in img_bytes)
 
@@ -170,7 +161,7 @@ class Downloader:
                 try:
                     return self._download_hls(
                         video, self._source_headers(source), path,
-                        progress_cb, cancel_evt, pause_evt,
+                        progress_cb, cancel_evt, pause_evt, source=source,
                     )
                 except (MergeCancelled, MergePaused):
                     raise
@@ -194,7 +185,7 @@ class Downloader:
                 raise  # 用户取消/暂停是意图，不透传 yt-dlp 兜底
             except Exception:  # noqa: BLE001 合并失败 → 用视频流 URL 走 yt-dlp 兜底
                 # 直接下 m3u8/mp4 流（yt-dlp 泛 HLS/HTTP 提取，绕开 ffmpeg 合并失败）
-                return self._download_via_ytdlp(video, path, "best", progress_cb, cancel_evt, pause_evt)
+                return self._download_via_ytdlp(video, path, "bestvideo+bestaudio/best", progress_cb, cancel_evt, pause_evt)
         # 取流为空 → 用章节页 URL 兜底（yt-dlp 能识别该站则下，否则报错明确）
         return self._download_via_ytdlp(chapter.url, path, "bestvideo+bestaudio/best", progress_cb, cancel_evt, pause_evt)
 
@@ -375,15 +366,15 @@ class Downloader:
         # 通用请求头：取源配置合并后的全量头（transports.headers + cookie → Referer/UA/Cookie）。
         # CDN 校验 Referer/UA 的源（如 B站、HLS 站）靠它通过；源无此接口则空。
         headers = self._source_headers(source)
-        referer = headers.get("Referer", "") or ""
         merger = FFmpegMerger(headers=headers)
         # m3u8 广告段过滤：视频是 HLS 时下载播放列表 → 剔除广告段 → 本地重写，
         # 用无广告的本地 m3u8 合并（下载不落广告片段）。
-        # 【鉴权保护】源带 Referer 时本地 m3u8 无法传给内部 https 段请求（ffmpeg 白名单/
-        # headers 不传播），CDN 会拒绝 → 跳过本地过滤，直接用原始 URL 下载（保证能下）。
+        # 带 Referer 的源也尝试过滤：本地 m3u8 的段请求会继承 -headers
+        # （ffmpeg 全局请求头 + protocol_whitelist 已放行 http/https），
+        # 过滤失败（无法下载播放列表/解析失败）时静默回退原始 URL。
         if video.startswith(("http://", "https://")) and (
             ".m3u8" in video.lower() or "m3u8" in video.lower()
-        ) and not referer:
+        ):
             filtered = self._filter_m3u8_for_download(source, video, path.parent)
             if filtered:
                 video = str(filtered)
@@ -426,6 +417,7 @@ class Downloader:
     def _download_hls(
         self, url, headers, path,
         progress_cb=None, cancel_evt=None, pause_evt=None,
+        source=None,
     ) -> int:
         """HLS（m3u8）逐段下载 → ffmpeg 本地合并成 mp4。
 
@@ -460,6 +452,19 @@ class Downloader:
             if not segs:
                 raise RuntimeError("HLS 播放列表无分段")
 
+            # 流内广告段剔除：段 URL 命中广告特征 / DISCONTINUITY 短段 → 跳过下载。
+            # 用 adblock 引擎（源级配置+内置规则）判定；无配置时跳过不误删。
+            try:
+                from .adblock import adblock_for
+
+                ad = adblock_for(source)
+                if ad.enabled:
+                    ad_segs, _cleaned = ad.detect_m3u8_ads(text, playlist_url)
+                else:
+                    ad_segs = []
+            except Exception:  # noqa: BLE001 广告检测失败不影响下载
+                ad_segs = []
+
             # AES-128 密钥（下载到本地，本地 m3u8 引用它）
             key_local = None
             if key_attrs:
@@ -468,11 +473,15 @@ class Downloader:
                 key_local = Path(hls_dir) / "key.key"
                 key_local.write_bytes(key_data)
 
-            # 逐段下载：带 Referer + 重试；彻底失败跳过（占位），不中断整集
+            # 逐段下载：带 Referer + 重试；彻底失败跳过（占位），不中断整集。
+            # 广告段（ad_segs）直接跳过下载，不写占位、不进本地 m3u8。
+            ad_set = set(ad_segs)
             seg_items = []  # (extinf, 本地文件名, 字节数)
             total = 0
             for idx, (extinf, seg_url) in enumerate(segs):
                 self._check_abort(cancel_evt, pause_evt)
+                if idx in ad_set:
+                    continue  # 流内广告段：不下载
                 seg_file = Path(hls_dir) / f"seg_{idx + 1:05d}.ts"
                 n = self._download_seg_retry(seg_url, headers, seg_file, cancel_evt, pause_evt)
                 seg_items.append((extinf, seg_file.name, n))
@@ -740,14 +749,19 @@ class Downloader:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"批量 Playwright 渲染失败: {exc}") from exc
 
-        # 逐话累积图片字节
-        out: dict[int, int] = {}
+        # 逐话渲染图片字节：先全部收集，全部成功后再一次性 append。
+        # 中间某话失败时抛错（前几话不残留到 epub_chapters），重试整批不会翻倍。
+        collected: list = []
         for idx, ch in to_download:
             images = result_map.get(ch.url)
             if images is None:
                 raise RuntimeError(f"渲染失败：{ch.title or ch.url}")
             # 防盗链：以章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
             img_bytes = [self._image_bytes(img, ch.url) for img in images]
+            collected.append((idx, ch, img_bytes))
+        # 整批全部成功，一次性累积
+        out: dict[int, int] = {}
+        for idx, ch, img_bytes in collected:
             task.epub_chapters.append((ch.title or f"第{idx+1}话", img_bytes))
             out[idx] = sum(len(b) for b in img_bytes)
         # 未处理的话标记 0
@@ -757,21 +771,6 @@ class Downloader:
         return out
 
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _img_ext(img: str) -> str:
-        """从 data URI mime 或 URL 后缀推断图片扩展名，默认 .jpg。"""
-        if img.startswith("data:"):
-            mime = img[5 : img.find(";") or img.find(",")]
-            return _MIME_EXT.get(mime, ".jpg")
-        ext = Path(urlparse(img).path).suffix.lower()
-        return ext if ext in _IMG_EXTS else ".jpg"
-
-    def _save_image(self, img: str, path: Path) -> int:
-        """保存单张图：data URI 解码 / http URL 下载。返回字节数。"""
-        raw = self._image_bytes(img)
-        path.write_bytes(raw)
-        return len(raw)
-
     def _image_bytes(self, img: str, referer: str = "") -> bytes:
         """单张图字节：data URI 解码 / http URL 下载。不落盘（供 epub 累积）。
 

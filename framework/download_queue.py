@@ -74,7 +74,11 @@ class DownloadTask:
     failed: List[str] = field(default_factory=list)   # 失败章节标题
     error: str = ""                                    # 最近一次错误信息
     bytes_written: int = 0
+    done_chapters: List[int] = field(default_factory=list)  # 已完成章节索引（resume 重跑时跳过）
+    dispatched: bool = False                        # 「已派发未完成」标记（resume 判断 worker 是否在跑）
     merge_progress: int = 0        # 视频合并已输出字节（UI 显示用）
+    has_ads: bool = False          # 视频任务：是否检测到流内广告段（加任务时预检）
+    ad_segments: dict = field(default_factory=dict)  # {章节索引: 广告段序号列表}
     start_time: float = 0.0
     end_time: float = 0.0
     out_dir: str = ""
@@ -168,8 +172,74 @@ class DownloadQueue:
             {"task_id": task.task_id, "title": task.title, "total": task.total},
             task,
         )
+        # 视频任务：后台预检 m3u8 流内广告段（不阻塞入队；失败静默，下载时再过滤）
+        if detail.content_type == "video" and task.total > 0:
+            self._spawn_ad_precheck(task)
         self._maybe_dispatch()
         return task
+
+    def _spawn_ad_precheck(self, task: DownloadTask) -> None:
+        """后台预检视频集 m3u8 广告段：取流 → detect_m3u8_ads → 标记 has_ads。
+
+        选中的每集都取一次流 URL（fetch_video_streams 带缓存/解密），对 HLS
+        播放列表做广告段检测。结果写入 task.has_ads / task.ad_segments，
+        UI 可据此展示「含广告，下载将自动剔除」。失败（网络/超时/限流）静默：
+        不影响入队，下载时 filter_m3u8 兜底。
+        """
+        def _precheck() -> None:
+            from .adblock import adblock_for
+
+            source = self._manager.get(task.source_id) if self._manager else None
+            if source is None:
+                return
+            ad = adblock_for(source)
+            if not ad.enabled:
+                return
+            found: dict = {}
+            for i, ch in enumerate(task.chapters):
+                if not task.selected[i]:
+                    continue
+                if task.cancel_evt.is_set():
+                    return
+                try:
+                    video, _audio = self._content.fetch_video_streams(
+                        source, ch.url, quality=task.quality or ""
+                    )
+                except Exception:  # noqa: BLE001
+                    continue  # 取流失败：静默跳过，下载时再试
+                if not video or ".m3u8" not in video.lower():
+                    continue  # 非 HLS（mp4/dash）不走 m3u8 广告段检测
+                try:
+                    text = self._http.get_text(
+                        video, headers=source.request_headers(), timeout=15, retries=1
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                if not text or "#EXTM3U" not in text:
+                    continue
+                ad_segs, _cleaned = ad.detect_m3u8_ads(text, video)
+                if ad_segs:
+                    found[i] = ad_segs
+            if found:
+                with self._lock:
+                    task.has_ads = True
+                    task.ad_segments = found
+                # 通知 UI：任务卡片可展示广告检测结果
+                self._emit(
+                    EVENT_DOWNLOAD_PROGRESS,
+                    {
+                        "task_id": task.task_id,
+                        "done": task.done,
+                        "total": task.total,
+                        "speed_mbs": task.speed_mbs,
+                        "title": task.title,
+                        "has_ads": True,
+                    },
+                    task,
+                )
+
+        t = threading.Thread(target=_precheck, daemon=True, name=f"adcheck-{task.task_id}")
+        t.start()
 
     def tasks(self) -> List[DownloadTask]:
         """全部任务快照（调用方自行按状态分组）。"""
@@ -204,10 +274,15 @@ class DownloadQueue:
             if t is None or t.status != TaskStatus.PAUSED:
                 return
             t.pause_evt.clear()
-            if t.worker is not None and t.worker.is_alive():
+            if t.dispatched:
                 t.status = TaskStatus.DOWNLOADING  # worker 仍在运行，直接恢复
             else:
-                t.status = TaskStatus.WAITING  # 从未启动，重新入队
+                # worker 已结束（或从未启动）：重新派发。done_chapters 保留，
+                # 重跑时跳过已完成章并补计数；epub_chapters 保留（对应章内容已累积），
+                # 避免整本重跑后 done/epub_chapters 翻倍或缺内容。
+                t.status = TaskStatus.WAITING
+                t.done = 0
+                t.bytes_written = 0
         self._maybe_dispatch()
         self._emit_refresh(t)
 
@@ -248,6 +323,8 @@ class DownloadQueue:
             t.error = ""
             t.done = 0
             t.bytes_written = 0
+            t.epub_chapters = []      # 重试前清空累积，避免重下后内容翻倍
+            t.done_chapters = []      # 全新下载：清空已完成记录，避免跳过章节
             t.start_time = 0.0
             t.end_time = 0.0
             t.cancel_evt = threading.Event()
@@ -279,11 +356,12 @@ class DownloadQueue:
             for t in self._tasks:
                 if t.status == TaskStatus.PAUSED:
                     t.pause_evt.clear()
-                    t.status = (
-                        TaskStatus.DOWNLOADING
-                        if t.worker is not None and t.worker.is_alive()
-                        else TaskStatus.WAITING
-                    )
+                    if t.dispatched:
+                        t.status = TaskStatus.DOWNLOADING
+                    else:
+                        t.status = TaskStatus.WAITING
+                        t.done = 0
+                        t.bytes_written = 0
         self._maybe_dispatch()
 
     def cancel_all(self) -> None:
@@ -338,6 +416,7 @@ class DownloadQueue:
                     return
                 # 先标记，杜绝重复派发竞态
                 nxt.status = TaskStatus.DOWNLOADING
+                nxt.dispatched = True  # 「已派发未完成」标记（resume 判断 worker 在跑用）
                 self._active_workers += 1
             self._spawn_worker(nxt)
 
@@ -379,6 +458,7 @@ class DownloadQueue:
         finally:
             with self._lock:
                 task.worker = None
+                task.dispatched = False  # 真正结束才清位（供 resume 判断）
                 self._active_workers -= 1
                 task.end_time = time.time()
             self._emit_final(task)
@@ -400,8 +480,12 @@ class DownloadQueue:
             return
 
         # ── 普通路径（novel / video，逐章串行） ──
-        for i, ch in enumerate(task.chapters):
+        i = 0
+        n = len(task.chapters)
+        while i < n:
+            ch = task.chapters[i]
             if not task.selected[i]:
+                i += 1
                 continue
             # 取消 / 暂停检查（每章边界）
             if task.cancel_evt.is_set():
@@ -413,6 +497,12 @@ class DownloadQueue:
                     break
             if task.cancel_evt.is_set():
                 break
+            # 已完成章节（resume 整本重跑时跳过，计数补上）
+            if i in task.done_chapters:
+                with self._lock:
+                    task.done += 1
+                i += 1
+                continue
             with self._lock:
                 task.status = TaskStatus.DOWNLOADING
 
@@ -439,17 +529,26 @@ class DownloadQueue:
                     with self._lock:
                         task.done += 1
                         task.bytes_written += max(0, nbytes)
+                        task.done_chapters.append(i)
+                    i += 1
                     break
                 except Exception as exc:  # noqa: BLE001
+                    task.image_progress_cb = None
                     last_err = str(exc)
                     if task.cancel_evt.is_set():
                         break  # 用户取消：停止下载，走取消终态
                     if task.pause_evt.is_set():
-                        # 用户暂停：中断当前合并，任务进入暂停（恢复后重下当前集）
+                        # 用户暂停：中断当前合并，任务进入暂停；恢复后重下当前章
+                        # （不递增 i，外层 while 重新尝试本章 —— 修复暂停中断章永久丢失）
                         with self._lock:
                             task.status = TaskStatus.PAUSED
                             task.bytes_written = 0  # 当前集未完整落盘
                         self._emit_refresh(task)
+                        while task.pause_evt.is_set():
+                            with self._lock:
+                                task.status = TaskStatus.PAUSED
+                            if task.cancel_evt.wait(0.3):
+                                break
                         break
                     if attempt < MAX_ATTEMPTS - 1:
                         time.sleep(min(0.5 * (2 ** attempt), 2.0))  # 退避
@@ -457,6 +556,7 @@ class DownloadQueue:
                 with self._lock:
                     task.failed.append(ch.title or f"第{i + 1}章")
                     task.error = last_err
+                i += 1
 
             with self._lock:
                 if task.cancel_evt.is_set():
@@ -592,8 +692,12 @@ class DownloadQueue:
     def _download_comic_serial(self, task: DownloadTask, source) -> None:
         """非 Playwright 漫画：逐章串行下载图片，复用 fetch_comic_pages。"""
 
-        for i, ch in enumerate(task.chapters):
+        i = 0
+        n = len(task.chapters)
+        while i < n:
+            ch = task.chapters[i]
             if not task.selected[i]:
+                i += 1
                 continue
             if task.cancel_evt.is_set():
                 break
@@ -604,6 +708,12 @@ class DownloadQueue:
                     break
             if task.cancel_evt.is_set():
                 break
+            # 已完成话（resume 整本重跑时跳过，计数补上）
+            if i in task.done_chapters:
+                with self._lock:
+                    task.done += 1
+                i += 1
+                continue
             with self._lock:
                 task.status = TaskStatus.DOWNLOADING
 
@@ -617,8 +727,11 @@ class DownloadQueue:
                     with self._lock:
                         task.done += 1
                         task.bytes_written += max(0, nbytes)
+                        task.done_chapters.append(i)
+                    i += 1
                     break
                 except Exception as exc:  # noqa: BLE001
+                    task.image_progress_cb = None
                     last_err = str(exc)
                     if task.cancel_evt.is_set():
                         break
@@ -628,8 +741,11 @@ class DownloadQueue:
                 with self._lock:
                     task.failed.append(ch.title or f"第{i + 1}话")
                     task.error = last_err
+                i += 1
 
             with self._lock:
+                if task.cancel_evt.is_set():
+                    break
                 task.end_time = time.time()
             self._emit(
                 EVENT_DOWNLOAD_PROGRESS,

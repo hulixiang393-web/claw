@@ -94,7 +94,7 @@ DETAIL_HTML = """<html><body><div class="site-header">d</div>
 
 
 class MockHttp(HttpClient):
-    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None):
+    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None, proxy_pool=None):
         if "/category" in url:
             return CATEGORY_HTML
         if "/cat/" in url:

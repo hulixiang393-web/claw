@@ -7,7 +7,7 @@
   （HLS / MP4 / DASH / 直播 / 未知），给出推荐网络缓存与上限。
 - 卡顿统计（Buffering 窗口）：记录缓冲事件频率；连续 5s 内发生
   >= 3 次独立缓冲即判定"频繁卡顿"→ 建议重播并逐级提高缓存。
-- 缓存阶梯：2000 → 4000 → 6000 → 8000 ms，封顶后不再升级。
+- 缓存阶梯：4000 → 6000 → 8000 ms，封顶后不再升级。
 
 典型用法：
     tuner = MediaTuner()
@@ -68,7 +68,7 @@ def classify(url: str) -> MediaProfile:
     return MediaProfile("unknown", 2500, 6000)
 
 
-_BUFFER_STEPS = (2000, 4000, 6000, 8000)  # 卡顿升级阶梯（ms）
+_BUFFER_STEPS = (4000, 6000, 8000)  # 卡顿升级阶梯（ms）
 
 
 class MediaTuner:
@@ -133,10 +133,10 @@ class MediaTuner:
         profile = classify(url)
         with self._lock:
             self._events.clear()      # 升级后重置统计窗口
-            if self._upgraded >= len(_BUFFER_STEPS) - 1:
+            if self._upgraded >= len(_BUFFER_STEPS):
                 return None
-            self._upgraded += 1
             ms = _BUFFER_STEPS[self._upgraded]
+            self._upgraded += 1
             if ms > profile.max_buffer_ms:
                 return None
             return ms

@@ -23,13 +23,13 @@ def setup_logging(settings: Any | None = None) -> None:
     """
     log_level = logging.INFO
     log_dir = "logs"
-    file_pattern = "framework-{date}.log"
+    file_pattern = "framework-{date}.jsonl"
 
     if settings is not None:
         if settings.get("diagnostics", "verbose_logging", False):
             log_level = logging.DEBUG
         log_dir = settings.get("diagnostics", "log_dir", "logs") or "logs"
-        file_pattern = settings.get("diagnostics", "log_file_pattern", "framework-{date}.log") or file_pattern
+        file_pattern = settings.get("diagnostics", "log_file_pattern", "framework-{date}.jsonl") or file_pattern
 
     root = logging.getLogger()
     root.setLevel(log_level)

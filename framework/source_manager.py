@@ -48,8 +48,8 @@ class SourceManager:
         self._warnings: List[str] = []
         self._health_file = Path(health_file) if health_file else None
         self._runtime = runtime_settings or {}
-        self._last_warn_ts: Dict[str, float] = {}
         self._cookie_provider = None  # 可选: load(source_id) -> cookie_header 字符串
+        self._auto_disabled: set = set()  # 因连续失败被自动禁用的 source_id（恢复路径专用）
         if self._health_file is not None:
             self._load_health()
         if sources_dir is not None:
@@ -149,6 +149,8 @@ class SourceManager:
     def set_enabled(self, source_id: str, enabled: bool) -> None:
         source = self.get(source_id)
         source.enabled = enabled
+        # 手动启停后由用户掌控，清除自动禁用标记（不再走自动恢复路径）
+        self._auto_disabled.discard(source_id)
 
     def set_weight(self, source_id: str, weight: float) -> None:
         source = self.get(source_id)
@@ -168,6 +170,7 @@ class SourceManager:
         for source in self._sources.values():
             enabled = source.source_id in selected
             source.enabled = enabled
+            self._auto_disabled.discard(source.source_id)
             self._persist_enabled(source, enabled)
 
     @staticmethod
@@ -197,6 +200,7 @@ class SourceManager:
 
     def update_health(self, source_id: str, state: str, error: str = "") -> None:
         health = self.get_health(source_id)
+        changed = health.state != state or (bool(error) and health.last_error != error)
         health.state = state
         if error:
             health.last_error = error
@@ -204,7 +208,9 @@ class SourceManager:
         if len(health.history) > MAX_HEALTH_HISTORY:
             health.history = health.history[-MAX_HEALTH_HISTORY:]
         self._apply_policy(source_id, health)
-        if self._health_file is not None:
+        # 状态/错误未变化时跳过写盘：后台自检每次成功（ok, ""）若都全量写
+        # health.json，会拖慢每一章/每一集的抓取。只在状态变化时落盘。
+        if self._health_file is not None and changed:
             self._save_health()
 
     # ------------------------------------------------------------------ #
@@ -229,12 +235,18 @@ class SourceManager:
 
         健康恢复（ok）时，若源因连续失败被自动禁用，自动重新启用（状态机恢复路径）。
         """
-        # 恢复路径：上次因自动禁用被关的源，健康恢复后重新启用
+        # 恢复路径：仅「因连续失败自动禁用」的源在健康恢复后自动重新启用；
+        # 用户手动禁用的源不自动打开（避免悄悄改变用户意图）。
         if health.state == HEALTH_OK:
             src = self._sources.get(source_id)
-            if src is not None and not src.enabled and health.last_error:
+            if (
+                src is not None
+                and not src.enabled
+                and source_id in self._auto_disabled
+            ):
                 src.enabled = True
                 health.last_error = ""
+                self._auto_disabled.discard(source_id)
                 self._warnings.append(f"源 {source_id} 健康恢复，已自动重新启用")
             return
         if health.state != HEALTH_BROKEN:
@@ -251,17 +263,10 @@ class SourceManager:
             src = self._sources.get(source_id)
             if src is not None and src.enabled:
                 src.enabled = False
+                self._auto_disabled.add(source_id)
                 note = "连续失败自动禁用" if not health.last_error else f"连续失败自动禁用：{health.last_error}"
                 health.last_error = note
                 self._warnings.append(f"源 {source_id} 连续失败 {streak} 次，已自动禁用")
-        # 告警门控：间隔内不重复
-        import time
-
-        interval_h = float(self._runtime_opt("broken_source_warn_interval_hours", 24) or 0)
-        if interval_h > 0:
-            now = time.time()
-            if now - self._last_warn_ts.get(source_id, 0.0) >= interval_h * 3600:
-                self._last_warn_ts[source_id] = now
 
     def _load_health(self) -> None:
         if not self._health_file.exists():

@@ -58,6 +58,7 @@ ANTI_SCRAPE_KEYWORDS = (
     "captcha", "geetest", "g-recaptcha", "verify you are human",
     "you have been blocked", "access denied", "access is denied",
     "forbidden", "anti-bot", "riskcontrol", "waf",
+    "acw_sc__v2", "aliyunwaf", "var arg1=",
     "验证码", "人机验证", "滑动验证", "拖动验证",
     "访问过于频繁", "访问频率过高", "请求过于频繁",
     "被封", "封禁", "已封", "被禁止访问", "ip被限制", "ip 被限制", "访问被拒绝",
@@ -67,6 +68,30 @@ ANTI_SCRAPE_KEYWORDS = (
 def _is_anti_scrape_status(status: int) -> bool:
     """按状态码判定反爬：403/429/5xx。"""
     return status in ANTI_SCRAPE_STATUSES or 500 <= status < 600
+
+
+def _is_acw_challenge(text: str) -> bool:
+    """判定 acw_sc__v2 阿里云盾 challenge 页（arg1 + acw_sc__v2 cookie 脚本）。"""
+    snippet = (text or "")[:4000]
+    return (
+        "var arg1=" in snippet
+        and "acw_sc__v2" in snippet
+        and ("aliyunwaf" in snippet or "setCookie" in snippet)
+    )
+
+
+def _solve_acw(challenge_html: str) -> str:
+    """解算 acw_sc__v2 cookie 值；失败返回空串。"""
+    try:
+        from .acw_solver import extract_arg1, extract_xor_key, solve_acw_cookie
+
+        arg1 = extract_arg1(challenge_html)
+        if not arg1:
+            return ""
+        key = extract_xor_key(challenge_html)
+        return solve_acw_cookie(arg1, key) if key else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _is_anti_scrape_text(text: str) -> bool:
@@ -231,6 +256,10 @@ class HttpClient:
                     last_error = exc
                     if attempt < retries:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+            # 反爬/网络异常已是 RequestError（含 AntiScrapeError）→ 原样透传，
+            # 保留类型供调用方区分反爬（否则包成纯 RequestError 会抹掉类型）。
+            if isinstance(last_error, RequestError):
+                raise last_error
             raise RequestError(f"请求失败 GET {url}：{last_error}")
 
         return self._run_with_proxy_switch(_once, proxy, proxy_pool, f"GET {url}")
@@ -285,6 +314,8 @@ class HttpClient:
                     last_error = exc
                     if attempt < retries:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+            if isinstance(last_error, RequestError):
+                raise last_error
             raise RequestError(f"请求失败 GET {url}：{last_error}")
 
         return self._run_with_proxy_switch(_once, proxy, proxy_pool, f"GET {url}")
@@ -375,6 +406,8 @@ class HttpClient:
                     last_error = exc
                     if attempt < retries:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+            if isinstance(last_error, RequestError):
+                raise last_error
             raise RequestError(f"请求失败 POST {url}：{last_error}")
 
         return self._run_with_proxy_switch(_once, proxy, proxy_pool, f"POST {url}")
@@ -446,11 +479,30 @@ class HttpClient:
                     last_error = exc
                     if attempt < retries:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+            if isinstance(last_error, RequestError):
+                raise last_error
             raise RequestError(f"请求失败 POST {url}：{last_error}")
 
         return self._run_with_proxy_switch(_once, proxy, proxy_pool, f"POST {url}")
 
     def _get_once(self, url, headers, proxy, timeout, encoding=None) -> str:
+        text = self._get_once_raw(url, headers, proxy, timeout, encoding)
+        # acw_sc__v2 阿里云盾 challenge：自动解算 cookie 并重放一次
+        if _is_acw_challenge(text):
+            cookie = _solve_acw(text)
+            if cookie:
+                acw_headers = dict(headers or {})
+                cookies = acw_headers.pop("Cookie", "")
+                cookies = (cookies + "; " if cookies else "") + f"acw_sc__v2={cookie}"
+                acw_headers["Cookie"] = cookies
+                text = self._get_once_raw(url, acw_headers, proxy, timeout, encoding)
+                if not _is_acw_challenge(text):
+                    return text
+        if _is_anti_scrape_text(text):
+            raise AntiScrapeError(f"反爬特征响应 {url}")
+        return text
+
+    def _get_once_raw(self, url, headers, proxy, timeout, encoding=None) -> str:
         if self._session is not None:
             proxies = {"http": proxy, "https": proxy} if proxy else None
             resp = self._session.get(url, headers=headers, proxies=proxies, timeout=timeout)
@@ -463,14 +515,17 @@ class HttpClient:
             else:
                 # 未指定编码：requests 默认 ISO-8859-1 会乱码中文站。
                 # 从响应头 charset / HTML meta 推断；取不到用 apparent_encoding 兜底。
+                # 注意 Content-Type 无 charset 时 split 会得到 "text/html" 整个串，
+                # 直接当编码名会报 unknown encoding（17k 等无 charset 声明的站）；
+                # 仅当含合法 charset 参数时才用（含 "/" 或非字母数字视为无效）。
                 charset = (resp.headers.get("Content-Type") or "").split("charset=")[-1].strip().lower()
+                if "charset=" not in resp.headers.get("Content-Type", "") or "/" in charset:
+                    charset = ""
                 if charset and charset not in ("iso-8859-1",):
                     resp.encoding = charset
                 else:
                     resp.encoding = resp.apparent_encoding or "utf-8"
                 text = resp.text
-            if _is_anti_scrape_text(text):
-                raise AntiScrapeError(f"反爬特征响应 {url}")
             return text
         # urllib 降级
         import urllib.request
@@ -482,6 +537,9 @@ class HttpClient:
                 if resp.status >= 400:
                     raise RequestError(f"HTTP {resp.status} {url}")
                 charset = (resp.headers.get("Content-Type") or "").split("charset=")[-1].strip().lower()
+                # 同 requests 分支：Content-Type 无 charset 时 split 结果无效（如 "text/html"）
+                if "charset=" not in resp.headers.get("Content-Type", "") or "/" in charset:
+                    charset = ""
                 if not charset or charset == "iso-8859-1":
                     charset = "utf-8"
                 if encoding:

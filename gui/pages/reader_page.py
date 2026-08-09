@@ -256,15 +256,21 @@ class ReaderPage(BasePage):
         from PySide6.QtCore import QThreadPool
 
         task = _LoadDetailTask(
-            self._content, source, book_url, content_type, start_chapter_url
+            self._content, source, book_url, content_type, start_chapter_url,
+            source_id,
         )
         task.signals.finished.connect(self._on_detail)
         self._detail_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
 
-    def _on_detail(self, detail, err, content_type: str, start_chapter_url: str) -> None:
+    def _on_detail(self, detail, err, content_type: str, start_chapter_url: str, source_id: str) -> None:
         if err or detail is None:
             self.title_label.setText(f"加载失败：{err}")
+            return
+        # 请求代际校验：快速连开多部作品时旧详情任务后到（detail.url/source 已非
+        # 当前目标），若照常应用会用新的 _current_source_id/_pending_position 渲染
+        # 旧书 → 错源/错续读位置。不匹配直接丢弃。
+        if source_id != self._current_source_id or detail.url != self._current_book_url:
             return
         # 切走视频视图前释放播放资源：换小说/漫画/另一部视频都不在后台
         # 继续播放、不堆积播放缓存（stop_playback 幂等，非视频时无副作用）
@@ -407,13 +413,13 @@ class ReaderPage(BasePage):
 
 class _DetailSignals(QObject):
     """详情加载信号。"""
-    finished = Signal(object, object, object, object)  # (detail, err, content_type, start_url)
+    finished = Signal(object, object, object, object, object)  # (detail, err, content_type, start_url, source_id)
 
 
 class _LoadDetailTask(QRunnable):
     """后台加载详情（QRunnable）。"""
 
-    def __init__(self, content, source, url, content_type, start_url):
+    def __init__(self, content, source, url, content_type, start_url, source_id):
         super().__init__()
         self.signals = _DetailSignals()
         self._content = content
@@ -421,6 +427,7 @@ class _LoadDetailTask(QRunnable):
         self._url = url
         self._content_type = content_type
         self._start_url = start_url
+        self._source_id = source_id
 
     def run(self) -> None:
         detail, err = None, None
@@ -430,7 +437,7 @@ class _LoadDetailTask(QRunnable):
             err = str(exc)
         try:
             self.signals.finished.emit(
-                detail, err, self._content_type, self._start_url
+                detail, err, self._content_type, self._start_url, self._source_id
             )
         except RuntimeError:
             pass

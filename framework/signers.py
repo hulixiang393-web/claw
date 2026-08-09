@@ -76,7 +76,7 @@ class BilibiliWbiSigner(Signer):
 
     def __init__(self, http=None, key_cache: Optional[dict] = None):
         self._http = http
-        self._cache = key_cache if key_cache is not None else {"mk": None, "mk_ts": 0.0}
+        self._cache = key_cache if key_cache is not None else {"mixin": None, "mk_ts": 0.0}
 
     def _mixin(self) -> str:
         # wbi key 每天轮换；缓存 30 分钟（TTL）后重新拉取，避免次日用过期 key 签名失败

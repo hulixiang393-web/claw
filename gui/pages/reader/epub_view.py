@@ -131,6 +131,7 @@ class EpubView(QWidget):
     # ------------------------------------------------------------------ #
     def open(self, path: str, start_idx: int = 0) -> bool:
         """打开本地 epub，返回是否成功。start_idx 指定起始章节（续读定位）。"""
+        self._ensure_text_label()  # 上次打开混排 epub 可能已删掉正文 QLabel
         if not HAS_EBOOKLIB:
             self.text.setText("未安装 EbookLib，无法阅读 epub")
             return False
@@ -198,16 +199,35 @@ class EpubView(QWidget):
         return None
 
     def _switch_gallery(self) -> None:
-        """漫画模式：改用图片流容器。"""
+        """漫画模式：改用图片流容器（setWidget 会删除旧 widget，被删则重建）。"""
         from PySide6.QtWidgets import QVBoxLayout as _V
+        import shiboken6
 
-        if getattr(self, "_gallery_widget", None) is None:
+        gal = getattr(self, "_gallery_widget", None)
+        if gal is None or not shiboken6.isValid(gal):
             self._gallery_widget = QWidget()
             self._gallery_layout = _V(self._gallery_widget)
             self._gallery_layout.setContentsMargins(0, 0, 0, 0)
             self._gallery_layout.setSpacing(4)
             self._gallery_layout.setAlignment(Qt.AlignHCenter)
         self.scroll.setWidget(self._gallery_widget)
+
+    def _ensure_text_label(self) -> None:
+        """正文 QLabel 被 setWidget 切换删除时重建（混排 epub 漫画/小说来回切）。"""
+        import shiboken6
+
+        if shiboken6.isValid(self.text):
+            return
+        self.text = QLabel()
+        self.text.setWordWrap(True)
+        self.text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # 直接套字号样式：_apply_font 在漫画模式（_is_comic）会提前返回，
+        # 混排 epub 重建正文 QLabel 时需独立应用（否则重建后无样式）。
+        size = self._clamp_font(self._base_font + self._font_delta)
+        self.text.setStyleSheet(
+            f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;"
+        )
 
     def _populate_toc(self) -> None:
         self.toc_list.clear()
@@ -239,12 +259,16 @@ class EpubView(QWidget):
         if ch.is_comic:
             self._render_comic_chapter(ch)
         else:
+            self._ensure_text_label()  # 漫画章后正文 QLabel 可能已被 setWidget 删除
             self.scroll.setWidget(self.text)
             self.text.setText(f"【{ch.title}】\n\n{ch.text}")
             self.scroll.verticalScrollBar().setValue(0)
         self.chapter_changed.emit((self._path, ch.title))
 
     def _render_comic_chapter(self, ch: _Chapter) -> None:
+        # 小说章后点漫画章：scroll 当前 widget 仍是 text → 必须 setWidget 切回画廊，
+        # 否则漫画内容画在 text 上不显示（空白/残留旧小说正文）。
+        self._switch_gallery()
         while self._gallery_layout.count():
             child = self._gallery_layout.takeAt(0)
             if child.widget():
@@ -273,6 +297,7 @@ class EpubView(QWidget):
     def _apply_font(self) -> None:
         if self._is_comic:
             return
+        self._ensure_text_label()  # 被删则重建，避免操作失效对象
         size = self._clamp_font(self._base_font + self._font_delta)
         self.text.setStyleSheet(
             f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;"

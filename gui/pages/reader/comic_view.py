@@ -222,8 +222,9 @@ class ComicView(QWidget):
         task.signals.partial.connect(self._on_images_partial)  # 边抓边显示
         self._comic_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
-        self.chapter_changed.emit((self._detail, ch.title, ch.url))
-        # 注：预加载不在此发起——等当前话加载完成（_on_images_loaded）再预渲染后续话，
+        # 注：chapter_changed 由 _finish_episode_load 统一发出（缓存/预渲染命中与
+        # 本次加载完成后都只发一次，未缓存路径这里不再提前发 → 避免换话双写进度）。
+        # 预加载不在此发起——等当前话加载完成（_on_images_loaded）再预渲染后续话，
         # 避免预渲染抢资源拖慢当前话首屏。
 
     def _finish_episode_load(self, ch) -> None:

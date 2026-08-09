@@ -61,6 +61,20 @@ def report_bg_check(
     """
     from threading import Thread
 
+    # 仅自检指定页面才起后台检查线程：章节/漫画/视频页的抓取 URL ≠ 自检指定
+    # URL，checker.check 在这些页上恒判 ok（列表选择器不适用该页型），每章/每集
+    # 触发只会多一次整页 GET + 一次 health.json 全量写盘（20 源 × 200 章 = 200
+    # 次重复 GET + 200 次磁盘写）。非指定页直接返回，不再发后台二次 GET。
+    selfcheck_url = ""
+    target_fn = getattr(checker, "_selfcheck_url", None)
+    if target_fn is not None:
+        try:
+            selfcheck_url = target_fn(source) or ""
+        except Exception:  # noqa: BLE001  自检 URL 计算失败 → 不阻止检查
+            selfcheck_url = ""
+    if selfcheck_url and abs_url.rstrip("/") != selfcheck_url.rstrip("/"):
+        return
+
     def _run() -> None:
         try:
             ok = checker.check(source, abs_url)

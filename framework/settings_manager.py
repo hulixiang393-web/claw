@@ -119,7 +119,7 @@ class SettingsManager:
                 tmp.write_text(
                     json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
-            tmp.replace(self.path)  # 原子替换：避免中途崩溃截断配置文件
+                tmp.replace(self.path)  # 原子替换（锁内：并发 save 不会半写覆盖）
         except OSError as exc:
             log.warning("保存配置失败：%s", exc)
 

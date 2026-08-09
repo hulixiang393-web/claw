@@ -217,25 +217,54 @@ class Search:
                 log.warning("[%s] 搜索第 %d 页解析失败：%s", source.source_id, page, exc)
                 return (page, [])
 
-        # 受控并发翻页：每源最多 3 页在途请求（防反爬）。
-        # 保留 transports.interval_ms 间隔（_http_get 内部已 sleep）；
-        # 并发上限 3 平衡提速与反爬风险，不放大单源请求频率。
+        # 分波受控并发翻页：每波最多 3 页在途请求（防反爬），站点只有几页时
+        # 遇连续空页提前停发后续波，避免 max_pages 调大后把空页也抓满
+        # （30 页搜索原本会连发 30 个请求）。每波内并发 3 平衡提速与反爬风险。
+        # 保留 transports.interval_ms 间隔（_http_get 内部已 sleep）。
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         page_items: dict = {}
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futs = {pool.submit(_fetch, p): p for p in range(1, max_pages + 1)}
-            for fut in as_completed(futs):
-                page, items = fut.result()
-                page_items[page] = items
+        wave_size = 3
+        with ThreadPoolExecutor(max_workers=wave_size) as pool:
+            start = 1
+            while start <= max_pages:
+                end = min(start + wave_size - 1, max_pages)
+                futs = {pool.submit(_fetch, p): p for p in range(start, end + 1)}
+                wave_items: dict = {}
+                for fut in as_completed(futs):
+                    page, items = fut.result()
+                    wave_items[page] = items
+                page_items.update(wave_items)
+                # 本波全空（连续空页）→ 站点已无更多结果，提前停发后续波。
+                # 单页失败返回空不会误停：只要本波内还有别的页有结果就继续。
+                if end < max_pages and wave_items and not any(wave_items.values()):
+                    break
+                start = end + 1
 
-        # 按页序合并（第 1 页先回调 on_page 秒出），URL 去重
+        # 按页序合并（第 1 页先回调 on_page 秒出），URL 去重。
+        #
+        # 终止策略（修复「结果被吞」）：
+        # - 全部页已在上面并发抓完，空页 ≠ 结果终点——单页抓取失败是网络
+        #   抖动/瞬时反爬，不是结果穷尽。若合并时遇空页即 break，中间一页
+        #   失败会吞掉后面所有页（如第 4 页失败，10 页只出 3 页）。
+        # - 以「最后一个有结果的页」为真实终点：只合并 1..last_non_empty，
+        #   中间的失败页跳过、其后续页照常并入；超出站点总页数的尾部空页
+        #   自然排除（如 avgood 某词只有 25 页，max_pages=30 时 26~30 为空）。
+        # - 关键词无结果（第 1 页即空）→ last_non_empty=0 → 快速返回 []。
+        # - max_results 是跨页总数上限：本页完整并入后再停，而不是每页内部
+        #   提前 return（否则「单页条数 >= max_results」的源第一页就返回，
+        #   真实站几十页也只显示一页；max_results 由源配置保证 >= 单页条数）。
         results = []
         seen_urls = set()
+        last_non_empty = max(
+            (p for p, items in page_items.items() if items), default=0
+        )
         for page in sorted(page_items):
+            if page > last_non_empty:
+                break
             items = page_items[page]
             if not items:
-                break  # 本页无结果 → 后续页大概率也无（沿用串行语义）
+                continue  # 中段失败页跳过（不吞后续页）
             page_start = len(results)  # 本页处理前的累计数（切分本页新增）
             for it in items:
                 title = it.get("title", "")
@@ -262,9 +291,7 @@ class Search:
                     on_page(source, page, results[page_start:])
                 except Exception:  # noqa: BLE001
                     pass
-            # 达到结果总数上限：本页完整并入后再停，而不是每页内部提前 return。
-            # 否则「单页条数 >= max_results」的源第一页就返回，真实站几十页也只
-            # 显示一页。max_results 是跨页总数上限，由源配置保证 >= 单页条数。
+            # 达到结果总数上限：本页完整并入后再停。
             if max_results and len(results) >= max_results:
                 break
         return results
@@ -373,6 +400,11 @@ class Search:
                 proxy=source.transports().get("proxy"),
             )
         kw = (keyword or "").strip()
+        # 关键词过滤开关：render_config.filter_keyword 显式 false 时跳过硬性过滤。
+        # 默认 true 保持原行为（剔除热门榜无关项）；17k 等站搜索结果页本身按站内
+        # 模糊匹配（搜"斗破"返回"剑破苍穹"等相似书名），root_selector 已限定结果区，
+        # 硬筛会误杀合法模糊结果 → 该源设 filter_keyword=false。
+        filter_keyword = bool(rc.get("filter_keyword", True))
         results = []
         seen_urls = set()
         for it in items:
@@ -383,7 +415,7 @@ class Search:
             if not title or not url or url in seen_urls:
                 continue
             # 关键词过滤：标题/文本含关键词才算真实命中（剔除热门榜无关项）
-            if kw and kw not in title and kw not in it.get("text", ""):
+            if filter_keyword and kw and kw not in title and kw not in it.get("text", ""):
                 continue
             seen_urls.add(url)
             results.append(
@@ -612,6 +644,7 @@ class Search:
             headers=source.request_headers(),
             timeout=float(source.transports().get("timeout") or http.defaults.timeout),
             retries=int(source.transports().get("retries") or http.defaults.retries),
+            interval_ms=int(source.transports().get("interval_ms") or http.defaults.interval_ms),
             encoding=source.transports().get("charset"),
             proxy_pool=source.proxy_pool(),
         )
@@ -627,6 +660,8 @@ class Search:
             form_data=data,
             headers=source.request_headers(),
             timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+            retries=int(source.transports().get("retries") or http.defaults.retries),
+            interval_ms=int(source.transports().get("interval_ms") or http.defaults.interval_ms),
             encoding=source.transports().get("charset"),
             proxy_pool=source.proxy_pool(),
         )

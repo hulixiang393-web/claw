@@ -460,14 +460,10 @@ class Discovery:
             if plain and plain is not raw:
                 import base64 as _b64
 
-                # 按魔数猜 mime，默认 jpeg
-                mime = "image/jpeg"
-                if plain[:4] == b"\x89PNG":
-                    mime = "image/png"
-                elif plain[:6] in (b"GIF89a", b"GIF87a"):
-                    mime = "image/gif"
-                elif plain[:4] == b"RIFF" and plain[8:12] == b"WEBP":
-                    mime = "image/webp"
+                from . import utils
+
+                # 按魔数猜 mime（复用 utils.guess_image_mime，含 BMP 识别），默认 jpeg
+                mime = utils.guess_image_mime(plain)
                 return f"data:{mime};base64,{_b64.b64encode(plain).decode()}"
         except Exception:  # noqa: BLE001
             pass

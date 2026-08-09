@@ -42,6 +42,8 @@ class Ytdlp:
     # 类级共享搜索缓存：search/discovery/content 各持一个 Ytdlp 实例，
     # 缓存跨实例复用（同关键词重复搜索秒回，减少 yt-dlp 子进程冷启动）
     _search_cache: dict = {}
+    # 缓存大小上限：防止类级 dict 无限增长（dict 保插入序，超限逐出最旧）
+    _search_cache_max: int = 200
 
     def __init__(self, binary: Optional[str] = None, timeout: float = 60.0):
         self._bin = binary or _find_ytdlp()
@@ -150,6 +152,9 @@ class Ytdlp:
                 "author": e.get("channel") or e.get("uploader") or "",
             })
         Ytdlp._search_cache[key] = results
+        # 超限逐出最旧条目（dict 保持插入顺序）
+        while len(Ytdlp._search_cache) > Ytdlp._search_cache_max:
+            Ytdlp._search_cache.pop(next(iter(Ytdlp._search_cache)))
         return results
 
     # ------------------------------------------------------------------ #
@@ -197,7 +202,6 @@ class Ytdlp:
             d = json.loads(out)
         except json.JSONDecodeError:
             raise YtdlpError("yt-dlp 详情解析失败")
-        chapters = []
         # 单视频作为"1 章"；若有多 P/章节用章节列表，否则整节当一章
         chapters = [{"title": d.get("title") or "视频", "url": url}]
         return {
@@ -237,15 +241,6 @@ class Ytdlp:
         return first[0] if first else ""
 
     # ------------------------------------------------------------------ #
-    def download(self, url: str, output: str, fmt: str = "bestvideo+bestaudio/best") -> str:
-        """yt-dlp 直接下载（含合并）。返回输出路径。"""
-        self._run([
-            "-f", fmt, "--no-warnings", "--newline",
-            "-o", output, "--merge-output-format", "mp4",
-            url,
-        ])
-        return output
-
     def download_file(
         self,
         url: str,

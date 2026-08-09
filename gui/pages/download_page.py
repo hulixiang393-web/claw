@@ -46,9 +46,6 @@ from framework.download_queue import TaskStatus
 
 from gui.pages.base_page import BasePage
 
-# 完成通知开关（设置页尚未实现，暂用常量）
-ENABLE_TRAY = True
-
 STATUS_OPTIONS = [("全部状态", None), ("下载中", "active"), ("已完成", "done"), ("失败", "failed")]
 TYPE_OPTIONS = [("全部类型", None), ("小说", "novel"), ("漫画", "comic"), ("视频", "video")]
 
@@ -470,42 +467,6 @@ class DownloadPage(BasePage):
 
         self.list_layout.addStretch()
 
-    # ------------------------------------------------------------------ #
-    # 删除本地文件（已完成区按钮 → 破坏性操作，需确认）
-    # ------------------------------------------------------------------ #
-    def _delete_local_files(self, task_id: str) -> None:
-        """删除任务对应的本地下载文件 + 从列表移除（需用户确认）。"""
-        from PySide6.QtWidgets import QMessageBox
-
-        task = self._queue.get(task_id)
-        if task is None:
-            return
-        out = Path(task.out_dir)
-        if not out.exists():
-            # 文件不存在，仅移除列表
-            self._queue.remove_done(task_id)
-            return
-        ret = QMessageBox.question(
-            self,
-            "删除本地文件",
-            f"确定删除《{task.title}》的本地下载文件吗？\n{out}\n（不可恢复）",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if ret != QMessageBox.Yes:
-            return
-        try:
-            if out.is_dir():
-                import shutil
-
-                shutil.rmtree(out)
-            else:
-                out.unlink()
-        except OSError:
-            pass
-        self._queue.remove_done(task_id)
-        self._full_rebuild()
-
     def _add_section_header(self, text: str) -> None:
         h = QLabel(text)
         h.setStyleSheet(
@@ -616,12 +577,6 @@ class DownloadPage(BasePage):
             self._tray.show()
         except Exception:
             self._tray = None  # 托盘不可用时降级为仅 GUI 内通知
-
-    # ------------------------------------------------------------------ #
-    def _cleanup(self) -> None:
-        """页面销毁前解绑 EventBus。"""
-        if self._bus:
-            self._bus.unsubscribe(self._on_event)
 
     # ------------------------------------------------------------------ #
     def on_theme_changed(self, theme: str) -> None:

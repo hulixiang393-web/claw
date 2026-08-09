@@ -269,9 +269,6 @@ class MainWindow(QMainWindow):
             elif key == "settings":
                 page = self._build_settings()
                 tab_label = label
-            elif key in IMPLEMENTED_TABS:
-                page = self._build_home()  # 其他已实现暂用首页占位
-                tab_label = label
             else:
                 page = self._build_placeholder(label)
                 tab_label = f"{label}·开发中"
@@ -594,7 +591,6 @@ class MainWindow(QMainWindow):
             self._open_source_selection_dialog
         )
         return self.settings_page
-        self.tabs.setCurrentIndex(self._tab_index["reader"])
 
     def _build_source(self):
         """源管理页：源列表 + 诊断 + 编辑入口。"""

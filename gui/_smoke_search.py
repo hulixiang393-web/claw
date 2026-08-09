@@ -36,7 +36,7 @@ HTML = """<html><body><div class="item"><a class="t" href="/book/1">测试书1</
 
 
 class MockHttp(HttpClient):
-    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None):
+    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None, proxy_pool=None):
         return HTML
 
 

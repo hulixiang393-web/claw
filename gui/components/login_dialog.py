@@ -98,10 +98,15 @@ class LoginDialog(QDialog):
 
     # ------------------------------------------------------------------ #
     def _on_done(self) -> None:
-        """提取 cookie 并保存（cookiesLoaded 信号异步收集）。"""
+        """提取 cookie 并保存（cookiesLoaded 信号异步收集，一次性连接防重复触发）。"""
         collected = []
 
-        def _collect(cookies):
+        def _handle(cookies):
+            # 处理完即断开：每次点击都是新的一次性连接，不会叠加旧槽重复触发
+            try:
+                self._cookie_store.cookiesLoaded.disconnect(_handle)
+            except (RuntimeError, TypeError):
+                pass
             for c in cookies:
                 collected.append(
                     {
@@ -112,12 +117,9 @@ class LoginDialog(QDialog):
                         "secure": c.isSecure(),
                     }
                 )
-
-        def _finish():
             self._save_and_close(collected)
 
-        self._cookie_store.cookiesLoaded.connect(_collect)
-        self._cookie_store.cookiesLoaded.connect(lambda cs: _finish())
+        self._cookie_store.cookiesLoaded.connect(_handle)
         self._cookie_store.loadAllCookies()
 
     def _save_and_close(self, cookies) -> None:
