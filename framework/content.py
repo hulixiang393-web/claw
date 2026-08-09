@@ -116,10 +116,11 @@ class Content:
         # （每次详情加载重新填充，天然不过期）。
         self._video_html_cache: dict = {}
         # 详情页 HTML 短 TTL 缓存：重复打开同一本书免二次整页下载（慢站详情慢）。
+        # 含目录页（chapters_url 二次抓取也走此缓存，见 _fetch_chapters）。
         # 只缓存最近 _detail_html_max 条，防长期会话无界增长（dict 保持插入序）。
         self._detail_html_cache: dict = {}  # {(source_id, abs_url): (expire_ts, html)}
         self._detail_html_ttl = 300.0  # 5 分钟
-        self._detail_html_max = 50
+        self._detail_html_max = 200  # 多书切换时减少驱逐，详情页/目录页复用
 
     def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
         """后台线程执行结构自检，不阻塞抓取（阅读/下载/播放提速）。
@@ -703,7 +704,12 @@ class Content:
             if book_id:
                 try:
                     cat_url = chapters_url_tpl.replace("{id}", book_id)
-                    cat_html = self._get(source, cat_url)
+                    # 目录页复用 _get_detail_html 的 TTL 缓存：同一本书 5 分钟内
+                    # 重复打开不再二次整页下载（novel 源详情 = 详情页 + 目录页
+                    # 两次串行请求，缓存目录页后重复打开秒级）。
+                    cat_html = self._get_detail_html(
+                        source, cat_url, self._abs_url(source, cat_url)
+                    )
                     cat_doc = self._parser.parse(cat_html)
                     doc = cat_doc  # 用目录页 doc 提取章节
                 except Exception:
@@ -1114,7 +1120,13 @@ class Content:
             )
 
     # ------------------------------------------------------------------ #
-    def fetch_comic_pages(self, source: SourceConfig, chapter_url: str, on_page=None) -> List[str]:
+    def fetch_comic_pages(
+        self,
+        source: SourceConfig,
+        chapter_url: str,
+        on_page=None,
+        cancel_evt=None,
+    ) -> List[str]:
         """漫画：抓取一话的全部分页图片 URL。
 
         对应 endpoints.content.page：
@@ -1123,6 +1135,9 @@ class Content:
 
         on_page：可选分批回调 on_page(已就绪的前缀列表)。解密型源在
         _decrypt_image_urls 解密过程中分批回调（连续前缀），GUI 边收边渲染。
+        cancel_evt：可选 threading.Event 取消令牌。换书/切页时置位，分页抓取
+        循环里检查并提前返回（已抓到的部分），旧书取流立即让路给新书，不再
+        白跑完一整话（dm5 一话 39 页 ≈74s）。None 表示不取消（下载器等同步调用）。
         """
         content_cfg = self._content_block(source)
         block = content_cfg.get("page") or {}
@@ -1177,7 +1192,9 @@ class Content:
         self._bg_check(source, abs_url)
         # 图片列表优先 body，兼容旧 list
         list_cfg = body_cfg or block.get("list") or {}
-        urls = self._fetch_comic_page_imgs(source, list_cfg, chapter_url)
+        urls = self._fetch_comic_page_imgs(
+            source, list_cfg, chapter_url, cancel_evt=cancel_evt
+        )
         # 图片解密源（如 18mh AES-CBC 加密图）：下载并把每张解密成 data URI，
         # 使阅读器/下载器无需改动即可显示/保存解密图。
         if urls and source.raw.get("decryption", {}).get("targets", {}).get("image"):
@@ -1255,7 +1272,8 @@ class Content:
         return utils.guess_image_mime(data)
 
     def _fetch_comic_page_imgs(
-        self, source: SourceConfig, list_cfg: dict, chapter_url: str
+        self, source: SourceConfig, list_cfg: dict, chapter_url: str,
+        cancel_evt=None,
     ) -> List[str]:
         """从单话 HTML 提取全部图片 URL，支持图片列表翻页（含并行翻页加速）。
 
@@ -1275,7 +1293,9 @@ class Content:
         """
         image_api = list_cfg.get("image_api") or {}
         if image_api:
-            return self._fetch_comic_image_api(source, image_api, chapter_url)
+            return self._fetch_comic_image_api(
+                source, image_api, chapter_url, cancel_evt=cancel_evt
+            )
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
         if not root_sel or not fields.get("url"):
@@ -1372,6 +1392,8 @@ class Content:
 
                 n = first_page
                 while n <= p_max:
+                    if cancel_evt and cancel_evt.is_set():
+                        break  # 换书取消：停止后续 wave 抓取，返回已收集部分
                     wave = list(range(n, min(n + window, p_max + 1)))
                     # 每 wave 并发抓取（max_workers=min(window, 页数)）
                     results: dict = {}
@@ -1406,6 +1428,8 @@ class Content:
         # 顺序循环（fallback，未配置 parallel / 并行回退时走这里）
         page_url = chapter_url
         for _ in range(max_pages if max_pages else 1000):
+            if cancel_evt and cancel_evt.is_set():
+                break  # 换书取消：停止后续翻页抓取
             if page_url in seen_url:
                 break
             seen_url.add(page_url)
@@ -1420,7 +1444,8 @@ class Content:
 
     # ------------------------------------------------------------------ #
     def _fetch_comic_image_api(
-        self, source: SourceConfig, cfg: dict, chapter_url: str
+        self, source: SourceConfig, cfg: dict, chapter_url: str,
+        cancel_evt=None,
     ) -> List[str]:
         """漫画图片来自 AJAX 文本接口的源（配置驱动，如 dm5 chapterfun.ashx）。
 
@@ -1535,6 +1560,8 @@ class Content:
         urls: List[str] = []
         seen: set = set()
         for page in range(1, count + 1):
+            if cancel_evt and cancel_evt.is_set():
+                break  # 换书取消：停止逐页接口抓取（dm5 一话几十页，立即让路）
             try:
                 resp_text = _fetch_api(page)
             except Exception:  # noqa: BLE001

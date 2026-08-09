@@ -115,8 +115,10 @@ class Downloader:
         img_map: dict = {}
         progress_cb = getattr(task, "image_progress_cb", None)
         with ThreadPoolExecutor(max_workers=8) as pool:
-            # 防盗链：以章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
-            futs = {pool.submit(self._image_bytes, img, chapter.url): i for i, img in enumerate(images)}
+            # 防盗链：不再传章节页 URL 作为正文图 Referer——cdndm5.com 图床实测
+            # 拒绝章节页 Referer（返回 404 假图），无 Referer/站点根 Referer 才放行。
+            # 与阅读器一致（comic_view 同理由 CoverLoader 域名规则推导，不传章节 URL）。
+            futs = {pool.submit(self._image_bytes, img): i for i, img in enumerate(images)}
             for fut in as_completed(futs):
                 idx = futs[fut]
                 try:
@@ -756,8 +758,9 @@ class Downloader:
             images = result_map.get(ch.url)
             if images is None:
                 raise RuntimeError(f"渲染失败：{ch.title or ch.url}")
-            # 防盗链：以章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
-            img_bytes = [self._image_bytes(img, ch.url) for img in images]
+            # 防盗链：不传章节页 URL 作为正文图 Referer（cdndm5.com 拒绝章节页
+            # Referer 返回 404 假图，无 Referer 才放行），与阅读器/上方 _download_comic 一致。
+            img_bytes = [self._image_bytes(img) for img in images]
             collected.append((idx, ch, img_bytes))
         # 整批全部成功，一次性累积
         out: dict[int, int] = {}
@@ -775,8 +778,9 @@ class Downloader:
         """单张图字节：data URI 解码 / http URL 下载。不落盘（供 epub 累积）。
 
         受 network.max_bytes_per_image 上限约束：超过则跳过该图并告警（不中断整本）。
-        referer: 防盗链图床所需的 Referer（漫画正文图 = 当前章节页 URL，
-        如 manben 的 manhua*.cdndm5.com 校验精确章节页 Referer）。
+        referer: 可选防盗链 Referer。漫画正文图调用方不再传章节页 URL——
+        cdndm5.com 图床实测拒绝章节页 Referer（返回 404 假图），无 Referer 即可放行，
+        与阅读器 CoverLoader 的域名规则一致（保留参数供仍需要精确 Referer 的源用）。
         """
         if img.startswith("data:"):
             _, b64 = img.split(",", 1)

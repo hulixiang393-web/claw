@@ -170,9 +170,13 @@ class MediaProxy:
     def _forward(self, handler: "_ProxyHandler", target: str, headers: dict) -> None:
         """转发一次请求。响应是 m3u8 则重写内部 URL，否则流式转发。"""
         req_headers = dict(headers)
-        # 透传客户端 Range（拖动进度 / 分片定位）
+        # 透传客户端 Range（拖动进度 / 分片定位）。
+        # 但 m3u8 播放列表必须整读：VLC 拉 m3u8 时常带 Range（如 bytes=0-1275
+        # 探测大小），若透传，CDN 返回截断的 m3u8 → 只拿到部分分片 → 播放
+        # 中断。仅对媒体分片/大文件透传 Range，m3u8 URL 一律不传。
+        is_hls_url = target.split("?", 1)[0].lower().endswith(".m3u8")
         rng = handler.headers.get("Range")
-        if rng:
+        if rng and not is_hls_url:
             req_headers["Range"] = rng
         # 连接池复用：requests.Session 保持到 CDN 的 keep-alive 连接，
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
@@ -187,8 +191,37 @@ class MediaProxy:
             if resp.status_code >= 400:
                 handler.send_error(resp.status_code, "upstream error")
                 return
-            # 先读一小块判断是不是 HLS 播放列表
-            first = resp.raw.read(65536)
+            # m3u8 播放列表必须整读且自动解压：stream=True 时 resp.raw 返回
+            # gzip 原始字节（Content-Encoding: gzip 不解压），直接重写会乱码/
+            # 截断（542B gzip vs 8871B 明文）。m3u8 是小文本，用 resp.content
+            # 完整读取 + 自动解压；媒体流（mp4/ts 大文件）才用 resp.raw 流式。
+            if is_hls_url:
+                body = resp.content  # 自动解压 gzip + 完整内容
+                is_m3u8 = body.lstrip().startswith(b"#EXTM3U") or (
+                    resp.headers.get("Content-Type") or ""
+                ).find("mpegurl") >= 0
+                if not is_m3u8:
+                    # URL 是 m3u8 但内容不是（可能重定向/错误页）→ 透传原始内容
+                    self._send_body(handler, resp, body)
+                    return
+                text = body.decode("utf-8", "replace")
+                rewritten = self._rewrite_m3u8(text, target, headers)
+                body = rewritten.encode("utf-8")
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                handler.send_header("Content-Length", str(len(body)))
+                handler.send_header("Connection", "close")
+                handler.end_headers()
+                handler.wfile.write(body)
+                return
+
+            # 先读一小块判断是不是 HLS 播放列表（URL 未含 .m3u8 但内容是的，
+            # 如短链接/参数化 m3u8）。上游 gzip 压缩时 raw 是压缩字节无法判断，
+            # 此时整读 content（自动解压）判断；明文则用 raw 流式读小块。
+            if (resp.headers.get("Content-Encoding") or "").lower() in ("gzip", "deflate", "br"):
+                first = resp.content
+            else:
+                first = resp.raw.read(65536)
             is_m3u8 = first.startswith(b"#EXTM3U") or (resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
 
             if is_m3u8:
@@ -228,6 +261,16 @@ class MediaProxy:
                 resp.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ------------------------------------------------------------------ #
+    def _send_body(self, handler, resp, body: bytes) -> None:
+        """透传上游完整响应体给客户端（m3u8 URL 内容非 m3u8 时的兜底）。"""
+        handler.send_response(resp.status_code)
+        handler.send_header("Content-Type", resp.headers.get("Content-Type") or "application/octet-stream")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(body)
 
     # ------------------------------------------------------------------ #
     def _rewrite_m3u8(self, text: str, base: str, headers: dict) -> str:

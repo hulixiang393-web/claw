@@ -43,6 +43,10 @@ CHALLENGE_MARKERS = (
     "http 403",
 )
 
+# 封面预加载窗口：滚动时提前触发视口下方 N 张卡片的封面加载
+# （滚动流畅、封面跟手；超过该窗口的留待接近时再加载，不挤占并发）。
+PREFETCH_COVER_EXTRA = 8
+
 
 class _SearchSignals(QObject):
     finished = Signal(object, object, object, object)  # (source, results, err, epoch)
@@ -140,7 +144,7 @@ class SearchPage(BasePage):
         self._pending_count = 0  # 未完成搜索的源数
         self._work_count = 0  # 当前网格卡片计数（追加/重建共用）
         self._shown_count = 0  # 已渲染到 _results 的条数（分批懒加载用）
-        self._page_size = 20  # 每批渲染条数（搜索结果分批，防一次几百张卡片卡顿）
+        self._page_size = 12  # 每批渲染条数：首屏更早出内容（12 张更快），余下滚动/预加载补
         self._preload_depth = 2  # 预加载缓冲批次：首屏 1 批 + 再预加载 2 批填满视口（防一次建太多卡片）
         self._selected: dict = {}  # 勾选批量：url → SearchResult
         self._select_mode = False  # 是否进入勾选模式
@@ -149,6 +153,8 @@ class SearchPage(BasePage):
         self._streamed: set = set()  # 已边抓边渲染的源（finished 不重复追加）
         self._search_epoch = 0  # 搜索会话标记：换源/换关键词自增，过期任务结果丢弃
         self._results_display = None  # 合并模式渲染列表；None 时用 _results（新搜索须重置）
+        self._deferred_covers = []  # 封面延迟加载队列：待进入视口才 load_cover 的卡片
+        self._cover_pump_queued = False  # 封面泵标志：同轮事件循环只泵一次
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -517,6 +523,7 @@ class SearchPage(BasePage):
         self._apply_column_stretch(cols)
         self._update_batch_status()
         self._maybe_preload_results()
+        self._pump_visible_covers()
 
     def _on_all_done(self) -> None:
         """全部源搜索结束。
@@ -547,6 +554,56 @@ class SearchPage(BasePage):
         else:
             self.status_label.setText(f"已显示 {self._shown_count} / {total} 条，滚动加载更多...")
 
+    def _pump_visible_covers(self) -> None:
+        """触发视口内卡片的封面加载（封面懒加载泵）。
+
+        每次只处理视口内 + 预加载窗口（视口下方 PREFETCH_COVER_EXTRA 张）
+        的卡片，其余留待滚动接近时再加载——首屏一批卡片不同时挤占
+        CoverLoader 并发，可见的封面先出、滚到的封面跟上。
+        """
+        if self._cover_pump_queued or not self._deferred_covers:
+            return
+        self._cover_pump_queued = True
+        QTimer.singleShot(0, self._pump_visible_covers_now)
+
+    def _pump_visible_covers_now(self) -> None:
+        """封面泵实际执行：按视口位置分批触发。"""
+        self._cover_pump_queued = False
+        if not self._deferred_covers:
+            return
+        view = self.scroll.viewport()
+        # 视口/预加载窗口统一用「视口相对坐标」：card.mapTo(view).y() 是
+        # 卡片相对视口的位置（内容滚动越深 y 越小，甚至为负）。切勿用
+        # scrollbar.value()（内容滚动坐标）当视口顶——两种坐标系混用会
+        # 导致滚动后视口内/预加载窗口内卡片永远判定「不在视口」→ 封面
+        # 一直不加载（历史 bug：滚动后整页无封面，看起来像搜索变慢/坏掉）。
+        # 视口相对坐标下视口顶恒为 0，底为 view.height()。
+        viewport_top = 0
+        viewport_bottom = view.height()
+        # 预加载窗口：视口下方额外提前加载 PREFETCH_COVER_EXTRA 张封面
+        prefetch_bottom = viewport_bottom + PREFETCH_COVER_EXTRA * self._card_step()
+        remaining = []
+        for idx, card in enumerate(self._deferred_covers):
+            y = card.mapTo(view, card.rect().topLeft()).y()
+            if y > prefetch_bottom:
+                # 网格自上而下有序入队，本卡及之后都在预加载窗口下方 →
+                # 整段保留，不再逐卡 mapTo（结果多时每帧滚动省去大量坐标计算）
+                remaining.extend(self._deferred_covers[idx:])
+                break
+            if y + card.height() < viewport_top:
+                # 已滚过视口上方的卡片：正常都已加载并移出队列，此处仅防
+                # 大幅跳滚残留的未加载卡片，继续保留
+                remaining.append(card)
+                continue
+            # 视口内或预加载窗口内 → 触发封面加载（并从待加载中移除）
+            card.load_cover()
+        self._deferred_covers = remaining
+
+    @staticmethod
+    def _card_step() -> int:
+        """卡片行高（封面懒加载窗口间距用）。"""
+        return 292  # 与 WorkCard.CARD_HEIGHT 一致
+
     def _append_results(self, items) -> None:
         """把一批结果卡片追加到网格尾部（按当前列数排），首屏懒加载。
 
@@ -569,6 +626,7 @@ class SearchPage(BasePage):
         self._apply_column_stretch(cols)
         self._update_batch_status()
         self._maybe_preload_results()
+        self._pump_visible_covers()  # 新批卡片进入视口 → 触发封面加载
 
     def _current_display(self):
         """当前渲染源：合并后为 _results_display，否则 _results。"""
@@ -591,6 +649,7 @@ class SearchPage(BasePage):
         self._apply_column_stretch(cols)
         self._update_batch_status()
         self._maybe_preload_results()
+        self._pump_visible_covers()
 
     def _maybe_preload_results(self) -> None:
         """视口未填满 → 继续渲染下一批（有限预加载深度，与发现页 _maybe_preload 同思路）。
@@ -654,6 +713,7 @@ class SearchPage(BasePage):
             self._append_card(r, cols)
         self._apply_column_stretch(cols)
         self._update_batch_status()
+        self._pump_visible_covers()
 
     def _emit_open(self, result) -> None:
         """点搜索结果卡片 → 打开 reader 播放/阅读。"""
@@ -669,12 +729,19 @@ class SearchPage(BasePage):
     # 勾选批量（ui-search.md #8）
     # ------------------------------------------------------------------ #
     def _make_card(self, r):
-        """创建勾选模式卡片并连接信号。"""
-        card = WorkCard(r, selectable=True)
+        """创建勾选模式卡片并连接信号。
+
+        封面延迟加载：卡片创建不立即拉封面（_deferred_covers 登记），
+        由 _pump_visible_covers 在滚动/批次渲染后触发视口内卡片加载，
+        首屏一批卡片不挤占 CoverLoader 并发，可见卡片先出封面。
+        """
+        card = WorkCard(r, selectable=True, defer_cover=True)
         card.clicked.connect(lambda _, rr=r: self._emit_open(rr))
         card.checked.connect(self._on_card_checked)
         if r.url in self._selected:
             card.set_checked(True)
+        if getattr(r, "cover", ""):
+            self._deferred_covers.append(card)
         return card
 
     def _on_card_checked(self, work, checked: bool) -> None:
@@ -753,6 +820,8 @@ class SearchPage(BasePage):
                 w.setParent(None)
                 w.deleteLater()
         self._work_count = 0
+        # 清空封面延迟加载队列（旧卡片已销毁，残留引用会让封面泵操作已删卡片）
+        self._deferred_covers = []
 
     def _set_filter(self, source_id: str) -> None:
         """来源角标筛选。"""
@@ -775,6 +844,7 @@ class SearchPage(BasePage):
         提前到 80% 而非贴底：滚动到底前下一批已在渲染，视觉无停顿；
         又不一次性把全部结果建卡（防闪屏/封面加载不过来）。
         """
+        self._pump_visible_covers()  # 滚动时触发视口内封面加载
         vbar = self.scroll.verticalScrollBar()
         if vbar.maximum() > 0 and value >= vbar.maximum() * 0.8:
             self._load_more_results()

@@ -72,7 +72,16 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
         else:
             play_url = url
             audio_url = audio
-        args = [vlc, "--no-video-title-show", play_url]
+        # 缓冲调优：按媒体类型给 VLC 设 network-caching（HLS 分片流网络抖动
+        # 敏感，慢 CDN 每片 1-2s 时默认 300ms 缓冲会频繁卡顿/加载慢）。
+        # 复用 media_tuner.classify 的缓冲画像，缺省 HLS 5000ms 抗慢 CDN。
+        try:
+            from .media_tuner import classify as _classify
+            _profile = _classify(play_url)
+            _caching = max(_profile.buffer_ms, 5000) if _profile.kind == "hls" else _profile.buffer_ms
+        except Exception:  # noqa: BLE001
+            _caching = 5000
+        args = [vlc, "--no-video-title-show", f"--network-caching={_caching}", play_url]
         if audio_url:
             args.append(f":input-slave={audio_url}")
         try:

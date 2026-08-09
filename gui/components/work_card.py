@@ -35,7 +35,8 @@ class WorkCard(QFrame):
     clicked = Signal(object)  # 发射 Work 对象
     checked = Signal(object, bool)  # (work, checked) 勾选状态变化（批量模式）
 
-    def __init__(self, work, selectable: bool = False, parent=None):
+    def __init__(self, work, selectable: bool = False, parent=None,
+                 defer_cover: bool = False):
         super().__init__(parent)
         self.work = work
         self.setObjectName("workCard")
@@ -44,6 +45,11 @@ class WorkCard(QFrame):
         self.setMinimumWidth(120)
         # 固定卡片高度：封面 180 + 标题 2 行 + 作者 + 来源，保证网格每行等高
         self.setFixedHeight(CARD_HEIGHT)
+        # 封面延迟加载：宿主页懒加载封面时传 defer_cover=True，创建时不立即
+        # 拉封面（首屏一批卡片不挤占 CoverLoader 并发），进入视口后由宿主
+        # 调用 load_cover() 触发。
+        self._defer_cover = defer_cover
+        self._cover_loaded = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -98,8 +104,11 @@ class WorkCard(QFrame):
             self._meta_label.hide()
         layout.addWidget(self._meta_label)
 
-        # 异步加载封面（全局限流，不会并发爆炸）
-        if work.cover:
+        # 异步加载封面（全局限流，不会并发爆炸）。
+        # defer_cover=True 时不立即拉（等宿主进入视口再 load_cover），
+        # 避免首屏一批卡片同时挤占 CoverLoader 并发。
+        if work.cover and not self._defer_cover:
+            self._cover_loaded = True
             if work.cover.startswith("data:"):
                 # data URI（解密后的封面）直接解码显示，无需网络
                 self._load_data_cover(work.cover)
@@ -135,8 +144,23 @@ class WorkCard(QFrame):
             pass
         self._load_data_cover(data_uri)
 
+    def load_cover(self) -> None:
+        """触发封面加载（defer_cover 卡片进入视口时由宿主调用）。
+
+        幂等：已加载/无封面/重复触发都直接返回。data URI 即时解码。
+        """
+        if self._cover_loaded:
+            return
+        if not self.work or not self.work.cover:
+            return
+        self._cover_loaded = True
+        if self.work.cover.startswith("data:"):
+            self._load_data_cover(self.work.cover)
+        else:
+            self._load_cover(self.work.cover)
+
     def _load_cover(self, url: str) -> None:
-        """通过 CoverLoader 加载封面（全局最多 4 个并发）。"""
+        """通过 CoverLoader 加载封面（全局最多 16 个并发）。"""
         CoverLoader.instance().load(url, self._on_cover_ready)
 
     def _on_check_toggled(self, checked: bool) -> None:

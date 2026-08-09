@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
@@ -50,6 +51,8 @@ class ComicView(QWidget):
         self._detail: Detail | None = None
         self._chapters = []
         self._current_idx = -1
+        self._gen = 0  # 加载代际：换书自增，旧书异步回调（取流/预取）因代际过期被丢弃
+        self._cancel_evt = None  # 换书取消令牌：置位后旧书后台取流/预取任务尽早退出
         self._images = []
         self._mode = "gallery"  # gallery / flip
         self._zoom = 1.0
@@ -144,6 +147,26 @@ class ComicView(QWidget):
         start_chapter_url: str = "",
         restore_position: float | None = None,
     ) -> None:
+        # 换书：代际自增 + 清空旧书状态。旧书的后台取流/预取任务仍可能后到，
+        # 但代际过期会被回调丢弃——避免旧书结果覆盖新书（URL 相同的章节
+        # 或旧预取污染新书缓存）。旧书图片/缓存/预取队列一并清掉，新书从
+        # 干净状态加载（不被旧书拖慢）。
+        self._gen += 1
+        # 取消旧书仍在后台跑的取流/预取任务：代际校验只丢弃回调，任务本身
+        # 还会白跑完一整话（dm5 一话几十页 ≈74s）占资源拖慢新书。置位旧
+        # 取消令牌 → 旧任务的分页循环检查后立即退出；新书用新令牌。
+        if self._cancel_evt is not None:
+            self._cancel_evt.set()
+        self._cancel_evt = threading.Event()
+        self._prefetch_tasks = []  # 旧预取任务引用一并清空（任务经令牌自行退出）
+        self._images = []
+        self._prefetched = {}
+        self._prefetch_queue = []
+        self._prefetch_busy = False
+        self._pending_swap = False
+        # 换书直接关闭旧漫画画面：不再等新书首批图（打开新书时旧书画面立即消失，
+        # 内存同步释放；同书内换话仍走 _pending_swap 保留旧画面避免闪屏）
+        self._clear_images()
         self._source = source
         self._detail = detail
         self._chapters = detail.chapters
@@ -224,7 +247,10 @@ class ComicView(QWidget):
         # 后台加载图片 URL
         from PySide6.QtCore import QThreadPool
 
-        task = _LoadComicTask(self._content, self._source, ch)
+        task = _LoadComicTask(
+            self._content, self._source, ch, gen=self._gen,
+            cancel_evt=self._cancel_evt,
+        )
         task.signals.finished.connect(self._on_images_loaded)
         task.signals.partial.connect(self._on_images_partial)  # 边抓边显示
         self._comic_task = task  # 持有引用，防止被 GC
@@ -263,7 +289,11 @@ class ComicView(QWidget):
         vbar.setValue(vbar.maximum())
         vbar.blockSignals(False)
 
-    def _on_images_loaded(self, ch, images, err) -> None:
+    def _on_images_loaded(self, gen, ch, images, err) -> None:
+        # 代际过期：换书后旧书取流任务后到 → 整单丢弃，避免旧书结果覆盖新书
+        # （URL 相同的章节会误判当前，渲染旧书画面）。
+        if gen != self._gen:
+            return
         if err:
             self.progress_label.setText(f"加载失败：{err}")
             self._auto_loading = False  # 加载失败也要解锁，防死锁
@@ -283,8 +313,10 @@ class ComicView(QWidget):
         # 当前话加载完成后再串行预渲染后续话（切话秒开，且不抢当前话资源）
         self._finish_episode_load(ch)
 
-    def _on_images_partial(self, ch, images, err) -> None:
+    def _on_images_partial(self, gen, ch, images, err) -> None:
         """fetch_comic_pages 分批回调：已就绪前缀 → 增量渲染（边抓边显示）。"""
+        if gen != self._gen:
+            return  # 换书后旧书取流分批回调 → 丢弃
         if self._current_idx < 0 or ch.url != self._chapters[self._current_idx].url:
             return  # 已切话/换章，丢弃旧批次
         if not images:
@@ -344,14 +376,22 @@ class ComicView(QWidget):
         if ch is None:
             self._prefetch_busy = False
             return
-        task = _PrefetchRenderTask(self._content, self._source, ch)
+        task = _PrefetchRenderTask(
+            self._content, self._source, ch, gen=self._gen,
+            cancel_evt=self._cancel_evt,
+        )
         task.signals.finished.connect(self._on_prefetch_done)
         self._prefetch_tasks = getattr(self, "_prefetch_tasks", [])
         self._prefetch_tasks.append(task)
         QThreadPool.globalInstance().start(task)
 
-    def _on_prefetch_done(self, chapter_url, images, err) -> None:
-        """预渲染完成，记录该话图片列表，并继续队列下一个。"""
+    def _on_prefetch_done(self, gen, chapter_url, images, err) -> None:
+        """预渲染完成，记录该话图片列表，并继续队列下一个。
+
+        代际过期（换书后旧书任务后到）→ 丢弃结果，不污染新书预取缓存。
+        """
+        if gen != self._gen:
+            return
         self._prefetched[chapter_url] = {
             "images": images or [], "count": len(images or [])
         }
@@ -363,7 +403,6 @@ class ComicView(QWidget):
         self._pending_swap = False  # 命中缓存直接渲染，无换话等待
         self._rendered_count = 0
         self._rendered_header = False
-        referer = ""
         # 每话开头显示章节编号（如「第12话」），不含标题文字
         if 0 <= self._current_idx < len(self._chapters):
             from framework.content import chapter_label
@@ -377,14 +416,15 @@ class ComicView(QWidget):
             header.setWordWrap(True)
             self.gallery_layout.addWidget(header)
             self._rendered_header = True
-            # 防盗链：以当前章节页 URL 作为正文图 Referer（manben 等图床校验精确章节页）
-            referer = self._chapters[self._current_idx].url
         # 首屏只渲染前 INITIAL_RENDER_COUNT 张，其余交给滚动懒加载分批补全；
         # 横向翻页模式无纵向滚动懒加载 → 一次全量渲染
+        # 正文图 Referer 由 CoverLoader 按图床域名规则推导（_REFERER_RULES）：
+        # 不再传章节 URL——dm5 图床（cdndm5.com）拒绝章节页 Referer（404 假图），
+        # manben 无 Referer 也可访问；统一走域名规则最安全。
         images = self._images or []
         limit = len(images) if self._mode == "flip" else min(INITIAL_RENDER_COUNT, len(images))
         for url in images[:limit]:
-            lbl = _ComicImageLabel(url, referer=referer)
+            lbl = _ComicImageLabel(url)
             lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
@@ -415,15 +455,12 @@ class ComicView(QWidget):
             header.setWordWrap(True)
             self.gallery_layout.addWidget(header)
             self._rendered_header = True
-        referer = (
-            self._chapters[self._current_idx].url
-            if 0 <= self._current_idx < len(self._chapters)
-            else ""
-        )
         target = len(images) if force_full else min(self._rendered_count + LAZY_BATCH, len(images))
         while self._rendered_count < target:
             url = images[self._rendered_count]
-            lbl = _ComicImageLabel(url, referer=referer)
+            # 正文图 Referer 由 CoverLoader 域名规则推导（同 _render_images，
+            # 不传章节 URL——dm5 图床拒绝章节 Referer 返回 404 假图）
+            lbl = _ComicImageLabel(url)
             lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
@@ -887,37 +924,40 @@ class _ComicImageLabel(QLabel):
 
 class _ComicSignals(QObject):
     """漫画加载信号。"""
-    finished = Signal(object, object, object)  # (chapter, images, err)
-    partial = Signal(object, object, object)  # (chapter, 已就绪前缀, None) 边抓边显示
+    finished = Signal(object, object, object, object)  # (gen, chapter, images, err)
+    partial = Signal(object, object, object, object)  # (gen, chapter, 已就绪前缀, None) 边抓边显示
 
 
 class _LoadComicTask(QRunnable):
     """后台加载漫画话图片 URL（on_page 分批回调，边抓边显示）。"""
 
-    def __init__(self, content, source, chapter):
+    def __init__(self, content, source, chapter, gen: int = 0, cancel_evt=None):
         super().__init__()
         self.signals = _ComicSignals()
         self._content = content
         self._source = source
         self._chapter = chapter
+        self._gen = gen
+        self._cancel_evt = cancel_evt  # 换书取消令牌：置位后分页抓取尽早退出
 
     def run(self) -> None:
         images, err = [], None
         try:
             images = self._content.fetch_comic_pages(
-                self._source, self._chapter.url, on_page=self._emit_partial
+                self._source, self._chapter.url,
+                on_page=self._emit_partial, cancel_evt=self._cancel_evt,
             )
         except Exception as exc:
             err = str(exc)
         try:
-            self.signals.finished.emit(self._chapter, images, err)
+            self.signals.finished.emit(self._gen, self._chapter, images, err)
         except RuntimeError:
             pass
 
     def _emit_partial(self, part) -> None:
         """解密/抓取进度分批回调 → 主线程 partial 信号（增量渲染）。"""
         try:
-            self.signals.partial.emit(self._chapter, list(part), None)
+            self.signals.partial.emit(self._gen, self._chapter, list(part), None)
         except RuntimeError:
             pass
 
@@ -925,7 +965,7 @@ class _LoadComicTask(QRunnable):
 class _PrefetchSignals(QObject):
     """预加载信号。"""
 
-    finished = Signal(object, object, object)  # (chapter_url, images, err)
+    finished = Signal(object, object, object, object)  # (gen, chapter_url, images, err)
 
 
 class _PrefetchRenderTask(QRunnable):
@@ -935,22 +975,24 @@ class _PrefetchRenderTask(QRunnable):
     _prefetched[url]["images"] → 秒开，不用现场爬 Playwright。
     """
 
-    def __init__(self, content, source, chapter):
+    def __init__(self, content, source, chapter, gen: int = 0, cancel_evt=None):
         super().__init__()
         self.signals = _PrefetchSignals()
         self._content = content
         self._source = source
         self._chapter = chapter
+        self._gen = gen
+        self._cancel_evt = cancel_evt  # 换书取消令牌：置位后分页抓取尽早退出
 
     def run(self) -> None:
         images, err = [], None
         try:
             images = self._content.fetch_comic_pages(
-                self._source, self._chapter.url
+                self._source, self._chapter.url, cancel_evt=self._cancel_evt
             )
         except Exception as exc:
             err = str(exc)
         try:
-            self.signals.finished.emit(self._chapter.url, images, err)
+            self.signals.finished.emit(self._gen, self._chapter.url, images, err)
         except RuntimeError:
             pass
