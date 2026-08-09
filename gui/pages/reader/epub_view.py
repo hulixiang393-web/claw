@@ -2,13 +2,17 @@
 
 独立 epub 阅读器：读本地 .epub 文件，不依赖网络源/Content。
 - 小说 epub：章节正文 → 滚动阅读 + 字号可调 + 目录侧栏
-- 漫画 epub：章节图片流 → 滚动画廊
+- 漫画 epub：章节图片流 → 滚动画廊（限宽解码，不整幅解码）
+- 合并单文档（整本书拼一个超大 xhtml，如 2000 章小说/几千图漫画）按
+  `<h1>` 拆分章节，拆出的章直接带文本或图片名，渲染时按需读 → 大书秒开不卡。
+- 底层用 FastEpub（zip 单遍索引 + 按需读取），不用 ebooklib 全量解析
+  （ebooklib read_epub 对 8000+ item 的大书要 20 秒+，本实现毫秒级）。
 支持跨章节（上一/下一章）与目录跳转，续读信号（key=epub 路径）。
-对应 ui-reader.md 本地阅读扩展。
 """
 
 from __future__ import annotations
 
+import posixpath
 import re
 import threading
 
@@ -26,62 +30,54 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-try:
-    import ebooklib
-    from ebooklib import epub
+from framework.epub_reader import (
+    FastEpub,
+    MERGE_DOC_THRESHOLD,
+    _html_to_text,
+    split_single_document,
+)
 
-    HAS_EBOOKLIB = True
-except Exception:  # noqa: BLE001
-    HAS_EBOOKLIB = False
-
-# ebooklib 的 zip 文件句柄跨线程读取非线程安全：所有章节内容读取串行加锁
+# FastEpub 的 zip 文件句柄跨线程读取非线程安全：所有章节内容读取串行加锁
 _READ_LOCK = threading.Lock()
 
-
-def _html_to_text(html: str) -> str:
-    """epub 章节 XHTML → 纯文本（段落换行，去标签）。"""
-    # 提取 body 内文本，<p>/<br> → 换行，其余标签去除
-    text = html or ""
-    # 段落换行
-    text = re.sub(r"<p[^>]*>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<br[^>]*>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+# 合并单文档拆分缓存（key=路径+大小+mtime），只保留最近一本，重开同书免重复拆分
+_SPLIT_CACHE: dict = {}
 
 
-def _chapter_title(item, html: str) -> str:
-    """提取章节标题：item.title → HTML <title> → 文件名（真实 epub 多无 item.title）。"""
-    t = (getattr(item, "title", "") or "").strip()
-    if t:
-        return t
-    m = re.search(r"<title[^>]*>([^<]+)</title>", html or "", flags=re.IGNORECASE)
-    if m and m.group(1).strip():
-        return m.group(1).strip()
-    return ""
+def _cache_key(path: str) -> tuple:
+    import os
+
+    try:
+        st = os.stat(path)
+        return (path, st.st_size, int(st.st_mtime))
+    except OSError:
+        return (path, 0, 0)
 
 
 class _Chapter:
-    """epub 单章索引：标题 + xhtml 资源名。
+    """epub 单章。普通书 src=xhtml 路径（渲染时读）；合并单文档拆出的章
+    直接带 text（小说）或 img_srcs（漫画，字节渲染时懒读）。"""
 
-    打开只建索引（不读任何内容）→ 秒开；渲染该章时才后台读 xhtml
-    提取文本（novel）或懒读图片字节（comic，限宽解码）。
-    """
-
-    def __init__(self, title: str, src: str = ""):
+    def __init__(
+        self,
+        title: str,
+        src: str = "",
+        text: str = "",
+        img_srcs: list | None = None,
+    ):
         self.title = title or "未命名章节"
-        self.src = src  # 章节 xhtml 在 epub 内的资源名（读内容用）
-        self.is_comic = False  # 渲染该章后由实际内容判定
+        self.src = src
+        self.text = text
+        self.img_srcs = list(img_srcs or [])
+        self.is_comic = bool(self.img_srcs)
 
 
 class _OpenSignals(QObject):
-    done = Signal(object, object, object, object)  # (path, chapters, err, item_index)
+    done = Signal(object, object, object, object)  # (path, chapters, err, epub)
 
 
 class _OpenTask(QRunnable):
-    """后台只读 epub 元数据建章节索引（不读章节内容）→ 大 epub 秒开。"""
+    """后台建章节索引：FastEpub zip 单遍 + 合并单文档拆分 → 大书秒开。"""
 
     def __init__(self, path: str):
         super().__init__()
@@ -89,15 +85,14 @@ class _OpenTask(QRunnable):
         self._path = path
 
     def run(self) -> None:
-        err, chapters, index = "", [], {}
+        err, chapters, epub = "", [], None
         try:
-            book = epub.read_epub(self._path)
-            index = EpubView._build_item_index(book)
-            chapters = EpubView._index_chapters(book)
+            epub = FastEpub(self._path)
+            chapters = EpubView._build_chapters(epub, self._path)
         except Exception as exc:  # noqa: BLE001
             err = str(exc)
         try:
-            self.signals.done.emit(self._path, chapters, err, index)
+            self.signals.done.emit(self._path, chapters, err, epub)
         except RuntimeError:
             pass
 
@@ -107,32 +102,37 @@ class _LoadSignals(QObject):
 
 
 class _LoadChapterTask(QRunnable):
-    """后台加载某一章内容：读 xhtml → 判类型 → 提取文本或读全部图片字节。
+    """后台加载某一章内容：拆分章直接取；普通章读 xhtml 判类型提取文本/图字节。"""
 
-    慢的部分（zip 读取/正则/图字节）在后台线程，UI 不卡；图解码在 UI 限宽做。
-    """
-
-    def __init__(self, idx: int, src: str, item_index: dict):
+    def __init__(self, idx: int, ch: _Chapter, epub: FastEpub):
         super().__init__()
         self.signals = _LoadSignals()
         self._idx = idx
-        self._src = src
-        self._index = item_index
+        self._ch = ch
+        self._epub = epub
 
     def run(self) -> None:
         kind, text, imgs = "novel", "", []
-        with _READ_LOCK:  # ebooklib zip 句柄跨线程读需串行
+        with _READ_LOCK:  # zip 文件句柄跨线程读需串行
             try:
-                html = EpubView._read_document(self._index, self._src)
-                if "<img" in (html or "").lower():
+                if self._ch.text:
+                    kind, text = "novel", self._ch.text
+                elif self._ch.img_srcs:
                     kind = "comic"
-                    for ref in re.findall(r'src="([^"]+)"', html or "", flags=re.IGNORECASE):
-                        raw = EpubView._read_resource(self._index, ref)
+                    for ref in self._ch.img_srcs:
+                        raw = EpubView._read_bytes(self._epub, self._ch.src, ref)
                         if raw:
                             imgs.append(raw)
-                else:
-                    kind = "novel"
-                    text = _html_to_text(html or "")
+                elif self._epub is not None:
+                    html = EpubView._read_doc(self._epub, self._ch.src)
+                    if "<img" in (html or "").lower():
+                        kind = "comic"
+                        for ref in re.findall(r'src="([^"]+)"', html or "", flags=re.IGNORECASE):
+                            raw = EpubView._read_bytes(self._epub, self._ch.src, ref)
+                            if raw:
+                                imgs.append(raw)
+                    else:
+                        kind, text = "novel", _html_to_text(html or "")
             except Exception:  # noqa: BLE001
                 kind, text = "novel", ""
         try:
@@ -154,7 +154,7 @@ class EpubView(QWidget):
         self._is_comic = False
         self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
-        self._item_index = {}  # epub 资源名(小写/basename) → item，章节懒读用
+        self._epub: FastEpub | None = None  # 当前书读取器（zip 按需读取）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -178,19 +178,21 @@ class EpubView(QWidget):
 
         self.prev_btn = QPushButton("上一章")
         self.next_btn = QPushButton("下一章")
+        self.prev_btn.setFixedWidth(70)
+        self.next_btn.setFixedWidth(70)
         self.prev_btn.clicked.connect(lambda: self._jump_relative(-1))
         self.next_btn.clicked.connect(lambda: self._jump_relative(1))
         toolbar.addWidget(self.prev_btn)
         toolbar.addWidget(self.next_btn)
 
-        toolbar.addStretch(1)
         self.progress_label = QLabel("")
-        toolbar.addWidget(self.progress_label)
+        self.progress_label.setStyleSheet("color: palette(dark);")
+        toolbar.addWidget(self.progress_label, stretch=1)
         layout.addLayout(toolbar)
 
-        # ---- 目录 + 正文 ----
+        # ---- 主体：目录 + 正文 ----
         body = QHBoxLayout()
-        body.setSpacing(8)
+        body.setSpacing(0)
 
         self.toc_list = QListWidget()
         self.toc_list.setFixedWidth(180)
@@ -214,14 +216,11 @@ class EpubView(QWidget):
 
     # ------------------------------------------------------------------ #
     def open(self, path: str, start_idx: int = 0, on_loaded=None) -> bool:
-        """异步打开本地 epub。立即返回；后台解析完成后回调 on_loaded(chapters)。
+        """异步打开本地 epub。立即返回；后台建索引完成后回调 on_loaded(chapters)。
 
         on_loaded 在主线程执行，可在此做续读定位（按章节标题）等收尾。
         """
         self._ensure_text_label()  # 上次打开混排 epub 可能已删掉正文 QLabel
-        if not HAS_EBOOKLIB:
-            self.text.setText("未安装 EbookLib，无法阅读 epub")
-            return False
         self._path = path
         self._start_idx = max(0, int(start_idx or 0))
         self._on_loaded = on_loaded
@@ -235,15 +234,21 @@ class EpubView(QWidget):
         QThreadPool.globalInstance().start(task)
         return True
 
-    def _on_open_done(self, path: str, chapters: list, err: str, item_index=None) -> None:
+    def _on_open_done(self, path: str, chapters: list, err: str, epub=None) -> None:
         """后台建索引完成（主线程回调）。过期结果（已切书）丢弃。"""
         if path != self._path:
+            if epub is not None:
+                epub.close()
             return
         if err or not chapters:
+            if epub is not None:
+                epub.close()
             self.text.setText(f"epub 读取失败：{err or '无可用章节内容'}")
             return
         self._chapters = chapters
-        self._item_index = item_index or {}
+        if self._epub is not None:
+            self._epub.close()
+        self._epub = epub
         self._is_comic = False
         self._populate_toc()
         idx = max(0, min(self._start_idx, len(self._chapters) - 1))
@@ -254,107 +259,69 @@ class EpubView(QWidget):
             except Exception:  # noqa: BLE001 —— 续读收尾失败不影响阅读
                 pass
 
+    # ------------------------------------------------------------------ #
     @staticmethod
-    def _toc_titles(book) -> dict:
-        """从 book.toc（navMap）展平 href→章节标题。真实 epub 的标题在此可靠。
-
-        ebooklib read_epub 会 lxml 重写 xhtml 并剥掉 <title>，因此章节标题
-        以目录（toc.ncx / nav）为准；item.title / <title> 仅作补充。
-        """
-        titles: dict[str, str] = {}
-
-        def walk(entries) -> None:
-            if not entries:
-                return
-            for e in entries:
-                if isinstance(e, tuple) and len(e) >= 2:
-                    head, rest = e[0], e[1]
-                    if hasattr(head, "href"):
-                        titles[head.href] = getattr(head, "title", "") or ""
-                    walk(rest)
-                elif hasattr(e, "href"):
-                    titles[e.href] = getattr(e, "title", "") or ""
-
-        walk(book.toc)
-        return titles
-
-    @staticmethod
-    def _index_chapters(book) -> list[_Chapter]:
-        """只读元数据建章节索引（spine + 标题），不读章节内容 → 大 epub 秒开。"""
+    def _build_chapters(epub: FastEpub, path: str) -> list[_Chapter]:
+        """建章节索引。合并单文档（spine 一个且很大）按 <h1> 拆分并缓存。"""
+        key = _cache_key(path)
+        cached = _SPLIT_CACHE.get(key)
+        if cached is not None:
+            return list(cached)
+        hrefs = epub.spine_hrefs
+        if len(hrefs) == 1 and epub.file_size(hrefs[0]) > MERGE_DOC_THRESHOLD:
+            html = EpubView._read_doc(epub, hrefs[0])
+            parts = split_single_document(html)
+            if len(parts) > 1:
+                chapters = [
+                    _Chapter(t, src=hrefs[0], text=txt, img_srcs=srcs)
+                    for t, txt, srcs in parts
+                ]
+                _SPLIT_CACHE.clear()  # 只保留最近一本，避免多本拆分结果堆积内存
+                _SPLIT_CACHE[key] = chapters
+                return list(chapters)
         chapters: list[_Chapter] = []
-        toc_titles = EpubView._toc_titles(book)
-        items = {i.get_id(): i for i in book.get_items()}
-        for idref, _linear in book.spine:
-            item = items.get(idref)
-            if item is None:
-                continue
-            name = (item.get_name() or "").lower()
-            if not name.endswith((".xhtml", ".html")):
-                continue
-            # 跳过导航/封面等非正文文档
-            if idref in ("nav", "ncx") or "nav" in name:
-                continue
-            title = (getattr(item, "title", "") or "").strip()
+        for href in hrefs:
+            leaf = posixpath.basename(href)
+            title = (epub.toc_titles.get(href) or epub.toc_titles.get(leaf) or "").strip()
             if not title:
-                # toc 映射：完整路径或文件名匹配
-                leaf = name.rsplit("/", 1)[-1]
-                title = (toc_titles.get(name) or toc_titles.get(leaf) or "").strip()
-            if not title:
-                from pathlib import Path
-
-                title = Path(name).stem  # 无标题时用文件名兜底
-            chapters.append(_Chapter(title=title or f"第{len(chapters)+1}章", src=name))
+                title = posixpath.splitext(leaf)[0]
+            chapters.append(_Chapter(title or f"第{len(chapters)+1}章", src=href))
         return chapters
 
     @staticmethod
-    def _build_item_index(book) -> dict:
-        """epub 资源名(小写, 含 basename) → item，章节/图片 O(1) 懒读。"""
-        index: dict = {}
-        for item in book.get_items():
-            n = (item.get_name() or "").lower()
-            if not n:
-                continue
-            index[n] = item
-            index[n.rsplit("/", 1)[-1]] = item  # basename 也挂一份，兼容 href 写法
-        return index
-
-    @staticmethod
-    def _read_document(item_index: dict, src: str) -> str:
-        """按 xhtml 资源名读文档文本（后台线程用）。"""
-        item = EpubView._find_item(item_index, src)
-        if item is None:
+    def _read_doc(epub: FastEpub, src: str) -> str:
+        """按 zip 内路径读正文文档文本（后台线程用）。"""
+        if not src or epub is None or not epub.has(src):
             return ""
-        content = item.get_content()
-        if isinstance(content, (bytes, bytearray)):
-            return bytes(content).decode("utf-8", errors="replace")
-        return str(content or "")
+        raw = epub.read(src)
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw).decode("utf-8", errors="replace")
+        return str(raw or "")
 
     @staticmethod
-    def _read_resource(item_index: dict, ref: str) -> bytes | None:
-        """按图片资源名懒读字节（后台线程用）。先精确名再 basename/后缀匹配。"""
-        item = EpubView._find_item(item_index, ref)
-        if item is None:
+    def _read_bytes(epub: FastEpub, base: str, ref: str) -> bytes | None:
+        """按引用读单资源字节（后台线程用）。先原样/相对 base 路径，再 basename 匹配。"""
+        if epub is None or not ref:
             return None
-        try:
-            c = item.get_content()
-            return bytes(c) if isinstance(c, (bytes, bytearray)) else None
-        except Exception:  # noqa: BLE001 —— 单资源读取失败跳过
-            return None
+        base_dir = posixpath.dirname(base or "")
+        cands = [ref, posixpath.join(base_dir, ref)]
+        for c in cands:
+            if epub.has(c):
+                try:
+                    raw = epub.read(c)
+                    return bytes(raw) if isinstance(raw, (bytes, bytearray)) else None
+                except Exception:  # noqa: BLE001
+                    return None
+        full = epub.basename_index.get(posixpath.basename(ref))
+        if full:
+            try:
+                raw = epub.read(full)
+                return bytes(raw) if isinstance(raw, (bytes, bytearray)) else None
+            except Exception:  # noqa: BLE001
+                pass
+        return None
 
-    @staticmethod
-    def _find_item(item_index: dict, ref: str):
-        ref = (ref or "").lower()
-        item = item_index.get(ref)
-        if item is None:
-            leaf = ref.rsplit("/", 1)[-1]
-            item = item_index.get(leaf)
-            if item is None:
-                for k, v in item_index.items():
-                    if k.endswith("/" + leaf):
-                        item = v
-                        break
-        return item
-
+    # ------------------------------------------------------------------ #
     def _switch_gallery(self) -> None:
         """漫画模式：改用图片流容器（setWidget 会删除旧 widget，被删则重建）。"""
         from PySide6.QtWidgets import QVBoxLayout as _V
@@ -388,10 +355,11 @@ class EpubView(QWidget):
 
     def _populate_toc(self) -> None:
         self.toc_list.clear()
-        for i, ch in enumerate(self._chapters):
-            item = QListWidgetItem(ch.title or f"第{i+1}章")
-            item.setData(Qt.UserRole, i)
-            self.toc_list.addItem(item)
+        self.toc_list.setUpdatesEnabled(False)
+        try:
+            self.toc_list.addItems([c.title or f"第{i+1}章" for i, c in enumerate(self._chapters)])
+        finally:
+            self.toc_list.setUpdatesEnabled(True)
 
     def _on_toc_clicked(self, item) -> None:
         idx = item.data(Qt.UserRole)
@@ -414,7 +382,7 @@ class EpubView(QWidget):
         ch = self._chapters[idx]
         self.toc_list.setCurrentRow(idx)
         self.progress_label.setText(f"第{idx+1}/{len(self._chapters)}章 · {ch.title}")
-        task = _LoadChapterTask(idx, ch.src, self._item_index)
+        task = _LoadChapterTask(idx, ch, self._epub)
         task.signals.done.connect(self._on_chapter_loaded)
         self._load_task = task  # 持有引用防 GC
         QThreadPool.globalInstance().start(task)
