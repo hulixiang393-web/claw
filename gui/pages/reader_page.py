@@ -365,7 +365,7 @@ class ReaderPage(BasePage):
             self.open_epub(path)
 
     def open_epub(self, path: str) -> None:
-        """打开本地 epub（独立 epub 阅读器）。"""
+        """打开本地 epub（独立 epub 阅读器）。解析在后台线程，不卡 UI。"""
         self._current_source_id = ""
         self._current_book_url = ""
         self.title_label.setText("epub 阅读")
@@ -375,19 +375,26 @@ class ReaderPage(BasePage):
         self.dl_btn.setEnabled(False)  # epub 本地书已在本机，无需下载
         self.video_view.stop_playback()  # 切 epub 前也释放视频播放资源
         self.stack.setCurrentWidget(self.epub_view)
-        if self.epub_view.open(path, start_idx=0):
+
+        # 先读续读记录再打开：_load_chapter(start) 会触发 chapter_changed 把进度
+        # 刷成当前章，若延后到回调里再 resume 会拿到被覆盖的起点而丢失续读位。
+        last_title = ""
+        if self._reading_progress is not None:
+            rec = self._reading_progress.resume(path)
+            last_title = (rec or {}).get("chapter_title", "")
+
+        def _on_loaded(chapters) -> None:
             # 续读：按上次章节标题定位
-            if self._reading_progress is not None:
-                rec = self._reading_progress.resume(path)
-                last_title = (rec or {}).get("chapter_title", "")
-                if last_title:
-                    for i, ch in enumerate(self.epub_view._chapters):
-                        if ch.title == last_title:
-                            self.epub_view._load_chapter(i)
-                            break
-            self.title_label.setText(self.epub_view._chapters[0].title if self.epub_view._chapters else "epub")
-        else:
-            self.title_label.setText("epub 打开失败")
+            if last_title:
+                for i, ch in enumerate(chapters):
+                    if ch.title == last_title:
+                        self.epub_view._load_chapter(i)
+                        break
+            self.title_label.setText(
+                chapters[0].title if chapters else "epub"
+            )
+
+        self.epub_view.open(path, start_idx=0, on_loaded=_on_loaded)
 
     def refresh(self) -> None:
         pass

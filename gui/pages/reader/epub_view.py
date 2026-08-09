@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -48,6 +48,17 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
+def _chapter_title(item, html: str) -> str:
+    """提取章节标题：item.title → HTML <title> → 文件名（真实 epub 多无 item.title）。"""
+    t = (getattr(item, "title", "") or "").strip()
+    if t:
+        return t
+    m = re.search(r"<title[^>]*>([^<]+)</title>", html or "", flags=re.IGNORECASE)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    return ""
+
+
 class _Chapter:
     """epub 单章：标题 + 文本（novel）或图片列表（comic）。"""
 
@@ -56,6 +67,31 @@ class _Chapter:
         self.text = text
         self.images = images or []  # 漫画：本话图片字节
         self.is_comic = bool(images)
+
+
+class _OpenSignals(QObject):
+    done = Signal(object, object, object)  # (path, chapters, err)
+
+
+class _OpenTask(QRunnable):
+    """后台解析 epub（read_epub + 提取章节）。大文件/漫画图多时避免卡死 UI。"""
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.signals = _OpenSignals()
+        self._path = path
+
+    def run(self) -> None:
+        err, chapters = "", []
+        try:
+            book = epub.read_epub(self._path)
+            chapters = EpubView._extract_chapters_static(book)
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+        try:
+            self.signals.done.emit(self._path, chapters, err)
+        except RuntimeError:
+            pass
 
 
 class EpubView(QWidget):
@@ -129,35 +165,78 @@ class EpubView(QWidget):
         layout.addLayout(body, stretch=1)
 
     # ------------------------------------------------------------------ #
-    def open(self, path: str, start_idx: int = 0) -> bool:
-        """打开本地 epub，返回是否成功。start_idx 指定起始章节（续读定位）。"""
+    def open(self, path: str, start_idx: int = 0, on_loaded=None) -> bool:
+        """异步打开本地 epub。立即返回；后台解析完成后回调 on_loaded(chapters)。
+
+        on_loaded 在主线程执行，可在此做续读定位（按章节标题）等收尾。
+        """
         self._ensure_text_label()  # 上次打开混排 epub 可能已删掉正文 QLabel
         if not HAS_EBOOKLIB:
             self.text.setText("未安装 EbookLib，无法阅读 epub")
             return False
         self._path = path
-        try:
-            book = epub.read_epub(path)
-            self._chapters = self._extract_chapters(book)
-        except Exception as exc:  # noqa: BLE001
-            self.text.setText(f"epub 读取失败：{exc}")
-            return False
-        if not self._chapters:
-            self.text.setText("epub 无可用章节内容")
-            return False
-        self._is_comic = any(ch.is_comic for ch in self._chapters)
+        self._start_idx = max(0, int(start_idx or 0))
+        self._on_loaded = on_loaded
+        self._chapters = []
+        self._is_comic = False
+        self.text.setText("正在打开 epub，请稍候…")
+        self.scroll.setWidget(self.text)
+        task = _OpenTask(path)
+        task.signals.done.connect(self._on_open_done)
+        self._open_task = task  # 持有引用防 GC
+        QThreadPool.globalInstance().start(task)
+        return True
+
+    def _on_open_done(self, path: str, chapters: list, err: str) -> None:
+        """后台解析完成（主线程回调）。过期结果（已切书）丢弃。"""
+        if path != self._path:
+            return
+        if err or not chapters:
+            self.text.setText(f"epub 读取失败：{err or '无可用章节内容'}")
+            return
+        self._chapters = chapters
+        self._is_comic = any(ch.is_comic for ch in chapters)
         # 漫画视图：切画廊模式
         if self._is_comic:
             self._switch_gallery()
         self._populate_toc()
-        start_idx = max(0, min(start_idx, len(self._chapters) - 1))
-        self._load_chapter(start_idx)
-        return True
+        idx = max(0, min(self._start_idx, len(self._chapters) - 1))
+        self._load_chapter(idx)
+        if self._on_loaded is not None:
+            try:
+                self._on_loaded(chapters)
+            except Exception:  # noqa: BLE001 —— 续读收尾失败不影响阅读
+                pass
 
-    def _extract_chapters(self, book) -> list[_Chapter]:
-        """从 ebooklib book 提取章节（按 spine 顺序，跳过 nav/cover）。"""
+    @staticmethod
+    def _toc_titles(book) -> dict:
+        """从 book.toc（navMap）展平 href→章节标题。真实 epub 的标题在此可靠。
+
+        ebooklib read_epub 会 lxml 重写 xhtml 并剥掉 <title>，因此章节标题
+        以目录（toc.ncx / nav）为准；item.title / <title> 仅作补充。
+        """
+        titles: dict[str, str] = {}
+
+        def walk(entries) -> None:
+            if not entries:
+                return
+            for e in entries:
+                if isinstance(e, tuple) and len(e) >= 2:
+                    head, rest = e[0], e[1]
+                    if hasattr(head, "href"):
+                        titles[head.href] = getattr(head, "title", "") or ""
+                    walk(rest)
+                elif hasattr(e, "href"):
+                    titles[e.href] = getattr(e, "title", "") or ""
+
+        walk(book.toc)
+        return titles
+
+    @staticmethod
+    def _extract_chapters_static(book) -> list[_Chapter]:
+        """静态提取章节（后台线程用，无 UI 依赖）。"""
         chapters: list[_Chapter] = []
-        # spine 顺序：book.spine 是 [(idref, linear)]；用 item map 定位
+        toc_titles = EpubView._toc_titles(book)
         items = {i.get_id(): i for i in book.get_items()}
         for idref, _linear in book.spine:
             item = items.get(idref)
@@ -174,16 +253,27 @@ class EpubView(QWidget):
                 html = bytes(content).decode("utf-8", errors="replace")
             else:
                 html = str(content)
-            title = getattr(item, "title", "") or ""
+            title = _chapter_title(item, html)
+            if not title:
+                # toc 映射：完整路径或文件名匹配
+                leaf = name.rsplit("/", 1)[-1]
+                title = (toc_titles.get(name) or toc_titles.get(leaf) or "").strip()
+            if not title:
+                from pathlib import Path
+
+                title = Path(name).stem  # 无标题时用文件名兜底（比"未命名"可读）
             # 检测本话图片
             img_refs = re.findall(r'src="([^"]+)"', html, flags=re.IGNORECASE)
-            imgs = [self._image_bytes(book, ref) for ref in img_refs]
+            imgs = [EpubView._image_bytes(book, ref) for ref in img_refs]
             imgs = [b for b in imgs if b]
             if imgs:
                 chapters.append(_Chapter(title, images=imgs))
             else:
                 chapters.append(_Chapter(title, text=_html_to_text(html)))
         return chapters
+
+    def _extract_chapters(self, book) -> list[_Chapter]:
+        return EpubView._extract_chapters_static(book)
 
     @staticmethod
     def _image_bytes(book, ref: str) -> bytes | None:

@@ -557,10 +557,17 @@ class MainWindow(QMainWindow):
         return self.library_page
 
     def _play_local_video(self, rec: dict) -> None:
-        """播本地视频：单集直接播，多集弹选择；本地文件无需防盗链头。"""
+        """播本地视频：记住上次看到哪集（下次默认定位该集）；单集直接播，多集弹选择。"""
         paths = list(rec.get("episode_paths") or [])
         if not paths:
             return
+        # 记忆 key：本地视频书 key=目录路径（与 shelf_service 一致）
+        key = rec.get("key") or rec.get("path") or ""
+        prev_title = ""
+        if key and self.reading_progress is not None:
+            recp = self.reading_progress.resume(key)
+            prev_title = (recp or {}).get("chapter_title", "")
+
         target = paths[0]
         if len(paths) > 1:
             from pathlib import Path
@@ -568,12 +575,23 @@ class MainWindow(QMainWindow):
             names = [Path(p).name for p in paths]
             from PySide6.QtWidgets import QInputDialog
 
+            cur = names.index(prev_title) if prev_title in names else 0
             item, ok = QInputDialog.getItem(
-                self, "选择集数", "选择要播放的集：", names, 0, False
+                self, "选择集数", "选择要播放的集：", names, cur, False
             )
             if not ok or not item:
                 return
             target = paths[names.index(item)]
+        # 记录"看到第 N 集"（外部播放器无法回传秒数，至少记住集数续播）
+        if key and self.reading_progress is not None:
+            try:
+                from pathlib import Path as _P
+
+                self.reading_progress.save(
+                    "", key, "video", target, _P(target).name or ""
+                )
+            except Exception:  # noqa: BLE001 —— 记忆失败不影响播放
+                pass
         from framework.external_player import open_with_player
 
         open_with_player(target)

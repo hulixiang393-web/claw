@@ -80,7 +80,7 @@ class _ShelfCard(QFrame):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_menu)
         self.setFixedWidth(190)
-        self.setMinimumHeight(150)
+        self.setFixedHeight(160)  # 卡片尺寸固定：长书名不撑大，内容区网格恒定
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -97,24 +97,37 @@ class _ShelfCard(QFrame):
         self._cover = cover
         self._load_cover(rec.get("cover") or "")
 
-        # 标题 + 本地徽章
+        # 标题 + 本地徽章（书名单行省略，超长横向裁剪不换行，tooltip 显示全名）
         title_row = QHBoxLayout()
-        title = QLabel(rec.get("title") or "无题")
-        title.setWordWrap(True)
+        title_text = rec.get("title") or "无题"
+        title = QLabel()
+        title.setWordWrap(False)
+        title.setFixedHeight(20)
         title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        fm = title.fontMetrics()
+        badge_w = 44 if rec.get("kind") == "local" else 0
+        elided = fm.elidedText(title_text, Qt.ElideRight, 190 - 24 - badge_w - 4)
+        title.setText(elided)
+        title.setToolTip(title_text)
         title_row.addWidget(title, stretch=1)
         if rec.get("kind") == "local":
             badge = QLabel("本地")
+            badge.setFixedWidth(40)
+            badge.setAlignment(Qt.AlignCenter)
             badge.setStyleSheet(
-                "font-size: 10px; padding: 1px 5px; border-radius: 3px;"
+                "font-size: 10px; padding: 1px 0px; border-radius: 3px;"
                 "background: palette(highlight); color: palette(highlighted-text);"
             )
             title_row.addWidget(badge, alignment=Qt.AlignTop)
         layout.addLayout(title_row)
 
-        meta = QLabel(self._meta_text())
+        meta_text = self._meta_text()
+        meta = QLabel()
+        meta.setWordWrap(False)
+        meta.setFixedHeight(16)
         meta.setStyleSheet("color: palette(dark); font-size: 11px;")
-        meta.setWordWrap(True)
+        meta.setText(fm.elidedText(meta_text, Qt.ElideRight, 190 - 24))
+        meta.setToolTip(meta_text)
         layout.addWidget(meta)
 
         self._apply_style()
@@ -181,7 +194,7 @@ class _ShelfCard(QFrame):
             parts.append(" ".join(f"#{t}" for t in tags[:3]))
         resume = rec.get("resume_title")
         if resume:
-            parts.append(f"读到 {resume}")
+            parts.append(f"{'看到' if ctype == 'video' else '读到'} {resume}")
         return " · ".join(parts) or ctype
 
     @staticmethod
