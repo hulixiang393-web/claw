@@ -86,6 +86,8 @@ class Parser:
         css = sel.get("css")
         xpath = sel.get("xpath")
         attr = sel.get("attr")
+        regex = sel.get("regex")
+        b64 = sel.get("b64decode")
         nodes = self._query(doc, css, xpath)
         results: List[str] = []
         for node in nodes:
@@ -109,6 +111,23 @@ class Parser:
                 txt = node.text_content().strip()
                 if txt:
                     results.append(txt)
+        if regex or b64:
+            import re as _re
+            from urllib.parse import unquote
+            import base64 as _b64
+
+            def _transform(r: str) -> str:
+                if regex:
+                    m = _re.search(str(regex), r)
+                    r = m.group(1) if m else ""
+                if b64 and r:
+                    try:
+                        r = _b64.b64decode(unquote(r)).decode("utf-8", "replace")
+                    except Exception:
+                        r = ""
+                return r
+
+            results = [_transform(r) for r in results]
         if base_url:
             results = [self._abs(base_url, r) for r in results]
         return results

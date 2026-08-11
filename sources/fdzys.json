@@ -175,9 +175,15 @@
       }
     }
   },
+  "decryption": {
+    "targets": {
+      "video_url": {
+        "strategy": "maccms_url"
+      }
+    }
+  },
   "media": {
-    "format": "hls",
-    "select": {
+    "format": "hls",    "select": {
       "video": {
         "quality": "best"
       }

@@ -223,6 +223,33 @@ def test_chapter_sorting():
     print("章节排序 OK（繁簡話/卷話/數字結尾/全角/無數字）")
 
 
+def test_decrypter_maccms_url():
+    """MacCMS 播放地址解密：urlencode(base64) 与纯 base64；明文原样返回。"""
+    from framework.http import HttpClient
+    from framework.decrypter import Decrypter
+
+    http = HttpClient(sleeper=lambda _: None)
+    dec = Decrypter(http)
+    src = SourceConfig.from_dict({
+        "$schema_version": 2, "$id": "d", "$type": "video", "$name": "d",
+        "decryption": {"targets": {"video_url": {"strategy": "maccms_url"}}},
+    })
+    plain = "https://cdn.example.com/2024/01/x/index.m3u8"
+    # urlencode(base64(url))
+    enc = "aHR0cHM6Ly9jZG4uZXhhbXBsZS5jb20vMjAyNC8wMS94L2luZGV4Lm0zdTg%3D"
+    assert dec.decrypt(src, enc, "video_url") == plain
+    # 纯 base64（无 % 编码）
+    import base64 as _b64
+    assert dec.decrypt(src, _b64.b64encode(plain.encode()).decode(), "video_url") == plain
+    # 明文 m3u8 原样返回（非密文不报错）
+    assert dec.decrypt(src, plain, "video_url") == plain
+    # 未配置解密策略 → 原样
+    src2 = SourceConfig.from_dict({
+        "$schema_version": 2, "$id": "d2", "$type": "video", "$name": "d2"})
+    assert dec.decrypt(src2, enc, "video_url") == enc
+    print("MacCMS 播放地址解密 OK")
+
+
 if __name__ == "__main__":
     test_eventbus()
     test_themes()
@@ -231,4 +258,5 @@ if __name__ == "__main__":
     test_config_validation()
     test_chapter_pagination()
     test_chapter_sorting()
+    test_decrypter_maccms_url()
     print("\n=== 内核基础模块冒烟测试全部通过 ===")

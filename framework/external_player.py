@@ -46,7 +46,8 @@ def _locate_vlc() -> str | None:
 
 
 def open_with_player(url: str, audio: str = "", referer: str = "",
-                     user_agent: str = "", headers: dict | None = None) -> str:
+                     user_agent: str = "", headers: dict | None = None,
+                     ad_block: dict | None = None) -> str:
     """用外部播放器打开媒体地址。
 
     url      媒体直链（单流）
@@ -54,6 +55,7 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
     referer / user_agent / headers  防盗链透传。referer/user_agent 是兼容旧
             调用的便捷参数；headers 提供完整头（含 Cookie 等）。任何防盗链
             头存在时走本地代理（VLC 无法设置 UA，只有代理能根治）。
+    ad_block 源 ad_block 配置，非空时代理转发 m3u8 会剔除广告段。
     """
     if not url:
         return ""
@@ -67,8 +69,8 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             hdrs.setdefault("User-Agent", user_agent)
         if hdrs:
             # 带防盗链 → 本地代理（代理打完整 headers）
-            play_url = proxy_url_for(url, hdrs)
-            audio_url = proxy_url_for(audio, hdrs) if audio else ""
+            play_url = proxy_url_for(url, hdrs, ad_block=ad_block)
+            audio_url = proxy_url_for(audio, hdrs, ad_block=ad_block) if audio else ""
         else:
             play_url = url
             audio_url = audio

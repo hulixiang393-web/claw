@@ -1,0 +1,173 @@
+{
+  "$schema_version": 2,
+  "$id": "5238",
+  "$type": "video",
+  "$name": "5238動漫",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.5238.me/",
+    "description": "5238動漫 - WordPress 站，成人動漫影片在線播放。播放地址提取链：详情页内嵌 iframe player5238G.php（video.520cc.cc）→ 播放页 refresh_page() AJAX 拉取 get3G.php（id/key/rand 由播放页注入）→ 响应 var ccsJsCmds 为 Caesar 移位4 + URL 编码的 JS，经 myencryptHTML + unescape 解码后含 <video><source src=\"...m3u8\">。视频为 HLS m3u8（AES-128，CDN vs02aa.520cc.cc，分片/key 均无防盗链，实测 200）。⚠ 内核阻塞点：当前 framework/playwright_helper.py 的 fetch_rendered_video_sync 只读 <video> 元素自身 src 属性（videojs/VHS 渲染后为 blob: 地址，不以 http 开头而被跳过），真实 m3u8 在 <video> 的 <source> 子节点上 → 需内核补丁支持提取 <video> <source> src（见报告）。源本身 discovery/search/detail 均正常。",
+    "lang": "zh-TW",
+    "region": "tw",
+    "tags": [
+      "视频",
+      "成人",
+      "裏番",
+      "動漫",
+      "hls"
+    ],
+    "last_verified": "2026-08-11"
+  },
+  "transports": {
+    "base_url": "https://www.5238.me",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.5238.me/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 800,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/page/1",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "page_placeholder": "\\d+$"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "最新影片",
+            "url": "/page/1"
+          },
+          {
+            "title": "有碼",
+            "url": "/category/%e6%9c%89%e7%a2%bc/page/1"
+          },
+          {
+            "title": "無碼",
+            "url": "/category/%e7%84%a1%e7%a2%bc/page/1"
+          },
+          {
+            "title": "不分類",
+            "url": "/category/%e4%b8%8d%e5%88%86%e9%a1%9e/page/1"
+          },
+          {
+            "title": "最多人看",
+            "url": "/page/1?order=views"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "li.thumi"
+        },
+        "fields": {
+          "title": {
+            "css": "a.title"
+          },
+          "url": {
+            "css": "a.title",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/",
+      "method": "GET",
+      "keyword_param": "s",
+      "item": {
+        "root_selector": {
+          "css": "li.thumi"
+        },
+        "fields": {
+          "title": {
+            "css": "a.title"
+          },
+          "url": {
+            "css": "a.title",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/[^/]+\\.html",
+      "fields": {
+        "title": {
+          "css": "h1"
+        },
+        "cover": {
+          "regex": "https?://[^\"'\\s]+/wp-content/uploads/\\d{4}/\\d{2}/\\d{6}\\.jpg"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页即播放页（内嵌 iframe player5238G.php → get3G.php → 解码出 m3u8）。需 Playwright 渲染执行 iframe 内 JS + get3G AJAX 拿到真实视频地址；当前内核 fetch_rendered_video_sync 因 videojs 把 video.src 置为 blob 而提取不到（见 metadata.description 阻塞点）。",
+        "play_url": {
+          "render": "playwright"
+        },
+        "render_config": {
+          "wait_until": "networkidle",
+          "timeout_ms": 45000,
+          "extra_delay_ms": 8000
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    },
+    "hls": {
+      "workers": 4
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 24
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "li.thumi"
+      },
+      "interval_hours": 24
+    }
+  }
+}

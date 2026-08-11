@@ -1,0 +1,227 @@
+{
+  "$schema_version": 2,
+  "$id": "heavy-r",
+  "$type": "video",
+  "$name": "Heavy-R",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.heavy-r.com",
+    "description": "Heavy-R - 成人猎奇视频站（自定义 PHP 站，非 WordPress）。列表/搜索共用 div.video-item 卡片；详情页内嵌 <video><source src=...m3u8> 直链（HLS，fMP4 分片，无需 Referer 防盗链）。",
+    "lang": "en",
+    "region": "en",
+    "tags": [
+      "视频",
+      "成人",
+      "猎奇",
+      "hls"
+    ],
+    "last_verified": "2026-08-11"
+  },
+  "transports": {
+    "base_url": "https://www.heavy-r.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.heavy-r.com/"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 800,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/videos/recent/{page}/",
+      "works_list_url": "/videos/recent/{page}/",
+      "note": "站点分页是 0 索引路径式：第 1 页 = /videos/recent/（无数字），第 2 页 = /videos/recent/1/，第 3 页 = /videos/recent/2/。框架分页从 1 起，故 URL 用 {page} 占位后第 1 页实为站点索引 1（即第 2 页，略过最新一页，后续连续无空洞）；/{page}/ 与 /{page}-1/ 写法站点均返回 200 同构，索引 0（最新页）= 基底 /videos/recent/。若需连最新页一起显示可改用基底 URL 配 page_placeholder（会有空洞），当前取连续无空洞方案。",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "最新视频",
+            "url": "/videos/recent/{page}/"
+          },
+          {
+            "title": "最多观看",
+            "url": "/videos/most_viewed/{page}/"
+          },
+          {
+            "title": "最高评分",
+            "url": "/videos/top_rated/{page}/"
+          },
+          {
+            "title": "最近收藏",
+            "url": "/videos/recent_favorites/{page}/"
+          },
+          {
+            "title": "Bizarre Porn Videos",
+            "url": "/bizarre_porn_videos/recent/{page}/"
+          },
+          {
+            "title": "Porn Videos",
+            "url": "/porn_videos/recent/{page}/"
+          },
+          {
+            "title": "Sexy Videos",
+            "url": "/sexy_videos/recent/{page}/"
+          },
+          {
+            "title": "Gay Porn Videos",
+            "url": "/gay_porn_videos/recent/{page}/"
+          },
+          {
+            "title": "Bizarre Gay Porn Videos",
+            "url": "/bizarre_gay_porn_videos/recent/{page}/"
+          },
+          {
+            "title": "Bizarre Videos",
+            "url": "/bizarre_videos/recent/{page}/"
+          },
+          {
+            "title": "Cool Videos",
+            "url": "/cool_videos/recent/{page}/"
+          },
+          {
+            "title": "Disgusting Videos",
+            "url": "/disgusting_videos/recent/{page}/"
+          },
+          {
+            "title": "Fail Videos",
+            "url": "/fail_videos/recent/{page}/"
+          },
+          {
+            "title": "Fight Videos",
+            "url": "/fight_videos/recent/{page}/"
+          },
+          {
+            "title": "Funny Videos",
+            "url": "/funny_videos/recent/{page}/"
+          },
+          {
+            "title": "Shocking Videos",
+            "url": "/shocking_videos/recent/{page}/"
+          },
+          {
+            "title": "Other Videos",
+            "url": "/other_videos/recent/{page}/"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.video-item"
+        },
+        "fields": {
+          "title": {
+            "css": "h4.title a"
+          },
+          "url": {
+            "css": "a.image",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a.image img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/{keyword}.html",
+      "method": "GET",
+      "keyword_param": "q",
+      "paginator": {
+        "url_template": "/search/{keyword}.html"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.video-item"
+        },
+        "fields": {
+          "title": {
+            "css": "h4.title a"
+          },
+          "url": {
+            "css": "a.image",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a.image img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/video/\\d+/",
+      "fields": {
+        "title": {
+          "css": "meta[property='og:title']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[property='og:description']",
+          "attr": "content"
+        },
+        "author": {
+          "css": "div.uploaded a.block.black"
+        },
+        "tags": {
+          "css": "div.links div.tags a[href*='free_porn']"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页即播放页（单集作品，无分集列表）：内嵌 <video id=video-file><source type=application/x-mpegurl src=...m3u8>，play_url.selector 直接取 <video> 下第一个 <source> 的 src（HLS fMP4 直链，播放页 HTML 无防盗链）。",
+        "play_url": {
+          "selector": {
+            "css": "video source",
+            "attr": "src"
+          }
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 30
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

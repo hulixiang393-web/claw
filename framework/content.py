@@ -122,6 +122,18 @@ class Content:
         self._detail_html_ttl = 300.0  # 5 分钟
         self._detail_html_max = 200  # 多书切换时减少驱逐，详情页/目录页复用
 
+    def _clean_field(self, value, pairs) -> str:
+        """按替换对列表清洗字段值：pattern 以 "re:" 前缀按正则替换。"""
+        value = str(value or "").strip()
+        for pat, repl in (pairs or []):
+            if not pat:
+                continue
+            if pat.startswith("re:"):
+                value = _re.sub(pat[3:], str(repl or ""), value)
+            else:
+                value = value.replace(pat, str(repl or ""))
+        return value.strip()
+
     def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
         """后台线程执行结构自检，不阻塞抓取（阅读/下载/播放提速）。
 
@@ -305,6 +317,16 @@ class Content:
         # 标签（可空）
         tags = self._parser.extract(doc, fields.get("tags"))
         detail.tags = tags
+        # 字段清洗：fields.clean.{field} 为 [pattern, repl] 替换对列表；
+        # pattern 以 "re:" 开头按正则替换（如 summary 去"最新章节推荐地址"尾巴）
+        for _key, _pairs in (fields.get("clean") or {}).items():
+            _val = getattr(detail, _key, None)
+            if _key == "tags":
+                detail.tags = [
+                    self._clean_field(t, _pairs) for t in detail.tags
+                ]
+            elif _val is not None:
+                setattr(detail, _key, self._clean_field(_val, _pairs))
 
         # 章节列表（按类型取 content 配置，传书名用于标题清理；
         # html 供目录页 id 从详情页 HTML 提取，如 dm5 COMIC_MID）
@@ -731,7 +753,7 @@ class Content:
         chapters_api = list_cfg.get("chapters_api") or {}
         if chapters_api and detail_url:
             try:
-                api_items = self._fetch_chapters_api(source, chapters_api, detail_url)
+                api_items = self._fetch_chapters_api(source, chapters_api, detail_url, html)
                 if api_items is not None:
                     items = api_items
             except Exception as exc:  # noqa: BLE001
@@ -801,89 +823,139 @@ class Content:
 
     # ------------------------------------------------------------------ #
     def _fetch_chapters_api(
-        self, source: SourceConfig, cfg: dict, detail_url: str
+        self, source: SourceConfig, cfg: dict, detail_url: str, html: str = ""
     ) -> Optional[List[dict]]:
         """API 目录：从详情 URL 提取 book id，直调章节 API，返回 [{title, url}]。
 
         供 SPA 目录站（详情页目录为 JS 渲染、SSR 空，如纵横小说）直接拿 JSON
         章节列表，避免渲染详情页。配置见 _fetch_chapters 的 chapters_api 注释。
 
-        - 从 detail_url 提取 book id（/{id} 占位）：无法提取 → 返回 None（调用方
-          回退 HTML 解析）
+        - 从 detail_url 提取 book id（/{id} 占位）或从详情页 HTML 取（id_from
+          = "html_attr" + id_css/id_attr，如 shuyous 的 .page2[data-aid]）：
+          无法提取 → 返回 None（调用方回退 HTML 解析）
+        - `encrypt`（{key, iv, field}）→ body JSON 先 AES-CBC 加密再 POST
+          （等价站点 JS 的 CryptoJS 加密请求，如 shuyous loadChapterPage）
+        - body 含 {page} 占位 + `max_pages` → 逐页轮询拼接（每页固定条数，
+          如每 100 章一页），返回空页即停；轮询结果按 URL 去重
         - 网络/解析失败 → 抛异常（调用方 catch 后回退 HTML 解析）
         - 成功（含空列表）→ 返回 [{title, url}]，调用方直接用（不回退）
         """
         from urllib.parse import urlencode, urljoin
 
-        m_id = _re.search(r"/(?:novel|book|comic|detail|bookinfo|program)/(\w+)", detail_url)
-        if not m_id:
+        book_id = ""
+        if (cfg.get("id_from") or "") == "html_attr" and html:
+            try:
+                doc = self._parser.parse(html)
+                aid = self._parser.extract_first(
+                    doc,
+                    {"css": cfg.get("id_css") or "body", "attr": cfg.get("id_attr") or "data-aid"},
+                    "",
+                )
+                book_id = str(aid or "").strip()
+            except Exception:  # noqa: BLE001
+                book_id = ""
+        if not book_id:
+            m_id = _re.search(r"/(?:novel|book|comic|detail|bookinfo|program)/(\w+)", detail_url)
+            book_id = m_id.group(1) if m_id else ""
+        if not book_id:
             return None
-        book_id = m_id.group(1)
         api_url = str(cfg.get("url") or "").replace("{id}", book_id)
         abs_url = urljoin(source.base_url, api_url)
         headers = dict(self._headers(source))
-        body = cfg.get("body") or {}
-        filled = utils.fill_json(body, id=book_id)
-
         method = (cfg.get("method") or "GET").upper()
-        if method == "POST":
-            body_format = (cfg.get("body_format") or "form").lower()
-            if body_format == "json":
-                resp = self._http.post_json(
-                    abs_url, json_body=filled, headers=headers,
-                    timeout=self._timeout(source), retries=self._retries(source),
-                    proxy_pool=source.proxy_pool(),
-                )
-            else:
-                text = self._http.post_form(
-                    abs_url, form_data=filled, headers=headers,
-                    timeout=self._timeout(source), retries=self._retries(source),
-                    proxy_pool=source.proxy_pool(),
-                )
-                import json as _json
-
-                resp = _json.loads(text) if text else {}
-        else:
-            qs = urlencode(filled)
-            abs_url = f"{abs_url}&{qs}" if "?" in abs_url else f"{abs_url}?{qs}"
-            resp = self._http.get_json(
-                abs_url, headers=headers,
-                timeout=self._timeout(source), retries=self._retries(source),
-                proxy_pool=source.proxy_pool(),
-            )
-
-        # response_path 定位列表
-        node = resp
-        rpath = cfg.get("response_path") or ""
-        if rpath:
-            node = self._jsonpath(resp, rpath)
-        # children_path 扁平化卷内章节子数组；缺省直接把 response_path 结果当章节列表
-        children_path = cfg.get("children_path") or ""
-        raw_items = []
-        if children_path and isinstance(node, list):
-            for sub in node:
-                if isinstance(sub, dict) and isinstance(sub.get(children_path), list):
-                    raw_items.extend(sub[children_path])
-        elif isinstance(node, list):
-            raw_items = node
-
+        body = cfg.get("body") or {}
+        max_pages = max(1, int(cfg.get("max_pages") or 1))
+        encrypt = cfg.get("encrypt") or {}
         item_fields = cfg.get("item_fields") or {}
         title_key = item_fields.get("title") or "title"
         cid_key = item_fields.get("chapter_id") or "chapter_id"
         url_tpl = str(cfg.get("url_template") or "")
         out: List[dict] = []
-        for it in raw_items:
-            if not isinstance(it, dict):
-                continue
-            c_title = str(it.get(title_key) or "").strip()
-            c_url = url_tpl
-            for ph, val in (("{id}", book_id), ("{chapter_id}", str(it.get(cid_key) or ""))):
-                c_url = c_url.replace(ph, val)
-            # 模板里其它 {占位符} 统一填充
-            c_url = utils.fill_template(c_url, it)
-            if c_title and c_url:
+        seen_url = set()
+        for page in range(1, max_pages + 1):
+            filled = utils.fill_json(body, id=book_id, page=page)
+            resp = None
+            if method == "POST":
+                if encrypt:
+                    # 请求体 JSON 加密为 AES base64，POST {field: 密文}
+                    field = encrypt.get("field") or "data"
+                    enc_body = self._encrypt_request_body(encrypt, filled)
+                    text = self._http.post_form(
+                        abs_url, form_data={field: enc_body}, headers=headers,
+                        timeout=self._timeout(source), retries=self._retries(source),
+                        interval_ms=self._interval_ms(source),
+                        proxy_pool=source.proxy_pool(),
+                    )
+                    import json as _json
+
+                    resp = _json.loads(text) if text else {}
+                else:
+                    body_format = (cfg.get("body_format") or "form").lower()
+                    if body_format == "json":
+                        resp = self._http.post_json(
+                            abs_url, json_body=filled, headers=headers,
+                            timeout=self._timeout(source), retries=self._retries(source),
+                            proxy_pool=source.proxy_pool(),
+                        )
+                    else:
+                        text = self._http.post_form(
+                            abs_url, form_data=filled, headers=headers,
+                            timeout=self._timeout(source), retries=self._retries(source),
+                            proxy_pool=source.proxy_pool(),
+                        )
+                        import json as _json
+
+                        resp = _json.loads(text) if text else {}
+            else:
+                qs = urlencode(filled)
+                page_url = f"{abs_url}&{qs}" if "?" in abs_url else f"{abs_url}?{qs}"
+                resp = self._http.get_json(
+                    page_url, headers=headers,
+                    timeout=self._timeout(source), retries=self._retries(source),
+                    proxy_pool=source.proxy_pool(),
+                )
+
+            node = resp
+            rpath = cfg.get("response_path") or ""
+            if rpath:
+                node = self._jsonpath(resp, rpath)
+            children_path = cfg.get("children_path") or ""
+            raw_items = []
+            if children_path and isinstance(node, list):
+                for sub in node:
+                    if isinstance(sub, dict) and isinstance(sub.get(children_path), list):
+                        raw_items.extend(sub[children_path])
+            elif isinstance(node, list):
+                raw_items = node
+            if not raw_items:
+                break  # 空页：轮询结束
+            for it in raw_items:
+                if not isinstance(it, dict):
+                    continue
+                c_title = str(it.get(title_key) or "").strip()
+                c_url = url_tpl
+                for ph, val in (("{id}", book_id), ("{chapter_id}", str(it.get(cid_key) or ""))):
+                    c_url = c_url.replace(ph, val)
+                c_url = utils.fill_template(c_url, it)
+                if not (c_title and c_url):
+                    continue
+                norm = c_url.rstrip("/").lower()
+                if norm in seen_url:
+                    continue
+                seen_url.add(norm)
                 out.append({"title": c_title, "url": c_url})
         return out
+
+    def _encrypt_request_body(self, encrypt: dict, filled: dict) -> str:
+        """把请求体 JSON 序列化后 AES-CBC 加密为 base64（源 JS 等价逻辑）。"""
+        import json as _json
+
+        text = _json.dumps(filled, ensure_ascii=False, separators=(",", ":"))
+        if self._decrypter is not None:
+            return self._decrypter.aes_cbc_encrypt_text(
+                str(encrypt.get("key") or ""), str(encrypt.get("iv") or ""), text
+            )
+        raise ContentMissingError("请求体需 AES 加密但未配置解密器", source_id="")
 
     # ------------------------------------------------------------------ #
     def fetch_chapter(self, source: SourceConfig, url: str) -> str:
@@ -2181,13 +2253,16 @@ class Content:
                 source_id=(source.source_id if source else ""),
             )
         raw_url = raw_url.replace("\\/", "/")
-        # ps=1 → 走 parse 接口转码（iframe 外链源 → m3u8）
+        # ps=1 → 走 parse 接口转码（iframe 外链源 → m3u8；parse 端自解加密）
         ps = str(obj.get("ps", "0") or "0")
         parse_url = (obj.get("parse") or switch_cfg.get("default_parse") or "")
         parse_url = parse_url.replace("\\/", "/")
         if ps == "1" and parse_url:
             sep = "&" if "?" in parse_url else "?"
             return f"{parse_url}{sep}url={raw_url}"
+        # ps=0 → url 直用（MacCMS 密文时按 decryption.targets.video_url 解密）
+        if source is not None and self._decrypter is not None:
+            return self._decrypter.decrypt(source, raw_url, "video_url")
         return raw_url
 
     def _fetch_chapters_for_source(

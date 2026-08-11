@@ -422,6 +422,7 @@ class HttpClient:
         retries: int | None = None,
         encoding: Optional[str] = None,
         proxy_pool: Optional[ProxyPool] = None,
+        interval_ms: int | None = None,
     ) -> str:
         """POST 表单并返回响应文本。encoding 指定响应编码（如utf-8）。
         proxy_pool: 代理IP池，反爬/失败时换IP重试。"""
@@ -433,8 +434,10 @@ class HttpClient:
             retries = self.defaults.retries
         if proxy is None:
             proxy = self.defaults.proxy
+        if interval_ms is None:
+            interval_ms = self.defaults.interval_ms
         headers = self._headers_with_ua(headers)
-        self._sleeper(0.0)
+        self._sleeper(interval_ms / 1000.0)
 
         def _once(current_proxy: Optional[str]) -> str:
             last_error: Exception | None = None

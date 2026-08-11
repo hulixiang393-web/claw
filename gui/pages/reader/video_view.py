@@ -970,10 +970,16 @@ class VideoView(QWidget):
             hdrs = _rh() or {}
         from framework.external_player import open_with_player
 
+        # 源 ad_block 配置：播放代理转发 m3u8 时过滤广告段（下载已有过滤）
+        ad_block = {}
+        try:
+            ad_block = (self._source.raw or {}).get("ad_block") or {}
+        except Exception:  # noqa: BLE001
+            pass
         msg = open_with_player(
             video, audio=audio,
             referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
-            headers=hdrs,
+            headers=hdrs, ad_block=ad_block,
         )
         self._show_status(f"{msg}：{title or video}")
         self.play_btn.setText("▶")

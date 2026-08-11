@@ -1,0 +1,170 @@
+{
+  "$schema_version": 2,
+  "$id": "shuyous",
+  "$type": "novel",
+  "$name": "书友社",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.shuyous.com/",
+    "description": "书友社 - 小说阅读网（UTF-8，服务端渲染，纯 HTTP。站点无搜索接口，目录页服务端仅返回前 100 章 + 最新章节，正文无加密直接可读）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "小说",
+      "免费"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.shuyous.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept-Language": "zh-CN,zh;q=0.9"
+    },
+    "timeout": 10,
+    "retries": 2,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/list-18-{page}/",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "现代言情",
+            "url": "/list-18-{page}/"
+          },
+          {
+            "title": "古代言情",
+            "url": "/list-16-{page}/"
+          },
+          {
+            "title": "仙侠奇缘",
+            "url": "/list-17-{page}/"
+          },
+          {
+            "title": "浪漫青春",
+            "url": "/list-19-{page}/"
+          },
+          {
+            "title": "玄幻言情",
+            "url": "/list-20-{page}/"
+          },
+          {
+            "title": "悬疑推理",
+            "url": "/list-21-{page}/"
+          },
+          {
+            "title": "科幻空间",
+            "url": "/list-22-{page}/"
+          },
+          {
+            "title": "游戏竞技",
+            "url": "/list-23-{page}/"
+          },
+          {
+            "title": "短篇言情",
+            "url": "/list-24-{page}/"
+          },
+          {
+            "title": "轻小说",
+            "url": "/list-42-{page}/"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.list2 ul li"
+        },
+        "fields": {
+          "title": {
+            "css": "div.name a"
+          },
+          "url": {
+            "css": "div.name a",
+            "attr": "href"
+          },
+          "author": {
+            "css": "div.author"
+          },
+          "status": {
+            "css": "div.cate"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/book/(\\d+)",
+      "fields": {
+        "title": {
+          "css": "div.chapterCon div.txtb div.name"
+        },
+        "author": {
+          "css": "div.chapterCon div.txtb div.txt ul li.li4:nth-of-type(1)"
+        },
+        "cover": {
+          "css": "div.chapterCon div.picb div.pic img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": "div.introTxt"
+        },
+        "status": {
+          "css": "div.chapterCon div.txtb div.txt ul li.li4:nth-of-type(3)"
+        },
+        "tags": {
+          "css": "div.chapterCon div.txtb div.txt ul li.li4:nth-of-type(2)"
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "list": {
+          "chapters_url": "/book/{id}.html",
+          "root_selector": {
+            "css": "div.chapterList div.list ul li"
+          },
+          "fields": {
+            "title": {
+              "css": "div.name a"
+            },
+            "url": {
+              "css": "div.name a",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": "div.content p"
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "discovery": {
+      "max_pages": 50
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 500,
+      "max_items": 5000
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "body"
+      }
+    }
+  }
+}

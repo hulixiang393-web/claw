@@ -616,9 +616,13 @@ class SearchPage(BasePage):
             return
         display = self._current_display()
         cols = self._columns()
-        # 首屏只渲染到 _page_size 条上限；后续页到达只累积 _results，
-        # 超过上限不再追着渲染（防边抓边显示一次性插入大量卡片闪屏）
-        new_shown = min(len(display), self._page_size)
+        # 首屏渲染量：填满视口（而非固定 _page_size 条）——否则结果多时
+        # 只渲染十几张、布局未刷新前滚动条不出现，用户看不到更多（"只显示
+        # 第一页"）。按视口高估算行数（卡片高约 292px，4 列）再留一屏缓冲，
+        # 让首屏渲染后滚动条必然出现；仍保留上限防一次性建几百张卡片闪屏。
+        rows = max(1, self.scroll.viewport().height() // 292 + 1)
+        first_batch = max(self._page_size, rows * cols)
+        new_shown = min(len(display), first_batch)
         while self._shown_count < new_shown:
             r = display[self._shown_count]
             self._append_card(r, cols)
@@ -666,8 +670,15 @@ class SearchPage(BasePage):
         display = self._current_display()
         if self._shown_count >= len(display):
             return
-        if self._shown_count >= self._page_size * (1 + self._preload_depth):
-            return  # 预加载深度到顶（首屏 1 批 + 缓冲 _preload_depth 批），等滚动
+        # 预加载深度：按视口填满度（首屏一批 + 缓冲若干屏）而非固定 _page_size
+        # 倍数——固定倍数（如 12*3=36）在结果多时只补 36 条就停，布局未刷新前
+        # 滚动条不出现，用户看到"只第一页"。按视口估算"已渲染量 ≥ 数屏"再停，
+        # 保证首屏后滚动条必然出现、用户可继续滚动加载。
+        cols = max(1, self._columns())
+        vp_rows = max(1, self.scroll.viewport().height() // 292)
+        fill_rows = (self._shown_count + cols - 1) // cols  # 已渲染占几行
+        if fill_rows >= vp_rows * (1 + self._preload_depth):
+            return  # 已渲染 ≥ 视口 1+_preload_depth 屏，等滚动触发
         if self.scroll.verticalScrollBar().maximum() >= self.scroll.height():
             return  # 视口已填满，等滚动触发
         QTimer.singleShot(0, self._load_more_results)

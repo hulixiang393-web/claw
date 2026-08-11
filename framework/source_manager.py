@@ -50,6 +50,7 @@ class SourceManager:
         self._runtime = runtime_settings or {}
         self._cookie_provider = None  # 可选: load(source_id) -> cookie_header 字符串
         self._auto_disabled: set = set()  # 因连续失败被自动禁用的 source_id（恢复路径专用）
+        self._soft_deleted: set = set()  # 软删除了的 source_id（配置保留，列表/发现均不出现）
         if self._health_file is not None:
             self._load_health()
         if sources_dir is not None:
@@ -69,6 +70,10 @@ class SourceManager:
                 config = load_source(path)
             except ConfigError as exc:
                 self._warnings.append(f"跳过 {path.name}：{exc.message}")
+                continue
+            if config.raw.get("$deleted"):
+                # 软删除过的源：配置保留但不出现在列表（重启后仍保持隐藏）
+                self._soft_deleted.add(config.source_id)
                 continue
             self.add(config)
 
@@ -99,6 +104,41 @@ class SourceManager:
 
     def all(self) -> List[SourceConfig]:
         return list(self._sources.values())
+
+    def soft_deleted_ids(self) -> List[str]:
+        return list(self._soft_deleted)
+
+    def is_soft_deleted(self, source_id: str) -> bool:
+        return source_id in self._soft_deleted
+
+    def soft_delete(self, source_id: str) -> None:
+        """软删除：$deleted=true + 禁用，持久化到源 JSON，配置保留可恢复。"""
+        source = self.get(source_id)
+        source.raw["$deleted"] = True
+        self._persist_enabled(source, False)
+        source.enabled = False
+        self._auto_disabled.discard(source_id)
+        self._soft_deleted.add(source_id)
+        self._sources.pop(source_id, None)
+
+    def restore(self, source_id: str) -> None:
+        """恢复软删除的源：清 $deleted 并重新启用（源文件仍在 sources 目录）。"""
+        path = Path(self._sources_dir) / f"{source_id}.json"
+        try:
+            cfg = load_source(path)
+        except ConfigError as exc:
+            raise SourceNotFoundError(f"恢复失败：{exc.message}", source_id=source_id) from exc
+        cfg.raw["$deleted"] = False
+        cfg.raw["$enabled"] = True
+        cfg.enabled = True
+        try:
+            path.write_text(
+                json.dumps(cfg.raw, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        self._soft_deleted.discard(source_id)
+        self.add(cfg)
 
     def by_type(self, content_type: str) -> List[SourceConfig]:
         return [s for s in self._sources.values() if s.content_type == content_type]
@@ -151,6 +191,12 @@ class SourceManager:
         source.enabled = enabled
         # 手动启停后由用户掌控，清除自动禁用标记（不再走自动恢复路径）
         self._auto_disabled.discard(source_id)
+
+    def set_enabled_persist(self, source_id: str, enabled: bool) -> None:
+        """启停并持久化 $enabled 到源 JSON（供删除/禁用等需要重启后保留的场景）。"""
+        self.set_enabled(source_id, enabled)
+        source = self.get(source_id)
+        self._persist_enabled(source, enabled)
 
     def set_weight(self, source_id: str, weight: float) -> None:
         source = self.get(source_id)

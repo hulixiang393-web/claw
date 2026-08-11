@@ -76,9 +76,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if entry is None:
             self.send_error(404, "token not found")
             return
-        target, headers = entry
+        target, headers, ad_block = entry
         try:
-            proxy._forward(self, target, headers)
+            proxy._forward(self, target, headers, ad_block)
         except Exception as exc:  # noqa: BLE001 —— 网络波动直接断流，播放器会提示
             try:
                 self.send_error(502, f"proxy error: {exc}")
@@ -125,14 +125,19 @@ class MediaProxy:
         self._last_use = time.time()
 
     # ------------------------------------------------------------------ #
-    def build_url(self, target_url: str, headers: dict | None = None) -> str:
-        """把目标媒体 URL 打包成本地代理 URL（播放器直接播这个）。"""
+    def build_url(self, target_url: str, headers: dict | None = None,
+                  ad_block: dict | None = None) -> str:
+        """把目标媒体 URL 打包成本地代理 URL（播放器直接播这个）。
+
+        ad_block：可选源 ad_block 配置。存在时代理转发 m3u8 会剔除广告段
+        （下载路径已有过滤；播放路径此前无过滤，广告分片会照播）。
+        """
         if not target_url:
             return ""
         self._ensure_server()
         token = uuid.uuid4().hex
         with self._lock:
-            self._tokens[token] = (target_url, dict(headers or {}))
+            self._tokens[token] = (target_url, dict(headers or {}), ad_block)
         return f"http://127.0.0.1:{self._server.server_address[1]}/s/{token}"
 
     def _ensure_server(self) -> None:
@@ -155,20 +160,26 @@ class MediaProxy:
             self._tokens.clear()
 
     # ------------------------------------------------------------------ #
-    def _new_token(self, target: str, headers: dict) -> str:
+    def _new_token(self, target: str, headers: dict, ad_block: dict | None = None) -> str:
         token = uuid.uuid4().hex
         with self._lock:
-            self._tokens[token] = (target, headers)
+            self._tokens[token] = (target, headers, ad_block)
         return token
 
-    def _proxy_url(self, target: str, base: str, headers: dict) -> str:
+    def _proxy_url(self, target: str, base: str, headers: dict,
+                   ad_block: dict | None = None) -> str:
         full = urljoin(base, target)
-        token = self._new_token(full, headers)
+        token = self._new_token(full, headers, ad_block)
         return f"http://127.0.0.1:{self._server.server_address[1]}/s/{token}"
 
     # ------------------------------------------------------------------ #
-    def _forward(self, handler: "_ProxyHandler", target: str, headers: dict) -> None:
-        """转发一次请求。响应是 m3u8 则重写内部 URL，否则流式转发。"""
+    def _forward(self, handler: "_ProxyHandler", target: str, headers: dict,
+                 ad_block: dict | None = None) -> None:
+        """转发一次请求。响应是 m3u8 则重写内部 URL，否则流式转发。
+
+        ad_block：源 ad_block 配置。非空时 m3u8 重写前先剔除广告段
+        （播放路径广告过滤，与下载路径 filter_m3u8 一致的判定启发式）。
+        """
         req_headers = dict(headers)
         # 透传客户端 Range（拖动进度 / 分片定位）。
         # 但 m3u8 播放列表必须整读：VLC 拉 m3u8 时常带 Range（如 bytes=0-1275
@@ -205,7 +216,11 @@ class MediaProxy:
                     self._send_body(handler, resp, body)
                     return
                 text = body.decode("utf-8", "replace")
-                rewritten = self._rewrite_m3u8(text, target, headers)
+                # 播放路径广告过滤：源配了 ad_block → 剔除 m3u8 广告段再重写
+                # （VLC 播放时不再插播广告分片；判定与下载路径 filter_m3u8 一致）
+                if ad_block:
+                    text = self._filter_ad_segments(text, target, ad_block)
+                rewritten = self._rewrite_m3u8(text, target, headers, ad_block)
                 body = rewritten.encode("utf-8")
                 handler.send_response(200)
                 handler.send_header("Content-Type", "application/vnd.apple.mpegurl")
@@ -225,10 +240,13 @@ class MediaProxy:
             is_m3u8 = first.startswith(b"#EXTM3U") or (resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
 
             if is_m3u8:
-                # 读完整文本，重写内部 URL（分片/KEY/变体）为本地代理
+                # 读完整文本，重写内部 URL（分片/KEY/变体）为本地代理。
+                # gzip 压缩时 first 已是完整解压内容（上方分支），rest 为空。
                 rest = resp.raw.read()
                 text = (first + rest).decode("utf-8", "replace")
-                rewritten = self._rewrite_m3u8(text, target, headers)
+                if ad_block:
+                    text = self._filter_ad_segments(text, target, ad_block)
+                rewritten = self._rewrite_m3u8(text, target, headers, ad_block)
                 body = rewritten.encode("utf-8")
                 handler.send_response(200)
                 handler.send_header("Content-Type", "application/vnd.apple.mpegurl")
@@ -273,26 +291,53 @@ class MediaProxy:
         handler.wfile.write(body)
 
     # ------------------------------------------------------------------ #
-    def _rewrite_m3u8(self, text: str, base: str, headers: dict) -> str:
-        """重写 m3u8 内部所有媒体 URL（分片 / EXT-X-KEY / EXT-X-MEDIA / 变体）为本地代理 URL。"""
+    def _filter_ad_segments(self, m3u8_text: str, base_url: str, ad_block: dict) -> str:
+        """按源 ad_block 配置剔除 m3u8 广告段（播放路径广告过滤）。
+
+        复用 adblock 引擎的 filter_m3u8（URL 广告特征 + 重复段 + 孤立短块
+        判定，与下载路径一致）。失败/异常返回原文（不过滤不阻断播放）。
+        """
+        try:
+            from .adblock import AdblockEngine
+            engine = AdblockEngine()
+            # 用源 ad_block 配置构造引擎（enabled/block_domains/block_url_regex）
+            engine.configure(type("S", (), {"raw": {"ad_block": ad_block}})())
+            if engine.enabled:
+                return engine.filter_m3u8(m3u8_text, base_url)
+        except Exception:  # noqa: BLE001 —— 过滤失败不阻断播放
+            pass
+        return m3u8_text
+
+    # ------------------------------------------------------------------ #
+    def _rewrite_m3u8(self, text: str, base: str, headers: dict,
+                      ad_block: dict | None = None) -> str:
+        """重写 m3u8 内部所有媒体 URL（分片 / EXT-X-KEY / EXT-X-MEDIA / 变体）为本地代理 URL。
+
+        ad_block 透传给分片 token：子清单/嵌套 m3u8 继续带过滤配置（保持
+        do_GET 解包 3 元组一致，且嵌套清单也能过滤广告）。
+        """
         out = []
         for ln in text.splitlines():
             s = ln.strip()
             if s.startswith(("#EXT-X-KEY", "#EXT-X-MEDIA", "#EXT-X-MAP", "#EXT-X-SESSION-KEY", "#EXT-X-PRELOAD-HINT", "#EXT-X-IMAGE-STREAM-INF", "#EXT-X-I-FRAME-STREAM-INF")):
                 # 这些标签的 URI="..." 属性也要代理
-                ln = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{self._proxy_url(m.group(1), base, headers)}"', ln)
+                ln = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{self._proxy_url(m.group(1), base, headers, ad_block)}"', ln)
             elif s and not s.startswith("#") and not s.startswith("<"):
                 # 普通行 = 分片 / 变体 URL
-                ln = self._proxy_url(ln, base, headers)
+                ln = self._proxy_url(ln, base, headers, ad_block)
             out.append(ln)
         return "\n".join(out) + "\n"
 
 
 # ------------------------------------------------------------------ #
-def proxy_url_for(url: str, headers: dict | None = None) -> str:
-    """便捷入口：把媒体 URL 转成本地代理 URL（带防盗链 headers）。"""
+def proxy_url_for(url: str, headers: dict | None = None,
+                  ad_block: dict | None = None) -> str:
+    """便捷入口：把媒体 URL 转成本地代理 URL（带防盗链 headers）。
+
+    ad_block：可选源 ad_block 配置，非空时代理转发 m3u8 会剔除广告段。
+    """
     if not url:
         return ""
     if headers:
-        return MediaProxy.instance().build_url(url, headers)
+        return MediaProxy.instance().build_url(url, headers, ad_block=ad_block)
     return url

@@ -163,6 +163,10 @@
 | `item.fields.update` | `selector` | 最新更新 |
 | `item.fields.tags` | `selector` | 标签 |
 | `item.fields.status` | `selector` | 状态 |
+| `item.clean` | `object` | 结果字段清洗：`{字段名: [[pattern, repl], ...]}`，pattern 以 `re:` 开头按正则替换（同 detail `fields.clean`） |
+| `pre_fetch` | `object` | POST 前先 GET 取动态 token：`{url, regex, param}`（regex 提取 group(1)，注入 body 的 param 字段，如 rrssk 搜索的 `_t`） |
+
+> **selector 通用键**：除 `css`/`xpath`/`attr` 外还支持 `regex`（对提取值 re.search 取 group(1)，如 onclick 属性里的隐藏 URL）与 `b64decode`（对提取值 URL 解码后 base64 解码，取隐藏跳转目标）。
 
 </details>
 
@@ -188,6 +192,7 @@
 | `fields.status` | `selector` | 状态 |
 | `fields.tags` | `selector` | 标签 |
 | `fields.meta` | `object` | 自定义额外字段 |
+| `fields.clean` | `object` | 字段清洗：`{字段名: [[pattern, repl], ...]}`，pattern 以 `re:` 开头按正则替换（如 summary 去"最新章节推荐地址"尾巴）；支持 author / status / summary / tags |
 
 </details>
 
@@ -432,7 +437,7 @@
 
 | 键 | 类型 | 用途 |
 |---|---|---|
-| `targets.*.strategy` | `enum` | 解密策略 `xor` / `aes_cbc` / `aes_ecb` / `rsa` / `custom_endpoint` |
+| `targets.*.strategy` | `enum` | 解密策略 `xor` / `aes_cbc` / `aes_ecb` / `rsa` / `base64_decode` / `maccms_url` / `translit` / `custom_endpoint` / `js_custom` |
 
 **选填**：
 
@@ -450,6 +455,9 @@
 | `.request_field` / `request_fields` | `string\|object` | 请求字段名 |
 | `.response_field` | `string` | 响应字段名 |
 | `.fallback_endpoint` | `string` | 备用解密服务 |
+| `.entry` | `string` | JS 入口函数名（`js_custom` 用，默认 `decrypt`） |
+| `.script` | `string` | JS 解密函数源码（`js_custom` 用） |
+| `.params` | `object` | JS 参数对象（`js_custom` 用，可放密钥/偏移等） |
 
 </details>
 

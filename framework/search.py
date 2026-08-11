@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import re as _re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from urllib.parse import quote, urlencode, urljoin
@@ -186,12 +187,22 @@ class Search:
         def _fetch(page: int):
             """抓取并解析第 page 页，返回 (page, items)。失败返回空列表。"""
             try:
+                body = {}
                 if method == "POST" and not url_template:
                     # POST：body 加 page 参数（配了 url_template 则改用 GET 模板拼 URL）
                     abs_url = urljoin(source.base_url, base_url)
                     body = {kw_param: keyword, page_param: page}
                     for k, v in extra.items():
                         body.setdefault(k, v)
+                    # 前置请求取动态 token（如 rrssk 的 _t）：pre_fetch.{url,regex,param}
+                    pre = search_cfg.get("pre_fetch") or {}
+                    if pre.get("url") and pre.get("regex"):
+                        pre_text = self._http_get(
+                            source, urljoin(source.base_url, pre["url"]), http=http
+                        )
+                        m = _re.search(str(pre["regex"]), pre_text)
+                        if m:
+                            body.setdefault(pre.get("param") or "token", m.group(1))
                     text = self._http_post_form(source, abs_url, body, http=http)
                 else:
                     # GET / 分页模板：统一由 _build_page_url 构造第 page 页 URL
@@ -212,6 +223,11 @@ class Search:
             try:
                 doc = self._parser.parse(text)
                 items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
+                # 字段清洗：item.clean.{field} 为 [pattern, repl] 替换对列（同 detail fields.clean）
+                for it in items:
+                    for _c_key, _pairs in (item_cfg.get("clean") or {}).items():
+                        if _c_key in it:
+                            it[_c_key] = self._apply_clean(it[_c_key], _pairs)
                 return (page, items or [])
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] 搜索第 %d 页解析失败：%s", source.source_id, page, exc)
@@ -607,6 +623,21 @@ class Search:
             rep.title = f"{head.title}（{len(items)} 个源）"
             merged.append(rep)
         return merged
+
+    @staticmethod
+    def _apply_clean(value, pairs) -> str:
+        """按替换对列表清洗字段：pattern 以 "re:" 前缀按正则替换（同 content._clean_field）。"""
+        import re as _re2
+
+        value = str(value or "").strip()
+        for pat, repl in (pairs or []):
+            if not pat:
+                continue
+            if pat.startswith("re:"):
+                value = _re2.sub(pat[3:], str(repl or ""), value)
+            else:
+                value = value.replace(pat, str(repl or ""))
+        return value.strip()
 
     @staticmethod
     def _clean_title(title: str) -> str:

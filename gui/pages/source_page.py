@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
@@ -17,8 +18,10 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QFrame,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -32,6 +35,7 @@ from framework.source_manager import (
     HEALTH_WARN,
     HEALTH_BROKEN,
 )
+from framework.config import SourceConfig, ConfigError
 from framework.selfcheck import StructureChecker
 
 from gui.components import EmptyState
@@ -363,6 +367,11 @@ class SourcePage(BasePage):
         self.add_btn.clicked.connect(self._on_add_source)
         self._toolbar.addWidget(self.add_btn)
 
+        self.import_btn = QPushButton("导入 JSON")
+        self.import_btn.setFixedWidth(90)
+        self.import_btn.clicked.connect(self._on_import_json)
+        self._toolbar.addWidget(self.import_btn)
+
     # ------------------------------------------------------------------ #
     def _rebuild_rows(self) -> None:
         """从 SourceManager 清空并重建所有源行。"""
@@ -421,18 +430,22 @@ class SourcePage(BasePage):
         self._manager.set_weight(source_id, weight)
 
     # ---------- 启停 / 诊断 ------------------------------------------- #
+    def _visible_sources(self):
+        """当前应显示的所有源（软删除的源在 manager.all() 已不含）。"""
+        return self._manager.all()
+
     def _on_enable_all(self) -> None:
-        for s in self._manager.all():
+        for s in self._visible_sources():
             self._manager.set_enabled(s.source_id, True)
         self._sync_row_enabled()
 
     def _on_disable_all(self) -> None:
-        for s in self._manager.all():
+        for s in self._visible_sources():
             self._manager.set_enabled(s.source_id, False)
         self._sync_row_enabled()
 
     def _sync_row_enabled(self) -> None:
-        for s in self._manager.all():
+        for s in self._visible_sources():
             for row in self._rows:
                 if row.source().source_id == s.source_id:
                     row.set_enabled_state(s.enabled)
@@ -440,7 +453,7 @@ class SourcePage(BasePage):
 
     def _on_diagnose_all(self) -> None:
         """全部诊断：后台逐个跑 selfcheck，更新健康灯。"""
-        sources = [s for s in self._manager.all() if s.enabled]
+        sources = [s for s in self._visible_sources() if s.enabled]
         if not sources:
             return
         for s in sources:
@@ -512,6 +525,46 @@ class SourcePage(BasePage):
     def _on_add_source(self) -> None:
         self.edit_requested.emit("")
 
+    def _on_import_json(self) -> None:
+        """导入本地 JSON 配置文件为一个新源（校验通过后直接落盘）。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入源 JSON", "", "JSON 文件 (*.json);;所有文件 (*)",
+        )
+        if not path:
+            return
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            QMessageBox.critical(self, "导入失败", f"无法解析 JSON 文件：\n{exc}")
+            return
+        if not isinstance(raw, dict):
+            QMessageBox.critical(self, "导入失败", "JSON 顶层必须是对象（源配置）")
+            return
+        try:
+            cfg = SourceConfig.from_dict(raw, path=path)
+        except ConfigError as exc:
+            QMessageBox.critical(self, "导入失败", f"配置不合法，无法导入：\n{exc.message}")
+            return
+        sid = cfg.source_id
+        dest = self._sources_dir / f"{sid}.json"
+        if dest.exists():
+            resp = QMessageBox.question(
+                self,
+                "已存在",
+                f"源「{sid}」已存在（{dest.name}），是否覆盖？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+        try:
+            dest.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "保存失败", f"写入失败：{exc}")
+            return
+        self._manager.load_dir(self._sources_dir)
+        self.refresh()
+        QMessageBox.information(self, "导入成功", f"源「{cfg.source_name}」已导入并启用。")
+
     def _on_login(self, source) -> None:
         """打开登录弹窗：内嵌浏览器登录源站点，保存 Cookie。"""
         if self._cookie_manager is None:
@@ -557,7 +610,7 @@ class SourcePage(BasePage):
         msg.setWindowTitle("删除源")
         msg.setText(f"确认删除「{name}」？")
         msg.setInformativeText(
-            "默认软删除（禁用该源，配置保留可恢复）。也可同时删除配置文件（不可恢复）。"
+            "默认软删除（禁用该源并从此列表移除，配置文件保留可恢复）。也可同时删除配置文件（不可恢复）。"
         )
         soft_btn = msg.addButton("软删除", QMessageBox.AcceptRole)
         hard_btn = msg.addButton("同时删除文件", QMessageBox.DestructiveRole)
@@ -565,7 +618,7 @@ class SourcePage(BasePage):
         msg.exec()
         clicked = msg.clickedButton()
         if clicked == soft_btn:
-            self._manager.set_enabled(source.source_id, False)
+            self._manager.soft_delete(source.source_id)
             self.refresh()
         elif clicked == hard_btn:
             self._confirm_hard_delete(source)

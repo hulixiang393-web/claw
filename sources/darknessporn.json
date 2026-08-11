@@ -1,0 +1,233 @@
+{
+  "$schema_version": 2,
+  "$id": "darknessporn",
+  "$type": "video",
+  "$name": "DarknessPorn",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://darknessporn.com",
+    "description": "DarknessPorn - 成人视频站（WordPress，详情页内嵌直接可播 MP4，无需二级跳转）。列表/搜索共用 .thumb 卡片；播放地址 = 详情页 <video><source src=..._high.mp4>，play_url.selector 直接提取。",
+    "lang": "en",
+    "region": "en",
+    "tags": [
+      "视频",
+      "成人",
+      "mp4"
+    ],
+    "last_verified": "2026-08-11"
+  },
+  "transports": {
+    "base_url": "https://darknessporn.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://darknessporn.com/"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 800,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/page/{page}/",
+      "note": "站点分页为 WordPress 式 /page/N/：首页 /page/1/ 会 301 到 /（正常），但分类页 /7652-hentai/page/1/ 会返回 500（Tracy 服务端错误，确定性站点 bug）——因此分类 URL 用基底 /7652-hentai/（第 1 页正常出 48 条），翻页用 page_placeholder 正则（对基底无匹配 → 第 2 页起复用基底，GUI 按 URL 去重不重复渲染）；「最新视频」用 /page/{page}/ 走 {page} 占位，翻页完整可用。",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "page_placeholder": "/page/\\d+/"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "最新视频",
+            "url": "/page/{page}/"
+          },
+          {
+            "title": "Hentai",
+            "url": "/7652-hentai/"
+          },
+          {
+            "title": "3D",
+            "url": "/26853-3d/"
+          },
+          {
+            "title": "Monster",
+            "url": "/4995-monsters/"
+          },
+          {
+            "title": "Gangbang",
+            "url": "/26860-gangbang/"
+          },
+          {
+            "title": "BDSM",
+            "url": "/118-bdsm/"
+          },
+          {
+            "title": "Kink",
+            "url": "/115-kink/"
+          },
+          {
+            "title": "Rough",
+            "url": "/25-rough/"
+          },
+          {
+            "title": "Pregnant",
+            "url": "/80643-pregnant/"
+          },
+          {
+            "title": "Anal Fisting",
+            "url": "/80648-anal-fisting/"
+          },
+          {
+            "title": "Femdom",
+            "url": "/80651-femdom/"
+          },
+          {
+            "title": "Piss",
+            "url": "/80650-piss/"
+          },
+          {
+            "title": "Slave",
+            "url": "/16017-slave/"
+          },
+          {
+            "title": "Humiliation",
+            "url": "/80644-humiliation/"
+          },
+          {
+            "title": "Pain",
+            "url": "/1346-pain/"
+          },
+          {
+            "title": "Tattooed",
+            "url": "/20782-tattooed/"
+          },
+          {
+            "title": "Young",
+            "url": "/15609-young/"
+          },
+          {
+            "title": "Lesbian",
+            "url": "/103057-lesbian/"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "a.thumb",
+          "exclude": [
+            {
+              "css": "a[href*='neurogrid7.com']"
+            }
+          ]
+        },
+        "fields": {
+          "title": {
+            "css": "a.thumb",
+            "attr": "aria-label"
+          },
+          "url": {
+            "css": "a.thumb",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.video-img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/",
+      "method": "GET",
+      "keyword_param": "s",
+      "paginator": {
+        "url_template": "/?s={keyword}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "a.thumb",
+          "exclude": [
+            {
+              "css": "a[href*='neurogrid7.com']"
+            }
+          ]
+        },
+        "fields": {
+          "title": {
+            "css": "a.thumb",
+            "attr": "aria-label"
+          },
+          "url": {
+            "css": "a.thumb",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.video-img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "css": "h1"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "video",
+          "attr": "poster"
+        },
+        "tags": {
+          "css": ".tag a.label-tag-video"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页即播放页（WordPress 单集作品，无分集列表）：内嵌 <video><source src=..._high.mp4><source src=..._low.mp4>，单集结构直接用详情 URL 作为唯一集，play_url.selector 取第一个 <source>（high 画质）的 src。",
+        "play_url": {
+          "selector": {
+            "css": "video source",
+            "attr": "src"
+          }
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "mp4",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 48
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

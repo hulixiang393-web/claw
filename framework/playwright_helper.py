@@ -904,6 +904,21 @@ def fetch_rendered_pages_batch_sync(
 # ------------------------------------------------------------------ #
 # 渲染后提取正文文本（SPA 小说站用）
 # ------------------------------------------------------------------ #
+def evaluate_js_sync(expr: str) -> object:
+    """在常驻浏览器中用 evaluate 执行一段 JS 表达式并取回结果。
+
+    供自定义解密（js_custom 策略）等需要 JS 引擎的场景使用；
+    不需要真实页面渲染，仅借用 Chromium 的 JS 引擎。表达式按原样
+    evaluate（Playwright 的 evaluate 会把字符串当表达式求值）：
+    - 纯表达式如 "1+2" → 3
+    - IIFE / 顶层语句已封装由调用方构造（如 "(function(){...})()"）
+    返回值经 Playwright 序列化返回（str/number/bool/list/dict）。
+    """
+    with _sync_browser() as (p, browser):
+        with _sync_page(browser) as page:
+            return page.evaluate(expr)
+
+
 def fetch_rendered_text_sync(
     url: str,
     selector: str,
@@ -1081,10 +1096,24 @@ def fetch_rendered_video_sync(
                     for f in page.frames:
                         try:
                             vids = f.query_selector_all("video")
+                            found_mp4 = ""
                             for v in vids:
-                                src = v.get_attribute("src") or ""
-                                if src and src.startswith("http"):
-                                    return src
+                                # videojs/VHS 会把 HLS 渲染成 blob: src（不以 http 开头，
+                                # 原逻辑直接跳过），真实 m3u8 留在 <video> 的 <source> 子节点
+                                # 上（5238 播放页）。因此同时读 video 自身 src 与其全部
+                                # <source> 子节点 src：优先 .m3u8（HLS 稳定地址），
+                                # 再兜底 .mp4（带签名时效的预览变体）。
+                                for src in (v.get_attribute("src") or "",
+                                            *(sv.get_attribute("src") or ""
+                                              for sv in v.query_selector_all("source"))):
+                                    if not src.startswith("http"):
+                                        continue
+                                    if ".m3u8" in src:
+                                        return src
+                                    if not found_mp4:
+                                        found_mp4 = src
+                            if found_mp4:
+                                return found_mp4
                         except Exception:
                             continue
                     page.wait_for_timeout(4000)
