@@ -7,7 +7,7 @@
   "$weight": 1.0,
   "$metadata": {
     "homepage": "https://www.5238.me/",
-    "description": "5238動漫 - WordPress 站，成人動漫影片在線播放。播放地址提取链：详情页内嵌 iframe player5238G.php（video.520cc.cc）→ 播放页 refresh_page() AJAX 拉取 get3G.php（id/key/rand 由播放页注入）→ 响应 var ccsJsCmds 为 Caesar 移位4 + URL 编码的 JS，经 myencryptHTML + unescape 解码后含 <video><source src=\"...m3u8\">。视频为 HLS m3u8（AES-128，CDN vs02aa.520cc.cc，分片/key 均无防盗链，实测 200）。⚠ 内核阻塞点：当前 framework/playwright_helper.py 的 fetch_rendered_video_sync 只读 <video> 元素自身 src 属性（videojs/VHS 渲染后为 blob: 地址，不以 http 开头而被跳过），真实 m3u8 在 <video> 的 <source> 子节点上 → 需内核补丁支持提取 <video> <source> src（见报告）。源本身 discovery/search/detail 均正常。",
+    "description": "5238動漫 - WordPress 站，成人動漫影片在線播放。播放地址提取链：详情页内嵌 iframe player5238G.php（video.520cc.cc）→ 播放页 JS 内 get3G.php?mp4=0 → 响应 var ccsJsCmds 为 Caesar 移位4 + URL 编码的 JS，解码后含 <video><source src=\"...m3u8\">。视频为 HLS m3u8（CDN vs02aa.520cc.cc / surecdn.cc，分片/key 均无防盗链，实测 200）。取流走 play_url.http_chain 纯 HTTP（不依赖 Playwright），秒级完成。源 discovery/search/detail 均正常。",
     "lang": "zh-TW",
     "region": "tw",
     "tags": [
@@ -121,14 +121,31 @@
     "content": {
       "episode": {
         "single_chapter": true,
-        "note": "详情页即播放页（内嵌 iframe player5238G.php → get3G.php → 解码出 m3u8）。需 Playwright 渲染执行 iframe 内 JS + get3G AJAX 拿到真实视频地址；当前内核 fetch_rendered_video_sync 因 videojs 把 video.src 置为 blob 而提取不到（见 metadata.description 阻塞点）。",
+        "note": "详情页即播放页。播放地址链：详情页内嵌 iframe player5238G.php（video.520cc.cc）→ 播放页 JS 内 get3G.php?mp4=0 → 响应 var ccsJsCmds 为 Caesar 移位+URL 编码的 JS，解码后含 <video><source src=...m3u8>。用 play_url.http_chain 纯 HTTP 秒级取流（不依赖 Playwright）。",
         "play_url": {
-          "render": "playwright"
-        },
-        "render_config": {
-          "wait_until": "networkidle",
-          "timeout_ms": 45000,
-          "extra_delay_ms": 8000
+          "http_chain": [
+            {
+              "name": "iframe",
+              "regex": "<iframe[^>]*src=[\"']([^\"']*player5238G\\.php[^\"']*)[\"']",
+              "referer": "episode"
+            },
+            {
+              "name": "get3g",
+              "regex": "get3G\\.php\\?[^\"']+",
+              "referer": "iframe",
+              "force_mp4_0": true
+            },
+            {
+              "name": "ccs",
+              "regex": "var ccsJsCmds\\s*=\\s*'([^']+)'",
+              "referer": "get3g",
+              "decode": "caesar_unquote"
+            },
+            {
+              "regex": "<source[^>]*src=\"([^\"]+)\"",
+              "referer": "get3g"
+            }
+          ]
         }
       }
     }

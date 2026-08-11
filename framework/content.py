@@ -1866,6 +1866,25 @@ class Content:
                 )
             return vurl
 
+        # 链式 HTTP 提取（play_url.http_chain）：多跳播放地址链，纯 HTTP 秒级完成、
+        # 不依赖 Playwright。每步从前一步响应（或详情页）提取 URL/数据，逐步收敛
+        # 到最终视频地址。适用 iframe→二级播放器→解密 类站（如 5238 的
+        # player5238G.php → get3G.php → Caesar 解码 → m3u8）。
+        #
+        # 配置结构（play_url.http_chain，数组，按序执行）：
+        #   [ {"regex": "<从当前文本提取的正则>", "name": "<结果名，供后续步引用>",
+        #      "referer": "episode|detail|<上一步的name>", "fetch": true|false,
+        #      "force_mp4_0": true, "decode": "caesar_unquote"} ]
+        #   - 第 1 步默认从详情页 HTML 提取（可用 html 源："detail" 同上）
+        #   - referer: 请求该步 URL 时用的 Referer（防防盗链）。缺省用源 Referer
+        #   - fetch=true 或出现 referer 时：把提取到的串当 URL 请求其页面
+        #   - force_mp4_0: URL 里 mp4= 值强制为 0（取 HLS 变体）
+        #   - decode: caesar_unquote = Caesar 移位(自动测3~5)+URL 解码
+        #   - 最后一步提取出的串即播放地址（http 开头）
+        chain_cfg = play_cfg.get("http_chain")
+        if chain_cfg:
+            return self._fetch_http_chain(source, episode_url, html, chain_cfg)
+
         # 换源站：从 player_aaaa JS 配置提取真实播放地址（ps=0 直接用 / ps=1 走 parse 转码）。
         # 播放页无 player_aaaa（MacCMS 变体：var now 直链等）→ 回退下方 play_url.regex 规则
         if switch_cfg:
@@ -1908,6 +1927,110 @@ class Content:
         if self._decrypter is not None:
             return self._decrypter.decrypt(source, play, "video_url")
         return play
+
+    # ------------------------------------------------------------------ #
+    def _fetch_http_chain(self, source: SourceConfig, episode_url: str,
+                          detail_html: str, chain: list) -> str:
+        """链式 HTTP 取流：多跳播放地址链，逐步收敛到视频地址。
+
+        每步从前一步响应文本（第 1 步从详情页 HTML）按 regex 提取，得到的串
+        作为下一步的 URL 继续请求，最终一步提取出 http 开头的播放地址。
+        referer 用于防盗链（"episode"/"detail" = 详情页 URL；上一步 name）。
+        返回最终播放 URL；失败抛 ContentMissingError。
+        """
+        from urllib.parse import urljoin
+
+        cur_text = detail_html  # 当前文本（初始为详情页 HTML）
+        results: dict = {"detail": detail_html}
+        cur_url = self._abs_url(source, episode_url)
+        step_urls: dict = {"episode": cur_url, "detail": cur_url}
+
+        for i, step in enumerate(chain):
+            regex = step.get("regex") or ""
+            if not regex:
+                raise ContentMissingError(
+                    f"http_chain 第{i}步缺 regex", source_id=source.source_id
+                )
+            m = _re.search(regex, cur_text, _re.IGNORECASE | _re.DOTALL)
+            if not m:
+                raise ContentMissingError(
+                    f"http_chain 第{i}步未匹配（{regex[:40]}）", source_id=source.source_id
+                )
+            val = m.group(1) if m.groups() else m.group(0)
+            val = val.replace("\\/", "/")
+
+            # 解码（Caesar 移位 + URL 解码）
+            decode = step.get("decode")
+            if decode == "caesar_unquote":
+                import urllib.parse as _up
+
+                for sh in (3, 4, 5):
+                    dec = _up.unquote("".join(chr(ord(c) - sh) for c in val))
+                    if any(k in dec for k in ("<source", ".m3u8", ".mp4", "<video")):
+                        val = dec.replace('\\"', '"')
+                        break
+
+            name = step.get("name") or f"s{i}"
+            results[name] = val
+            step_urls[name] = val
+
+            # 是否继续请求该 URL 拿下一页
+            fetch = step.get("fetch")
+            if fetch is None:
+                # 未显式指定：decode 步骤是解密出文本（供后续步提取），不请求。
+                # 其余：referer 非空 且 提取的不是视频文件（m3u8/mp4/mpd 等）
+                # → 视为中间跳转页需请求（iframe → get3G 这类相对路径 .php 也请求）。
+                # 视频文件后缀不请求，作为最终播放地址返回。
+                if step.get("decode"):
+                    fetch = False
+                elif not step.get("referer"):
+                    fetch = False
+                else:
+                    _low = val.lower()
+                    fetch = not any(_low.endswith(s) for s in
+                                    (".m3u8", ".mp4", ".mpd", ".ts", ".m4a", ".m4s"))
+            if not fetch:
+                cur_text = val  # 后续步骤在提取结果上继续（如解码后的 JS）
+                continue
+
+            ref_key = step.get("referer") or "episode"
+            referer = step_urls.get(ref_key, step_urls.get("episode"))
+            headers = self._headers(source)
+            if referer and not referer.startswith(("http", "/")):
+                referer = urljoin(self._abs_url(source, episode_url), referer)
+            headers["Referer"] = referer or self._abs_url(source, episode_url)
+
+            abs_step_url = val if val.startswith(("http://", "https://")) else urljoin(cur_url, val)
+            if step.get("force_mp4_0"):
+                import re as _r
+                abs_step_url = (_r.sub(r"mp4=[^&]*", "mp4=0", abs_step_url)
+                                if "mp4=" in abs_step_url
+                                else abs_step_url + ("&" if "?" in abs_step_url else "?") + "mp4=0")
+            try:
+                cur_text = self._http.get_text(
+                    abs_step_url, headers=headers,
+                    timeout=self._timeout(source), retries=self._retries(source),
+                    interval_ms=self._interval_ms(source),
+                    encoding=source.transports().get("charset"),
+                    proxy_pool=source.proxy_pool(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise ContentMissingError(
+                    f"http_chain 第{i}步请求失败 {abs_step_url}: {exc}",
+                    source_id=source.source_id,
+                ) from exc
+            cur_url = abs_step_url
+            step_urls[name] = abs_step_url
+
+        # 最后一步提取的 val 即播放地址
+        final = val
+        if final and not final.startswith(("http://", "https://")):
+            final = urljoin(cur_url, final)
+        if not final or not final.startswith("http"):
+            raise ContentMissingError(
+                f"http_chain 未取到播放地址（{episode_url}）", source_id=source.source_id
+            )
+        return final
 
     # ------------------------------------------------------------------ #
     # 换源站线路自动轮换（source_switch）
