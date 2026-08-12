@@ -107,10 +107,13 @@ class ShelfService:
         hidden_file_name: str = "hidden_local.json",
         meta_file_name: str = "shelf_meta.json",
     ):
-        self._output_dir = Path(output_dir)
+        # 输出目录统一解析为绝对路径：扫描产出的本地 key（epub 文件路径/视频目录）
+        # 与阅读器存续读时用的绝对路径（app._open_epub 等）保持一致，否则
+        # 相对目录配置下书架扫描查不到续读（本地小说/漫画/视频记忆失效）。
+        self._output_dir = Path(output_dir).resolve()
         self._data_dir = (
             Path(data_dir) if data_dir is not None
-            else Path(output_dir).parent / "data"
+            else Path(output_dir).resolve().parent / "data"
         )
         self._store = library_store
         self._progress = reading_progress
@@ -179,6 +182,11 @@ class ShelfService:
                 if not l.tags:
                     l.tags = list(f.tags)
                 l.updated_at = f.updated_at or l.updated_at
+                # 本地无续读时，视频可回退线上收藏的进度（线上看到哪集，本地也定位到那集）。
+                # 小说/漫画本地 epub 不做跨形态回退：线上章节标题与 epub 目录对不上，
+                # 显示"读到第X章"但点开无法定位，反而像记忆坏了。
+                if not l.resume_title and f.resume_title and l.content_type == "video":
+                    l.resume_title = f.resume_title
             out.append(l)
             seen.add(key)
         # 纯收藏（无本地文件）

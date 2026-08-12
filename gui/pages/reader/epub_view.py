@@ -2,7 +2,8 @@
 
 独立 epub 阅读器：读本地 .epub 文件，不依赖网络源/Content。
 - 小说 epub：章节正文 → 滚动阅读 + 字号可调 + 目录侧栏
-- 漫画 epub：章节图片流 → 滚动画廊（限宽解码，不整幅解码）
+- 漫画 epub：章节图片流 → 滚动画廊（限宽解码不整幅解码；后台并发解码 +
+  等高占位回填，首屏秒出、不冻结 UI）
 - 合并单文档（整本书拼一个超大 xhtml，如 2000 章小说/几千图漫画）按
   `<h1>` 拆分章节，拆出的章直接带文本或图片名，渲染时按需读 → 大书秒开不卡。
 - 底层用 FastEpub（zip 单遍索引 + 按需读取），不用 ebooklib 全量解析
@@ -16,7 +17,7 @@ import posixpath
 import re
 import threading
 
-from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, Signal
+from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -147,11 +148,52 @@ class _LoadChapterTask(QRunnable):
             pass
 
 
+class _ComicDecodeSignals(QObject):
+    done = Signal(object, object, object)  # (gen, idx, QImage)
+
+
+class _ComicDecodeTask(QRunnable):
+    """后台限宽解码单张漫画页字节 → QImage（gen 过期结果由宿主丢弃）。"""
+
+    def __init__(self, gen: int, idx: int, raw: bytes, target_w: int):
+        super().__init__()
+        self.signals = _ComicDecodeSignals()
+        self._gen = gen
+        self._idx = idx
+        self._raw = raw
+        self._target_w = target_w
+
+    def run(self) -> None:
+        from PySide6.QtCore import QBuffer, QIODevice, QSize
+        from PySide6.QtGui import QImage, QImageReader
+
+        img = QImage()
+        try:
+            buf = QBuffer()
+            buf.setData(self._raw)
+            buf.open(QIODevice.ReadOnly)
+            reader = QImageReader(buf)
+            size = reader.size()
+            if size.isValid() and size.width() > self._target_w:
+                h = max(1, round(size.height() * self._target_w / size.width()))
+                reader.setScaledSize(QSize(self._target_w, h))
+            img = reader.read()
+            buf.close()
+        except Exception:  # noqa: BLE001 —— 单页解码失败跳过，不拖垮整章
+            img = QImage()
+        try:
+            self.signals.done.emit(self._gen, self._idx, img)
+        except RuntimeError:
+            pass
+
+
 class EpubView(QWidget):
     """epub 阅读视图（本地文件）。"""
 
     chapter_changed = Signal(object)  # 发 (epub_path, chapter_title) 供续读
     position_changed = Signal(object)  # 发 (epub_path, 章内滚动比例 0~1)，节流
+    fullscreen_requested = Signal()  # 工具条 ⛶ → ReaderPage 切主窗全屏
+    background_cycle_requested = Signal()  # 「背景」按钮 → ReaderPage 循环切换护眼背景色
 
     def __init__(self, font_scale: float = 1.0, parent=None):
         super().__init__(parent)
@@ -159,11 +201,22 @@ class EpubView(QWidget):
         self._chapters: list[_Chapter] = []
         self._current_idx = -1
         self._is_comic = False
+        self._zoom = 1.0  # 漫画图流缩放（Ctrl+滚轮，0.25~4.0）
+        self._comic_imgs: list = []  # 当前话图片原始字节缓存（缩放时重新解码）
+        self._comic_gen = 0  # 漫画渲染代际：切章/缩放自增，旧异步解码结果丢弃
+        self._comic_labels: list = []  # 当前话占位 label（解码完成回填）
+        self._comic_tasks: list = []  # 持引用防 GC
+        self._zoom_timer = QTimer(self)  # Ctrl+滚轮防抖：滚轮连发只重排一次
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.setInterval(150)
+        self._zoom_timer.timeout.connect(self._on_zoom_timeout)
         self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
         self._epub: FastEpub | None = None  # 当前书读取器（zip 按需读取）
         self._last_pos_emit = 0.0  # 章内位置节流
         self._pending_pos = 0.0  # 待恢复的章内滚动比例（续读定位用，恢复后清零）
+        self._reading_bg = ""  # 阅读区独立背景色（空=透明跟随主题）
+        self._reading_fg = ""  # 夜间黑等深色背景下的正文前景色（空=跟随主题）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -193,6 +246,18 @@ class EpubView(QWidget):
         self.next_btn.clicked.connect(lambda: self._jump_relative(1))
         toolbar.addWidget(self.prev_btn)
         toolbar.addWidget(self.next_btn)
+
+        self.bg_btn = QPushButton("背景")
+        self.bg_btn.setFixedWidth(50)
+        self.bg_btn.setToolTip("切换阅读背景色（白/米黄/护眼绿/夜间黑）")
+        self.bg_btn.clicked.connect(self.background_cycle_requested.emit)
+        toolbar.addWidget(self.bg_btn)
+
+        self.fullscreen_btn = QPushButton("⛶")
+        self.fullscreen_btn.setFixedWidth(40)
+        self.fullscreen_btn.setToolTip("全屏阅读")
+        self.fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
+        toolbar.addWidget(self.fullscreen_btn)
 
         self.progress_label = QLabel("")
         self.progress_label.setStyleSheet("color: palette(dark);")
@@ -224,6 +289,14 @@ class EpubView(QWidget):
         body.addWidget(self.scroll, stretch=1)
         layout.addLayout(body, stretch=1)
 
+        # 鼠标侧键翻章 + Ctrl+滚轮字号：应用级事件过滤器（正文 QLabel 带
+        # TextSelectableByMouse 会吞掉子控件级鼠标事件，需覆盖滚动区/正文等）。
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
     # ------------------------------------------------------------------ #
     def open(self, path: str, start_idx: int = 0, on_loaded=None) -> bool:
         """异步打开本地 epub。立即返回；后台建索引完成后回调 on_loaded(chapters)。
@@ -239,6 +312,7 @@ class EpubView(QWidget):
         self._on_loaded = on_loaded
         self._chapters = []
         self._is_comic = False
+        self._zoom = 1.0
         self._pending_pos = 0.0
         self.text.setText("正在打开 epub，请稍候…")
         self.scroll.setWidget(self.text)
@@ -348,11 +422,18 @@ class EpubView(QWidget):
             self._gallery_layout.setContentsMargins(0, 0, 0, 0)
             self._gallery_layout.setSpacing(4)
             self._gallery_layout.setAlignment(Qt.AlignHCenter)
+        # 漫画图流宽度由内容决定（缩放后比视口宽时可横向滚动）：
+        # widgetResizable 会把 gallery 压缩到视口宽，宽图被裁剪且无法滚动
+        self.scroll.setWidgetResizable(False)
         self.scroll.setWidget(self._gallery_widget)
 
     def _ensure_text_label(self) -> None:
         """正文 QLabel 被 setWidget 切换删除时重建（混排 epub 漫画/小说来回切）。"""
         import shiboken6
+
+        # 从漫画图流切回文本：恢复 widgetResizable + 关横向滚动
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         if shiboken6.isValid(self.text):
             return
@@ -360,12 +441,9 @@ class EpubView(QWidget):
         self.text.setWordWrap(True)
         self.text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        # 直接套字号样式：_apply_font 在漫画模式（_is_comic）会提前返回，
-        # 混排 epub 重建正文 QLabel 时需独立应用（否则重建后无样式）。
-        size = self._clamp_font(self._base_font + self._font_delta)
-        self.text.setStyleSheet(
-            f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;"
-        )
+        # 直接套正文样式：_apply_font 在漫画模式（_is_comic）会提前返回，
+        # 混排 epub 重建正文 QLabel 时需独立应用（否则重建后无样式/背景色）。
+        self.text.setStyleSheet(self._body_css())
 
     def _populate_toc(self) -> None:
         self.toc_list.clear()
@@ -426,6 +504,8 @@ class EpubView(QWidget):
                     int(p * self.scroll.verticalScrollBar().maximum())
                 ))
         self.chapter_changed.emit((self._path, ch.title))
+        # 背景色应用到滚动区（漫画图流模式 galley 可能刚重建）
+        self._apply_viewport_bg()
 
     def _on_scroll(self, value: int) -> None:
         """章内滚动 → 节流记录阅读比例（记住读到哪）。"""
@@ -442,11 +522,24 @@ class EpubView(QWidget):
         except RuntimeError:
             pass
 
-    def _render_comic_imgs(self, imgs: list) -> None:
-        """漫画章：逐张限宽解码（QImageReader 不解码全尺寸，省内存、不卡 UI）。"""
-        from PySide6.QtCore import QBuffer, QIODevice, QSize
+    def _render_comic_imgs(self, imgs: list, preserve_ratio: bool = False) -> None:
+        """漫画章：后台并发限宽解码 + 占位回填（首屏秒出，不冻结 UI）。
+
+        整章同步解码（60 页 ≈ 2s）会卡住界面——改为：主线程预读每张尺寸
+        （读头部，毫秒级）建等高占位 label（滚动/续读位置不跳），再交给
+        线程池并发解码、完成逐张回填。Ctrl+滚轮缩放重走一遍（gen 过期
+        丢弃旧渲染）；preserve_ratio=True（缩放）时重排后按阅读比例恢复
+        滚动位置，切章走 setValue(0) 从顶部开始。
+        """
+        from PySide6.QtCore import QBuffer, QIODevice
         from PySide6.QtGui import QImageReader
 
+        self._comic_imgs = list(imgs)
+        self._comic_gen += 1
+        gen = self._comic_gen
+        self._comic_tasks = []
+        vbar = self.scroll.verticalScrollBar()
+        ratio = (vbar.value() / vbar.maximum()) if vbar.maximum() > 0 else 0.0
         while self._gallery_layout.count():
             child = self._gallery_layout.takeAt(0)
             if child.widget():
@@ -456,28 +549,80 @@ class EpubView(QWidget):
             lbl.setAlignment(Qt.AlignCenter)
             self._gallery_layout.addWidget(lbl)
             return
-        target_w = self.scroll.width() or 600
+        vp = self.scroll.viewport().width() or 600
+        target_w = int(vp * self._zoom)
+        # 缩放后比视口宽 → 开横向滚动、gallery 定宽为内容宽；否则关滚动跟视口宽
+        self.scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOn if target_w > vp else Qt.ScrollBarAlwaysOff
+        )
+        self._gallery_widget.setFixedWidth(max(target_w, vp))
+        # 预读尺寸 → 占位等高（与解码结果一致，回填不跳位置）
+        heights = []
         for raw in imgs:
-            lbl = QLabel()
-            lbl.setAlignment(Qt.AlignCenter)
+            h = 700
             try:
                 buf = QBuffer()
                 buf.setData(raw)
                 buf.open(QIODevice.ReadOnly)
-                reader = QImageReader(buf)
-                size = reader.size()
-                if size.isValid() and size.width() > target_w:
-                    h = max(1, round(size.height() * target_w / size.width()))
-                    reader.setScaledSize(QSize(target_w, h))
-                qimg = reader.read()
+                s = QImageReader(buf).size()
                 buf.close()
-                if qimg is not None and not qimg.isNull():
-                    lbl.setPixmap(QPixmap.fromImage(qimg))
-                else:
-                    lbl.setText("图片加载失败")
-            except Exception:  # noqa: BLE001 —— 单图解码失败跳过，不拖垮整章
-                lbl.setText("图片加载失败")
+                if s.isValid() and s.width():
+                    h = s.height() if s.width() <= target_w else round(
+                        s.height() * target_w / s.width()
+                    )
+                    h = max(200, min(4096, h))
+            except Exception:  # noqa: BLE001 —— 尺寸读不到用默认占位
+                pass
+            heights.append(h)
+        self._comic_labels = []
+        for i, h in enumerate(heights):
+            lbl = QLabel("加载中…")
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setMinimumWidth(max(target_w, vp))
+            lbl.setMinimumHeight(h)
             self._gallery_layout.addWidget(lbl)
+            self._comic_labels.append(lbl)
+        for i, raw in enumerate(imgs):
+            task = _ComicDecodeTask(gen, i, raw, target_w)
+            task.signals.done.connect(self._on_comic_decoded)
+            QThreadPool.globalInstance().start(task)
+            self._comic_tasks.append(task)
+        # 缩放才保留比例；切章由 _on_chapter_loaded 的 setValue(0) 归零
+        if preserve_ratio and ratio > 0:
+            QTimer.singleShot(0, lambda r=ratio: self._restore_comic_ratio(r))
+
+    def _on_comic_decoded(self, gen: int, idx: int, img) -> None:
+        """后台解码完成回填（主线程）：过期 gen 丢弃；占位高度让位给实际图。"""
+        if gen != self._comic_gen or not (0 <= idx < len(self._comic_labels)):
+            return  # 切章/缩放后的过期结果
+        import shiboken6
+
+        lbl = self._comic_labels[idx]
+        if not shiboken6.isValid(lbl):
+            return
+        if img is None or img.isNull():
+            lbl.setText("图片加载失败")
+        else:
+            lbl.setText("")
+            lbl.setPixmap(QPixmap.fromImage(img))
+        lbl.setMinimumHeight(0)
+        lbl.updateGeometry()  # 通知布局：尺寸提示已变为实际图高
+        self._gallery_widget.adjustSize()
+        vbar = self.scroll.verticalScrollBar()
+        vbar.setValue(min(vbar.value(), vbar.maximum()))
+
+    def _restore_comic_ratio(self, ratio: float) -> None:
+        """按阅读比例恢复滚动位置（缩放/重排后防跳回顶部）。"""
+        if ratio <= 0:
+            return
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() > 0:
+            vbar.setValue(int(ratio * vbar.maximum()))
+
+    def _on_zoom_timeout(self) -> None:
+        """Ctrl+滚轮防抖到期 → 真正重排一次（滚轮连发只排一次，保留阅读比例）。"""
+        if self._comic_imgs:
+            self._render_comic_imgs(self._comic_imgs, preserve_ratio=True)
 
     @staticmethod
     def _clamp_font(size: int) -> int:
@@ -490,14 +635,19 @@ class EpubView(QWidget):
         self._base_font = self._clamp_font(round(17 * float(scale or 1.0)))
         self._apply_font()
 
+    def _body_css(self) -> str:
+        """正文 QLabel 样式（字号/行高/背景/前景统一生成，重建标签后仍一致）。"""
+        size = self._clamp_font(self._base_font + self._font_delta)
+        bg = self._reading_bg
+        bg_css = f" background-color: {bg};" if bg else ""
+        fg_css = f" color: {self._reading_fg};" if self._reading_fg else ""
+        return f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;{bg_css}{fg_css}"
+
     def _apply_font(self) -> None:
         if self._is_comic:
             return
         self._ensure_text_label()  # 被删则重建，避免操作失效对象
-        size = self._clamp_font(self._base_font + self._font_delta)
-        self.text.setStyleSheet(
-            f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;"
-        )
+        self.text.setStyleSheet(self._body_css())
 
     def _adjust_font(self, delta: int) -> None:
         if self._is_comic:
@@ -505,6 +655,70 @@ class EpubView(QWidget):
         self._font_delta += delta
         self._apply_font()
 
+    def set_reading_style(self, bg: str = "", font_size: int = 0, fg: str = "") -> None:
+        """设置阅读区独立背景色/字号/前景色（ui-reader #12）。
+
+        bg：颜色字符串（#RRGGBB），空 = 透明跟随主题；
+        font_size：>0 时覆盖全局字号，0 = 跟随全局 font_scale；
+        fg：正文前景色（夜间黑等深色背景配浅字），空 = 跟随主题。
+        """
+        self._reading_bg = bg or ""
+        self._reading_fg = fg or ""
+        if font_size > 0:
+            self._base_font = self._clamp_font(font_size)
+        self._apply_font()
+        self._apply_viewport_bg()
+
+    def _apply_viewport_bg(self) -> None:
+        """按 _reading_bg 设置滚动区背景（漫画图流模式也生效；空 = 重置跟随主题）。"""
+        bg = self._reading_bg
+        css = f"background-color: {bg};" if bg else ""
+        if hasattr(self, "scroll"):
+            self.scroll.viewport().setStyleSheet(css)
+            import shiboken6
+
+            gal = getattr(self, "_gallery_widget", None)
+            if gal is not None and shiboken6.isValid(gal):
+                gal.setStyleSheet(css)
+
     # ------------------------------------------------------------------ #
+    def _is_descendant(self, obj) -> bool:
+        """obj（或其父链）是否属于本视图 —— 应用级过滤器只处理本视图内事件。"""
+        w = obj if isinstance(obj, QWidget) else None
+        while w is not None:
+            if w is self:
+                return True
+            w = w.parentWidget()
+        return False
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        """应用级事件过滤器：鼠标侧键翻章 + Ctrl+滚轮调字号（本视图内）。
+
+        正文 QLabel 带 TextSelectableByMouse 会吞掉子控件级鼠标事件，故用
+        应用级过滤器覆盖滚动区/正文/目录等所有子控件；非本视图事件直接放行。
+        """
+        if not self._is_descendant(obj):
+            return super().eventFilter(obj, event)
+        if event.type() == event.Type.MouseButtonPress:
+            btn = event.button()
+            if btn == Qt.XButton2:
+                self._jump_relative(1)  # 鼠标前侧键 → 下一章
+                return True
+            if btn == Qt.XButton1:
+                self._jump_relative(-1)  # 鼠标后侧键 → 上一章
+                return True
+        elif event.type() == event.Type.Wheel and (event.modifiers() & Qt.ControlModifier):
+            if self._is_comic and self._comic_imgs:
+                # 漫画 epub：Ctrl+滚轮缩放图片（后台重解码，防抖合并滚轮连发）
+                factor = 1.1 if event.angleDelta().y() > 0 else 0.9
+                self._zoom = max(0.25, min(4.0, self._zoom * factor))
+                self._zoom_timer.start()
+            else:
+                delta = 1 if event.angleDelta().y() > 0 else -1
+                self._adjust_font(delta)
+            event.accept()
+            return True
+        return super().eventFilter(obj, event)
+
     def refresh(self) -> None:
         pass

@@ -140,39 +140,28 @@ def main():
         f"应定位到第一章最后一页，page={novel._current_page}/{novel._page_count}"
     print(f"  [ok] 小说翻页模式双向跳章（回第一章第{novel._current_page+1}页）")
 
-    # ---- 双向翻章测试（漫画） ----
+    # ---- 自动翻章已删除：滚到底/滚回顶不自动跳话，70% 仍预渲染下一话 ----
     from gui.pages.reader.comic_view import ComicView
     comic = ComicView(content)
     comic.resize(600, 800)
     comic.show()
     comic._chapters = detail.chapters  # 复用两章
     comic._current_idx = 1
-    comic._images = ["data:image/png;base64," + "A" * 200 for _ in range(20)]
-    comic._render_images()
-    # 离屏下图片不足以撑高 scrollbar → 手动设 range 模拟可滚动内容
+    comic._pending_swap = False
     comic.scroll.verticalScrollBar().setRange(0, 1000)
-    comic._auto_prev_loading = False
-    comic._load_episode(1)  # 第2话
-    assert comic._current_idx == 1
-    comic._current_idx = 1
-    # 冷却机制：离开边界(滚到中段)武装；滚回顶部触发向上跳话；触发后解除+冷却期内不重复
-    comic._last_auto_nav_ts = 0.0
-    comic._auto_prev_loading = False
-    comic._maybe_auto_next(500)  # 滚回中段 → 不触发（非边界）
-    assert not comic._auto_prev_loading, "中段不应触发向上跳话"
-    comic._maybe_auto_next(0)  # 滚到顶部 → 触发向上跳话锁
-    assert comic._auto_prev_loading, "滚回顶部应触发向上跳话锁"
-    # 冷却期内再滚顶 → 不重复触发（时间冷却）
-    comic._auto_prev_loading = False
-    comic._last_auto_nav_ts = 9999999999  # 模拟冷却期内
-    comic._maybe_auto_next(0)
-    assert not comic._auto_prev_loading, "冷却期内不应重复触发"
-    # 冷却结束再触发
-    import time
-    comic._last_auto_nav_ts = 0.0
-    comic._maybe_auto_next(0)
-    assert comic._auto_prev_loading, "冷却结束后应重新触发"
-    print(f"  [ok] 漫画向上触发（中段不跳 + 到顶触发 + 冷却抑制重复 + 冷却后恢复）")
+    assert not hasattr(comic, "_maybe_auto_next"), "自动翻话方法已删除"
+    # 70% → 预渲染下一话（保留）；中段 → 不触发；滚到底/顶 → 不跳话
+    prefetched = []
+    comic._prefetch_future = lambda *a, **k: prefetched.append(True)
+    comic._on_scroll_prefetch(500)   # 中段
+    assert not prefetched, "中段不应预渲染下一话"
+    comic._on_scroll_prefetch(800)   # 70%+
+    assert prefetched, "读到 70% 应预渲染下一话"
+    comic._on_scroll_prefetch(1000)  # 滚到底
+    assert comic._current_idx == 1, f"自动翻话已删除：滚到底不跳话，idx={comic._current_idx}"
+    comic._on_scroll_prefetch(0)     # 滚回顶
+    assert comic._current_idx == 1, f"自动翻话已删除：滚回顶不跳话，idx={comic._current_idx}"
+    print("  [ok] 漫画自动翻话已删除（滚到底/顶不跳话）；70% 预渲染下一话保留")
 
     # ---- 小说滚动模式：向上滑到顶 → 上一章末尾（不重回开头） ----
     from gui.pages.reader.novel_view import NovelView
@@ -204,27 +193,14 @@ def main():
     _lp4.exec()
     app.processEvents()
     assert nv._current_idx == 1, f"应在第二章，idx={nv._current_idx}"
-    # 真实用户行为：向上滑 → 滚回中段（不触发），再滚回顶部 → 触发向上翻章
+    assert not hasattr(nv, "_maybe_auto_next"), "自动翻章方法已删除"
+    # 滚到底 → 不自动下一章；滚回顶 → 不自动上一章
     vbar = nv.scroll.verticalScrollBar()
-    mid = vbar.maximum() // 2
-    nv._maybe_auto_next(mid)  # 中段不触发翻章
-    assert nv._current_idx == 1, f"中段不应触发翻章"
-    nv._auto_prev_loading = False
-    nv._last_auto_nav_ts = 0.0  # 清零冷却，允许触发
-    nv._maybe_auto_next(0)  # 滚回顶部 → 触发向上翻章
-    _lp5 = _EL()
-    _T.singleShot(1200, _lp5.quit)
-    _lp5.exec()
-    app.processEvents()
-    assert nv._current_idx == 0, f"向上滑应回第一章，idx={nv._current_idx}"
-    vbar = nv.scroll.verticalScrollBar()
-    assert vbar.value() >= vbar.maximum() - 5, \
-        f"应定位到第一章末尾，value={vbar.value()}/max={vbar.maximum()}"
-    # 冷却期内（2s）不重复触发向下跳
-    ts = nv._last_auto_nav_ts
-    nv._maybe_auto_next(vbar.maximum())
-    assert nv._current_idx == 0, f"冷却期不应触发翻章，idx={nv._current_idx}"
-    print(f"  [ok] 小说滚动模式向上翻章定位上一章末尾且时间冷却防反弹（value={vbar.value()}/{vbar.maximum()}）")
+    vbar.setValue(vbar.maximum())  # 滚到底
+    assert nv._current_idx == 1, f"自动翻章已删除：滚到底不跳章，idx={nv._current_idx}"
+    vbar.setValue(0)  # 滚回顶
+    assert nv._current_idx == 1, f"自动翻章已删除：滚回顶不跳章，idx={nv._current_idx}"
+    print("  [ok] 小说自动翻章已删除（滚到底/滚回顶均不跳章）")
 
     # ---- 续读记忆：重新打开恢复到上次章节 + 章内位置信号接线 ----
     from framework.reading_progress import ReadingProgress

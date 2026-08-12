@@ -5,8 +5,7 @@
 - 滚动画廊（默认）/ 横向翻页可切换
 - 图片缩放（点击放大/双击还原）
 - 目录侧栏（可折叠，点击跳话）
-- 自动下一话：读到当前话最后一张图底部 → 无缝加载下一话
-- 预加载后续 5 话图片 URL（不下载字节，翻话时有页数/预热）
+- 预渲染后续话（读到 70% 预渲染下一话、向前缓存 3 话，切话秒开）
 - 续读信号（chapter_changed 发 detail+话名+话URL）
 """
 
@@ -33,6 +32,7 @@ from framework.content import Content, Detail
 
 # 预加载后续话数：只预加载下一话（读到 70% 才触发，不加载过多）
 PREFETCH_COUNT = 2  # 预渲染后续话数：连看时下一话已就绪、再下一话开始预渲染，切话更顺
+PREFETCH_BACK = 3  # 向前缓存话数：向上翻话命中缓存秒开（以当前话为基点前 3 话）
 # 懒加载：首屏渲染页数 / 滚动增量渲染每批页数
 INITIAL_RENDER_COUNT = 10
 LAZY_BATCH = 12
@@ -43,6 +43,8 @@ class ComicView(QWidget):
 
     chapter_changed = Signal(object)  # 发 (detail, chapter_title, chapter_url)
     position_changed = Signal(object)  # (detail, title, url, position, None) 章内位置续读
+    fullscreen_requested = Signal()  # 工具条 ⛶ → ReaderPage 切主窗全屏
+    background_cycle_requested = Signal()  # 「背景」按钮 → ReaderPage 循环切换护眼背景色
 
     def __init__(self, content: Content, parent=None):
         super().__init__(parent)
@@ -56,9 +58,6 @@ class ComicView(QWidget):
         self._images = []
         self._mode = "gallery"  # gallery / flip
         self._zoom = 1.0
-        self._auto_loading = False  # 自动翻话锁，防重复触发
-        self._auto_prev_loading = False  # 向上自动翻话锁，防重复触发
-        self._last_auto_nav_ts = 0.0  # 上次自动翻话时间戳（防循环）
         self._prefetched = {}  # {url: {"images":[...], "count":N}} 预渲染的后续话
         self._prefetch_queue = []  # 串行预渲染队列（同一时间只渲染 1 话）
         self._prefetch_busy = False  # 是否正在预渲染
@@ -67,6 +66,8 @@ class ComicView(QWidget):
         self._pending_swap = False  # 换话保留旧画面：新话首批图就绪后再清空替换
         self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
         self._pending_position = None  # 打开书续读位置（0~1 滚动比例），话加载后定位
+        self._reading_bg = ""  # 阅读区独立背景色（空=透明跟随主题）
+        self._reading_fg = ""  # 夜间黑等深色背景下的前景色（漫画以图为主，预留）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -82,12 +83,24 @@ class ComicView(QWidget):
         self.mode_btn.clicked.connect(self._toggle_mode)
         toolbar.addWidget(self.mode_btn)
 
+        self.bg_btn = QPushButton("背景")
+        self.bg_btn.setFixedWidth(50)
+        self.bg_btn.setToolTip("切换阅读背景色（白/米黄/护眼绿/夜间黑）")
+        self.bg_btn.clicked.connect(self.background_cycle_requested.emit)
+        toolbar.addWidget(self.bg_btn)
+
         self.prev_btn = QPushButton("上一话")
         self.next_btn = QPushButton("下一话")
         self.prev_btn.clicked.connect(lambda: self._jump_relative(-1))
         self.next_btn.clicked.connect(lambda: self._jump_relative(1))
         toolbar.addWidget(self.prev_btn)
         toolbar.addWidget(self.next_btn)
+
+        self.fullscreen_btn = QPushButton("⛶")
+        self.fullscreen_btn.setFixedWidth(40)
+        self.fullscreen_btn.setToolTip("全屏阅读")
+        self.fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
+        toolbar.addWidget(self.fullscreen_btn)
 
         toolbar.addStretch(1)
         self.progress_label = QLabel("")
@@ -118,16 +131,15 @@ class ComicView(QWidget):
         self.gallery_layout = QVBoxLayout(self.gallery)
         self.gallery_layout.setContentsMargins(0, 0, 0, 0)
         self.gallery_layout.setSpacing(4)
-        self.gallery_layout.setAlignment(Qt.AlignHCenter)
+        # 注意：不设 AlignHCenter——设了图片 label 只按 sizeHint 排布不拉伸，
+        # Ctrl+滚轮缩放只改 gallery 定宽、图片不随宽度变化（缩放看起来没反应）。
+        # gallery 窄于视口时的水平居中由 scroll.setAlignment(AlignHCenter) 负责。
         self.scroll.setWidget(self.gallery)
         body.addWidget(self.scroll, stretch=1)
         layout.addLayout(body, stretch=1)
 
-        # 自动下一话：滚动到话底不再自动加载 —— 用户须手动点「下一话/下一章」按钮。
-        # （_maybe_auto_next 保留但不连接，避免滚动到底意外跳话）
-
         self._apply_mode()
-        # 懒加载 + 读到 70% 预渲染下一话：监听滚动（不启用自动翻话，保留手动「下一话」按钮）
+        # 读到 70% → 预渲染下一话（不自动翻话）
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_prefetch)
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_lazy)
         # 章内位置记忆：纵向/横向滚动节流存盘（精准到页）
@@ -136,6 +148,13 @@ class ComicView(QWidget):
         # Ctrl+滚轮缩放：用事件过滤器抢在 scroll area / 图片子控件之前捕获
         self.scroll.viewport().installEventFilter(self)
         self.scroll.installEventFilter(self)
+        # 鼠标侧键翻话（+ Ctrl+滚轮缩放）：应用级过滤器覆盖全部子控件事件
+        # （图片 QLabel 会吞掉子控件级鼠标事件，装到视图自身覆盖不到图区）
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         # 键盘焦点（支持←→↑↓翻话/翻图）
         self.setFocusPolicy(Qt.StrongFocus)
 
@@ -197,7 +216,7 @@ class ComicView(QWidget):
     def _toggle_toc(self) -> None:
         self.toc_list.setVisible(not self.toc_list.isVisible())
 
-    def _load_episode(self, idx: int, scroll_to_end: bool = False) -> None:
+    def _load_episode(self, idx: int) -> None:
         if self._source is None or not (0 <= idx < len(self._chapters)):
             return
         self._current_idx = idx
@@ -210,10 +229,11 @@ class ComicView(QWidget):
         keep = {self._chapters[idx].url}
         for j in range(idx + 1, min(idx + 1 + PREFETCH_COUNT, len(self._chapters))):
             keep.add(self._chapters[j].url)
+        for j in range(max(idx - PREFETCH_BACK, 0), idx):  # 保留前缓存窗口（向前预取会再命中）
+            keep.add(self._chapters[j].url)
         self._prefetched = {k: v for k, v in self._prefetched.items() if k in keep}
         ch = self._chapters[idx]
         self.toc_list.setCurrentRow(idx)  # 目录高亮当前话
-        self._scroll_on_load = 1 if scroll_to_end else 0
 
         # 【速度优化】已缓存本话图片 → 直接显示，秒开不重爬
         if hasattr(ch, "_cached_images") and ch._cached_images:
@@ -261,33 +281,23 @@ class ComicView(QWidget):
         # 避免预渲染抢资源拖慢当前话首屏。
 
     def _finish_episode_load(self, ch) -> None:
-        """加载完成后统一收尾：清翻话锁 + 定位（顶部/话尾）+ 续读信号。"""
-        self._auto_loading = False
-        self._auto_prev_loading = False
+        """加载完成后统一收尾：定位顶部 + 续读信号。"""
         self.chapter_changed.emit((self._detail, ch.title, ch.url))
-        if self._scroll_on_load == 1:
-            # 定位到上一话末尾（等 layout 完成后再滚，blockSignals 防自动翻话循环）
-            QTimer.singleShot(0, self._scroll_to_bottom_silently)
-        else:
-            vbar = self.scroll.verticalScrollBar()
-            vbar.blockSignals(True)
-            vbar.setValue(0)
-            vbar.blockSignals(False)
+        vbar = self.scroll.verticalScrollBar()
+        vbar.blockSignals(True)
+        vbar.setValue(0)
+        vbar.blockSignals(False)
         # 续读定位：打开书恢复到上次滚动位置（重试链随懒加载高度增长逐步到位）
         if self._pending_position is not None:
             pos = self._pending_position
             self._pending_position = None
             if pos > 0:
                 self._restore_position_with_retry(pos)
-        # 预加载不在加载后立即发起：等读到当前话 70% 再预渲染下一话
-        # （_maybe_auto_next），避免提前占用 Playwright 资源拖慢当前话。
-
-    def _scroll_to_bottom_silently(self) -> None:
-        """无触发地滚到底（blockSignals 包住，防自动翻话循环）。"""
-        vbar = self.scroll.verticalScrollBar()
-        vbar.blockSignals(True)
-        vbar.setValue(vbar.maximum())
-        vbar.blockSignals(False)
+        # 预渲染下一话不在加载后立即发起：等读到当前话 70%（_on_scroll_prefetch）
+        # 再预渲染，避免提前占用 Playwright 资源拖慢当前话。
+        # 向前缓存例外：本话已渲染完成，后台预渲染前 PREFETCH_BACK 话，
+        # 向上翻话命中缓存秒开（与后续话共用串行队列，排在最后不抢资源）。
+        self._prefetch_prev(self._current_idx)
 
     def _on_images_loaded(self, gen, ch, images, err) -> None:
         # 代际过期：换书后旧书取流任务后到 → 整单丢弃，避免旧书结果覆盖新书
@@ -296,8 +306,6 @@ class ComicView(QWidget):
             return
         if err:
             self.progress_label.setText(f"加载失败：{err}")
-            self._auto_loading = False  # 加载失败也要解锁，防死锁
-            self._auto_prev_loading = False
             return
         if self._current_idx < 0 or ch.url != self._chapters[self._current_idx].url:
             ch._cached_images = images  # 过期回调：仅写缓存，不渲染当前画面
@@ -474,7 +482,7 @@ class ComicView(QWidget):
         横向翻页模式无纵向滚动事件、或定位话尾需要完整高度时，懒加载会缺图，
         须全量渲染。
         """
-        return self._mode == "flip" or bool(getattr(self, "_scroll_on_load", 0))
+        return self._mode == "flip"
 
     def _relayout_gallery_queued(self) -> None:
         """图片异步加载完/重绘后，排队重算 gallery 高度。
@@ -550,61 +558,66 @@ class ComicView(QWidget):
         if 0 <= nxt < len(self._chapters):
             self._load_episode(nxt)
 
-    def _maybe_auto_next(self, value: int) -> None:
-        """滚动到底 → 自动下一话；滚到顶 → 自动上一话。
+    def set_reading_style(self, bg: str = "", font_size: int = 0, fg: str = "") -> None:
+        """设置阅读区独立背景色（ui-reader #12）：作用于滚动区（图间空隙）。
 
-        用时间冷却（_last_auto_nav_ts）防快速重触发，比边沿触发更自然。
+        font_size/fg：漫画以图为主，预留参数不生效（与 novel/epub 签名一致）。
+        """
+        self._reading_bg = bg or ""
+        self._reading_fg = fg or ""
+        self._apply_bg()
+
+    def _apply_bg(self) -> None:
+        """按 _reading_bg 设置滚动区/画廊背景（空 = 重置回跟随主题）。"""
+        bg = self._reading_bg
+        css = f"background-color: {bg};" if bg else ""
+        if hasattr(self, "scroll"):
+            self.scroll.viewport().setStyleSheet(css)
+            self.gallery.setStyleSheet(css)
+
+    def _on_scroll_prefetch(self, value: int) -> None:
+        """读到当前话 70% → 预渲染下一话（不自动翻话）。
+
+        预渲染走 _prefetch_future 的串行队列锁（同一时间只渲染 1 话），
+        切话时 _load_episode 命中 _prefetched → 秒开；70% 以下不触发。
         """
         if self._current_idx < 0:
             return
-        if not self._images:
-            return
-        vbar = self.scroll.verticalScrollBar()
-        if vbar.maximum() == 0:
-            return
-        if self._mode != "gallery":
-            return  # 横向翻页模式走独立的翻页边界逻辑
-        # 时间冷却：翻话后 2s 内不重复触发
-        if time.time() - self._last_auto_nav_ts < 2.0:
-            return
-        max_v = vbar.maximum()
-        total = len(self._chapters)
-        # 读到 70% → 预加载下一话（只 1 话，避免加载过多；_prefetch_future 有队列锁防重复）
-        if value >= max_v * 0.7:
-            self._prefetch_future(self._current_idx, PREFETCH_COUNT)
-        # 向下：近底部 → 下一话
-        if value >= max_v - 40:
-            if self._auto_loading or self._current_idx >= total - 1:
-                return
-            self._auto_loading = True
-            self._last_auto_nav_ts = time.time()
-            self._load_episode(self._current_idx + 1, scroll_to_end=False)
-        # 向上：滚回顶部 → 上一话末尾
-        elif value <= 2:
-            if self._auto_prev_loading or self._current_idx <= 0:
-                return
-            self._auto_prev_loading = True
-            self._last_auto_nav_ts = time.time()
-            self._load_episode(self._current_idx - 1, scroll_to_end=True)
-
-    def _on_scroll_prefetch(self, value: int) -> None:
-        """滚动读到 70% → 预渲染下一话（仅预渲染，不自动翻话）。
-
-        由滚动条 valueChanged 触发。区别于 _maybe_auto_next（同时含底部自动
-        翻话/顶部自动翻回）——这里只保留预渲染部分；自动翻话维持禁用，
-        用户手动点「下一话」按钮翻话。
-        """
-        if self._current_idx < 0 or not self._images:
-            return
         if self._pending_swap:
-            return  # 换话加载中，跳过
+            return  # 换话加载中：_images 仍是旧话，勿用旧数据触发预渲染
         if self._mode != "gallery":
-            return
+            return  # 横向翻页模式无纵向滚动（翻页由按钮/方向键驱动）
         vbar = self.scroll.verticalScrollBar()
         if vbar.maximum() == 0:
             return
         if value >= vbar.maximum() * 0.7:
             self._prefetch_future(self._current_idx, PREFETCH_COUNT)
+
+    def _prefetch_prev(self, idx: int, n: int = PREFETCH_BACK) -> None:
+        """预加载前面 n 话（向前缓存）：向上翻话命中缓存秒开。
+
+        与后续话共用同一串行队列（_prefetch_queue + _prefetch_busy），最多
+        同时预渲染 1 话；在当前话渲染完成（_finish_episode_load）后入队执行。
+        """
+        if self._source is None or not self._chapters:
+            return
+        for k in range(idx - 1, max(idx - 1 - n, -1), -1):
+            if not (0 <= k < len(self._chapters)):
+                continue
+            ch = self._chapters[k]
+            if ch.url in self._prefetched:
+                continue  # 已预渲染过
+            if hasattr(ch, "_cached_images") and ch._cached_images:
+                self._prefetched[ch.url] = {
+                    "images": ch._cached_images, "count": len(ch._cached_images)
+                }
+                continue
+            if ch.url in self._prefetch_queue:
+                continue  # 已在队列
+            self._prefetch_queue.append(ch.url)
+        # 若空闲则启动第一个（正在渲染后续话时不打断，串行排到后面）
+        if not self._prefetch_busy and self._prefetch_queue:
+            self._start_next_prefetch()
 
     def _on_scroll_lazy(self, value: int) -> None:
         """滚动接近已渲染末端 → 增量渲染下一批图片（懒加载）。
@@ -684,7 +697,19 @@ class ComicView(QWidget):
     # ------------------------------------------------------------------ #
     # Ctrl+滚轮缩放（事件过滤器，抢在子控件 wheelEvent 之前）
     # ------------------------------------------------------------------ #
+    def _is_descendant(self, obj) -> bool:
+        """obj（或其父链）是否属于本视图 —— 应用级过滤器只处理本视图内事件。"""
+        w = obj if isinstance(obj, QWidget) else None
+        while w is not None:
+            if w is self:
+                return True
+            w = w.parentWidget()
+        return False
+
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        # 应用级过滤器：先判定事件是否属于本视图（防误吞其他页面的 Ctrl+滚轮/侧键）
+        if not self._is_descendant(obj):
+            return super().eventFilter(obj, event)
         if event.type() == event.Type.Wheel:
             if event.modifiers() & Qt.ControlModifier:
                 delta = 1.1 if event.angleDelta().y() > 0 else 0.9
@@ -692,6 +717,15 @@ class ComicView(QWidget):
                 self._zoom = max(0.25, min(4.0, self._zoom))
                 self._apply_zoom()
                 event.accept()
+                return True
+            return False  # 普通滚动交给滚动条
+        if event.type() == event.Type.MouseButtonPress:
+            btn = event.button()
+            if btn == Qt.XButton2:
+                self._jump_relative(1)  # 鼠标前侧键 → 下一话
+                return True
+            if btn == Qt.XButton1:
+                self._jump_relative(-1)  # 鼠标后侧键 → 上一话
                 return True
         return super().eventFilter(obj, event)
 
@@ -892,8 +926,9 @@ class _ComicImageLabel(QLabel):
         """按当前容器宽度重绘（缩放/窗口变化时调用）。
 
         优化：容器宽未变（_fit_w 命中）跳过重缩放——滚动/resizeEvent 反复
-        触发时不做全图 scaledToWidth（长图 1000×5000 每次重算极卡）。仅在
-        原始图比容器宽才缩小（容器变宽时不放大原图，防像素化 + 省 CPU）。
+        触发时不做全图 scaledToWidth（长图 1000×5000 每次重算极卡）。
+        始终缩放到容器宽（含放大）：Ctrl+滚轮缩放要求图片双向跟随宽度，
+        原图比容器窄时不放大会让放大方向无效果（用户感知"缩放没反应"）。
         """
         if self._orig is None:
             return
@@ -902,7 +937,7 @@ class _ComicImageLabel(QLabel):
         if avail == self._fit_w:
             return  # 容器宽未变，无需重缩放
         pix = self._orig
-        if pix.width() > avail:
+        if pix.width() != avail:
             pix = pix.scaledToWidth(avail, Qt.SmoothTransformation)
         self._fit_w = avail
         self.setPixmap(pix)

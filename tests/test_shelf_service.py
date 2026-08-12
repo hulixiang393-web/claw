@@ -100,6 +100,51 @@ def test_hidden_local_roundtrip(base: Path):
     assert svc.scan_local()[0].title == "书A"
 
 
+def test_local_resume_relative_output_dir_resolved(base: Path, monkeypatch):
+    """相对 output_dir 下本地续读 key 归一为绝对路径（修复：相对/绝对不一致致记忆断链）。
+
+    书架扫描用相对目录时，产出的 key 须与阅读器存的绝对路径一致，
+    否则本地 epub 卡片不显示"读到第X章"、续读匹配不上。
+    """
+    from framework.reading_progress import ReadingProgress
+
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    monkeypatch.chdir(base)  # 相对 output_dir 以 base 为基准解析
+    rp = ReadingProgress(base / "rp.json")
+    # 模拟阅读器以绝对路径存续读（app._open_epub 用 Path.resolve()）
+    abs_key = str((base / "dl" / "书A" / "书A.epub").resolve())
+    rp.save("", abs_key, "epub", abs_key, "第三章", position=0.5)
+    svc = ShelfService(
+        output_dir="dl",  # 相对路径（默认配置形态）
+        data_dir=base / "data",
+        reading_progress=rp,
+        epub_detector=lambda p: "novel",
+    )
+    items = svc.scan_local()
+    assert items and items[0].resume_title == "第三章"
+    assert items[0].key == abs_key  # 扫描 key 已归一为绝对路径
+
+
+def test_merged_video_carries_online_resume(base: Path):
+    """合并视频卡：本地无进度时展示线上收藏的续读（线上看到哪集）。"""
+    from framework.reading_progress import ReadingProgress
+
+    store = LibraryStore(base / "lib.json")
+    (base / "dl" / "视频C").mkdir(parents=True, exist_ok=True)
+    (base / "dl" / "视频C" / "第1集.mp4").write_bytes(b"x")
+    (base / "dl" / "视频C" / "第2集.mp4").write_bytes(b"x")
+    store.add("src", "http://x/vid", "视频C", content_type="video")
+    rp = ReadingProgress(base / "rp.json")
+    rp.save("src", "http://x/vid", "video", "http://x/vid/2", "第2集", position=0.3)
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data",
+        library_store=store, reading_progress=rp,
+    )
+    merged = [i for i in svc.list_items() if i.kind == "local"]
+    assert len(merged) == 1
+    assert merged[0].resume_title == "第2集"  # 本地无进度 → 回退线上收藏进度
+
+
 def test_favorites_merged_with_local(base: Path):
     store = LibraryStore(base / "lib.json")
     make_epub(base / "dl" / "本地书" / "本地书.epub")

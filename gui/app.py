@@ -228,6 +228,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tabs)
 
         self._build_pages()
+        # 切到书架 Tab 时刷新：阅读/下载后回来，续读记忆（读到第X章/看到第X集）实时更新
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # 主题
         self.theme_manager.on_theme_changed(self._apply_theme_qss)
@@ -291,11 +293,15 @@ class MainWindow(QMainWindow):
         self.reader.download_requested.connect(self._download_from_shelf)
         # 收藏判断回调：LibraryStore.has(url)（书架库未构建时先构建）
         self.reader.set_favorite_checker(self._favorite_has)
+        # 阅读器全屏：隐藏/恢复 Tab 栏（沉浸阅读，退出全屏还原）
+        self.reader.fullscreen_changed.connect(self._on_reader_fullscreen)
         # 启动即应用阅读区独立背景/字号（ui-reader #12）
         self.reader.apply_reading_style(
             self.settings.get("ui", "reading_bg", "") or "",
             int(self.settings.get("ui", "reading_font_size", 0) or 0),
         )
+        # 阅读器「背景」按钮循环 → 写回设置（记忆用户护眼背景色，下次重启沿用）
+        self.reader.reading_bg_changed.connect(self._on_reading_bg_changed)
         # App 退出：先释放 VLC 播放器，再释放共享 vlc.Instance
         from PySide6.QtWidgets import QApplication
 
@@ -309,6 +315,15 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=warmup_vlc, daemon=True, name="vlc-warmup").start()
         return self.reader
+
+    def _on_reader_fullscreen(self, fs: bool) -> None:
+        """阅读器全屏时隐藏 Tab 栏（沉浸），退出全屏恢复。"""
+        self.tabs.tabBar().setVisible(not fs)
+
+    def _on_reading_bg_changed(self, bg: str) -> None:
+        """阅读器「背景」循环后写回设置（记忆护眼背景色，下次打开/重启沿用）。"""
+        self.settings.set("ui", "reading_bg", bg)
+        self.settings.save()
 
     def _favorite_has(self, url: str) -> bool:
         """收藏判断：书架库是否已收藏该书。库未构建则先构建。"""
@@ -385,6 +400,12 @@ class MainWindow(QMainWindow):
                     page.refresh()
         except Exception:  # noqa: BLE001 —— 书架刷新失败不影响下载
             pass
+
+    def _on_tab_changed(self, idx: int) -> None:
+        """Tab 切换：切到书架时重建一次（续读记忆实时更新，读完回来即看到）。"""
+        page = self.tabs.widget(idx)
+        if page is getattr(self, "library_page", None) and hasattr(page, "refresh"):
+            page.refresh()
 
     # ------------------------------------------------------------------ #
     def _on_batch_add_shelf(self, items) -> None:
@@ -528,9 +549,11 @@ class MainWindow(QMainWindow):
         """下载页「打开阅读」→ 用内置 epub 阅读器打开。"""
         if self.reader is None or not path:
             return
-        import os
+        from pathlib import Path
 
-        path = os.path.abspath(path)  # 统一绝对路径，与书架/进度 key 一致（否则续读匹配不上）
+        # 统一解析路径，与书架扫描（shelf_service output_dir .resolve()）生成的
+        # 续读 key 完全一致，否则相对目录配置下续读匹配不上。
+        path = str(Path(path).resolve())
         self.reader.open_epub(path)
         self.tabs.setCurrentIndex(self._tab_index["reader"])
 
@@ -564,12 +587,18 @@ class MainWindow(QMainWindow):
         paths = list(rec.get("episode_paths") or [])
         if not paths:
             return
-        # 记忆 key：本地视频书 key=目录路径（与 shelf_service 一致）
+        # 记忆 key：本地视频书 key=目录路径（与 shelf_service 一致，已归一为绝对路径）
         key = rec.get("key") or rec.get("path") or ""
         prev_title = ""
         if key and self.reading_progress is not None:
             recp = self.reading_progress.resume(key)
             prev_title = (recp or {}).get("chapter_title", "")
+        if not prev_title:
+            # 本地无进度 → 回退线上收藏进度（同书线上看到哪集，本地也定位到那集）
+            url = rec.get("url") or ""
+            if url and self.reading_progress is not None:
+                recp = self.reading_progress.resume(url)
+                prev_title = (recp or {}).get("chapter_title", "")
 
         target = paths[0]
         if len(paths) > 1:
@@ -578,7 +607,13 @@ class MainWindow(QMainWindow):
             names = [Path(p).name for p in paths]
             from PySide6.QtWidgets import QInputDialog
 
-            cur = names.index(prev_title) if prev_title in names else 0
+            # 文件名模糊匹配：线上集标题（如"第5集"）未必等于文件名（如"第5集.mp4"）
+            cur = 0
+            if prev_title:
+                for i, n in enumerate(names):
+                    if prev_title in n or n in prev_title:
+                        cur = i
+                        break
             item, ok = QInputDialog.getItem(
                 self, "选择集数", "选择要播放的集：", names, cur, False
             )

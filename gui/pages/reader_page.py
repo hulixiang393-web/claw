@@ -28,6 +28,15 @@ from .reader.video_view import VideoView
 from .reader.epub_view import EpubView
 from .base_page import BasePage
 
+# 阅读背景主题（bg, fg）：白/米黄/护眼绿/夜间黑。「背景」按钮按此循环，
+# fg 为空 = 跟随主题；夜间黑配浅字保证可读。选择写回 ui.reading_bg 记忆。
+READING_BG_THEMES = [
+    ("", ""),                # 0 白 / 跟随主题
+    ("#FBF3D2", ""),         # 1 米黄
+    ("#C7EDCC", ""),         # 2 护眼绿
+    ("#2B2B2B", "#E8E8E8"),  # 3 夜间黑
+]
+
 
 class _SwitchSourceSignals(QObject):
     """换源后台任务信号。"""
@@ -67,6 +76,10 @@ class ReaderPage(BasePage):
     favorite_requested = Signal(object)
     # 「下载」→ App 层拉详情入下载队列（小说/漫画产 epub，视频产 mp4）
     download_requested = Signal(object)
+    # 全屏态切换 → App 层隐藏/恢复 Tab 栏（沉浸阅读）
+    fullscreen_changed = Signal(bool)
+    # 「背景」循环切换 → App 层写回 ui.reading_bg（记忆护眼背景色选择）
+    reading_bg_changed = Signal(str)
 
     def __init__(
         self,
@@ -87,13 +100,17 @@ class ReaderPage(BasePage):
         self._favorite_checker = None  # 可选回调: url -> bool（App 注入判断是否已收藏）
         self._pending_position = None  # 打开书续读位置（0~1 比例），_on_detail 传给视图
         self._pending_page = None  # 打开书续读翻页页索引（小说翻页模式）
+        self._bg_idx = 0  # 当前护眼背景主题索引（READING_BG_THEMES）
+        self._reading_font_size = 0  # 当前阅读字号（背景循环不改变字号）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ---- 作品信息条 ----
-        info = QHBoxLayout()
+        # ---- 作品信息条（容器化：全屏阅读时整体隐藏，沉浸）----
+        self.info_bar = QWidget()
+        info = QHBoxLayout(self.info_bar)
+        info.setContentsMargins(0, 0, 0, 0)
         self.title_label = QLabel("未打开作品")
         self.title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         info.addWidget(self.title_label)
@@ -116,7 +133,7 @@ class ReaderPage(BasePage):
         self.epub_btn = QPushButton("打开本地 epub")
         self.epub_btn.clicked.connect(self._pick_epub)
         info.addWidget(self.epub_btn)
-        layout.addLayout(info)
+        layout.addWidget(self.info_bar)
 
         # ---- 四视图切换 ----
         self.stack = QStackedWidget()
@@ -148,6 +165,57 @@ class ReaderPage(BasePage):
         # ---- 播放器内下载：转发 App 层下载链路（与顶部「下载」一致）----
         self.video_view.download_requested.connect(self.download_requested)
 
+        # ---- 全屏阅读：小说/漫画/epub 工具条 ⛶ → 切主窗全屏（视频自带全屏不重复）----
+        self._fullscreen = False
+        self._fs_was_max = False  # 进入全屏前窗口是否最大化（退出时还原）
+        self.novel_view.fullscreen_requested.connect(self._toggle_fullscreen)
+        self.comic_view.fullscreen_requested.connect(self._toggle_fullscreen)
+        self.epub_view.fullscreen_requested.connect(self._toggle_fullscreen)
+        # Esc 退出全屏（WindowShortcut：主窗激活即生效，不依赖子控件焦点）
+        from PySide6.QtGui import QKeySequence, QShortcut
+
+        sc = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        sc.activated.connect(self._exit_fullscreen)
+        # 「背景」按钮 → 循环切换护眼背景色（三视图共用一个循环态，切换一致）
+        self.novel_view.background_cycle_requested.connect(self.cycle_reading_bg)
+        self.comic_view.background_cycle_requested.connect(self.cycle_reading_bg)
+        self.epub_view.background_cycle_requested.connect(self.cycle_reading_bg)
+
+    def _toggle_fullscreen(self) -> None:
+        """切换全屏阅读：主窗全屏 + 隐藏信息条/Tab 栏（沉浸），退出时还原。"""
+        win = self.window()
+        if not self._fullscreen:
+            self._fs_was_max = bool(win.windowState() & Qt.WindowMaximized)
+            win.showFullScreen()
+        else:
+            win.showNormal()
+            if self._fs_was_max:
+                win.showMaximized()
+        self._fullscreen = not self._fullscreen
+        self._apply_fullscreen_ui()
+
+    def _exit_fullscreen(self) -> None:
+        """退出全屏（幂等：非全屏态直接返回）。"""
+        if not self._fullscreen:
+            return
+        self._toggle_fullscreen()
+
+    def _apply_fullscreen_ui(self) -> None:
+        """全屏态 UI 联动：信息条显隐 + 各视图按钮提示 + 通知 App 层。"""
+        self.info_bar.setVisible(not self._fullscreen)
+        tip = "退出全屏（Esc）" if self._fullscreen else "全屏阅读"
+        for v in (self.novel_view, self.comic_view, self.epub_view):
+            btn = getattr(v, "fullscreen_btn", None)
+            if btn is not None:
+                btn.setToolTip(tip)
+        self.fullscreen_changed.emit(self._fullscreen)
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        """切走阅读器 Tab：若在全屏则自动退出（防主窗卡在全屏无法导航）。"""
+        if self._fullscreen:
+            self._exit_fullscreen()
+        super().hideEvent(event)
+
     def _on_source_changed(self, payload) -> None:
         """换源：重新抓取该源详情 + 刷新 VideoView 分集。"""
         if self._content is None or not isinstance(payload, (tuple, list)):
@@ -169,8 +237,9 @@ class ReaderPage(BasePage):
         if new_detail is None:
             return
         self.video_view.reload_detail(new_detail)
-        # 进度记忆用原 URL（含 sid 变化，保留同一部剧 key）
-        self._on_progress_signal((new_detail, new_detail.title, ""))
+        # 进度记忆由 reload_detail → _load_episode(0) → episode_changed 正常落盘
+        # （新源当前集 url）。这里不再补一条空 url 的进度——那会把已存的
+        # chapter_url 覆盖成空，导致该书续读丢失。
 
     def _on_source_switch_failed(self, err: str) -> None:
         self.video_view.play_label.setText(f"换源失败：{err}")
@@ -431,9 +500,43 @@ class ReaderPage(BasePage):
             self.epub_view.set_font_scale(self._font_scale)
 
     def apply_reading_style(self, bg: str = "", font_size: int = 0) -> None:
-        """设置阅读区独立背景/字号（ui-reader #12）：转发给小说视图。"""
-        if hasattr(self, "novel_view"):
-            self.novel_view.set_reading_style(bg, font_size)
+        """设置阅读区独立背景/字号/前景色（ui-reader #12）：转发给小说/漫画/epub。
+
+        bg：颜色字符串（#RRGGBB），空 = 透明跟随主题；
+        font_size：>0 时覆盖全局字号，0 = 跟随全局 font_scale；
+        前景色按主题配套（夜间黑配浅字），浅色背景保持默认前景。
+        """
+        self._bg_idx = self._bg_index_for(bg)
+        if font_size > 0:
+            self._reading_font_size = font_size
+        fg = self._fg_for(bg)
+        for view in (self.novel_view, self.comic_view, self.epub_view):
+            view.set_reading_style(bg, font_size, fg=fg)
+
+    def cycle_reading_bg(self) -> None:
+        """「背景」按钮：循环切换 白/米黄/护眼绿/夜间黑，应用三视图 + 通知 App 记忆。"""
+        self._bg_idx = (self._bg_idx + 1) % len(READING_BG_THEMES)
+        bg, _fg = READING_BG_THEMES[self._bg_idx]
+        self.apply_reading_style(bg, self._reading_font_size)
+        self.reading_bg_changed.emit(bg)
+
+    @staticmethod
+    def _bg_index_for(bg: str) -> int:
+        """按背景色字符串匹配主题索引（未识别回 0 = 白/跟随主题）。"""
+        key = (bg or "").strip().lower()
+        for i, (b, _) in enumerate(READING_BG_THEMES):
+            if b.lower() == key:
+                return i
+        return 0
+
+    @staticmethod
+    def _fg_for(bg: str) -> str:
+        """按背景色取配套前景色（浅色背景配默认前景，夜间黑配浅字）。"""
+        key = (bg or "").strip().lower()
+        for b, f in READING_BG_THEMES:
+            if b.lower() == key:
+                return f
+        return ""
 
     def shutdown_video(self) -> None:
         """App 退出释放 VLC 播放器（必须先于 shutdown_vlc 释放实例）。"""
