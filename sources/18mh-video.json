@@ -130,20 +130,8 @@
     },
     "content": {
       "episode": {
-        "list": {
-          "root_selector": {
-            "css": "a[href*='/mv/detail/']"
-          },
-          "fields": {
-            "title": {
-              "css": "a[href*='/mv/detail/']"
-            },
-            "url": {
-              "css": "a[href*='/mv/detail/']",
-              "attr": "href"
-            }
-          }
-        },
+        "single_chapter": true,
+        "note": "详情页即单个视频（/mv/detail/{id}），无分集列表。此前 list.root_selector 抓详情页所有 /mv/detail/ 链接当选集（max_items=1 取第一个），详情页推荐/相关视频排在前面就播成了别的视频——改 single_chapter 用详情 URL 作唯一分集，点谁播谁，并复用 fetch_detail 已缓存的详情页 HTML 提取 m3u8。",
         "play_url": {
           "regex": "\"url\"\\s*:\\s*\"([^\"]*m3u8[^\"]*)\""
         }

@@ -188,7 +188,11 @@
           "fields": {
             "url": {
               "css": "img",
-              "attr": "src"
+              "attr": "src",
+              "url_replace": [
+                "//t\\d+\\.qy0\\.ru/data/t/(\\d+)/(\\d+)/([^/\"]+)\\.(\\w+)",
+                "https://img5.qy0.ru/data/{1}/{2}/{seq}.{4}"
+              ]
             }
           },
           "paginator": {

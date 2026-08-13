@@ -1,0 +1,213 @@
+{
+  "$schema_version": 2,
+  "$id": "xasiat",
+  "$type": "video",
+  "$name": "Xasiat",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.xasiat.com/",
+    "description": "Xasiat - 亚洲成人直播录制视频站（Stripchat/OnlyFans等平台）。列表/搜索共用 div#list_videos_most_recent_videos_items div.item 卡片；播放页内嵌独立播放器（embed 页含 JS 配置含视频直链 mp4，HTTP 链式提取，无需 Playwright）。",
+    "lang": "en",
+    "region": "tw",
+    "tags": [
+      "视频",
+      "成人",
+      "亚洲",
+      "直播录制",
+      "stripchat",
+      "onlyfans"
+    ],
+    "last_verified": "2026-08-13"
+  },
+  "transports": {
+    "base_url": "https://www.xasiat.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.xasiat.com/"
+    },
+    "timeout": 20,
+    "retries": 2,
+    "interval_ms": 1000,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "Latest Updates",
+            "url": "/latest-updates/{page}/"
+          },
+          {
+            "title": "Top Rated",
+            "url": "/top-rated/{page}/"
+          },
+          {
+            "title": "Most Viewed",
+            "url": "/most-popular/{page}/"
+          },
+          {
+            "title": "Albums",
+            "url": "/albums/{page}/"
+          },
+          {
+            "title": "Categories",
+            "url": "/categories/{page}/"
+          },
+          {
+            "title": "Models",
+            "url": "/models/{page}/"
+          },
+          {
+            "title": "Playlists",
+            "url": "/playlists/{page}/"
+          },
+          {
+            "title": "Channels",
+            "url": "/channels/{page}/"
+          },
+          {
+            "title": "Community",
+            "url": "/members/{page}/"
+          },
+          {
+            "title": "Tags",
+            "url": "/tags/{page}/"
+          }
+        ],
+        "root_selector": {
+          "css": "div.item"
+        },
+        "fields": {
+          "title": {
+            "css": "a[href*='/videos/']",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a[href*='/videos/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.thumb",
+            "attr": "data-original"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/",
+      "method": "GET",
+      "keyword_param": "search_query",
+      "paginator": {
+        "url_template": "/search/?search_query={keyword}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.item"
+        },
+        "fields": {
+          "title": {
+            "css": "a[href*='/videos/']",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a[href*='/videos/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.thumb",
+            "attr": "data-original"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/videos/\\d+/",
+      "fields": {
+        "title": {
+          "css": "meta[property='og:title']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[property='og:description']",
+          "attr": "content"
+        },
+        "tags": {
+          "css": "meta[property='video:tag']",
+          "attr": "content"
+        },
+        "categories": {
+          "regex": "video_categories:\\s*['\"]([^'\"]+)['\"]"
+        },
+        "author": {
+          "regex": "video_tags:\\s*['\"]([^'\"]+)['\"]"
+        },
+        "gallery": {
+          "css": "a[rel='screenshots'] img.thumb",
+          "attr": "data-original"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "播放地址通过 http_chain 从 embed 页提取：Step 0 拿 embed HTML，regex 抓 JS config 里的 video_alt_url（最佳画质 HD mp4，含 v-acctoken）。video_alt_url_hd=1 表示有 HD 版本。",
+        "play_url": {
+          "http_chain": [
+            {
+              "regex": "video_alt_url[\"']?\\s*:\\s*[\"']([^\"']*\\.mp4[^\"']*)[\"']",
+              "name": "video_url",
+              "fetch": false
+            }
+          ]
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "mp4",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 100
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "div#list_videos_most_recent_videos_items"
+      }
+    }
+  }
+}

@@ -77,13 +77,25 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
         # 缓冲调优：按媒体类型给 VLC 设 network-caching（HLS 分片流网络抖动
         # 敏感，慢 CDN 每片 1-2s 时默认 300ms 缓冲会频繁卡顿/加载慢）。
         # 复用 media_tuner.classify 的缓冲画像，缺省 HLS 5000ms 抗慢 CDN。
+        # 注意：类型要用**原始媒体 URL** 判定——play_url 走本地代理后是
+        # http://127.0.0.1:/s/token，不含 .m3u8/.mp4 特征，会被判成 unknown
+        # 拿 2500ms，走代理的慢 HLS 反而缓冲更小（播放卡顿的根因之一）。
         try:
             from .media_tuner import classify as _classify
-            _profile = _classify(play_url)
+            _profile = _classify(url)
             _caching = max(_profile.buffer_ms, 5000) if _profile.kind == "hls" else _profile.buffer_ms
+            # 经本地代理转发（防盗链头）多一跳、更抖，缓冲再加大抗卡顿
+            if play_url != url:
+                _caching = max(_caching, 8000)
         except Exception:  # noqa: BLE001
             _caching = 5000
-        args = [vlc, "--no-video-title-show", f"--network-caching={_caching}", play_url]
+        # 播放处理（调研 VLC 流播放调优）：除加大网络缓冲外，加 --no-drop-late-frames
+        # 让 VLC 不丢晚到的帧（默认丢帧会表现为画面卡顿跳动）；不强制硬件解码——
+        # DXVA2/D3D11VA 的 copy-back 开销在某些机器上反而更卡，交给 VLC 自动判断。
+        args = [
+            vlc, "--no-video-title-show", "--no-drop-late-frames",
+            f"--network-caching={_caching}", play_url,
+        ]
         if audio_url:
             args.append(f":input-slave={audio_url}")
         try:

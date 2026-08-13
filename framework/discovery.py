@@ -139,9 +139,23 @@ class Discovery:
                 w.cover = new_cover
 
     @staticmethod
+    def _apply_clean(value, pairs) -> str:
+        """按替换对列表清洗字段：pattern 以 "re:" 前缀按正则替换（同 search._apply_clean）。"""
+        import re as _re2
+
+        value = str(value or "").strip()
+        for pat, repl in (pairs or []):
+            if not pat:
+                continue
+            if pat.startswith("re:"):
+                value = _re2.sub(pat[3:], str(repl or ""), value)
+            else:
+                value = value.replace(pat, str(repl or ""))
+        return value.strip()
+
+    @staticmethod
     def _parse_initial_state(html: str):
         """从 html 中提取 window.__INITIAL_STATE__ = {...}; 并解析为 dict。
-
         大括号平衡扫描（跳过字符串内）切出 JSON，容错：找不到/解析失败返回 None。
         """
         if not html:
@@ -354,6 +368,13 @@ class Discovery:
             )
 
         items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
+        # 字段清洗：works_list_item.clean.{field} 为 [pattern, repl] 替换对列表
+        # （同 search.item.clean / detail.fields.clean，去列表标题噪声如 51cg 的
+        # 「热搜 HOT」）。pattern 以 "re:" 开头按正则替换。
+        for it in items:
+            for _c_key, _pairs in (works_list_item.get("clean") or {}).items():
+                if _c_key in it:
+                    it[_c_key] = self._apply_clean(it[_c_key], _pairs)
         works: List[Work] = []
         seen: set = set()  # 同页内按 URL 去重（maccms 等列表页偶发重复项）
         for it in items:

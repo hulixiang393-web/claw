@@ -1,0 +1,225 @@
+{
+  "$schema_version": 2,
+  "$id": "51cg1",
+  "$type": "video",
+  "$name": "51吃瓜",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://51cg1.com/",
+    "description": "51吃瓜 - 吃瓜/网红黑料/成人视频图文站（Typecho + Mirages 主题）。发现首页分页 /page/{page}/；分类 /category/{slug}/ 单页（分类翻页 403 反爬）。列表项标题带「热搜 HOT」噪声已清洗；正文含多图（data-src 懒加载）+ DPlayer m3u8 视频（从详情页 JS 提取）。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "吃瓜",
+      "网红",
+      "成人",
+      "hls"
+    ],
+    "last_verified": "2026-08-13"
+  },
+  "transports": {
+    "base_url": "https://51cg1.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Referer": "https://51cg1.com/"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "最新",
+            "url": "/page/{page}/"
+          },
+          {
+            "title": "今日吃瓜",
+            "url": "/category/wpcz/"
+          },
+          {
+            "title": "网红黑料",
+            "url": "/category/whhl/"
+          },
+          {
+            "title": "热门大瓜",
+            "url": "/category/rdsj/"
+          },
+          {
+            "title": "必看大瓜",
+            "url": "/category/bkdg/"
+          },
+          {
+            "title": "AI成人短剧",
+            "url": "/category/cbdj/"
+          },
+          {
+            "title": "看片娱乐",
+            "url": "/category/ysyl/"
+          },
+          {
+            "title": "51剧场",
+            "url": "/category/51djc/"
+          },
+          {
+            "title": "探花精选",
+            "url": "/category/thjx/"
+          },
+          {
+            "title": "网黄合集",
+            "url": "/category/whhj/"
+          },
+          {
+            "title": "明星黑料",
+            "url": "/category/whmx/"
+          },
+          {
+            "title": "海外吃瓜",
+            "url": "/category/hwcg/"
+          },
+          {
+            "title": "学生校园",
+            "url": "/category/xsxy/"
+          },
+          {
+            "title": "国产剧情",
+            "url": "/category/gcjq/"
+          },
+          {
+            "title": "骚男骚女",
+            "url": "/category/snsn/"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "article[itemscope]"
+        },
+        "clean": {
+          "title": [
+            ["re:热搜 HOT", ""]
+          ]
+        },
+        "fields": {
+          "title": {
+            "css": "h2.post-card-title"
+          },
+          "url": {
+            "css": "a[href*='/archives/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "script",
+            "regex": "loadBannerDirect\\('([^']+)'"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/{keyword}/",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "paginator": {
+        "url_template": "/search/{keyword}/"
+      },
+      "item": {
+        "root_selector": {
+          "css": "article[itemscope]"
+        },
+        "clean": {
+          "title": [
+            ["re:热搜 HOT", ""]
+          ]
+        },
+        "fields": {
+          "title": {
+            "css": "h2.post-card-title"
+          },
+          "url": {
+            "css": "a[href*='/archives/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "script",
+            "regex": "loadBannerDirect\\('([^']+)'"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/archives/\\d+/",
+      "fields": {
+        "title": {
+          "css": "meta[property='og:title']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "gallery": {
+          "css": ".post-content img[data-xkrkllgl]",
+          "attr": "data-xkrkllgl"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页即单条文章（/archives/{id}），无分集列表。播放地址从详情页 DPlayer JS 配置提取 m3u8（regex 抓 hls 地址，框架自动 \/ -> /）。部分文章纯图文无视频，播放地址为空属正常。",
+        "play_url": {
+          "regex": "\"url\"\\s*:\\s*\"([^\"]*m3u8[^\"]*)\""
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "mp4",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 100
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "article[itemscope]"
+      }
+    }
+  }
+}

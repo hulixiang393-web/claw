@@ -91,6 +91,9 @@ class Detail:
     chapters: List[Chapter] = field(default_factory=list)
     # 播放源列表（换源站）：[{sid, name, from_, ps, parse}]；无换源配置时为空
     source_list: List[dict] = field(default_factory=list)
+    # 图文集（video 详情页内嵌截图序列等，如 xasiat 的 fancybox screenshots）；
+    # 由 detail.fields.gallery 多值选择器提取，详情抽屉以缩略图形式展示
+    gallery: List[str] = field(default_factory=list)
 
 
 class Content:
@@ -317,6 +320,10 @@ class Content:
         # 标签（可空）
         tags = self._parser.extract(doc, fields.get("tags"))
         detail.tags = tags
+        # 图文集（视频页截图序列等）：detail.fields.gallery 多值选择器 → 绝对 URL
+        detail.gallery = self._parser.extract(
+            doc, fields.get("gallery"), source.base_url
+        )
         # 字段清洗：fields.clean.{field} 为 [pattern, repl] 替换对列表；
         # pattern 以 "re:" 开头按正则替换（如 summary 去"最新章节推荐地址"尾巴）
         for _key, _pairs in (fields.get("clean") or {}).items():
@@ -1380,9 +1387,20 @@ class Content:
         next_sel = (paginator.get("next_link") or {}).get("selector")
 
         url_sel = fields.get("url")
+        # 图片 URL 重写（缩略图 → 原图）：url_replace = [regex, repl]。
+        # repl 支持 {n} 引用正则捕获组、{seq} 表示按收集顺序自动编号
+        # （从 1 起，如 wnacg 缩略图时间戳 → img5 原图序号 0001..）。无匹配
+        # 时保留原始 URL，避免误伤；仅当有 url_replace 才启用顺序编号。
+        url_replace_re = ""
+        url_replace_tpl = ""
+        _ur = (url_sel or {}).get("url_replace") if isinstance(url_sel, dict) else None
+        if isinstance(_ur, (list, tuple)) and len(_ur) == 2 and _ur[0]:
+            url_replace_re = str(_ur[0])
+            url_replace_tpl = str(_ur[1])
         urls: List[str] = []
         seen_url: set = set()   # 已访问的页面 URL（防死循环）
         seen_img: set = set()   # 已收集的图片 URL（跨页去重）
+        _seq_counter = [0]  # {seq} 顺序编号器（被闭包共享）
 
         # 共用小函数：抓单页 → (本页图片列表, 下一页链接)。顺序与并行翻页都复用。
         def _fetch_page(page_url: str, http=None) -> tuple:
@@ -1402,11 +1420,21 @@ class Content:
             return page_imgs, nxt
 
         def _add_imgs(page_imgs: List[str]) -> None:
-            """广告过滤 + 去重后并入最终列表（顺序/并行共用）。"""
+            """广告过滤 + url_replace 重写 + 去重后并入最终列表（顺序/并行共用）。"""
             for u in self._filter_ad_images(page_imgs, source):
-                if u not in seen_img:
-                    seen_img.add(u)
-                    urls.append(u)
+                final = u
+                if url_replace_re:
+                    m = _re.search(url_replace_re, u)
+                    if m:
+                        _seq_counter[0] += 1
+                        repl = url_replace_tpl
+                        for gi in range(1, len(m.groups()) + 1):
+                            repl = repl.replace("{%d}" % gi, m.group(gi) or "")
+                        repl = repl.replace("{seq}", "%04d" % _seq_counter[0])
+                        final = repl
+                if final and final not in seen_img:
+                    seen_img.add(final)
+                    urls.append(final)
 
         # 并行翻页（config-driven）：URL 可预测时按 wave 并发抓取，提速明显
         # （acgxmh 实测顺序 55 页 ≈71s → 并行 ~20s，window 过大触发站点 429

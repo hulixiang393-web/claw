@@ -91,6 +91,11 @@ class DetailDrawer(QFrame):
         self.summary.setAlignment(Qt.AlignTop)
         layout.addWidget(self.summary)
 
+        # 图文集（视频截图序列等）：横向缩略图条，占位隐藏
+        self._gallery_scroll: QScrollArea | None = None
+        self._gallery_row: QHBoxLayout | None = None
+        self._gallery_thumbs: list[QLabel] = []
+
         layout.addStretch(1)
 
         # 按钮
@@ -143,8 +148,84 @@ class DetailDrawer(QFrame):
                 f"共 {len(detail.chapters)} 章节" if detail.chapters else "无章节信息"
             )
         self.summary.setText(detail.summary or "（无简介）")
-        self._load_cover(detail.cover)
+        # 抽屉内不显示任何图片（封面/图文集）：隐藏封面区与 gallery 图集条，
+        # 避免广告图/截图序列遮挡按钮或干扰阅读（布局自动重排，标题上移）。
+        self.cover.setVisible(False)
+        if self._gallery_scroll is not None:
+            self._gallery_scroll.setVisible(False)
         self.setVisible(True)
+
+    def _show_gallery(self, images: list) -> None:
+        """展示图文集缩略图条（横向滚动）；无图则隐藏/清空。"""
+        import shiboken6
+
+        if not images:
+            if self._gallery_scroll is not None and shiboken6.isValid(self._gallery_scroll):
+                self._gallery_scroll.setVisible(False)
+                for thumb in self._gallery_thumbs:
+                    if shiboken6.isValid(thumb):
+                        thumb.deleteLater()
+                self._gallery_thumbs = []
+            return
+        if self._gallery_scroll is None:
+            self._gallery_scroll = QScrollArea()
+            self._gallery_scroll.setWidgetResizable(True)
+            self._gallery_scroll.setFixedHeight(100)
+            self._gallery_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._gallery_scroll.setStyleSheet(
+                "QScrollArea { border: none; background: transparent; }"
+                "QScrollBar:horizontal { height: 6px; }"
+            )
+            inner = QWidget()
+            self._gallery_row = QHBoxLayout(inner)
+            self._gallery_row.setContentsMargins(0, 0, 0, 0)
+            self._gallery_row.setSpacing(6)
+            self._gallery_scroll.setWidget(inner)
+            self.layout().insertWidget(self.layout().count() - 2, self._gallery_scroll)
+        else:
+            for thumb in self._gallery_thumbs:
+                if shiboken6.isValid(thumb):
+                    thumb.deleteLater()
+            self._gallery_thumbs = []
+            while self._gallery_row.count():
+                item = self._gallery_row.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+        self._gallery_scroll.setVisible(True)
+
+        def _make_thumb(url: str) -> QLabel:
+            thumb = QLabel()
+            thumb.setFixedSize(100, 80)
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setStyleSheet(
+                "background: palette(midlight); border-radius: 6px;"
+                "font-size: 24px;"
+            )
+            thumb.setText("🖼")
+
+            def _on_ready(pixmap) -> None:
+                import shiboken6 as _shib
+
+                if pixmap is None or not _shib.isValid(thumb):
+                    return
+                scaled = pixmap.scaled(
+                    100, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+                )
+                sx = max(0, (scaled.width() - 100) // 2)
+                sy = max(0, (scaled.height() - 80) // 2)
+                crop = scaled.copy(sx, sy, min(100, scaled.width()), min(80, scaled.height()))
+                thumb.setPixmap(crop)
+
+            from gui.components.cover_loader import CoverLoader
+
+            CoverLoader.instance().load(url, _on_ready)
+            return thumb
+
+        for url in images:
+            thumb = _make_thumb(url)
+            self._gallery_row.addWidget(thumb)
+            self._gallery_thumbs.append(thumb)
 
     def _load_cover(self, url: str) -> None:
         """异步加载封面（CoverLoader 全局限流），失败/为空保留占位符。"""

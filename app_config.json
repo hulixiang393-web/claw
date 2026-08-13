@@ -5,17 +5,20 @@
     "default_retries": 3,
     "default_request_interval": 0,
     "proxy": null,
-    "proxy_pool": {"file": "data/proxies.json", "max_switches": 3},
     "concurrent_search_sources": 4,
-    "max_bytes_per_image": 5242880
+    "max_bytes_per_image": 5242880,
+    "proxy_pool": {
+      "file": "data/proxies.json",
+      "max_switches": 3
+    }
   },
   "ui": {
-    "theme": "sakura",
+    "theme": "mint",
     "font_scale": 1.5,
     "cover_cache_size_mb": 256,
     "default_page_size": 20,
     "background_image": "D:/code/claw/薇尔莉特.jpg",
-    "background_opacity": 0.6,
+    "background_opacity": 0.4,
     "reading_bg": "",
     "reading_font_size": 0
   },
@@ -25,7 +28,8 @@
     "merge_chapters_into_one_file": true,
     "skip_existing": true,
     "max_concurrent_downloads": 6,
-    "show_notification": true
+    "show_notification": true,
+    "max_parallel_chapters": 3
   },
   "library": {
     "shelf_export_dir": "library",

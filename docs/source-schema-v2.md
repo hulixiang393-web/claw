@@ -123,6 +123,11 @@
 | `list_item.fields.url` | `selector` | 分类页 URL |
 | `list_item.fields.cover` | `selector` | 封面图 |
 | `list_item.fields.tags` | `selector` | 分类标签 |
+| `works_list_item.root_selector` | `selector` | 作品列表项根节点（比 `list_item` 更优先用于作品列表，如 51cg 的 `article[itemscope]`） |
+| `works_list_item.fields.title` | `selector` | 作品标题 |
+| `works_list_item.fields.url` | `selector` | 作品详情页 URL |
+| `works_list_item.fields.cover` | `selector` | 作品封面图 |
+| `works_list_item.clean` | `object` | 作品字段清洗：`{字段名: [[pattern, repl], ...]}`，pattern 以 `re:` 开头按正则替换（同 search `item.clean`，如 51cg 去列表标题噪声「热搜 HOT」） |
 
 </details>
 
@@ -191,6 +196,7 @@
 | `fields.summary` | `selector` | 简介 / 描述 |
 | `fields.status` | `selector` | 状态 |
 | `fields.tags` | `selector` | 标签 |
+| `fields.gallery` | `selector`（多值） | 图文集：详情页内嵌的图片序列（如 video 页的截图集），多值提取为绝对 URL 列表，详情抽屉以横向缩略图条展示 |
 | `fields.meta` | `object` | 自定义额外字段 |
 | `fields.clean` | `object` | 字段清洗：`{字段名: [[pattern, repl], ...]}`，pattern 以 `re:` 开头按正则替换（如 summary 去"最新章节推荐地址"尾巴）；支持 author / status / summary / tags |
 
@@ -255,6 +261,7 @@
 |---|---|---|
 | `list.paginator` | `paginator` | 图片列表翻页器 |
 | `list.fields.url.attr_path` | `string` | 懒加载用 `data-src` |
+| `list.fields.url.url_replace` | `array` | 图片 URL 重写：`[regex, repl]`。列表缩略图 → 高清原图（如 wnacg 的 `t4.qy0.ru/data/t/{a}/{b}/{ts}.webp` → `img5.qy0.ru/data/{a}/{b}/{seq}.webp`）。repl 支持 `{1}..{n}` 捕获组引用与 `{seq}` 顺序编号（`%04d` 从 1 起）；无匹配保留原 URL；协议相对 URL 需显式写 `https://` |
 | `list.root_selector.exclude` | `array<selector>` | 排除广告图 |
 
 </details>

@@ -38,28 +38,84 @@ _READ_CHUNK = 64 * 1024
 # 转发到 CDN 的连接池单例：VLC 经本地代理逐个拉 m3u8 分片时复用 keep-alive
 # 连接，避免每个分片都重新对 CDN 握手（urllib.urlopen 无连接池，几十个分片
 # 几十次 TCP/TLS 握手是播放卡顿/加载慢的常见根因）。
+#
+# 两个会话：
+# - 系统代理会话（trust_env=True）：尊重用户 HTTP(S)_PROXY（如 Clash 7890）。
+#   用于直连失败的**回退**（被墙/区域限制 CDN 只能经代理到达）。
+# - 直连会话（trust_env=False）：媒体流**直连 CDN**，绕开本地代理对每个分片
+#   的转发延迟（播放卡顿根因——缓冲加再大也盖不住逐分片的代理往返）。
+#   直连失败按 host 记住 30s，后续分片直接走代理，不再逐片等直连超时。
 _PROXY_SESSION = None
+_DIRECT_SESSION = None
+_DIRECT_FAIL = {}  # {host: 直连失败时间戳}：失败后 30s 内该 host 直接走代理
+_DIRECT_FAIL_TTL = 30.0
+_DIRECT_CONNECT_TIMEOUT = 5.0  # 直连 connect 短超时：被墙主机快速回退，不拖慢播放
 _PROXY_SESSION_LOCK = threading.Lock()
+_DIRECT_SESSION_LOCK = threading.Lock()
+_DIRECT_FAIL_LOCK = threading.Lock()
+
+
+def _make_session(trust_env: bool) -> requests.Session:
+    s = requests.Session()
+    s.trust_env = trust_env
+    try:
+        s.mount("http://", HTTPAdapter(pool_connections=16, pool_maxsize=64))
+        s.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=64))
+    except Exception:  # noqa: BLE001
+        pass
+    return s
 
 
 def _get_session() -> requests.Session:
-    """模块级单例 requests.Session（连接复用，keep-alive 提速）。"""
+    """系统代理会话（连接复用，keep-alive 提速）——回退用。"""
     global _PROXY_SESSION
     if _PROXY_SESSION is None:
         with _PROXY_SESSION_LOCK:
             if _PROXY_SESSION is None:
-                s = requests.Session()
+                _PROXY_SESSION = _make_session(True)
+    return _PROXY_SESSION
+
+
+def _get_direct_session() -> requests.Session:
+    """直连会话（trust_env=False：不读系统代理，媒体流直连 CDN）。"""
+    global _DIRECT_SESSION
+    if _DIRECT_SESSION is None:
+        with _DIRECT_SESSION_LOCK:
+            if _DIRECT_SESSION is None:
+                _DIRECT_SESSION = _make_session(False)
+    return _DIRECT_SESSION
+
+
+def _fetch_upstream(target: str, headers: dict):
+    """直连优先，失败回退系统代理（按 host 记住 30s）。
+
+    直连 connect 短超时（5s）：被墙/不可达主机快速回退，不卡住播放；回退
+    成功后该 host 30s 内直接走代理（HLS 分片都在同一 CDN host，只吃一次
+    探测代价）。直连 4xx/5xx（区域拒绝）同样回退代理换出口 IP。
+    """
+    from urllib.parse import urlparse
+
+    host = urlparse(target).netloc
+    with _DIRECT_FAIL_LOCK:
+        blocked = time.time() - _DIRECT_FAIL.get(host, 0.0) < _DIRECT_FAIL_TTL
+    if not blocked:
+        try:
+            resp = _get_direct_session().get(
+                target, headers=headers,
+                timeout=(_DIRECT_CONNECT_TIMEOUT, 60), stream=True,
+            )
+            if resp is not None:
+                if resp.status_code < 400:
+                    return resp
                 try:
-                    s.mount(
-                        "http://", HTTPAdapter(pool_connections=16, pool_maxsize=64)
-                    )
-                    s.mount(
-                        "https://", HTTPAdapter(pool_connections=16, pool_maxsize=64)
-                    )
+                    resp.close()  # 4xx/5xx：释放连接，走代理换出口
                 except Exception:  # noqa: BLE001
                     pass
-                _PROXY_SESSION = s
-    return _PROXY_SESSION
+        except requests.RequestException:  # noqa: BLE001 —— 直连不通/超时/SSL
+            pass
+        with _DIRECT_FAIL_LOCK:
+            _DIRECT_FAIL[host] = time.time()
+    return _get_session().get(target, headers=headers, timeout=30, stream=True)
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -192,9 +248,8 @@ class MediaProxy:
         # 连接池复用：requests.Session 保持到 CDN 的 keep-alive 连接，
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
         # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
-        resp = _get_session().get(
-            target, headers=req_headers, timeout=30, stream=True
-        )
+        # 直连优先（绕开系统代理的逐分片转发延迟），失败自动回退系统代理。
+        resp = _fetch_upstream(target, req_headers)
         try:
             # 上游错误（403/404/5xx）不发 body 给播放器：原 urllib 会抛
             # HTTPError，这里等价处理（播放器收到 502 会提示换线路/重试，
