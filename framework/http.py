@@ -70,6 +70,22 @@ def _is_anti_scrape_status(status: int) -> bool:
     return status in ANTI_SCRAPE_STATUSES or 500 <= status < 600
 
 
+def _is_nonretryable_status(exc) -> bool:
+    """4xx（排除可重试的 408/425/429）为确定性失败：重试无意义且拖慢末页探测。
+
+    404 是分页探测末页的正常信号，逐页重试 3 次（间隔 0.5/1/2s）会把
+    搜索/发现卡到几十秒。requests 抛 HTTPError（带 response），urllib
+    抛 urllib.error.HTTPError（带 code）。
+    """
+    code = None
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+    if code is None:
+        code = getattr(exc, "code", None)
+    return isinstance(code, int) and 400 <= code < 500 and code not in (408, 425, 429)
+
+
 def _is_acw_challenge(text: str) -> bool:
     """判定 acw_sc__v2 阿里云盾 challenge 页（arg1 + acw_sc__v2 cookie 脚本）。"""
     snippet = (text or "")[:4000]
@@ -253,6 +269,8 @@ class HttpClient:
                     if attempt < retries:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
                 except Exception as exc:  # noqa: BLE001
+                    if _is_nonretryable_status(exc):
+                        raise RequestError(f"请求失败 GET {url}：{exc}")
                     last_error = exc
                     if attempt < retries:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
@@ -311,6 +329,8 @@ class HttpClient:
                     if attempt < retries:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
                 except Exception as exc:  # noqa: BLE001
+                    if _is_nonretryable_status(exc):
+                        raise RequestError(f"请求失败 GET {url}：{exc}")
                     last_error = exc
                     if attempt < retries:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
@@ -503,6 +523,11 @@ class HttpClient:
                     return text
         if _is_anti_scrape_text(text):
             raise AntiScrapeError(f"反爬特征响应 {url}")
+        # Cloudflare 等边缘节点对瞬时流量偶发返回 200 空 body（首个连接常发，
+        # 无 Set-Cookie/无内容，第 2 次请求即正常）。空文本对 HTML 解析无意义，
+        # 视为瞬时失败走 retries 重试（间隔 0.5s/1s/2s 避峰），避免把活源误判为空页。
+        if not text.strip():
+            raise RequestError(f"空响应 GET {url}")
         return text
 
     def _get_once_raw(self, url, headers, proxy, timeout, encoding=None) -> str:

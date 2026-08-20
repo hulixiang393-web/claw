@@ -25,6 +25,7 @@ check() 返回：
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Optional
@@ -107,7 +108,12 @@ class StructureChecker:
         if not base:
             return ""
         if rel:
-            return rel if rel.startswith("http") else urljoin(base, rel)
+            url = rel if rel.startswith("http") else urljoin(base, rel)
+            # 列表 URL 模板占位符：{page} → 第一页；其余占位符清空
+            # （否则会把 {page} 编码成 %7Bpage%7D 请求 404，误判软失败）
+            url = re.sub(r"\{page\}", "1", url, flags=re.I)
+            url = re.sub(r"\{[^{}]*\}", "", url)
+            return url
         return base
 
     @staticmethod

@@ -1992,9 +1992,16 @@ class Content:
             if decode == "caesar_unquote":
                 import urllib.parse as _up
 
-                for sh in (3, 4, 5):
+                # 站点对 get3G 响应做 Caesar 移位时 shift 会随机轮换（实测
+                # 5238/520cc 的 ccsJsCmds 在 shift=1/2/3/4 间随机返回），故遍历
+                # 1~8 自动探测：哪档位移解码后含视频标记即采用。
+                # 先做 JS 字符串 unescape（\' → '，站点在值内用转义单引号防
+                # 单引号闭合，如 Caesar+2 格式里 `\'5F` → `'5F`），再逐档位移。
+                val = val.replace("\\'", "'")
+                for sh in range(1, 9):
                     dec = _up.unquote("".join(chr(ord(c) - sh) for c in val))
                     if any(k in dec for k in ("<source", ".m3u8", ".mp4", "<video")):
+                        # 解码后 JS 内 `\"` 还原为 `"`（供后续 <source src="..."> 匹配）
                         val = dec.replace('\\"', '"')
                         break
 

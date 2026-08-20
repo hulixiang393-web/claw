@@ -7,7 +7,7 @@
   "$weight": 1.0,
   "$metadata": {
     "homepage": "https://51cg1.com/",
-    "description": "51吃瓜 - 吃瓜/网红黑料/成人视频图文站（Typecho + Mirages 主题）。发现首页分页 /page/{page}/；分类 /category/{slug}/ 单页（分类翻页 403 反爬）。列表项标题带「热搜 HOT」噪声已清洗；正文含多图（data-src 懒加载）+ DPlayer m3u8 视频（从详情页 JS 提取）。",
+    "description": "51吃瓜 - 吃瓜/网红黑料/成人视频图文站（Typecho + Mirages 主题）。发现首页分页 /page/{page}/；分类 /category/{slug}/{page}/（路径式分页，官方同样式）；列表项标题带「热搜 HOT」噪声已清洗；正文含多图（data-src 懒加载）+ DPlayer m3u8 视频（从详情页 JS 提取）。搜索 /search/{keyword}/{page}/ 路径式分页。",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -17,7 +17,7 @@
       "成人",
       "hls"
     ],
-    "last_verified": "2026-08-13"
+    "last_verified": "2026-08-14"
   },
   "transports": {
     "base_url": "https://51cg1.com",
@@ -33,6 +33,7 @@
   },
   "endpoints": {
     "discovery": {
+      "list_url": "/page/{page}/",
       "list_paginator": {
         "type": "increment",
         "start": 1,
@@ -47,59 +48,59 @@
           },
           {
             "title": "今日吃瓜",
-            "url": "/category/wpcz/"
+            "url": "/category/wpcz/{page}/"
           },
           {
             "title": "网红黑料",
-            "url": "/category/whhl/"
+            "url": "/category/whhl/{page}/"
           },
           {
             "title": "热门大瓜",
-            "url": "/category/rdsj/"
+            "url": "/category/rdsj/{page}/"
           },
           {
             "title": "必看大瓜",
-            "url": "/category/bkdg/"
+            "url": "/category/bkdg/{page}/"
           },
           {
             "title": "AI成人短剧",
-            "url": "/category/cbdj/"
+            "url": "/category/cbdj/{page}/"
           },
           {
             "title": "看片娱乐",
-            "url": "/category/ysyl/"
+            "url": "/category/ysyl/{page}/"
           },
           {
             "title": "51剧场",
-            "url": "/category/51djc/"
+            "url": "/category/51djc/{page}/"
           },
           {
             "title": "探花精选",
-            "url": "/category/thjx/"
+            "url": "/category/thjx/{page}/"
           },
           {
             "title": "网黄合集",
-            "url": "/category/whhj/"
+            "url": "/category/whhj/{page}/"
           },
           {
             "title": "明星黑料",
-            "url": "/category/whmx/"
+            "url": "/category/whmx/{page}/"
           },
           {
             "title": "海外吃瓜",
-            "url": "/category/hwcg/"
+            "url": "/category/hwcg/{page}/"
           },
           {
             "title": "学生校园",
-            "url": "/category/xsxy/"
+            "url": "/category/xsxy/{page}/"
           },
           {
             "title": "国产剧情",
-            "url": "/category/gcjq/"
+            "url": "/category/gcjq/{page}/"
           },
           {
             "title": "骚男骚女",
-            "url": "/category/snsn/"
+            "url": "/category/snsn/{page}/"
           }
         ]
       },
@@ -132,7 +133,7 @@
       "method": "GET",
       "keyword_param": "keyword",
       "paginator": {
-        "url_template": "/search/{keyword}/"
+        "url_template": "/search/{keyword}/{page}/"
       },
       "item": {
         "root_selector": {
@@ -203,8 +204,8 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 1,
-      "max_results": 100
+      "max_pages": 100,
+      "max_results": 500
     },
     "detail": {
       "max_pages": 1
@@ -212,6 +213,16 @@
     "episode": {
       "max_pages": 1,
       "max_items": 1
+    }
+  },
+  "decryption": {
+    "targets": {
+      "image": {
+        "strategy": "aes_cbc",
+        "key": "f5d965df75336270",
+        "iv": "97b60394abc2fbe1",
+        "padding": "pkcs7"
+      }
     }
   },
   "diagnostics": {

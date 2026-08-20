@@ -233,9 +233,12 @@ class ShelfService:
         for sub in sorted(out.iterdir()):
             if not sub.is_dir() or sub.name in hidden:
                 continue
-            epubs = list(sub.glob("*.epub"))
+            epubs = sorted(sub.glob("*.epub"))
             if epubs:
-                path = str(epubs[0])
+                # 一个文件夹可有多本 epub（同名书名目录下多本/合集）：
+                # path 取第一本（默认），episode_paths 记全部，供书架「选本阅读」。
+                paths = [str(p) for p in epubs]
+                path = paths[0]
                 try:
                     st = Path(path).stat()
                     size, mtime = st.st_size, st.st_mtime
@@ -247,6 +250,8 @@ class ShelfService:
                     title=sub.name,
                     content_type=self.epub_type(path),
                     path=path,
+                    episode_count=len(epubs),
+                    episode_paths=paths,
                     size_bytes=size,
                     mtime=mtime,
                 ))

@@ -155,6 +155,7 @@ class SearchPage(BasePage):
         self._results_display = None  # 合并模式渲染列表；None 时用 _results（新搜索须重置）
         self._deferred_covers = []  # 封面延迟加载队列：待进入视口才 load_cover 的卡片
         self._cover_pump_queued = False  # 封面泵标志：同轮事件循环只泵一次
+        self._render_all_pending = False  # 完成后全量渲染分批标志（防重入）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -503,6 +504,8 @@ class SearchPage(BasePage):
         self._clear_grid()
         # 分批渲染：先渲染第一批
         self._append_displayed_batch()
+        # 重建后全量渲染剩余（防"只有首屏三页"，滚动触发失效时也能看到全部）
+        self._render_all_remaining()
 
     def _append_displayed_batch(self) -> None:
         """按 _results_display 渲染下一批（合并后走此路径）。
@@ -531,6 +534,12 @@ class SearchPage(BasePage):
         非合并模式：边抓边显示已渲染首屏，直接更新状态（不重建网格，
         避免搜索完成瞬间清空重插导致闪屏）；合并模式：结果一直在累积
         未渲染，统一合并后渲染首屏，剩余滚动懒加载。
+
+        完成后把剩余结果全部渲染（_render_all_remaining）：此前首屏只
+        渲染预加载深度 2 屏（约 3 屏卡片），剩余靠滚动 80% 逐批加载；
+        若滚动触发失效（布局未刷新/滚动条未出现/用户未滚动到 80%），
+        用户只能看到首屏几十张（"只有三页"）。完成后一次性渲染全部，
+        滚动条必然出现、用户一定能看到所有结果（分批渲染防闪屏）。
         """
         if not self._results:
             self.status_label.setText("搜不到这个哦，换个词试试？")
@@ -540,11 +549,45 @@ class SearchPage(BasePage):
         elif self._shown_count == 0:
             # 兜底：边抓边显示异常（on_page 缺省）→ 直接渲染首屏
             self._append_results(self._results)
+        self._render_all_remaining()
         self._update_batch_status()
+
+    def _render_all_remaining(self) -> None:
+        """把尚未渲染的结果全部渲染（分批 QTimer，防一次性大量建卡闪屏）。
+
+        结果累积到 _results（_on_source_page 边抓边渲染首屏），搜索完成后
+        调本方法把剩余结果全量渲染进网格；分批（_page_size*2 张/批）延到
+        布局完成再渲染下一批，避免几百张卡片同帧插入闪屏/跳动。封面仍由
+        _pump_visible_covers 懒加载（视口内才拉），不挤占 CoverLoader。
+        """
+        if self._render_all_pending:
+            return
+        display = self._current_display()
+        if self._shown_count >= len(display):
+            return
+        self._render_all_pending = True
+        self._render_all_tick()
+
+    def _render_all_tick(self) -> None:
+        """全量渲染分批步进：渲染一批后若无剩余则结束，否则延下一轮。"""
+        display = self._current_display()
+        cols = self._columns()
+        end = min(len(display), self._shown_count + self._page_size * 2)
+        while self._shown_count < end:
+            r = display[self._shown_count]
+            self._append_card(r, cols)
+            self._shown_count += 1
+        self._apply_column_stretch(cols)
+        self._update_batch_status()
+        self._pump_visible_covers()
+        if self._shown_count < len(display):
+            QTimer.singleShot(0, self._render_all_tick)
+        else:
+            self._render_all_pending = False
 
     def _update_batch_status(self) -> None:
         """更新状态文本：已显示 X / 共 Y 条。"""
-        total = len(self._results)
+        total = len(self._current_display())
         if self._filter_source:
             # 筛选时显示筛选后总数（_results 未过滤，需单独算）
             filtered = sum(1 for r in self._results if r.source_id == self._filter_source)

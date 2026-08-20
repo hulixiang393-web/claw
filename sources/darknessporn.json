@@ -33,7 +33,7 @@
   "endpoints": {
     "discovery": {
       "list_url": "/page/{page}/",
-      "note": "站点分页为 WordPress 式 /page/N/：首页 /page/1/ 会 301 到 /（正常），但分类页 /7652-hentai/page/1/ 会返回 500（Tracy 服务端错误，确定性站点 bug）——因此分类 URL 用基底 /7652-hentai/（第 1 页正常出 48 条），翻页用 page_placeholder 正则（对基底无匹配 → 第 2 页起复用基底，GUI 按 URL 去重不重复渲染）；「最新视频」用 /page/{page}/ 走 {page} 占位，翻页完整可用。",
+      "note": "站点分页为 WordPress 式：最新视频 /page/{page}/、分类 /slug/page/{page}/、搜索 /page/{page}/?s={keyword} 均可用（/slug/page/1/ 会 301 到基底，正常）。每页 48 条（1 条 neurogrid7 广告被 exclude）。",
       "list_paginator": {
         "type": "increment",
         "start": 1,
@@ -48,71 +48,71 @@
           },
           {
             "title": "Hentai",
-            "url": "/7652-hentai/"
+            "url": "/7652-hentai/page/{page}/"
           },
           {
             "title": "3D",
-            "url": "/26853-3d/"
+            "url": "/26853-3d/page/{page}/"
           },
           {
             "title": "Monster",
-            "url": "/4995-monsters/"
+            "url": "/4995-monsters/page/{page}/"
           },
           {
             "title": "Gangbang",
-            "url": "/26860-gangbang/"
+            "url": "/26860-gangbang/page/{page}/"
           },
           {
             "title": "BDSM",
-            "url": "/118-bdsm/"
+            "url": "/118-bdsm/page/{page}/"
           },
           {
             "title": "Kink",
-            "url": "/115-kink/"
+            "url": "/115-kink/page/{page}/"
           },
           {
             "title": "Rough",
-            "url": "/25-rough/"
+            "url": "/25-rough/page/{page}/"
           },
           {
             "title": "Pregnant",
-            "url": "/80643-pregnant/"
+            "url": "/80643-pregnant/page/{page}/"
           },
           {
             "title": "Anal Fisting",
-            "url": "/80648-anal-fisting/"
+            "url": "/80648-anal-fisting/page/{page}/"
           },
           {
             "title": "Femdom",
-            "url": "/80651-femdom/"
+            "url": "/80651-femdom/page/{page}/"
           },
           {
             "title": "Piss",
-            "url": "/80650-piss/"
+            "url": "/80650-piss/page/{page}/"
           },
           {
             "title": "Slave",
-            "url": "/16017-slave/"
+            "url": "/16017-slave/page/{page}/"
           },
           {
             "title": "Humiliation",
-            "url": "/80644-humiliation/"
+            "url": "/80644-humiliation/page/{page}/"
           },
           {
             "title": "Pain",
-            "url": "/1346-pain/"
+            "url": "/1346-pain/page/{page}/"
           },
           {
             "title": "Tattooed",
-            "url": "/20782-tattooed/"
+            "url": "/20782-tattooed/page/{page}/"
           },
           {
             "title": "Young",
-            "url": "/15609-young/"
+            "url": "/15609-young/page/{page}/"
           },
           {
             "title": "Lesbian",
-            "url": "/103057-lesbian/"
+            "url": "/103057-lesbian/page/{page}/"
           }
         ]
       },
@@ -146,7 +146,7 @@
       "method": "GET",
       "keyword_param": "s",
       "paginator": {
-        "url_template": "/?s={keyword}"
+        "url_template": "/page/{page}/?s={keyword}"
       },
       "item": {
         "root_selector": {
@@ -171,7 +171,8 @@
             "attr": "src"
           }
         }
-      }
+      },
+      "note": "搜索为 WordPress /?s={keyword}，分页 /page/{page}/?s={keyword}（实测翻页内容完全去重）。"
     },
     "detail": {
       "fields": {
@@ -214,8 +215,8 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 1,
-      "max_results": 48
+      "max_pages": 10,
+      "max_results": 500
     },
     "detail": {
       "max_pages": 1

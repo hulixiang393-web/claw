@@ -7,7 +7,7 @@
   "$weight": 1.0,
   "$metadata": {
     "homepage": "https://www.xasiat.com/",
-    "description": "Xasiat - 亚洲成人直播录制视频站（Stripchat/OnlyFans等平台）。列表/搜索共用 div#list_videos_most_recent_videos_items div.item 卡片；播放页内嵌独立播放器（embed 页含 JS 配置含视频直链 mp4，HTTP 链式提取，无需 Playwright）。",
+    "description": "Xasiat - 亚洲成人直播录制视频站（Stripchat/OnlyFans等平台）。发现列表走 /latest-updates/{page}/ 等真实视频列表（官方 4000+ 页）；搜索走 /search/{keyword}/ 路径式（无分页，关键词空格→\"-\"、原连字符→\"--\"，无结果返回 404 视为空）。播放页内嵌独立播放器（embed 页含 JS 配置含视频直链 mp4，HTTP 链式提取，无需 Playwright）。",
     "lang": "en",
     "region": "tw",
     "tags": [
@@ -18,7 +18,7 @@
       "stripchat",
       "onlyfans"
     ],
-    "last_verified": "2026-08-13"
+    "last_verified": "2026-08-14"
   },
   "transports": {
     "base_url": "https://www.xasiat.com",
@@ -35,6 +35,7 @@
   },
   "endpoints": {
     "discovery": {
+      "list_url": "/latest-updates/{page}/",
       "list_paginator": {
         "type": "increment",
         "start": 1,
@@ -54,36 +55,27 @@
           {
             "title": "Most Viewed",
             "url": "/most-popular/{page}/"
-          },
-          {
-            "title": "Albums",
-            "url": "/albums/{page}/"
-          },
-          {
-            "title": "Categories",
-            "url": "/categories/{page}/"
-          },
-          {
-            "title": "Models",
-            "url": "/models/{page}/"
-          },
-          {
-            "title": "Playlists",
-            "url": "/playlists/{page}/"
-          },
-          {
-            "title": "Channels",
-            "url": "/channels/{page}/"
-          },
-          {
-            "title": "Community",
-            "url": "/members/{page}/"
-          },
-          {
-            "title": "Tags",
-            "url": "/tags/{page}/"
           }
         ],
+        "root_selector": {
+          "css": "div.item"
+        },
+        "fields": {
+          "title": {
+            "css": "a[href*='/videos/']",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a[href*='/videos/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.thumb",
+            "attr": "data-original"
+          }
+        }
+      },
+      "works_list_item": {
         "root_selector": {
           "css": "div.item"
         },
@@ -106,13 +98,18 @@
     "search": {
       "base_url": "/search/",
       "method": "GET",
-      "keyword_param": "search_query",
+      "keyword_param": "q",
       "paginator": {
-        "url_template": "/search/?search_query={keyword}"
+        "url_template": "/search/{keyword}/",
+        "keyword_replace": [
+          ["-", "[dash]"],
+          [" ", "-"],
+          ["[dash]", "--"]
+        ]
       },
       "item": {
         "root_selector": {
-          "css": "div.item"
+          "css": "div#list_videos_videos_list_search_result_items div.item"
         },
         "fields": {
           "title": {

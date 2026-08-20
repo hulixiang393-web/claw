@@ -200,7 +200,9 @@ class _ShelfCard(QFrame):
         if type_label:
             parts.append(type_label)
         if rec.get("episode_count"):
-            parts.append(f"共 {rec['episode_count']} 集")
+            # 视频=集数；epub 多本文件夹=本数（单选一本读）
+            unit = "本" if ctype in ("novel", "comic", "epub") else "集"
+            parts.append(f"共 {rec['episode_count']} {unit}")
         if rec.get("online"):
             parts.append("可离线")
         size = rec.get("size_bytes") or 0
@@ -605,16 +607,36 @@ class LibraryPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def _on_card_clicked(self, rec: dict) -> None:
-        """点击：本地优先加载（视频播本地、epub 读本地），无本地才走网络。"""
+        """点击：本地优先加载（视频播本地、epub 读本地），无本地才走网络。
+
+        一个文件夹多本 epub（episode_paths>1）→ 弹下拉框选读哪本（同视频选集）。
+        """
         if rec.get("kind") == "local":
             if rec.get("content_type") == "video" and rec.get("episode_paths"):
                 self.play_local_video_requested.emit(rec)
+            elif rec.get("episode_paths") and len(rec["episode_paths"]) > 1:
+                self._pick_epub(rec)
             elif rec.get("path"):
                 self.open_epub_requested.emit(rec["path"])
         elif rec.get("url"):
             self.open_online_requested.emit(
                 (rec.get("source_id", ""), rec.get("url", ""), rec.get("content_type", ""))
             )
+
+    def _pick_epub(self, rec: dict) -> None:
+        """多本 epub：弹下拉框选一本读（同视频选集模式）。"""
+        from PySide6.QtWidgets import QInputDialog
+
+        paths = list(rec.get("episode_paths") or [])
+        names = [Path(p).name for p in paths]
+        item, ok = QInputDialog.getItem(
+            self, "选择书籍", f"《{rec.get('title', '')}》文件夹含多本，选一本阅读：",
+            names, 0, False,
+        )
+        if not ok or not item:
+            return
+        idx = names.index(item)
+        self.open_epub_requested.emit(paths[idx])
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:

@@ -137,7 +137,7 @@
             },
             {
               "name": "ccs",
-              "regex": "var ccsJsCmds\\s*=\\s*'([^']+)'",
+              "regex": "var ccsJsCmds\\s*=\\s*'((?:[^'\\\\]|\\\\.)*)'",
               "referer": "get3g",
               "decode": "caesar_unquote"
             },

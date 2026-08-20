@@ -165,6 +165,9 @@ class Search:
         paginator_cfg = search_cfg.get("paginator") or {}
         page_param = paginator_cfg.get("param") or "page"
         url_template = paginator_cfg.get("url_template") or ""
+        # 关键词 URL 变形（站点特殊 slug 规则）：[[old, new], ...] 按序字符串替换，
+        # 在 URL 编码前应用。如 xasiat 要求空格→"-"、原连字符→"--"（/search/{kw}/）。
+        keyword_replace = paginator_cfg.get("keyword_replace") or []
         extra = search_cfg.get("extra_params") or {}
         if not isinstance(extra, dict):
             extra = {}
@@ -180,7 +183,7 @@ class Search:
             abs_url = self._build_page_url(
                 source=source, base_url=base_url, keyword=keyword,
                 kw_param=kw_param, page=1, page_param=page_param,
-                url_template=url_template,
+                url_template=url_template, keyword_replace=keyword_replace,
             )
             return self._search_html_rendered(source, abs_url, item_cfg, keyword)
 
@@ -215,10 +218,16 @@ class Search:
                         page=page,
                         page_param=page_param,
                         url_template=url_template,
+                        keyword_replace=keyword_replace,
                     )
                     text = self._http_get(source, abs_url, http=http)
             except Exception as exc:  # noqa: BLE001
-                log.warning("[%s] 搜索第 %d 页失败：%s", source.source_id, page, exc)
+                # 404 是分页探测末页的正常信号（超过站点总页数），静默不报；
+                # 其余失败才警告（网络/反爬）。
+                msg = str(exc)
+                is_404 = ("404 Client Error" in msg) or ("HTTP 404" in msg)
+                if not is_404:
+                    log.warning("[%s] 搜索第 %d 页失败：%s", source.source_id, page, exc)
                 return (page, [])
             try:
                 doc = self._parser.parse(text)
@@ -241,6 +250,7 @@ class Search:
 
         page_items: dict = {}
         wave_size = 3
+        fetched_total = 0  # 已抓取的累计条数（未去重）：达 max_results 提前停发后续波
         with ThreadPoolExecutor(max_workers=wave_size) as pool:
             start = 1
             while start <= max_pages:
@@ -251,11 +261,19 @@ class Search:
                     page, items = fut.result()
                     wave_items[page] = items
                 page_items.update(wave_items)
+                wave_count = sum(len(v) for v in wave_items.values())
+                fetched_total += wave_count
                 # 本波全空（连续空页）→ 站点已无更多结果，提前停发后续波。
                 # 单页失败返回空不会误停：只要本波内还有别的页有结果就继续。
                 if end < max_pages and wave_items and not any(wave_items.values()):
                     break
                 start = end + 1
+                # 已抓够 max_results 条 → 不再发下一波。此前在合并阶段才按
+                # max_results 截断，导致 wave 循环把 max_pages 全部页抓完
+                # （51cg1「视频」max_pages=100，白抓 80 页约 40s）才丢弃。
+                # 提前停省时；合并阶段仍按 max_results 精确截断兜底。
+                if max_results and fetched_total >= max_results:
+                    break
 
         # 按页序合并（第 1 页先回调 on_page 秒出），URL 去重。
         #
@@ -322,6 +340,7 @@ class Search:
         page: int,
         page_param: str = "page",
         url_template: str = "",
+        keyword_replace=None,
     ) -> str:
         """构造搜索第 page 页的 URL（分页拼接规则由源配置决定）。
 
@@ -332,8 +351,15 @@ class Search:
           「搜索 URL + 关键词」后，否则作为路径后缀（如 -{page}.html）
         - 留空 → 默认：GET 追加 ?{page_param}={page}；{page} 占位走占位替换
 
+        keyword_replace（endpoints.search.paginator.keyword_replace）：
+        [[old, new], ...] 按序字符串替换，在 URL 编码前应用到关键词
+        （站点 slug 特殊规则，如 xasiat 空格→"-"、原连字符→"--"）。
+
         全部参数用关键字传递（* 强制），避免位置错位生成 `&1=page` 的错误 URL。
         """
+        if keyword_replace:
+            for old, new in keyword_replace:
+                keyword = keyword.replace(old, new)
         if url_template:
             if "{keyword}" in url_template:
                 tpl = url_template.replace("{keyword}", quote(keyword)).replace(
