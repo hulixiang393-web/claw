@@ -158,6 +158,12 @@ def _fake_source():
         def get_detail_config(self):
             return {"fields": {}}
 
+        def get_discovery_config(self):
+            return {}
+
+        def get_search_config(self):
+            return {}
+
     return S()
 
 
@@ -278,3 +284,20 @@ def test_search_cache_write_and_hit():
     # 第二次命中
     searcher.search_one_cached(src, "keyw", use_cache=True)
     assert calls["n"] == 1
+
+
+def test_discovery_list_cache_hit():
+    from framework.discovery import Discovery
+
+    store = make_store()
+    http = _FakeHttp()
+    src = _fake_source()
+    disc = Discovery(http, _fake_parser(), _fake_checker(), cache=store)
+    url = "https://x.com/list"
+    fetch_url = disc._build_page_url(src, url, 1)
+    key = f"list:{src.source_id}:{fetch_url}"
+    store.set(key, [{"title": "T", "url": "u"}])
+    # 命中直接返回，不经过 _get（http.calls 为空）
+    res = disc.list_works_cached(src, url, page=1, use_cache=True)
+    assert res == [{"title": "T", "url": "u"}]
+    assert not http.calls

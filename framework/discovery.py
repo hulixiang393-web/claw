@@ -60,12 +60,16 @@ class Discovery:
         parser: Parser,
         checker: StructureChecker,
         health_reporter=None,
+        cache=None,
     ):
         self._http = http
         self._parser = parser
         self._checker = checker
         self._health_reporter = health_reporter  # 可选：update_health(source_id, state, error)
         self._ytdlp = None  # 懒加载单例
+        # 可选 RedisLikeStore 实例（None=禁用）。键约定：
+        #   list:{source_id}:{abs_url} → work list（24h，search 池）
+        self.cache = cache
 
     # ------------------------------------------------------------------ #
     def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
@@ -412,6 +416,31 @@ class Discovery:
         # 为空/占位的条目（解析失败静默保留原封面，容错）。
         if works and works_list_item.get("cover_state"):
             self._apply_cover_state(works, works_list_item["cover_state"], fields, html)
+        return works
+
+    def list_works_cached(
+        self,
+        source: SourceConfig,
+        url: str,
+        page: int = 1,
+        use_cache: bool = True,
+    ) -> List[Work]:
+        """带发现列表缓存的抓取：命中 list: 键直接返回，否则抓取后写（24h）。
+
+        use_cache=False 强制真实抓取。缓存键基于**真实抓取 URL**
+        （_build_page_url 结果）的 abs_url，避免同 url 不同 page 撞键。
+        """
+        if not self.cache or not use_cache:
+            return self.list_works(source, url, page)
+        fetch_url = self._build_page_url(source, url, page)
+        abs_url = self._abs_url(source, fetch_url)
+        key = f"list:{source.source_id}:{abs_url}"
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+        works = self.list_works(source, url, page)
+        if works is not None:
+            self.cache.set(key, works, ttl=24 * 3600)
         return works
 
     # ------------------------------------------------------------------ #
