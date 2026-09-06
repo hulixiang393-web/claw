@@ -6,8 +6,8 @@
 ## 一、背景与目标
 
 用户诉求：
-1. **书架缓存（≤10G）**：缓存书架书籍封面 + 「当前阅读书籍 → 当前章节 + 后面三章」预加载（不满三章按实际，只有一章就只缓存一章）。
-2. **发现/搜索缓存（≤5G）**：显著提升整体加载速度。
+1. **书架缓存（≤3G）**：缓存书架书籍封面 + 「当前阅读书籍 → 当前章节 + 后面三章」预加载（不满三章按实际，只有一章就只缓存一章）。
+2. **发现/搜索缓存（≤10G）**：显著提升整体加载速度。
 3. **搜索页数放开**：取消 `constraints.search.max_pages/max_results` 上限，全部显示；以懒加载渲染保证 ≤10s 首屏 + 滚动不卡顿。
 4. **手动清除缓存**。
 5. **使用 Redis 编程范式**（键值 + TTL + LRU + 配额）。
@@ -36,9 +36,11 @@
               │      ├── _touch_lru / _evict_until_under_quota()   # LRU 驱逐
               │      └── _save()/_load()   # pickle-gz 单文件，写入计数 + 定时 + 退出
               │
-              ├── ShelfCache   (Quota=10G)   # cover:{source}:{url} / page:... / body:...
-              └── SearchCache  (Quota=5G)    # search:{source}:{query} / list:{source}:{url}
+              ├── ShelfCache   (Quota=3G)    # cover:{source}:{url} / page:... / body:...
+              └── SearchCache  (Quota=10G)   # search:{source}:{query} / list:{source}:{url}
 ```
+
+> 2026-09-06 配额调整：书架缓存 **3G**，发现/搜索缓存 **10G**（搜索放开大量结果缓存是重点）。
 
 两个池实例由 `cache_service.get_shelf_cache()` / `get_search_cache()` 单例提供。
 
@@ -46,12 +48,12 @@
 
 | 数据 | 键 | 值 | TTL | 池 |
 |---|---|---|---|---|
-| 封面字节 | `cover:{source_id}:{abs_url}` | bytes | 永久 | shelf 10G |
-| 页面文本（详情/目录/章页/发现页） | `page:{source_id}:{abs_url}` | str | 永久 | shelf 10G |
-| 章节正文 | `body:{source_id}:{abs_url}` | str | 7d | shelf 10G |
-| 漫画页图 URL 列表 | `pages:{source_id}:{abs_url}` | json list | 7d | shelf 10G |
-| 搜索结果 | `search:{source_id}:{norm_query}` | json list | 24h | search 5G |
-| 发现列表 | `list:{source_id}:{abs_url}` | json list | 24h | search 5G |
+| 封面字节 | `cover:{source_id}:{abs_url}` | bytes | 永久 | shelf 3G |
+| 页面文本（详情/目录/章页/发现页） | `page:{source_id}:{abs_url}` | str | 永久 | shelf 3G |
+| 章节正文 | `body:{source_id}:{abs_url}` | str | 7d | shelf 3G |
+| 漫画页图 URL 列表 | `pages:{source_id}:{abs_url}` | json list | 7d | shelf 3G |
+| 搜索结果 | `search:{source_id}:{norm_query}` | json list | 24h | search 10G |
+| 发现列表 | `list:{source_id}:{abs_url}` | json list | 24h | search 10G |
 
 TTL 语义：永久=不设过期，靠 LRU 配额淘汰；有限 TTL 到期后 get 返回 None、惰性删除。
 
