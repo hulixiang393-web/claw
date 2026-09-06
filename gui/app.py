@@ -205,11 +205,22 @@ class MainWindow(QMainWindow):
         )
         # 下载完成/新增 → 刷新书架（新下载的书出现在本地组）；收藏变化在 _on_favorite 刷新
         self.event_bus.subscribe(self._on_download_event)
-        # 封面缓存预算接线（cover_cache_size_mb）
+        # Redis 持久化缓存注入：书架池（封面/详情/正文/漫画页）+ 搜索&发现池（搜索/列表）。
+        # 数据目录随 data/ 走 settings（与首页索引同目录）。
+        from framework.cache_service import get_shelf_cache, get_search_cache
+
+        shelf_cache = get_shelf_cache(str(base_dir / "data" / "cache"))
+        search_cache = get_search_cache(str(base_dir / "data" / "cache"))
+        self.discovery.cache = search_cache
+        self.content._cache = shelf_cache
+        self.search.cache = search_cache
+        self.http.cache = None  # 上层显式查/写，HttpClient 仅持句柄供复用（不透明拦截）
+        # 封面缓存预算接线（cover_cache_size_mb）+ 书架封面持久化
         from gui.components.cover_loader import CoverLoader
 
         CoverLoader.instance().configure(
-            self.settings.get("ui", "cover_cache_size_mb", 256)
+            self.settings.get("ui", "cover_cache_size_mb", 256),
+            shelf_cache=shelf_cache,
         )
 
         # Tab 索引映射
@@ -1033,11 +1044,14 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
                 int(self.settings.get("ui", "reading_font_size", 0) or 0),
             )
         # 网络默认值 → 已读的 http.defaults 跟不上（构造时快照），但超时等走 per-source
-        # 封面缓存预算
+        # 封面缓存预算（保留已注入的书架持久化缓存，避免覆盖为 None）
         from gui.components.cover_loader import CoverLoader
 
+        from framework.cache_service import get_shelf_cache
+
         CoverLoader.instance().configure(
-            self.settings.get("ui", "cover_cache_size_mb", 256)
+            self.settings.get("ui", "cover_cache_size_mb", 256),
+            shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
         )
 
     # ------------------------------------------------------------------ #

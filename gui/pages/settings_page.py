@@ -212,6 +212,42 @@ class SettingsPage(BasePage):
         row.addStretch(1)
         sec._form.addRow("缓存", row)
 
+        # Redis 持久化缓存管理：书架 / 搜索&发现 两个独立池（分开清除）
+        def _usage(store):
+            try:
+                return (store.bytes_used() / (1024 ** 3)) if store else 0
+            except Exception:  # noqa: BLE001
+                return 0
+
+        from framework.cache_service import get_shelf_cache, get_search_cache
+
+        usage_row = QHBoxLayout()
+        usage_row.setSpacing(18)
+        self._ui_shelf_usage = QLabel(f"{_usage(get_shelf_cache()):.2f} GB（书架）")
+        self._ui_search_usage = QLabel(f"{_usage(get_search_cache()):.2f} GB（搜索&发现）")
+        usage_row.addWidget(self._ui_shelf_usage)
+        usage_row.addWidget(self._ui_search_usage)
+        usage_row.addStretch(1)
+        sec._form.addRow("缓存用量", usage_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self._cache_clear_shelf_btn = QPushButton("清除书架缓存")
+        self._cache_clear_shelf_btn.clicked.connect(
+            lambda: self._on_cache_pool_clear("shelf")
+        )
+        self._cache_clear_search_btn = QPushButton("清除搜索&发现缓存")
+        self._cache_clear_search_btn.clicked.connect(
+            lambda: self._on_cache_pool_clear("search")
+        )
+        btn_row.addWidget(self._cache_clear_shelf_btn)
+        btn_row.addWidget(self._cache_clear_search_btn)
+        hint2 = QLabel("书架：封面/详情/章节；搜索&发现：搜索结果/首页列表")
+        hint2.setStyleSheet("color: palette(mid); font-size: 11px;")
+        btn_row.addWidget(hint2)
+        btn_row.addStretch(1)
+        sec._form.addRow("缓存清除", btn_row)
+
         # 源选择入口：重开首次启动的引导对话框，重新勾选启用源
         src_row = QHBoxLayout()
         src_row.setSpacing(8)
@@ -226,7 +262,7 @@ class SettingsPage(BasePage):
         self.tabs.addTab(sec, "UI")
 
     def _on_cache_clear(self) -> None:
-        """清除封面内存缓存 + 临时合成图目录。"""
+        """清除封面内存缓存 + 临时合成图目录（保留 Redis 持久化 .gz 文件）。"""
         from PySide6.QtGui import QPixmapCache
         from PySide6.QtWidgets import QMessageBox
 
@@ -237,20 +273,49 @@ class SettingsPage(BasePage):
             CoverLoader.instance().clear_cache()
         except Exception:  # noqa: BLE001
             pass
-        # 清 data/cache 临时合成图
+        # 清 data/cache 临时合成图（保留 redis_shelf.gz/redis_search.gz 持久化缓存）
         from pathlib import Path
 
         cache_dir = Path(__file__).resolve().parent.parent.parent / "data" / "cache"
         removed = 0
         if cache_dir.is_dir():
             for f in cache_dir.iterdir():
-                if f.is_file():
+                if f.is_file() and f.suffix.lower() != ".gz":
                     try:
                         f.unlink()
                         removed += 1
                     except OSError:
                         pass
-        QMessageBox.information(self, "清除缓存", f"已清除缓存（删除 {removed} 个临时文件）")
+        QMessageBox.information(self, "清除缓存", f"已清除缓存（删除 {removed} 个临时文件；Redis 持久化缓存请用下方按钮单独清除）")
+
+    def _on_cache_pool_clear(self, pool: str) -> None:
+        """清除指定缓存池（shelf 或 search）并刷新用量显示。
+
+        书架（shelf）：封面/详情/章节正文/漫画页图。
+        搜索&发现（search）：搜索结果 / 发现首页列表（同一 10G 池）。
+        """
+        from framework.cache_service import get_shelf_cache, get_search_cache
+        from PySide6.QtWidgets import QMessageBox
+
+        store = get_shelf_cache() if pool == "shelf" else get_search_cache()
+        label = "书架" if pool == "shelf" else "搜索&发现"
+        if store is not None:
+            before = store.bytes_used()
+            store.clear()
+            try:
+                store.flush_checked()  # 立即落盘（持久化清除状态，重启不复活）
+            except Exception:  # noqa: BLE001
+                pass
+            if pool == "shelf":
+                self._ui_shelf_usage.setText(f"0.00 GB（书架）")
+            else:
+                self._ui_search_usage.setText(f"0.00 GB（搜索&发现）")
+            QMessageBox.information(
+                self, "清除缓存",
+                f"已清除{label}缓存（释放约 {before / (1024 ** 3):.2f} GB）",
+            )
+        else:
+            QMessageBox.information(self, "清除缓存", f"{label}缓存未初始化")
 
     def _on_source_select(self) -> None:
         """点「源选择 / 重新下载源」→ 由 App 层打开同一个引导对话框。"""
