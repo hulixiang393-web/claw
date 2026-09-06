@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -27,6 +29,8 @@ from .reader.comic_view import ComicView
 from .reader.video_view import VideoView
 from .reader.epub_view import EpubView
 from .base_page import BasePage
+
+log = logging.getLogger(__name__)
 
 # 阅读背景主题（bg, fg）：白/米黄/护眼绿/夜间黑。「背景」按钮按此循环，
 # fg 为空 = 跟随主题；夜间黑配浅字保证可读。选择写回 ui.reading_bg 记忆。
@@ -96,6 +100,7 @@ class ReaderPage(BasePage):
         self._font_scale = float(font_scale or 1.0)
         self._current_source_id = None
         self._current_book_url = None
+        self._current_start_url = ""
         self._current_content_type = ""  # 当前作品类型（收藏时记录）
         self._favorite_checker = None  # 可选回调: url -> bool（App 注入判断是否已收藏）
         self._pending_position = None  # 打开书续读位置（0~1 比例），_on_detail 传给视图
@@ -334,6 +339,7 @@ class ReaderPage(BasePage):
         self._current_source_id = source_id
         self._current_source = source
         self._current_book_url = book_url
+        self._current_start_url = start_chapter_url
         self._current_content_type = content_type
         self.dl_btn.setEnabled(True)
         self.title_label.setText(f"加载中...")
@@ -387,6 +393,37 @@ class ReaderPage(BasePage):
                 self._manager.get(self._current_source_id), detail, start_chapter_url,
                 restore_position=pos,
             )
+        # 后台预加载当前章+后 3 章正文到 Redis 缓存（小说/漫画，视频除外）。
+        # 不阻塞渲染：ReaderPage 已离开_LoadDetailTask 后台线程，此处起独立 QRunnable。
+        if content_type in ("novel", "comic"):
+            self._start_precache(source_id, detail)
+
+    def _start_precache(self, source_id: str, detail) -> None:
+        """后台预加载当前章+后 3 章正文到缓存（小说/漫画共用）。
+
+        需要 self._content.cache 已注入（Task 9 引导）。未注入则 no-op。
+        """
+        try:
+            if getattr(self._content, "_cache", None) is None:
+                return
+            chapters = getattr(detail, "chapters", None)
+            if not chapters:
+                return
+            source = self._manager.get(source_id)
+            if source is None:
+                return
+            sidx = 0
+            start_url = getattr(self, "_current_start_url", "")
+            if start_url:
+                for i, ch in enumerate(chapters):
+                    if getattr(ch, "url", "") == start_url:
+                        sidx = i
+                        break
+            QThreadPool.globalInstance().start(
+                _PrecacheTask(self._content, source, chapters, sidx)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cache] 预加载调度失败: %s", exc)
 
     # ------------------------------------------------------------------ #
     def set_favorite_checker(self, cb) -> None:
@@ -573,4 +610,23 @@ class _LoadDetailTask(QRunnable):
                 detail, err, self._content_type, self._start_url, self._source_id
             )
         except RuntimeError:
+            pass
+
+
+class _PrecacheTask(QRunnable):
+    """后台预加载当前章+后 3 章正文（QRunnable，异常静默）。"""
+
+    def __init__(self, content, source, chapters, idx):
+        super().__init__()
+        self._content = content
+        self._source = source
+        self._chapters = chapters or []
+        self._idx = idx
+
+    def run(self) -> None:
+        try:
+            self._content.precache_chapters(
+                self._source, self._chapters, self._idx
+            )
+        except Exception:  # noqa: BLE001
             pass
