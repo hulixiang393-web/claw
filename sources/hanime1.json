@@ -33,6 +33,7 @@
   "endpoints": {
     "discovery": {
       "list_url": "/search?genre={cat}&page={page}",
+      "works_list_url": "/search?page={page}",
       "list_paginator": {
         "type": "increment",
         "start": 1,
@@ -88,19 +89,21 @@
       },
       "works_list_item": {
         "root_selector": {
-          "css": "div.video-item-container"
+          "css": "div.video-item-container, a[href*='watch?v=']"
         },
         "fields": {
           "title": {
-            "css": ".video-title, .title"
+            "css": ".video-title, .title, .home-rows-videos-title"
           },
           "url": {
             "css": "a[href*='watch?v=']",
             "attr": "href"
           },
           "cover": {
-            "css": "img.main-thumb",
-            "attr": "src"
+            "fallback": [
+              {"css": "img.main-thumb", "attr": "src"},
+              {"css": "img", "attr": "src"}
+            ]
           },
           "author": {
             "css": ".subtitle a[href*='query=']"

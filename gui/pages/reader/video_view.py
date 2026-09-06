@@ -202,13 +202,27 @@ class VideoView(QWidget):
         self.source_label.setVisible(False)
         self.source_combo.setVisible(False)
 
-        # ---- 主体：分集列表 + 播放区 ----
+        # ---- 主体：分集列表（含封面）+ 播放区 ----
         body = QHBoxLayout()
         body.setSpacing(8)
+        side_wrap = QWidget()
+        side_wrap.setFixedWidth(200)
+        side = QVBoxLayout(side_wrap)
+        side.setContentsMargins(0, 0, 0, 0)
+        side.setSpacing(6)
+        # 视频分集侧边栏顶部作品封面（小说/漫画阅读界面无此区）
+        self.cover_label = QLabel()
+        self.cover_label.setFixedHeight(120)
+        self.cover_label.setScaledContents(True)
+        self.cover_label.hide()
+        self.cover_label.setStyleSheet(
+            "background: #222; border-radius: 6px;"
+        )
+        side.addWidget(self.cover_label)
         self.ep_list = QListWidget()
-        self.ep_list.setFixedWidth(200)
         self.ep_list.itemClicked.connect(self._on_ep_clicked)
-        body.addWidget(self.ep_list)
+        side.addWidget(self.ep_list, stretch=1)
+        body.addWidget(side_wrap)
 
         right = QVBoxLayout()
         right.setSpacing(6)
@@ -655,6 +669,24 @@ class VideoView(QWidget):
                           if self.help_overlay.isVisible() else None)
 
     # ------------------------------------------------------------------ #
+    def _load_ep_cover(self, detail: Detail) -> None:
+        """在侧边栏顶部显示作品封面（仅视频有 cover 时；小说/漫画无此区）。"""
+        cover = (detail.cover or "").strip()
+        if not cover:
+            self.cover_label.hide()
+            self.cover_label.clear()
+            return
+        self.cover_label.show()
+
+        def _set(pm):
+            if pm is None or pm.isNull():
+                return
+            self.cover_label.setPixmap(pm)
+
+        from gui.components.cover_loader import CoverLoader
+
+        CoverLoader.instance().load(cover, _set, cache=True, persist=False)
+
     def load(self, source, detail: Detail, start_ep_url: str = "", restore_position: float | None = None) -> None:
         self._source = source
         self._detail = detail
@@ -667,6 +699,7 @@ class VideoView(QWidget):
         self._episodes = detail.chapters
         self._stream_cache.clear()
         self._prefetch_idx = -2
+        self._load_ep_cover(detail)
         self._populate_source_combo(detail)
         self._populate_quality_combo(source)
         self.ep_list.clear()
@@ -703,6 +736,7 @@ class VideoView(QWidget):
         self._stream_cache.clear()
         self._prefetch_idx = -2
         self._detail_url_for_play = ""
+        self._load_ep_cover(new_detail)
         self.ep_list.clear()
         for i, ep in enumerate(new_detail.chapters):
             item = QListWidgetItem(ep.title or f"第{i+1}集")
