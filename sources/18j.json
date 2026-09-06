@@ -37,7 +37,7 @@
   },
   "endpoints": {
     "discovery": {
-      "list_url": "/vod/",
+      "list_url": "/label/hot/by/time/",
       "list_paginator": {
         "type": "increment",
         "start": 1,
@@ -48,7 +48,7 @@
         "categories": [
           {
             "title": "全部",
-            "url": "/vod/"
+            "url": "/label/hot/by/time/"
           },
           {
             "title": "国产",

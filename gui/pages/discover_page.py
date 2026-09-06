@@ -602,7 +602,16 @@ class DiscoverPage(BasePage):
             self._maybe_preload()
             return
         self._loaded_pages.add(page)
-        self._append_works(works)
+        added = self._append_works(works)
+        if added == 0:
+            # 整页内容全部重复（源分页失效返回相同首页/页内容）：
+            # 再往后翻也只会是同样的内容 → 停止加载并提示，避免空转。
+            self._has_more = False
+            self.status_label.setText(
+                f"已加载 {len(self._loaded_pages)} 页 · 共 {self._work_count} 部（该源分页已无新内容）"
+            )
+            self._maybe_preload()
+            return
         self.status_label.setText(
             f"已加载 {len(self._loaded_pages)} 页 · 共 {self._work_count} 部"
         )
@@ -827,11 +836,12 @@ class DiscoverPage(BasePage):
         super().resizeEvent(event)
         self._reflow()
 
-    def _append_works(self, works) -> None:
+    def _append_works(self, works) -> int:
         """把作品卡片按网格排列（每行自适应列数个）。
 
         跨页按 URL 去重：分页异常/并发预加载时同一作品可能重复出现
         （如 maccms 分页失效返回相同内容），已显示过的跳过，不重复渲染。
+        返回实际新增条数（整页全重复时为 0，调用方据此停止加载）。
         """
         fresh = []
         for w in works:
@@ -840,12 +850,13 @@ class DiscoverPage(BasePage):
             self._seen_urls.add(w.url)
             fresh.append(w)
         if not fresh:
-            return
+            return 0
         self._works.extend(fresh)
         cols = self._columns()
         for w in fresh:
             self._append_card(w, cols)
         self._apply_column_stretch(cols)
+        return len(fresh)
 
     # ------------------------------------------------------------------ #
     def _on_work_clicked(self, work: Work) -> None:
