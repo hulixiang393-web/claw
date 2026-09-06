@@ -65,12 +65,16 @@ class Search:
         parser: Parser,
         discovery: Optional[Discovery] = None,
         concurrent: int = 1,
+        cache=None,
     ):
         self._http = http
         self._parser = parser
         self._discovery = discovery
         self._concurrent = max(1, int(concurrent or 1))
         self._ytdlp = None  # 懒加载单例
+        # 可选 RedisLikeStore 实例（None=禁用）。键约定：
+        #   search:{source_id}:{norm_query} → result list（24h，search 池）
+        self.cache = cache
 
     # ------------------------------------------------------------------ #
     def search_one(
@@ -97,6 +101,31 @@ class Search:
             return self._search_api(source, keyword, http=http)
         return self._search_html(source, keyword, http=http, on_page=on_page)
 
+    def search_one_cached(
+        self,
+        source: SourceConfig,
+        keyword: str,
+        http: Optional[HttpClient] = None,
+        on_page=None,
+        use_cache: bool = True,
+    ) -> List[SearchResult]:
+        """带搜索缓存的单源搜索：命中 search: 键直接返回，否则搜索后写（24h）。
+
+        use_cache=False 强制走真实搜索（GUI「重新搜索」等需要新鲜的入口）。
+        缓存 key 用规范化关键词（strip），不区分大小写与否由实现方定。
+        """
+        if not self.cache or not use_cache:
+            return self.search_one(source, keyword, http=http, on_page=on_page)
+        norm = (keyword or "").strip()
+        key = f"search:{source.source_id}:{norm}"
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+        results = self.search_one(source, keyword, http=http, on_page=on_page)
+        if results is not None:
+            self.cache.set(key, results, ttl=24 * 3600)
+        return results or []
+
     def search_type(
         self, sources: List[SourceConfig], keyword: str
     ) -> List[SearchResult]:
@@ -109,7 +138,7 @@ class Search:
         if self._concurrent <= 1 or len(sources) <= 1:
             for source in sources:
                 try:
-                    results.extend(self.search_one(source, keyword))
+                    results.extend(self.search_one_cached(source, keyword))
                 except Exception as exc:
                     log.warning("[%s] 搜索失败: %s", source.source_id, exc)
             return results
@@ -121,9 +150,10 @@ class Search:
             worker_http = self._http.__class__(
                 sleeper=getattr(self._http, "_sleeper", None),
                 defaults=self._http.defaults,
+                cache=self.cache,
             )
             try:
-                return self.search_one(source, keyword, http=worker_http)
+                return self.search_one_cached(source, keyword, http=worker_http)
             except Exception as exc:
                 log.warning("[%s] 搜索失败: %s", source.source_id, exc)
                 return []

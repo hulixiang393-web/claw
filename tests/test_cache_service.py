@@ -252,3 +252,29 @@ def test_content_precache_chapters():
         "https://x.com/b/2.html",
         "https://x.com/b/3.html",
     }
+
+
+def test_search_cache_write_and_hit():
+    from framework.search import Search
+
+    store = make_store()
+    src = _fake_source()
+    src._raw["constraints"] = {"search": {"max_pages": 1, "max_results": 999999}}
+    src._raw["endpoints"]["search"] = {
+        "item": {"root_selector": "x", "fields": {"title": {"sel": "a"}}}
+    }
+    calls = {"n": 0}
+
+    def fake_html(source, keyword, http=None, on_page=None):
+        calls["n"] += 1
+        return []
+
+    searcher = Search(_FakeHttp(), _fake_parser())
+    searcher._search_html = fake_html  # type: ignore
+    searcher.cache = store
+    searcher.search_one_cached(src, "keyw", use_cache=True)
+    assert calls["n"] == 1
+    assert store.get(f"search:{src.source_id}:keyw") == []
+    # 第二次命中
+    searcher.search_one_cached(src, "keyw", use_cache=True)
+    assert calls["n"] == 1
