@@ -8,7 +8,7 @@
 用户诉求：
 1. **书架缓存（≤3G）**：缓存书架书籍封面 + 「当前阅读书籍 → 当前章节 + 后面三章」预加载（不满三章按实际，只有一章就只缓存一章）。
 2. **发现/搜索缓存（≤10G）**：显著提升整体加载速度。
-3. **搜索页数放开**：取消 `constraints.search.max_pages/max_results` 上限，全部显示；以懒加载渲染保证 ≤10s 首屏 + 滚动不卡顿。
+3. **搜索页数放开**：取消 `constraints.search.max_pages` 作为搜索限制——有多少加载多少，翻到站点页尾由「连续空页」自然停；**不设默认页数限量**（仅保留引擎级硬保护 `_SEARCH_MAX_PAGES_HARD_CAP=2000` 防分页模板失效死循环，绝非搜索限制）。GUI 端动态分批渲染（`_append_displayed_batch`/`_render_all_remaining` 逐批、`_pump_visible_covers` 视口懒加载封面），保证有多少显示多少、但不一次全加载、首屏不卡顿。发现页已按页抓取 + 滚动 80% 增量加载，无需改。
 4. **手动清除缓存**。
 5. **使用 Redis 编程范式**（键值 + TTL + LRU + 配额）。
 
@@ -96,10 +96,12 @@ TTL 语义：永久=不设过期，靠 LRU 配额淘汰；有限 TTL 到期后 g
 
 ## 四、手动清除 + 配额管理
 
-设置页（`gui/ui-settings`）新增「缓存管理」区：
-- 显示当前用量（Shelf/搜索 各 X.X GB / 配额）
-- 按钮：清空书架缓存 / 清空搜索缓存 / 全部清空 / 按源清（下拉选源）
-- 调用 `cache_service.clear()` / `clear_prefix("cover:x")` / `scan("search:*")` 后逐删
+设置页（`gui/settings_page.py`）新增「缓存管理」区：
+- 显示当前用量：书架缓存（3G）、搜索&发现缓存（10G）各显示已用 GB。
+- **独立清除按钮（分开管理）**：
+  - 「清除书架缓存」→ `get_shelf_cache().clear()`（清封面 + 详情 + 章节 + 漫画页图）。
+  - 「清除搜索&发现缓存」→ `get_search_cache().clear()`（搜索 + 发现同池 10G）。
+- 每个清除按钮清完立即 `flush_checked()` 落盘（持久化清除状态，重启后不复活）。
 
 数据目录：`data/cache/redis_{shelf,search}.gz`（随 data/ 走 settings）。
 

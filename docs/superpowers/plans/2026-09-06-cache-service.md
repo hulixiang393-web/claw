@@ -785,7 +785,9 @@ git commit -m "feat(cache): Content 详情/正文/封面缓存 + precache_chapte
 
 **Interfaces:**
 - Consumes: 无（纯行为变更）。
-- Produces: `_search_html` 不再读 `constraints.search.max_pages/max_results` 作为页数上限——改为**不设上限**，由「连续空页提前停」（search.py:268-290）自然停到站底。`search_type` 合并去重逻辑不动。
+- Produces: `_search_html` 不再以 `constraints.search.max_pages` 作为页数上限——**不设默认值上限**，由「连续空页提前停」（search.py:266-276）自然停到站底；`max_results` 不再截断。`search_type` 合并去重逻辑不动。GUI 端由现有 `_append_displayed_batch` / `_render_all_remaining` 分批渲染（有多少加载多少，不一次加载完）。
+
+> **设计说明（防死循环保护，非"默认限量"）**：无限翻页有死循环隐患——个别站分页 URL 模板失效时会每页都返回页首内容（一直非空），永不触发「连续空页」停。故保留一个**引擎级硬保护上限**（`_SEARCH_MAX_PAGES_HARD_CAP = 2000`，仅作资源防失控），但绝不作为「搜索限制」——真正的终止语义完全交给空页自然停。默认（源未配 max_pages）不再给 3/999999，而是"无限+硬保护"。这与用户要求"有多少加载多少"一致：正常源翻到底自然停，用户的搜索结果不被配额截断。
 
 - [ ] **Step 1: 改实现**（search.py:163-164）
 
@@ -797,26 +799,36 @@ max_results = int((constraints.get("search") or {}).get("max_results") or 0)
 改为：
 
 ```python
-# 页数放开：不再限制 max_pages/max_results（原设计搜索到站点页尾自然停）。
-# 保留读取以便旧源配置无副作用；默认给极大软上限防 int 溢出。
-max_pages = int((constraints.get("search") or {}).get("max_pages") or 999999)
-max_results = int((constraints.get("search") or {}).get("max_results") or 999999)
+# 搜索页数放开：不再以 max_pages 作为搜索限制——有多少加载多少，翻到站点
+# 页尾时由「连续空页」提前停（下方 while 内 break）。
+# - 源若显式配了 max_pages/max_results，则尊重源配置（避免破坏现有源语义，
+#   且 51cg1 等源配大页数用于并发提速，本处不做截断）。
+# - 未配置 → 无限（保留引擎硬保护 _SEARCH_MAX_PAGES_HARD_CAP 防分页模板
+#   失效死循环，非搜索结果限制）。
+max_pages = (constraints.get("search") or {}).get("max_pages")
+max_results = (constraints.get("search") or {}).get("max_results")
+if not max_pages:
+    max_pages = _SEARCH_MAX_PAGES_HARD_CAP  # 1500→2000 硬保护，不进 constraints
+if not max_results:
+    max_results = 0  # 0 = 不按条数截断
 ```
 
-- [ ] **Step 2: 运行测试**
+文件顶部加常量 `_SEARCH_MAX_PAGES_HARD_CAP = 2000`。
 
-Run: `$env:PYTHONPATH = "D:\code\claw"; python -m pytest tests/test_search_merge.py -q`
-Expected: PASS（合并逻辑不变）
+- [ ] **Step 2: 补齐空页停语义**（search.py:268）
 
-- [ ] **Step 3: 验证搜索空页提前停止逻辑保留**
+当前 `if end < max_pages and wave_items and not any(wave_items.values()):` 里的 `end < max_pages` 守卫在 max_pages=$HARD_CAP 时恒成立（end 远小于 2000），保留无副作用。行为不变：第一波或后续波连续全空即 break 自然停。无需改。
 
-Run: `python -c "pass"` 后人工审 read search.py:268-290 确认 `if end < max_pages and wave_items and not any(wave_items.values())` 仍存在（自然停逻辑不依赖 max_pages=999999 破坏）。
+- [ ] **Step 3: 运行测试**
+
+Run: `$env:PYTHONPATH = "D:\code\claw"; python -m pytest tests/test_search_merge.py tests/test_chapter_sort.py -q`
+Expected: PASS（合并逻辑、分页逻辑不变）
 
 - [ ] **Step 4: 提交**
 
 ```bash
 git add framework/search.py
-git commit -m "feat(search): 搜索页数放开（搜到站底自然停）"
+git commit -m "feat(search): 搜索页数放开（搜到站底自然停，不设默认限量）"
 ```
 
 ---
@@ -1131,45 +1143,63 @@ git commit -m "feat(cache): 阅读器进入预加载当前章+后三章"
 
 **Interfaces:**
 - Consumes: `get_shelf_cache`/`get_search_cache`（Task 1）；Store `bytes_used`/`clear`/`scan`。
-- Produces: 设置页新增「缓存管理」区（书架 3G / 搜索 10G 用量 + 全清/按源/各池清）。
+- Produces: 设置页新增「缓存管理」区：**书架缓存**（3G）与**搜索&发现缓存**（10G）各自的用量 + 独立清除按钮（书架一个、搜索&发现一个，分开管理）。搜索和发现共用 SearchCache 10G 池 → 一个「清除搜索&发现缓存」按钮同时清两者。
 
 - [ ] **Step 1: settings_page.py 扩展缓存区**
 
-在 `_build_ui` 缓存清除行（203-213）追加用显示 + 按钮（用 `_Section._form.addRow`）：
+在 `_build_ui` 缓存清除行（203-213）追加用量显示 + 两个独立清除按钮（用 `_Section._form.addRow`）：
 
 ```python
 def _build_cache_manage(self, sec):
     from framework.cache_service import get_shelf_cache, get_search_cache
-    shelf, search = get_shelf_cache(), get_search_cache()
 
-    row = QHBoxLayout()
-    def _label(store, cap):
-        used = (store.bytes_used() / (1024 ** 3)) if store else 0
-        return QLabel(f"{used:.2f} / {cap} GB")
-    self._ui_shelf_usage = _label(shelf, 3)
-    self._ui_search_usage = _label(search, 10)
-    row.addWidget(self._ui_shelf_usage)
-    row.addWidget(QLabel("  书架缓存"))
-    row.addWidget(self._ui_search_usage)
-    row.addWidget(QLabel("  搜索缓存"))
-    row.addStretch(1)
-    sec._form.addRow("缓存用量", row)
+    def _usage(store):
+        return (store.bytes_used() / (1024 ** 3)) if store else 0
 
-    btns = QHBoxLayout()
-    self._cache_clear_shelf_btn = QPushButton("清书架缓存")
-    self._cache_clear_shelf_btn.clicked.connect(lambda: self._on_cache_pool_clear("shelf"))
-    self._cache_clear_search_btn = QPushButton("清搜索缓存")
-    self._cache_clear_search_btn.clicked.connect(lambda: self._on_cache_pool_clear("search"))
-    self._cache_clear_all_btn = QPushButton("全部清空")
-    self._cache_clear_all_btn.clicked.connect(self._on_cache_clear_all)
-    btns.addWidget(self._cache_clear_shelf_btn)
-    btns.addWidget(self._cache_clear_search_btn)
-    btns.addWidget(self._cache_clear_all_btn)
-    btns.addStretch(1)
-    sec._form.addRow("缓存管理", btns)
+    # 用量行：两个缓冲池分开显示
+    usage_row = QHBoxLayout()
+    usage_row.setSpacing(18)
+    self._ui_shelf_usage = QLabel(f"{_usage(get_shelf_cache()):.2f} GB（书架）")
+    self._ui_search_usage = QLabel(f"{_usage(get_search_cache()):.2f} GB（搜索&发现）")
+    usage_row.addWidget(self._ui_shelf_usage)
+    usage_row.addWidget(self._ui_search_usage)
+    usage_row.addStretch(1)
+    sec._form.addRow("缓存用量", usage_row)
+
+    # 清除按钮：书架 / 搜索&发现 分开
+    btn_row = QHBoxLayout()
+    btn_row.setSpacing(8)
+    self._cache_clear_shelf_btn = QPushButton("清除书架缓存")
+    self._cache_clear_shelf_btn.clicked.connect(
+        lambda: self._on_cache_pool_clear("shelf")
+    )
+    self._cache_clear_search_btn = QPushButton("清除搜索&发现缓存")
+    self._cache_clear_search_btn.clicked.connect(
+        lambda: self._on_cache_pool_clear("search")
+    )
+    btn_row.addWidget(self._cache_clear_shelf_btn)
+    btn_row.addWidget(self._cache_clear_search_btn)
+    btn_row.addStretch(1)
+    sec._form.addRow("缓存清除", btn_row)
 ```
 
-`_on_cache_pool_clear` / `_on_cache_clear_all` 调用 `store.clear()`（各池）后刷新用量 label。保留既有 `_on_cache_clear`（内存缓存）。
+新增处理函数（清除后刷新用量）：
+
+```python
+def _on_cache_pool_clear(self, pool: str) -> None:
+    """清除指定缓存池（shelf 或 search）并刷新用量显示。"""
+    from framework.cache_service import get_shelf_cache, get_search_cache
+    store = get_shelf_cache() if pool == "shelf" else get_search_cache()
+    if store is not None:
+        store.clear()
+        store.flush_checked()  # 立即落盘（持久化清除状态）
+    if pool == "shelf":
+        self._ui_shelf_usage.setText(f"{0:.2f} GB（书架）")
+    else:
+        self._ui_search_usage.setText(f"{0:.2f} GB（搜索&发现）")
+```
+
+保留既有 `_on_cache_clear`（清封面内存缓存 + QPixmapCache + data/cache 合成图，与 Redis 池无关）。
 
 - [ ] **Step 2: gui/app.py 引导注入**
 
@@ -1188,20 +1218,21 @@ CoverLoader.instance().configure(
 
 - [ ] **Step 3: 手动冒烟**
 
-启动 → 设置页见两个用量标签与按钮；点「清搜索缓存」→ 用量归零；重启 App → 用量仍显示（持久化）。
+启动 → 设置页见「书架 (x GB) / 搜索&发现 (y GB)」用量与两个独立按钮；点「清除书架缓存」→ 仅书架用量归零，搜索&发现不变；点「清除搜索&发现缓存」→ 搜索归零；重启 App → 用量仍显示（持久化，清除状态保留）。
 
 - [ ] **Step 4: 提交**
 
 ```bash
 git add gui/pages/settings_page.py gui/app.py
-git commit -m "feat(cache): 设置页缓存管理（用量+清除）+ 引导注入"
+git commit -m "feat(cache): 设置页缓存管理（书架/搜索&发现分开清除）+ 引导注入"
 ```
 
 ---
 
 ## 自审记录
 
-- **Spec 覆盖**：书架 3G（Task 1 池配置 + Task 3/7/8 注入）；搜索/发现 10G（Task 1 + 5/6）；搜索放开（Task 4）；预加载 3 章（Task 8）+ 不满按实际；手动清除（Task 9）；视频不额外缓存（设计约束，未涉及 video）；TTL 分档（Task 3/5/6）。
+- **Spec 覆盖**：书架 3G（Task 1 池配置 + Task 3/7/8 注入）；搜索/发现 10G（Task 1 + 5/6）；搜索放开不设默认限量（Task 4 + 引擎硬保护 _SEARCH_MAX_PAGES_HARD_CAP=2000 防死循环）；预加载 3 章（Task 8）+ 不满按实际；手动清除分开——书架 / 搜索&发现 两个独立按钮（Task 9）；视频不额外缓存（设计约束，未涉及 video）；TTL 分档（Task 3/5/6）；发现页动态分批已有（按页 + 滚动 80%），搜索页分批渲染已有（_append_displayed_batch/_render_all_remaining）。
+- **2026-09-06 二次调整**：搜索 max_pages 不设默认值（原 999999 → 未配置则硬保护 2000，非搜索限制）；max_results 未配置则 0（不截断）；设置页清除按钮改为「书架 / 搜索&发现」两个独立按钮（搜索与发现同池 10G，一个按钮清两者）。
 - **占位符**：无 TBD/TODO；所有 Step 含实际代码。
 - **类型一致性**：`RedisLikeStore` 方法名（get/set/hset/scan/clear/bytes_used/flush_checked/save/load）贯穿各 Task；`cache` 属性统一（HttpClient/Content/Search/Discovery/CoverLoader cache）。
 
@@ -1211,3 +1242,4 @@ git commit -m "feat(cache): 设置页缓存管理（用量+清除）+ 引导注�
 - `fetch_comic_pages` 分页/on_page 分支较多，缓存写要在最终 return 前统一做，避免两个 return 分支遗漏。实现时用局部变量收集 + 末尾统一写入。
 - CoverLoader `_on_reply` 里 `readAll()` 只能取一次——需保存 raw bytes 再构造 QPixmap。
 - `Search._search_html` 被 task 5 的 `fake_html` monkeypatch 后，`Search.search_type` worker 调用 `search_one_cached`——FakeSource 需 `raw` dict（dict 属性 vs SourceConfig.raw property 差异）。
+- Task 4 的 `_SEARCH_MAX_PAGES_HARD_CAP=2000` 是引擎级防死循环保护，**不是搜索限制**（正常源翻到底空页自然停，远达不到 2000）。实现时必须保持 `while start <= max_pages` 循环 + `end < max_pages` 空页守卫不变，否则会误停或死循环。该常量仅赋值给未配置 max_pages 的源，源显式配了 max_pages 则尊重源值。
