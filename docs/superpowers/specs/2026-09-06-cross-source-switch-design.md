@@ -1,7 +1,12 @@
-# 跨源换源（全类型）设计文档
+# 跨源换源 + LLM Agent 自动制源 设计文档
 
 日期：2026-09-06
 状态：待实施计划
+说明：本文包含两个相互独立的功能模块——「部分 I：跨源换源（全类型）」与「部分 II：LLM Agent 自动制源」。两部分共享源 schema / 阅读界面 / 源编辑器基础设施，可分别实施与验收。
+
+---
+
+# 部分 I：跨源换源（全类型）
 
 ## 1. 背景与目标
 
@@ -203,3 +208,204 @@ difflib.SequenceMatcher(None, clean_a, clean_b).ratio()
 4. 全源无结果 → 明细弹窗展示各源原因
 5. 阅读界面所有列表项长标题换行完整显示，不再截断
 6. 现有 106 个测试全部通过；新增测试覆盖核心逻辑
+
+---
+
+# 部分 II：LLM Agent 自动制源
+
+## 11. 背景与目标
+
+现有源制作依赖人工：在源编辑器手填各字段，再逐一用「测试搜索 / 测试详情 / 选择器验证」面板试错。目标：**用大模型驱动 Agent 自动完成整个制源闭环**——用户给出站点 URL，Agent 抓取页面、分析结构、生成源配置 JSON、复用现有验证引擎自动验证、失败自动优化重试，成功则添加为可用源。
+
+覆盖全部内容类型（novel / comic / video）。
+
+## 12. 需求决策（已确认）
+
+| 决策点 | 结论 |
+|---|---|
+| 自动化程度 | 抓取→分析→生成→验证闭环（复用现有引擎） |
+| 目标站点 | 用户输入站点 URL + 类型 + 可选类别 |
+| 云端接入 | OpenAI 兼容接口（Key + base_url + 模型名） |
+| 本地接入 | Ollama；**用户填写模型服务地址** |
+| 本地一键启动 | 「启动 Ollama」按钮拉起本地服务 |
+| 失败策略 | 自动重试 N=5 轮保底，仍失败转人工并给建议 |
+| 绕过能力 | 智能识别（JS渲染/登录/反爬）+ 建议绕过，不自动部署代理池/破解验证码 |
+| 密钥安全 | API Key 存 `data/llm_keys.json`（data/ 已 gitignore，不进 git） |
+| 提示词 | 内置 `prompts/source_builder.txt` 模板（全类型要点 + schema + 注意事项） |
+| 验证能力 | 复用 source_editor 预览内核 / search_one / fetch_detail / 取流 |
+
+## 13. 架构
+
+```
+framework/llm.py                    # LLM 客户端适配（本地+云端统一）
+  LlmClient(base_url, api_key, model)   # OpenAI 兼容 chat
+  OllamaManager()                       # 一键启动/健康探测/模型列表
+  LlmKeyStore()                         # data/llm_keys.json 读写（密钥隔离）
+
+framework/source_agent.py           # Agent 制源闭环
+  SourceAgent(llm, http, preview, ...)
+  make_source(site_url, content_type) -> AgentResult
+  # Phase1 探测 → Phase2 生成 → Phase3 验证闭环(N轮) → Phase4 结果
+
+prompts/source_builder.txt          # 内置提示词模板（全类型）
+  - novel / comic / video 字段矩阵速查
+  - 选择器写作规范 + 反爬注意事项 + URL 占位符用法
+  - JSON 输出严格格式约束
+
+gui/pages/settings_page.py          # LLM 设置区块（改动）
+  - 云端 API Key / base_url / 模型名
+  - 本地 Ollama 地址 / 选模型 / 「启动 Ollama」按钮
+
+gui/components/source_editor.py     # 「🤖 AI 制源」入口 + Agent 对话框（改动/新增）
+  AgentDialog                           # 站点URL/类型/类别/模型 + 实时日志
+```
+
+## 14. LLM 客户端层（framework/llm.py）
+
+### 14.1 `LlmClient`
+- 构造：`LlmClient(base_url, api_key, model)`，兼容 OpenAI Chat Completions 格式
+- `chat(system, user, json_mode=False) -> str`：POST `{base_url}/chat/completions`
+  - 用项目现有 `HttpClient`（`framework/http.py`）发起，不新增第三方依赖
+  - `json_mode=True` 时带 `response_format: {"type": "json_object"}`（部分兼容端点支持）
+  - 超时取模型相关设置，失败抛 `LlmError`
+- 本地/云端统一走本类：本地 base_url=用户填的 Ollama 地址（如 `http://127.0.0.1:11434/v1`）
+- 地址归一：`base_url` 不以 `/v1` 结尾时追加 `/v1`（兼容用户只填端口）；管理接口（OllamaManager 的 `/api/*`）用**未追加**的原始地址
+
+### 14.2 `OllamaManager`
+- `start() -> bool`：探测地址端口 → 未响应则启动 `ollama serve`（找到 ollama.exe，找不到提示安装）
+- `models() -> list[str]`：GET `{base}/api/tags` 返回已安装模型名列表
+- `running() -> bool`：健康探测
+- 地址来源：用户填写（`data/llm_keys.json` 的 `local.base_url`），保留默认 `http://127.0.0.1:11434`
+
+### 14.3 `LlmKeyStore`（密钥安全）
+- 文件：`data/llm_keys.json`（`data/` 已被 `.gitignore` 排除，**绝不入 git**）
+- 结构：
+  ```json
+  {
+    "cloud": { "api_key": "sk-...", "base_url": "...", "model": "..." },
+    "local": { "base_url": "http://127.0.0.1:11434", "model": "" }
+  }
+  ```
+- `app_config.json` 里**不存** API Key（该文件被 git 追踪），只存模型名/base_url 等非敏感项
+- 读取失败/文件不存在 → 返回空，不阻塞程序
+- `data/` 目录不存在时自动创建
+
+## 15. Agent 制源流程（framework/source_agent.py）
+
+```python
+@dataclass
+class AgentResult:
+    ok: bool
+    source_id: str = ""          # 成功时已生成的源 id
+    draft: dict | None = None    # 失败时保存的草稿 JSON
+    attempts: int = 0            # 实际迭代轮数
+    logs: list = field(default_factory=list)   # 各阶段日志（抓取/生成/验证）
+    suggestions: list = field(default_factory=list)  # 人工介入建议
+```
+
+`make_source(site_url, content_type)` 步骤：
+
+- **Phase 1 探测**
+  - 抓取列表页/首页，判定页面技术：SSR（HTML 含内容）/ SPA（JS 渲染，body 空壳）/ API（XHR JSON 特征）
+  - 空壳/反爬特征 → 标记「可能需要 render / 参考同类站」，转 Phase 2 附建议；后续验证阶段可尝试 playwright 渲染再抓
+- **Phase 2 生成**
+  - 把真实 HTML 片段（长度截断 + 关键节点结构化）与 schema 摘要 + 类型要点 + 阶段 1 判断喂给 LLM
+  - 要求输出**单个 JSON 代码块**（严格字段、占位符 `{page}/{cat}/{keyword}/{id}` 正确使用）
+  - LLM 输出 → 解析 JSON（容错代码块标签剥除）→ `SourceConfig.from_dict` 结构校验
+- **Phase 3 验证闭环（N=5 轮）**
+  - 每轮按类型跑验证链（见 §16），失败信息 + 实际 HTML 片段回喂 LLM 要求修正
+  - 轮间给 LLM 提供「上次验证错误 + 建议方向」，修正后重新生成/局部修正
+  - 达到 N 轮仍失败 → 保存草稿，输出建议
+- **Phase 4 结果**
+  - 成功 → 写入 `sources/{id}.json` → 通知 `SourceManager.add()` 刷新 → UI 提示已在源编辑器加载
+  - 失败 → 草稿保存到 `data/agent_drafts/{id}.json` + 完整日志 + 建议清单
+
+## 16. 验证链（每类型）
+
+| 类型 | 验证步骤（全部通过才算成功） |
+|---|---|
+| 共有 | `SourceConfig.from_dict` 结构校验 → 发现列表（若配置了 discovery）提取 ≥1 条 → 搜索 `search_one(keyword)` ≥1 条 → 详情 `fetch_detail(url)` 元数据非空 |
+| novel | 章节目录 `fetch_chapters` ≥1 章 → 正文 `fetch_body` 非空 |
+| comic | 分页/图片列表 ≥1 图 → 图 URL 可请求（HEAD/小范围 GET） |
+| video | 分集列表 ≥1 集 → 通过 `Content` 统一入口取流（视频播放地址提取，内部按源配置走 HTML 直链 / 接口 / yt-dlp）→ 拿到 ≥1 条可播放 URL |
+| 特殊 | 站点需渲染 → 复用 `playwright_helper` 渲染后抓取再验证 |
+
+每步失败 → 记入 `logs` → 进入下一轮优化。验证使用**有限数量**（搜索 1 页、详情 1 个、图片 1 张、流 1 条），避免打满站点配额。
+
+## 17. 源制作界面（GUI）
+
+### 17.1 设置页 LLM 区块（gui/pages/settings_page.py）
+- 「云端模型」组：API Key（QLineEdit，`EchoMode.Password`）、base_url、模型名
+- 「本地模型」组：Ollama 地址、「获取模型列表」下拉、「🤖 启动 Ollama」按钮 + 状态灯
+- 保存 → `LlmKeyStore.save()` 写 `data/llm_keys.json`（不碰 app_config.json 的 Key）
+
+### 17.2 源编辑器 AI 入口（gui/components/source_editor.py）
+- 顶部按钮区新增「🤖 AI 制源」→ 弹 `AgentDialog`
+- `AgentDialog`：
+  - 输入：站点 URL、内容类型（下拉 novel/comic/video）、可选类别、模型选择（云端/本地）
+  - 实时日志面板（追加式 QPlainTextEdit）：每个 Phase 输出（抓取 URL、LLM 生成摘要、每轮验证结果/错误）
+  - 按钮：开始 / 停止
+  - 成功 → 关闭并**自动加载**进源编辑器表单（复用现有 `_load_config` 路径）+ 提示可预览验证
+  - 失败 → 显示建议清单 + 「保存草稿」，用户可继续在表单手调
+
+## 18. 提示词模板（prompts/source_builder.txt）
+
+内置（全类型都要）内容结构：
+1. **角色设定**：你是专业爬虫配置工程师，产出严格符合项目 schema 的源配置
+2. **类型字段矩阵**：novel→`content.chapter`、comic→`content.page`、video→`content.episode`+`media`；附各类型必填/选填速查
+3. **选择器写作规范**：
+   - 优先 CSS；取属性用 `attr`；多候选结构写 `fallback` 数组（按命中率排序）
+   - 避免选择器过宽（命中无关元素）或过窄（依赖单一 class，站点小改即碎）
+   - 长文本选 `text`，链接取 `href`，图片取 `src`/`data-original`
+4. **URL / 占位符用法**：分页 `{page}`、分类 `{cat}`、搜索 `{keyword}`、详情/分集 `{id}`
+5. **反爬规避注意事项**：
+   - transports 配 UA / Referer / Accept-Language / timeout / retries / interval_ms / charset
+   - 站点有 JS 渲染 → `render` 配置；接口加密 → `decryption`；广告 → `ad_block`
+   - 识别需登录 → `auth.login_required`，不强行绕登录
+   - 识别网站是 MacCMS / Meipui / 其他已知 CMS → 提示可参考同类源配置模式（source_switch 多线路）
+6. **输出格式强约束**：只输出单个 ```json 代码块；`$id` 小写蛇形唯一；必填字段齐备；禁止虚构不存在的字段
+7. **验证失败回喂格式**：每轮附带「错误信息 + 相关 HTML 片段」，要求给出修正后的完整 JSON
+
+## 19. 错误处理
+
+| 场景 | 处理 |
+|---|---|
+| LLM 无配置（Key/地址缺失） | 弹设置引导，跳转设置页 LLM 区块 |
+| Ollama 未运行 | 提示并尝试启动；启动失败引导安装 |
+| LLM 返回非 JSON / 字段缺失 | 重试解析，连续失败计入迭代 |
+| 站点反爬/CF | 记录识别特征 → 建议（可用 playwright 渲染选项） |
+| 某验证步骤失败 | 回喂 LLM 优化重试（最多 N 轮） |
+| 全类型验证通过但想要的部分缺失 | 源仍保存（可用），建议补充 |
+
+## 20. 测试计划
+
+- `tests/test_llm.py`：
+  - `LlmClient`：mock HttpClient 的请求/响应解析、错误、json_mode、超时
+  - `OllamaManager`：端口探测、models 解析、启动调用（mock）
+  - `LlmKeyStore`：读写、文件缺失、**确认写 data/ 且不碰 app_config.json**
+- `tests/test_source_agent.py`：
+  - 全流程 mock LLM + fixture 站点：Phase 生成、验证链调用、成功路径
+  - N 轮重试：连续失败→草稿+建议
+  - 各类型验证链分支（novel/comic/video）
+- GUI 冒烟：
+  - 设置页 LLM 区块显示/保存
+  - AgentDialog 打开/日志追加
+- 回归：`pytest tests`（106 基线）
+
+## 21. 范围裁剪（YAGNI）
+
+- 不自动部署代理池 / 验证码破解（仅识别 + 建议）
+- 不做 Agent 自主找站
+- 不做云端厂商原生 SDK（统一 OpenAI 兼容）
+- 不无限重试（N=5 保底转人工）
+- 播放流验证仅到「可取流 URL」，不真播完整视频
+- API Key 不写入源 JSON / app_config.json / 任何 git 跟踪文件
+
+## 22. 验收标准
+
+1. 设置页可配置云端（Key/base_url/model）与本地（地址/模型），Key 存 `data/llm_keys.json` 不回显明文且不入 git
+2. 「启动 Ollama」按钮可拉起本地模型服务，列表可读模型
+3. 源编辑器「🤖 AI 制源」输入 URL+类型，Agent 自动抓取→生成→验证，成功后源出现在源列表且可在源编辑器预览面板搜索/详情验证
+4. 验证失败自动重试最多 5 轮；仍失败保存草稿 + 日志 + 建议
+5. 提示词模板覆盖三种类型要点与制源注意事项
+6. 现有 106 测试全绿，新增 llm / source_agent 测试通过
