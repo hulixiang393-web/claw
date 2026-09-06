@@ -98,3 +98,12 @@ def test_flush_check_throttle(tmp_path):
     s._writes = 500
     s.flush_checked()  # 达阈值 → 落盘
     assert Path(path).exists()
+
+
+def test_http_client_holds_cache_ref():
+    from framework.http import HttpClient
+
+    store = RedisLikeStore(quota=1024 * 1024)
+    http = HttpClient(sleeper=lambda s: None, cache=store)
+    assert http.cache is store
+    http.close()

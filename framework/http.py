@@ -200,9 +200,11 @@ class HttpClient:
     _POOL_CONNECTIONS = 40
     _POOL_MAXSIZE = 128
 
-    def __init__(self, sleeper=None, defaults: Optional[NetworkDefaults] = None):
+    def __init__(self, sleeper=None, defaults: Optional[NetworkDefaults] = None,
+                 cache=None):
         self._sleeper = sleeper if sleeper is not None else time.sleep
         self.defaults = defaults or NetworkDefaults()
+        self.cache = cache  # 可选 RedisLikeStore 实例（None=禁用），供上层显式查/写
         self._session = None
         self._last_url = ""
         if _REQUESTS_AVAILABLE:
