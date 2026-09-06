@@ -12,7 +12,7 @@ import pytest
 from framework.cache_service import RedisLikeStore
 
 
-def make_store(tmp_path, quota=64 * 1024, persist=None):
+def make_store(tmp_path=None, quota=64 * 1024, persist=None):
     return RedisLikeStore(quota=quota, persist_path=persist)
 
 
@@ -107,3 +107,148 @@ def test_http_client_holds_cache_ref():
     http = HttpClient(sleeper=lambda s: None, cache=store)
     assert http.cache is store
     http.close()
+
+
+class _FakeHttp:
+    """可替换 get_text 的假 HttpClient，记录调用次数。"""
+
+    cache = None
+
+    def __init__(self):
+        self.calls = {}
+        self.defaults = type("D", (), {"timeout": 10, "retries": 0, "interval_ms": 0})()
+
+    def get_text(self, url, **kw):
+        self.calls[url] = self.calls.get(url, 0) + 1
+        return f"<h1>{url}</h1>"
+
+    def close(self):
+        pass
+
+
+def _fake_source():
+    class S:
+        source_id = "srcA"
+        base_url = "https://x.com"
+        content_type = "novel"
+        _raw = {
+            "endpoints": {
+                "content": {
+                    "chapter": {
+                        "pagination": {"enabled": False},
+                        "body": {"selector": {"css": "#content"}},
+                    }
+                }
+            }
+        }
+
+        @property
+        def raw(self):
+            return self._raw
+
+        def transports(self):
+            return {}
+
+        def request_headers(self):
+            return {}
+
+        def proxy_pool(self):
+            return None
+
+        def get_detail_config(self):
+            return {"fields": {}}
+
+    return S()
+
+
+def _fake_parser():
+    class P:
+        def parse(self, html):
+            return html
+
+        def extract(self, doc, sel):
+            return [doc]
+
+        def extract_first(self, doc, sel, base_url):
+            return ""
+
+        def parse_items(self, doc, root_sel, fields, base_url):
+            return []
+
+    return P()
+
+
+def _fake_checker():
+    class C:
+        def __init__(self):
+            pass
+
+    return C()
+
+
+def _make_content(store, http=None, parser=None):
+    from framework.content import Content
+
+    return Content(
+        http or _FakeHttp(),
+        parser or _fake_parser(),
+        _fake_checker(),
+        cache=store,
+    )
+
+
+def test_content_fetch_detail_caches_and_hits():
+    """_get_detail_html 走 Redis 二级缓存（page: 永久键）、二次命中免下载。"""
+    store = make_store()
+    http = _FakeHttp()
+    c = _make_content(store, http)
+    src = _fake_source()
+    html = c._get_detail_html(src, "https://x.com/book", "https://x.com/book")
+    assert http.calls.get("https://x.com/book") == 1
+    key = f"page:{src.source_id}:https://x.com/book"
+    assert store.get(key) == html
+    # 清空内存缓存，模拟「重启」后 Redis 命中（不再下载）
+    c._detail_html_cache.clear()
+    html2 = c._get_detail_html(src, "https://x.com/book", "https://x.com/book")
+    assert html2 == html
+    assert http.calls.get("https://x.com/book") == 1
+
+
+def test_content_fetch_chapter_caches_body():
+    """fetch_chapter 真实链路：开头 Redis 命中免抓、末尾写 body: 键。"""
+    store = make_store()
+    http = _FakeHttp()
+    c = _make_content(store, http)
+    src = _fake_source()
+    url = "https://x.com/b/1.html"
+    text = c.fetch_chapter(src, url)
+    key = f"body:{src.source_id}:{url}"
+    assert store.get(key) == text
+    # 二次调用（清内存缓存后）不重新抓取
+    c._detail_html_cache.clear()
+    text2 = c.fetch_chapter(src, url)
+    assert text2 == text
+    assert http.calls.get(url, 0) == 1
+
+
+def test_content_precache_chapters():
+    """预加载当前章+后3章：只抓没缓存的章 + 写 body 键。"""
+    store = make_store()
+    http = _FakeHttp()
+    c = _make_content(store, http)
+    src = _fake_source()
+    chapters = [
+        type("Ch", (object,), {"url": f"https://x.com/b/{i}.html"})()
+        for i in range(5)
+    ]
+    c.precache_chapters(src, chapters, 1, ahead=3)
+    # 当前章(1) + 后续章[2,3) → 预加载 1,2,3（后 ahead-1 章）
+    for i in (1, 2, 3):
+        assert store.get(f"body:{src.source_id}:https://x.com/b/{i}.html") is not None
+    # 第4章（index 4）不在范围内
+    assert store.get(f"body:{src.source_id}:https://x.com/b/4.html") is None
+    assert set(http.calls) == {
+        "https://x.com/b/1.html",
+        "https://x.com/b/2.html",
+        "https://x.com/b/3.html",
+    }

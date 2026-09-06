@@ -104,12 +104,19 @@ class Content:
         checker: StructureChecker,
         decrypter: Optional["Decrypter"] = None,
         health_reporter=None,
+        cache=None,
     ):
         self._http = http
         self._parser = parser
         self._checker = checker
         self._decrypter = decrypter
         self._health_reporter = health_reporter  # 可选：update_health(source_id, state, error)
+        # 可选 RedisLikeStore 实例（None=禁用）。键约定：
+        #   page:{source_id}:{abs_url}   详情/目录页（永久，shelf 池）
+        #   body:{source_id}:{abs_url}   章节正文（7 天，shelf 池）
+        #   pages:{source_id}:{abs_url}  漫画页图（7 天，shelf 池）
+        #   cover:{source_id}:{abs_url}  封面字节（永久，shelf 池）
+        self._cache = cache
         # yt-dlp 流 URL 缓存（同视频短时复用，避免重复签名等待）
         self._ytdlp_stream_cache: dict = {}
         self._ytdlp = None  # 懒加载单例，复用 yt-dlp 子进程
@@ -224,11 +231,21 @@ class Content:
         hit = self._detail_html_cache.get(key)
         if hit and hit[0] > time.time():
             return hit[1]
+        # Redis 二级：详情/目录页永久（重启后/预加载后免抓）
+        redis = self._cache
+        redis_key = f"page:{source.source_id}:{abs_url}"
+        if redis is not None:
+            cached = redis.get(redis_key)
+            if cached is not None:
+                self._detail_html_cache[key] = (time.time() + self._detail_html_ttl, cached)
+                return cached
         html = self._get(source, url)
         self._detail_html_cache[key] = (time.time() + self._detail_html_ttl, html)
         if len(self._detail_html_cache) > self._detail_html_max:
             # dict 保持插入序：弹出最先插入的一条（近似 LRU）
             self._detail_html_cache.pop(next(iter(self._detail_html_cache)))
+        if redis is not None:
+            redis.set(redis_key, html)
         return html
 
     def _content_block(self, source: SourceConfig) -> dict:
@@ -1028,6 +1045,13 @@ class Content:
         cur = url
         seen = set()
         max_pages = int(pag_cfg.get("max_pages") or 20)
+        # 开头：cached body 命中直接返回（重启后/预加载后免抓）
+        if self._cache is not None:
+            cached = self._cache.get(
+                f"body:{source.source_id}:{self._abs_url(source, url)}"
+            )
+            if cached is not None:
+                return cached
         while cur and len(pages) < max_pages:
             page_text, nxt = self._fetch_chapter_page(source, cur, pag_enabled)
             if page_text:
@@ -1043,7 +1067,49 @@ class Content:
                 cur = nxt_abs
                 continue
             break  # 基路径不同 → 是真正的下一章或重复，停止分页
-        return "\n".join(pages)
+        text = "\n".join(pages)
+        # 末尾：写 body: 键（7 天，shelf 池）
+        if self._cache is not None and text:
+            self._cache.set(
+                f"body:{source.source_id}:{self._abs_url(source, url)}",
+                text,
+                ttl=7 * 86400,
+            )
+        return text
+
+    def precache_chapters(
+        self,
+        source: SourceConfig,
+        chapters,
+        current_idx: int,
+        ahead: int = 3,
+    ) -> None:
+        """后台预加载当前章+后 ahead 章正文到缓存。不满 ahead 按实际。
+
+        进入阅读器时调用（novel/comic 都可用）。串行、逐章 fetch_chapter
+        （fetch_chapter 内部已写 body: 缓存）。异常静默。
+
+        chapters：可迭代对象，元素含 .url 属性。current_idx 为当前章下标。
+        """
+        if self._cache is None or not chapters:
+            return
+        end = min(current_idx + ahead, len(chapters))
+        for i in range(current_idx, end):
+            ch = chapters[i]
+            url = getattr(ch, "url", "")
+            if not url:
+                continue
+            abs_url = self._abs_url(source, url)
+            key = f"body:{source.source_id}:{abs_url}"
+            if self._cache.get(key) is not None:
+                continue  # 已缓存
+            try:
+                text = self.fetch_chapter(source, url)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[cache] 预加载失败 %s: %s", url, exc)
+                continue
+            if text:
+                self._cache.set(key, text, ttl=7 * 86400)
 
     def _fetch_chapter_page(
         self, source: SourceConfig, url: str, pag_enabled: bool = True
@@ -1245,8 +1311,9 @@ class Content:
         on_page=None,
         cancel_evt=None,
     ) -> List[str]:
-        """漫画：抓取一话的全部分页图片 URL。
+        """漫画：抓取一话的全部分页图片 URL（带缓存包装）。
 
+        pages:{source_id}:{abs_url} 键命中（7 天）直接返回；否则内部抓取后写缓存。
         对应 endpoints.content.page：
         - render: playwright → 用 Playwright 渲染（分片加密站）
         - 普通源 → HTML 提取图片 URL
@@ -1257,6 +1324,31 @@ class Content:
         循环里检查并提前返回（已抓到的部分），旧书取流立即让路给新书，不再
         白跑完一整话（dm5 一话 39 页 ≈74s）。None 表示不取消（下载器等同步调用）。
         """
+        if self._cache is not None:
+            abs_url = self._abs_url(source, chapter_url)
+            cached = self._cache.get(f"pages:{source.source_id}:{abs_url}")
+            if cached is not None:
+                if on_page and cached:
+                    on_page(list(cached))
+                return cached
+        imgs = self._fetch_comic_pages_impl(
+            source, chapter_url, on_page=on_page, cancel_evt=cancel_evt
+        )
+        if self._cache is not None and imgs:
+            self._cache.set(
+                f"pages:{source.source_id}:{self._abs_url(source, chapter_url)}",
+                list(imgs),
+                ttl=7 * 86400,
+            )
+        return imgs
+
+    def _fetch_comic_pages_impl(
+        self,
+        source: SourceConfig,
+        chapter_url: str,
+        on_page=None,
+        cancel_evt=None,
+    ) -> List[str]:
         content_cfg = self._content_block(source)
         block = content_cfg.get("page") or {}
         abs_url = self._abs_url(source, chapter_url)
