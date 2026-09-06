@@ -73,6 +73,9 @@ class Chapter:
     title: str
     url: str
     source_id: str = ""  # 该集所属播放源标识（换源站：sid 值）；普通源空
+    # 该集封面（如 hanime1 详情页侧边栏播放清單内每集缩略图）；
+    # 由 content.<type>.list.fields.cover 提取，空则该集界面回退作品封面
+    cover: str = ""
 
 
 @dataclass
@@ -749,6 +752,7 @@ class Content:
                                 title=it.get("title", "")
                                 or f"第{len(chapters)+1}集",
                                 url=url,
+                                cover=it.get("cover", "") or "",
                             )
                         )
                     if chapters:

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import webbrowser
 
-from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
+from PySide6.QtCore import QSize, Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -220,6 +220,7 @@ class VideoView(QWidget):
         )
         side.addWidget(self.cover_label)
         self.ep_list = QListWidget()
+        self.ep_list.setIconSize(QSize(84, 56))
         self.ep_list.itemClicked.connect(self._on_ep_clicked)
         side.addWidget(self.ep_list, stretch=1)
         body.addWidget(side_wrap)
@@ -687,6 +688,34 @@ class VideoView(QWidget):
 
         CoverLoader.instance().load(cover, _set, cache=True, persist=False)
 
+    def _populate_ep_list(self, chapters) -> None:
+        """重建分集列表；每集异步加载各自封面缩略图（无则忽略，不阻塞标题）。"""
+        self.ep_list.clear()
+        from gui.components.cover_loader import CoverLoader
+
+        def _make_item(i: int, ep) -> QListWidgetItem:
+            item = QListWidgetItem(ep.title or f"第{i+1}集")
+            item.setData(Qt.UserRole, i)
+
+            def _on_cover(pm):
+                if pm is None or pm.isNull():
+                    return
+                try:
+                    from PySide6.QtGui import QIcon
+
+                    item.setIcon(QIcon(pm))
+                except RuntimeError:
+                    pass  # item 已随列表清空销毁
+
+            url = (getattr(ep, "cover", "") or "").strip()
+            if url:
+                # cache=True：封面进共享 LRU 缓存，重开/换集不重复下载
+                CoverLoader.instance().load(url, _on_cover, cache=True, persist=False)
+            return item
+
+        for i, ep in enumerate(chapters):
+            self.ep_list.addItem(_make_item(i, ep))
+
     def load(self, source, detail: Detail, start_ep_url: str = "", restore_position: float | None = None) -> None:
         self._source = source
         self._detail = detail
@@ -702,11 +731,7 @@ class VideoView(QWidget):
         self._load_ep_cover(detail)
         self._populate_source_combo(detail)
         self._populate_quality_combo(source)
-        self.ep_list.clear()
-        for i, ep in enumerate(detail.chapters):
-            item = QListWidgetItem(ep.title or f"第{i+1}集")
-            item.setData(Qt.UserRole, i)
-            self.ep_list.addItem(item)
+        self._populate_ep_list(detail.chapters)
         idx = 0
         if start_ep_url:
             for i, ep in enumerate(detail.chapters):
@@ -737,11 +762,7 @@ class VideoView(QWidget):
         self._prefetch_idx = -2
         self._detail_url_for_play = ""
         self._load_ep_cover(new_detail)
-        self.ep_list.clear()
-        for i, ep in enumerate(new_detail.chapters):
-            item = QListWidgetItem(ep.title or f"第{i+1}集")
-            item.setData(Qt.UserRole, i)
-            self.ep_list.addItem(item)
+        self._populate_ep_list(new_detail.chapters)
         self.ep_list.setCurrentRow(0)
         self._switching = False
         self._sync_overlay_state(playing=False)

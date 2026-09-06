@@ -172,6 +172,12 @@
             "url": {
               "css": "a[href*='watch?v=']",
               "attr": "href"
+            },
+            "cover": {
+              "fallback": [
+                {"css": "img.main-thumb", "attr": "src"},
+                {"css": "img", "attr": "src"}
+              ]
             }
           }
         },
