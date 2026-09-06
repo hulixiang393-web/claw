@@ -107,10 +107,16 @@ class _CoverLoader(QObject):
         self._cache: "OrderedDict[str, QPixmap]" = OrderedDict()
         self._cache_bytes = 0
         self._cache_budget = 0  # 0 = 关闭缓存
+        # Redis 书架封面缓存（可选，None=禁用）。键：cover:{url}（永久，shelf 池）
+        self._shelf_cache = None
 
-    def configure(self, cache_mb: float | int = 0) -> None:
-        """设置缓存字节预算（MB）。0 关闭缓存。启动时调用一次。"""
+    def configure(self, cache_mb: float | int = 0, shelf_cache=None) -> None:
+        """设置缓存字节预算（MB）。0 关闭内存缓存。启动时调用一次。
+
+        shelf_cache：可选 RedisLikeStore（书架封面持久化）。None 禁用。
+        """
         self._cache_budget = max(0, int(cache_mb or 0)) * 1024 * 1024
+        self._shelf_cache = shelf_cache
         self._trim_cache()
 
     def clear_cache(self) -> None:
@@ -178,6 +184,7 @@ class _CoverLoader(QObject):
         callback: Callable[[Optional[QPixmap]], None],
         referer: Optional[str] = None,
         cache: bool = True,
+        persist: bool = False,
     ) -> None:
         """异步加载图片。
 
@@ -185,6 +192,8 @@ class _CoverLoader(QObject):
         为空时按图片域名从 _REFERER_RULES 推导兜底。
         cache: 是否进 LRU 内存缓存。封面默认 True；漫画正文长图传 False——
         正文图流式阅读、重看概率低，进共享 LRU 会挤掉封面缓存且内存占用大。
+        persist：是否查/写 Redis 书架封面持久化（cover: 键，永久）。True 时
+        内存 miss 后先查 Redis（重启后免下载），网络成功下载后写回 Redis。
         """
         if not url:
             callback(None)
@@ -194,13 +203,26 @@ class _CoverLoader(QObject):
             if cached is not None:
                 callback(cached)
                 return
-        self._queue.append((url, callback, referer, MAX_RETRIES, cache))
+        # Redis 持久化封面：命中直接构造 QPixmap（内存 miss 后/重启首开免下载）
+        if persist and self._shelf_cache is not None:
+            try:
+                data = self._shelf_cache.get(f"cover:{url}")
+            except Exception:  # noqa: BLE001
+                data = None
+            if data is not None:
+                p = QPixmap()
+                if p.loadFromData(data) and not p.isNull():
+                    if cache:
+                        self._cache_put(url, p)
+                    callback(p)
+                    return
+        self._queue.append((url, callback, referer, MAX_RETRIES, cache, persist))
         self._pump()
 
     def _pump(self) -> None:
         self._ensure_proxy()
         while self._active < MAX_CONCURRENT and self._queue:
-            url, callback, referer, retries_left, cache = self._queue.pop(0)
+            url, callback, referer, retries_left, cache, persist = self._queue.pop(0)
             request = QNetworkRequest(QUrl(url))
             request.setHeader(QNetworkRequest.UserAgentHeader, _BROWSER_UA)
             request.setTransferTimeout(REQUEST_TIMEOUT_MS)  # 超时，防卡队列
@@ -211,17 +233,19 @@ class _CoverLoader(QObject):
             # 用属性存回调 + 代理标记，reply 完成后取出
             reply = self._manager.get(request)
             used_proxy = self._proxy_url is not None
-            self._pending[reply] = (callback, url, used_proxy, referer, retries_left, cache)
+            self._pending[reply] = (callback, url, used_proxy, referer, retries_left, cache, persist)
 
     def _on_reply(self, reply: QNetworkReply) -> None:
-        callback, url, used_proxy, referer, retries_left, cache = self._pending.pop(
-            reply, (None, "", False, None, 0, True)
+        callback, url, used_proxy, referer, retries_left, cache, persist = self._pending.pop(
+            reply, (None, "", False, None, 0, True, False)
         )
         self._active -= 1
         pixmap = None
+        raw_data = b""
         try:
             if reply.error() == QNetworkReply.NoError:
                 data = reply.readAll()
+                raw_data = bytes(data)  # readAll() 只能取一次，先保存供持久化写
                 p = QPixmap()
                 if p.loadFromData(data) and not p.isNull():
                     pixmap = p
@@ -238,29 +262,37 @@ class _CoverLoader(QObject):
                 if referer:
                     req2.setRawHeader(b"Referer", referer.encode("utf-8"))
                 r2 = self._manager_direct.get(req2)
-                self._direct_pending[r2] = (callback, url, referer, retries_left, cache)
+                self._direct_pending[r2] = (callback, url, referer, retries_left, cache, persist)
             self._pump()
             return
         # 未走代理也失败 → 同样短退避重试（有上限），重试耗尽才判失败
         if pixmap is None and url and callback is not None and retries_left > 0:
-            self._retry_later(url, callback, referer, retries_left - 1, cache)
+            self._retry_later(url, callback, referer, retries_left - 1, cache, persist)
             self._pump()
             return
         if pixmap is not None and url and cache:
             self._cache_put(url, pixmap)
+        # 网络下载成功 → 写 Redis 持久化封面（书架封面持久化转载）
+        if pixmap is not None and url and raw_data and self._shelf_cache is not None:
+            try:
+                self._shelf_cache.set(f"cover:{url}", raw_data)
+            except Exception:  # noqa: BLE001
+                pass
         if callback:
             callback(pixmap)
         self._pump()
 
     def _on_direct_reply(self, reply: QNetworkReply) -> None:
         """无代理 fallback 完成。"""
-        callback, url, referer, retries_left, cache = self._direct_pending.pop(
-            reply, (None, "", None, 0, True)
+        callback, url, referer, retries_left, cache, persist = self._direct_pending.pop(
+            reply, (None, "", None, 0, True, False)
         )
         pixmap = None
+        raw_data = b""
         try:
             if reply.error() == QNetworkReply.NoError:
                 data = reply.readAll()
+                raw_data = bytes(data)
                 p = QPixmap()
                 if p.loadFromData(data) and not p.isNull():
                     pixmap = p
@@ -269,21 +301,27 @@ class _CoverLoader(QObject):
         reply.deleteLater()
         # 直连也失败 → 短退避后重新走代理路径重试（图床延迟抖动大，个别超时不代表永久失败）
         if pixmap is None and url and callback is not None and retries_left > 0:
-            self._retry_later(url, callback, referer, retries_left - 1, cache)
+            self._retry_later(url, callback, referer, retries_left - 1, cache, persist)
             self._pump()
             return
+        # 网络成功 → 顺带写 Redis 持久化封面（低频 direct fallback，命中复用好）
+        if pixmap is not None and url and raw_data and self._shelf_cache is not None:
+            try:
+                self._shelf_cache.set(f"cover:{url}", raw_data)
+            except Exception:  # noqa: BLE001
+                pass
         # 保守不缓存 direct fallback（低频）。仅调回。
         if callback:
             callback(pixmap)
         self._pump()
 
-    def _retry_later(self, url, callback, referer, retries_left, cache=True) -> None:
+    def _retry_later(self, url, callback, referer, retries_left, cache=True, persist=False) -> None:
         """失败重试：短退避(RETRY_DELAY_MS)后把 URL 重新入队，仍在 MAX_CONCURRENT 限流内。
 
         主线程安全：QTimer.singleShot 在主线程事件循环触发，重试调度匹配现有结构。
         """
         def _do() -> None:
-            self._queue.append((url, callback, referer, retries_left, cache))
+            self._queue.append((url, callback, referer, retries_left, cache, persist))
             self._pump()
         QTimer.singleShot(RETRY_DELAY_MS, _do)
 

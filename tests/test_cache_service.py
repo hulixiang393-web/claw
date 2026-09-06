@@ -301,3 +301,9 @@ def test_discovery_list_cache_hit():
     res = disc.list_works_cached(src, url, page=1, use_cache=True)
     assert res == [{"title": "T", "url": "u"}]
     assert not http.calls
+
+
+def test_cover_bytes_persist_roundtrip():
+    store = make_store()
+    store.set("cover:s1:https://c/img.jpg", b"\x89PNG-fake-bytes")
+    assert store.get("cover:s1:https://c/img.jpg") == b"\x89PNG-fake-bytes"
