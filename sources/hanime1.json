@@ -158,8 +158,22 @@
     "content": {
       "episode": {
         "single_chapter": true,
+        "list": {
+          "root_selector": {
+            "css": "#playlist-scroll .video-item-container"
+          },
+          "fields": {
+            "title": {
+              "css": "h4.video-title a, .video-title a"
+            },
+            "url": {
+              "css": "a[href*='watch?v=']",
+              "attr": "href"
+            }
+          }
+        },
         "series": {
-          "enabled": true,
+          "enabled": false,
           "base_from_title": [
             "(.+?)\\s*第(\\d+)[話话].*",
             "(.+?)\\s*第(\\d+)[集話话].*",

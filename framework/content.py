@@ -719,17 +719,54 @@ class Content:
             return self._fetch_chapters_for_source(
                 source, doc, detail_url, sid
             )
-        # 单章图集：详情页即唯一章节，无需解析章节列表
+        # 单章图集：详情页即唯一章节。若同时配置了 list（如 hanime1 详情页
+        # 侧边栏「播放清單」= 同系列/相关分集），优先按列表解析；解析失败
+        # 或无结果回退单章（detail 自身仍可播）。
+        list_cfg = block.get("list") or {}
+        root_sel = list_cfg.get("root_selector")
+        fields = list_cfg.get("fields") or {}
         if block.get("single_chapter"):
+            if root_sel and fields:
+                try:
+                    items = self._parser.parse_items(
+                        doc, root_sel, fields, source.base_url
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "[%s] 播放清單解析失败，回退单章：%s", source.source_id, exc
+                    )
+                    items = []
+                if items:
+                    chapters: List[Chapter] = []
+                    seen: set[str] = set()
+                    for it in items:
+                        url = it.get("url", "")
+                        if not url or url in seen:
+                            continue
+                        seen.add(url)
+                        chapters.append(
+                            Chapter(
+                                title=it.get("title", "")
+                                or f"第{len(chapters)+1}集",
+                                url=url,
+                            )
+                        )
+                    if chapters:
+                        # 当前视频置首（用户打开的那一集放列表顶部）
+                        own = (detail_url or "").rstrip("/").lower()
+                        if own:
+                            for idx, ch in enumerate(chapters):
+                                if ch.url.rstrip("/").lower() == own:
+                                    cur = chapters.pop(idx)
+                                    chapters.insert(0, cur)
+                                    break
+                        return chapters
             return [
                 Chapter(
                     title=book_title or "全本",
                     url=detail_url or self._abs_url(source, source.base_url),
                 )
             ]
-        list_cfg = block.get("list") or {}
-        root_sel = list_cfg.get("root_selector")
-        fields = list_cfg.get("fields") or {}
         if not root_sel and not list_cfg.get("chapters_api"):
             return []
 
