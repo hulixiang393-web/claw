@@ -40,8 +40,28 @@
       "list_item": {
         "categories": [
           {
+            "title": "里番",
+            "url": "/category/里番/page/{page}"
+          },
+          {
+            "title": "游戏",
+            "url": "/category/r18_game/page/{page}"
+          },
+          {
             "title": "里番系列合集",
             "url": "/category/里番系列合集/page/{page}"
+          },
+          {
+            "title": "同人动画",
+            "url": "/category/同人动画/page/{page}"
+          },
+          {
+            "title": "Flash小游戏",
+            "url": "/category/flash/page/{page}"
+          },
+          {
+            "title": "漫画",
+            "url": "/category/漫画/page/{page}"
           }
         ]
       },
