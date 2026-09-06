@@ -1,0 +1,169 @@
+{
+  "$schema_version": 2,
+  "$id": "91pornacomic",
+  "$type": "video",
+  "$name": "91Porn动漫(91porna)",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://91porna.com/",
+    "description": "91Porn动漫 - /comic 分类：成人动画/里番视频（服务端直出HTML，懒加载 data-src 封面）。注意：①播放层 m3u8 由混淆 JS+时间戳签名生成，静态抓取无法闭环，播放可能失败；②详情页浏览器内有随机跳转联盟站，claw 静态抓取不受影响。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "动画",
+      "里番",
+      "成人"
+    ]
+  },
+  "transports": {
+    "base_url": "https://91porna.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://91porna.com/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/comic/index/search?keyword=动漫",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "动漫",
+            "url": "/comic/index/search?keyword=动漫"
+          },
+          {
+            "title": "H动画",
+            "url": "/comic/index/search?keyword=H%E5%8A%A8%E7%94%BB"
+          },
+          {
+            "title": "里番",
+            "url": "/comic/index/search?keyword=%E9%87%8C%E7%95%AA"
+          },
+          {
+            "title": "同人",
+            "url": "/comic/index/search?keyword=%E5%90%8C%E4%BA%BA"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "ul.video-items > li > div.video-item"
+        },
+        "fields": {
+          "title": {
+            "css": "div.video-item h2"
+          },
+          "url": {
+            "css": "div.video-item a[href*='/comic/index/detail?video_key=']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.video-item img",
+            "attr": "data-src"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/comic/index/search",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "paginator": {
+        "url_template": "/comic/index/search?keyword={keyword}&page={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "ul.video-items > li > div.video-item"
+        },
+        "fields": {
+          "title": {
+            "css": "div.video-item h2"
+          },
+          "url": {
+            "css": "div.video-item a[href*='/comic/index/detail?video_key=']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.video-item img",
+            "attr": "data-src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "video_key=\\d+",
+      "fields": {
+        "title": {
+          "css": "h1.dx-title"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": ".video-desc"
+        },
+        "tags": {
+          "css": "ul.flex.flex-wrap li a"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页即单个视频（/comic/index/detail?video_key=N），无分集列表。播放链路：详情页提取 64 位签名 → 构造 /index/embed_play.js（u=签名&t=时间戳）→ packer 解包 → 提取 m3u8（auth_key 有时间窗，需实时取流）。",
+        "play_url": {
+          "http_chain": [
+            {
+              "name": "u",
+              "regex": "([a-f0-9]{100,})",
+              "referer": ""
+            },
+            {
+              "name": "player",
+              "url": "/index/embed_play.js?img=%2Fstatic%2Fweb%2Fimages%2Flogo.png&u={u}&t={t}",
+              "referer": "episode",
+              "packer": true
+            },
+            {
+              "name": "final",
+              "regex": "(https?://[^\\s\"']+?\\.m3u8[^\\s\"']*)",
+              "referer": ""
+            }
+          ]
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 20,
+      "max_results": 480
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

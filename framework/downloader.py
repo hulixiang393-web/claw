@@ -169,6 +169,13 @@ class Downloader:
                     raise
                 except Exception:  # noqa: BLE001 自研 HLS 失败 → 回退 FFmpegMerger
                     pass
+                # 自研 HLS 失败：代理 m3u8（如 18mh /media/m3u8）分片/key 不可
+                # 经代理取 → ffmpeg 直连 HLS 也 403。直接拿原 m3u8 URL 走 yt-dlp
+                # 兜底（yt-dlp 自带 Referer 透传 + HLS 解析，通常可过防盗链）。
+                return self._download_via_ytdlp(
+                    video, path, "best",
+                    progress_cb, cancel_evt, pause_evt,
+                )
             # 直接文件（mp4/flv/webm，无分离音轨）→ 并行 Range 分段下载提速：
             # 单连接受 CDN 每连接限速（~400KB/s），多连接分段可成倍提升。
             if not audio and self._is_direct_file(video):
@@ -199,7 +206,12 @@ class Downloader:
 
     @staticmethod
     def _source_headers(source) -> dict:
-        """取源配置合并后的全量请求头（transports.headers + cookie）。"""
+        """取源配置合并后的全量请求头（transports.headers + cookie）。
+
+        Referer 兜底：CDN 防盗链依赖 Referer 校验（如 18mh 的 xv.dzuxta.cn
+        直连 403，段/key 请求必须带源站 Referer）。源配置未声明 Referer 时
+        用源 base_url 兜底，保证段/密钥请求带上。
+        """
         headers = {}
         _rh = getattr(source, "request_headers", None)
         if callable(_rh):
@@ -207,6 +219,10 @@ class Downloader:
                 headers = dict(_rh() or {})
             except Exception:  # noqa: BLE001
                 headers = {}
+        if not headers.get("Referer"):
+            base = getattr(source, "base_url", None) or ""
+            if base:
+                headers["Referer"] = base.rstrip("/") + "/"
         return headers
 
     def _download_direct_parallel(

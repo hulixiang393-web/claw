@@ -99,11 +99,15 @@ class Parser:
                 results.append(inner)
             elif attr:
                 v = node.get(attr)
-                # 懒加载兜底：URL 类属性（src/href）未取到时回退 data-src/data-original
-                if not v and attr in ("src", "href"):
+                # 懒加载兜底：URL 类属性（src/href）为空**或是 data: 占位**
+                # （如 eporner 懒加载卡片 src="data:image/gif;base64,..."、
+                # 真实图在 data-src）时回退 data-src/data-original。
+                # data: URI 非空但不是可加载的网络图，必须让位给懒加载属性，
+                # 否则一半卡片封面拿到透明 GIF（表现为"封面时有时无"）。
+                if attr in ("src", "href") and (not v or v.startswith("data:")):
                     for lazy_attr in ("data-src", "data-original", "data-lazy-src"):
                         v = node.get(lazy_attr)
-                        if v:
+                        if v and not v.startswith("data:"):
                             break
                 if v:
                     results.append(v)

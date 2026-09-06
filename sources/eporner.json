@@ -1,0 +1,145 @@
+{
+  "$schema_version": 2,
+  "$id": "eporner",
+  "$type": "video",
+  "$name": "Eporner",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.eporner.com",
+    "description": "Eporner - 高清视频站（列表/搜索走 HTML；详情与取流走 yt-dlp 引擎。JSON-LD contentUrl 已是无签名裸地址，直连 403，真实播放地址是带 IP+时效签名的 vid-*.eporner.com 直链，只能由 yt-dlp 提取）",
+    "lang": "en",
+    "region": "us",
+    "tags": [
+      "视频",
+      "成人",
+      "免费",
+      "mp4"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.eporner.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.eporner.com/"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 300
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/",
+      "list_item": {
+        "categories": [
+          { "title": "最新视频", "url": "/" },
+          { "title": "全部", "url": "/cat/all/" },
+          { "title": "4K", "url": "/cat/4k-porn/" },
+          { "title": "HD", "url": "/cat/hd-porn/" },
+          { "title": "日本", "url": "/cat/japanese/" },
+          { "title": "亚洲", "url": "/cat/asian/" },
+          { "title": "自拍", "url": "/cat/amateur/" },
+          { "title": "肛交", "url": "/cat/anal/" },
+          { "title": "口交", "url": "/cat/blowjob/" },
+          { "title": "奶子", "url": "/cat/tits/" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.mb"
+        },
+        "fields": {
+          "title": {
+            "css": "p.mbtit a"
+          },
+          "url": {
+            "css": "a[href*='/video-']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          }
+        }
+      },
+      "list_paginator": {
+        "type": "increment",
+        "page_placeholder": "$"
+      }
+    },
+    "search": {
+      "base_url": "/tag/{keyword}",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "paginator": {
+        "type": "increment",
+        "url_template": "/tag/{keyword}/{page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.mb"
+        },
+        "fields": {
+          "title": {
+            "css": "p.mbtit a"
+          },
+          "url": {
+            "css": "a[href*='/video-']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "css": "h1"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页即单个视频（/video-{id}/...），无分集列表。详情走 HTML（endpoints.detail h1，快）；仅取流走 yt-dlp——JSON-LD contentUrl 已是无签名裸地址（CDN 403），真实播放地址是 vid-*.eporner.com 签名直链（IP+时效绑定，需现取现播），yt-dlp 子进程提取约 10s 属正常。"
+      }
+    }
+  },
+  "api_endpoints": {
+    "episode": {
+      "engine": "ytdlp",
+      "format": "best"
+    }
+  },
+  "media": {
+    "format": "mp4",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 10,
+      "max_results": 600
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

@@ -722,3 +722,74 @@ class Discovery:
 
         # next_link / 默认：页码参数
         return f"{url}?page={page}"
+
+    # ------------------------------------------------------------------ #
+    def check_links(
+        self,
+        source: SourceConfig,
+        urls: List[str],
+        thread_cap: int = 3,
+        timeout: float = 15.0,
+    ) -> List[dict]:
+        """并发检查一批链接可用性（每个链接一个线程）。
+
+        链接数 ≥ thread_cap（默认 3）时降级为固定 thread_cap 线程并行，
+        防止链接过多时线程爆炸（用户要求：链接过多则降为 3 线程）。
+        返回 [{url, ok, status, error, time_ms}]。单链接失败不影响其他。
+
+        HttpClient 非线程安全：每 worker 各建独立实例（复用源配置）。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+
+        urls = [u for u in urls if u]
+        if not urls:
+            return []
+        workers = min(len(urls), thread_cap) if len(urls) >= thread_cap else len(urls)
+        workers = max(workers, 1)
+        results: List[dict] = [None] * len(urls)
+        base_headers = self._default_headers(source)
+
+        def _check_one(idx: int, u: str) -> dict:
+            http = HttpClient()
+            t0 = time.time()
+            try:
+                # get_text 走完整反爬/重试链（GET，HEAD 对 Cloudflare 不稳）
+                http.get_text(u, headers=base_headers, timeout=timeout, retries=1)
+                return {
+                    "url": u,
+                    "ok": True,
+                    "status": 200,
+                    "error": "",
+                    "time_ms": int((time.time() - t0) * 1000),
+                }
+            except Exception as e:  # noqa: BLE001
+                status = getattr(e, "status_code", 0) or getattr(e, "status", 0) or 0
+                return {
+                    "url": u,
+                    "ok": False,
+                    "status": status,
+                    "error": str(e)[:200],
+                    "time_ms": int((time.time() - t0) * 1000),
+                }
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_check_one, i, u): i for i, u in enumerate(urls)}
+            for fut in as_completed(futs):
+                results[futs[fut]] = fut.result()
+        return results
+
+    def _default_headers(self, source: SourceConfig) -> dict:
+        """源默认请求头（UA + 可选 Referer），供检查线程使用。"""
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        base = getattr(source, "base_url", "") or ""
+        if base:
+            headers["Referer"] = base.rstrip("/") + "/"
+        return headers

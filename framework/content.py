@@ -814,6 +814,45 @@ class Content:
                 seen_title.add(title_key)
             chapters.append(Chapter(title=title or f"第{len(chapters)+1}章", url=url))
 
+        # WordPress 帖子分页（div.page-links）：当前页（详情页自身）是
+        # <span class="...current">（无 href），列表只提取后续页 <a> 链接 →
+        # 第一集丢失。first_page_is_current: 启用时读 current span 的页号，
+        # 若小于已提取的最小页号（即列表缺第 1 页），把详情 URL 作为该页补入
+        # 列表头部（详情页本身即第 1 页内容）。
+        if list_cfg.get("first_page_is_current") and detail_url:
+            try:
+                cur_vals = self._parser.extract(
+                    doc,
+                    {"css": "div.page-links span.current, div.page-links span.post-page-numbers"},
+                )
+                cur_num = -1
+                for cv in cur_vals:
+                    try:
+                        cv = cv.strip()
+                        if cv.isdigit():
+                            cur_num = int(cv)
+                            break
+                    except ValueError:
+                        continue
+                if cur_num > 0:
+                    nums = []
+                    for ch in chapters:
+                        m = _re.match(r"^\s*(\d+)\s*$", ch.title)
+                        if m:
+                            nums.append(int(m.group(1)))
+                    if not nums or cur_num < min(nums):
+                        chapters.insert(
+                            0,
+                            Chapter(
+                                title=str(cur_num),
+                                url=detail_url,
+                            ),
+                        )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[%s] current 页码补全失败，跳过：%s", source.source_id, exc
+                )
+
         # 倒序反转（HTML 倒序 → 正序）
         order = list_cfg.get("chapter_order", "asc")
         if order == "desc":
@@ -1931,6 +1970,12 @@ class Content:
                 play = m.group(1) if m.groups() else m.group(0)
                 # unescape JS 转义（\/ → /）
                 play = play.replace("\\/", "/")
+                # 相对地址绝对化（如 18mh /media/m3u8?url=... 是相对路径，
+                # 不补全 VLC/下载器拿不到完整 URL，表现为"无法爬取"）
+                if play and not play.startswith(("http://", "https://", "//", "data:", "javascript:")):
+                    from urllib.parse import urljoin
+
+                    play = urljoin(abs_ep, play)
                 # 通用后缀：正则只提取到 CDN base 时补全（如 missav → /playlist.m3u8）
                 suffix = play_cfg.get("suffix", "")
                 if suffix:
@@ -1974,18 +2019,29 @@ class Content:
         step_urls: dict = {"episode": cur_url, "detail": cur_url}
 
         for i, step in enumerate(chain):
+            packer = step.get("packer")
+            # url 模板：按 {前步name} 引用此前提取值、{t}=秒级时间戳 构造请求 URL
+            url_tpl = step.get("url") or ""
             regex = step.get("regex") or ""
-            if not regex:
+            if url_tpl and not regex:
+                val = url_tpl
+                for _k, _v in results.items():
+                    val = val.replace("{" + _k + "}", _v)
+                if "{t}" in val:
+                    import time as _time
+                    val = val.replace("{t}", str(int(_time.time())))
+            elif regex:
+                m = _re.search(regex, cur_text, _re.IGNORECASE | _re.DOTALL)
+                if not m:
+                    raise ContentMissingError(
+                        f"http_chain 第{i}步未匹配（{regex[:40]}）", source_id=source.source_id
+                    )
+                val = m.group(1) if m.groups() else m.group(0)
+                val = val.replace("\\/", "/")
+            else:
                 raise ContentMissingError(
-                    f"http_chain 第{i}步缺 regex", source_id=source.source_id
+                    f"http_chain 第{i}步缺 regex/url", source_id=source.source_id
                 )
-            m = _re.search(regex, cur_text, _re.IGNORECASE | _re.DOTALL)
-            if not m:
-                raise ContentMissingError(
-                    f"http_chain 第{i}步未匹配（{regex[:40]}）", source_id=source.source_id
-                )
-            val = m.group(1) if m.groups() else m.group(0)
-            val = val.replace("\\/", "/")
 
             # 解码（Caesar 移位 + URL 解码）
             decode = step.get("decode")
@@ -2012,11 +2068,14 @@ class Content:
             # 是否继续请求该 URL 拿下一页
             fetch = step.get("fetch")
             if fetch is None:
-                # 未显式指定：decode 步骤是解密出文本（供后续步提取），不请求。
+                # 未显式指定：url 模板（构造请求地址）默认要请求。
+                # decode 步骤是解密出文本（供后续步提取），不请求。
                 # 其余：referer 非空 且 提取的不是视频文件（m3u8/mp4/mpd 等）
                 # → 视为中间跳转页需请求（iframe → get3G 这类相对路径 .php 也请求）。
                 # 视频文件后缀不请求，作为最终播放地址返回。
-                if step.get("decode"):
+                if url_tpl and not regex:
+                    fetch = True
+                elif step.get("decode"):
                     fetch = False
                 elif not step.get("referer"):
                     fetch = False
@@ -2056,11 +2115,18 @@ class Content:
                 ) from exc
             cur_url = abs_step_url
             step_urls[name] = abs_step_url
+            if packer:
+                # JS Packer（Dean Edwards）混淆的中间页响应，解包后还原明文
+                # 供后续步骤（一般为最终视频地址的 regex）继续提取。
+                cur_text = self._unpack_js_packer(cur_text)
 
         # 最后一步提取的 val 即播放地址
         final = val
         if final and not final.startswith(("http://", "https://")):
             final = urljoin(cur_url, final)
+        # 解包文本中 URL 常带 JS 转义反斜杠（如 ...&via_bm=dx\\），还原为真实字符
+        if final:
+            final = final.replace("\\\\", "\\").rstrip("\\")
         if not final or not final.startswith("http"):
             raise ContentMissingError(
                 f"http_chain 未取到播放地址（{episode_url}）", source_id=source.source_id
@@ -2244,6 +2310,10 @@ class Content:
         缓存：yt-dlp 取流 ~10s（签名+网络），同视频短时间复用，避免重复等待。
         """
         yt = self._get_ytdlp()
+
+        # 分集 URL 可能是相对路径（HTML 搜索结果未绝对化时）→ 补全，
+        # yt-dlp 只认完整 URL
+        episode_url = self._abs_url(source, episode_url)
 
         key = (episode_url, quality, merged)
         cached = self._ytdlp_stream_cache.get(key)

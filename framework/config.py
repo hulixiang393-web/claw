@@ -86,6 +86,51 @@ class SourceConfig:
             source_path=path,
         )
 
+    def _cf_cookie_for_host(self) -> str:
+        """从 data/cf_cookies.json 读取当前源域名对应的 Cloudflare cookie。
+
+        文件结构：{"<host>": {"cf_clearance": "...", "__cf_bm": "..."}} 或
+        {"<host>": "cf_clearance=...; __cf_bm=..."}（整串 cookie）。
+        匹配：源 base_url 的 host（含 www. 去前缀的裸域匹配）。
+        找不到/文件缺失 → 空串（不注入）。
+        """
+        try:
+            from urllib.parse import urlparse
+
+            host = (urlparse(self.base_url).hostname or "").lower().lstrip("www.")
+            if not host:
+                return ""
+            path = Path(__file__).resolve().parent.parent / "data" / "cf_cookies.json"
+            if not path.exists():
+                return ""
+            import json as _json
+
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return ""
+            entry = None
+            # 精确 host → 裸域 → 任意含 host 的键
+            for key in (host, "www." + host):
+                if key in data:
+                    entry = data[key]
+                    break
+            if entry is None:
+                for key in data:
+                    if host in str(key).lower():
+                        entry = data[key]
+                        break
+            if not entry:
+                return ""
+            if isinstance(entry, str):
+                return entry.strip()
+            if isinstance(entry, dict):
+                return "; ".join(
+                    f"{k}={v}" for k, v in entry.items() if v
+                )
+        except Exception:
+            pass
+        return ""
+
     def to_dict(self) -> dict:
         """导出回 JSON dict（供编辑器/落盘）。"""
         # 保留 raw 里原有的自定义 metadata / transports 键，再覆盖固定键（往返不丢字段）
@@ -186,6 +231,13 @@ class SourceConfig:
                     self._buvid3 = f"{uuid.uuid4()}infoc"
                 cookie = cookie.replace("{buvid3}", self._buvid3)
             cookie_parts.append(cookie)
+        # Cloudflare 手动验证 cookie（data/cf_cookies.json）：站点被 CF 托管质询
+        # 硬拦（如 5238 全站 403）时，用户浏览器手动过验证后把 cf_clearance
+        # 写入该文件，此处按域名合并进 Cookie 头。优先于静态 transports.cookie
+        # （cf_cookies 里同 key 覆盖），使全站请求自动带上已通过的凭据。
+        cf = self._cf_cookie_for_host()
+        if cf:
+            cookie_parts.append(cf)
         # 登录保存的 cookie（CookieManager）追加合并
         if self.cookie_provider is not None:
             try:

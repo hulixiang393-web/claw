@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -22,6 +24,59 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 SpiderFramework/1.0"
 )
+
+# 用户手动过 Cloudflare 验证后的 cookie 存储：data/cf_cookies.json
+# 格式：{"www.5238.me": {"cf_clearance": "...", "__cf_bm": "..."}}
+# 请求 5238 等被 CF 拦截的源时自动注入，纯 HTTP 直连过反爬。
+_CF_COOKIES_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cf_cookies.json"
+)
+_cf_cookies_cache: Optional[dict] = None
+
+
+def _load_cf_cookies() -> dict:
+    """读取 data/cf_cookies.json（带缓存）。文件不存在/损坏返回空 dict。"""
+    global _cf_cookies_cache
+    if _cf_cookies_cache is None:
+        try:
+            if os.path.exists(_CF_COOKIES_PATH):
+                with open(_CF_COOKIES_PATH, encoding="utf-8") as f:
+                    _cf_cookies_cache = json.load(f) or {}
+            else:
+                _cf_cookies_cache = {}
+        except Exception:  # noqa: BLE001
+            _cf_cookies_cache = {}
+    return _cf_cookies_cache
+
+
+def _cf_cookies_for(url: str) -> Optional[str]:
+    """取 url 对应域名的 cf_clearance cookie 串（含 __cf_bm）；无则 None。"""
+    try:
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(url).hostname or "").lower()
+        if not host:
+            return None
+        cf = _load_cf_cookies()
+        entry = cf.get(host) or {}
+        # 兼容 "www.5238.me" 与裸域 "5238.me" 两种 key
+        if not entry and host.startswith("www."):
+            entry = cf.get(host[4:]) or {}
+        parts = [f"{k}={v}" for k, v in entry.items() if v]
+        return "; ".join(parts) if parts else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _with_cf_cookies(headers: Optional[dict], url: str) -> dict:
+    """注入 cf_clearance 等 cookie 到请求头（仅当该域名有配置且未显式带 Cookie）。"""
+    out = dict(headers or {})
+    if "Cookie" in out:
+        return out
+    cf = _cf_cookies_for(url)
+    if cf:
+        out["Cookie"] = cf
+    return out
 
 
 @dataclass
@@ -149,6 +204,7 @@ class HttpClient:
         self._sleeper = sleeper if sleeper is not None else time.sleep
         self.defaults = defaults or NetworkDefaults()
         self._session = None
+        self._last_url = ""
         if _REQUESTS_AVAILABLE:
             self._session = requests.Session()
             # 注意：不要设 trust_env=False——那会忽略用户系统的 HTTP(S)_PROXY
@@ -178,10 +234,20 @@ class HttpClient:
 
     # ------------------------------------------------------------------ #
     def _headers_with_ua(self, headers: Optional[dict]) -> Optional[dict]:
-        """调用方未传 headers 时注入全局默认 UA（有 UA 则不覆盖）。"""
+        """调用方未传 headers 时注入全局默认 UA（有 UA 则不覆盖）。
+
+        同时注入 data/cf_cookies.json 中该域名的 cf_clearance（手动过
+        Cloudflare 验证的 cookie），纯 HTTP 直连过 CF 反爬。
+        """
         if headers is None and self.defaults.user_agent:
-            return {"User-Agent": self.defaults.user_agent}
+            headers = {"User-Agent": self.defaults.user_agent}
+        if headers:
+            headers = _with_cf_cookies(headers, self._last_url or "")
         return headers
+
+    def _set_last_url(self, url: str) -> None:
+        """记录最近一次请求 URL，供 _headers_with_ua 注入 CF cookie 用。"""
+        self._last_url = url
 
     # ------------------------------------------------------------------ #
     def _run_with_proxy_switch(self, once, proxy, proxy_pool, url_desc):
@@ -252,6 +318,7 @@ class HttpClient:
             retries = self.defaults.retries
         if interval_ms is None:
             interval_ms = self.defaults.interval_ms
+        self._set_last_url(url)
         headers = self._headers_with_ua(headers)
         self._sleeper(interval_ms / 1000.0)
         if proxy is None:
@@ -299,6 +366,7 @@ class HttpClient:
             retries = self.defaults.retries
         if proxy is None:
             proxy = self.defaults.proxy
+        self._set_last_url(url)
         headers = self._headers_with_ua(headers)
         self._sleeper(0.0)
 
@@ -379,6 +447,7 @@ class HttpClient:
             retries = self.defaults.retries
         if proxy is None:
             proxy = self.defaults.proxy
+        self._set_last_url(url)
         headers = self._headers_with_ua(headers)
         self._sleeper(0.0)
 

@@ -23,8 +23,10 @@ import asyncio
 import atexit
 import base64
 import contextlib
+import functools
 import logging
 import os
+import queue
 import re
 import threading
 from pathlib import Path
@@ -40,77 +42,142 @@ log = logging.getLogger(__name__)
 # 常驻 Chromium 跨调用复用：首次后免启动，秒开。
 #
 # 注意：Playwright sync API 把事件循环 + greenlet fiber **绑定在首次 start() 的线程**上，
-# 单一全局复用时，另一线程再调用会做跨 OS 线程的 greenlet 切换 →
-# 抛 `greenlet.error: cannot switch to a different thread`（browser.new_context 报错）。
-# 因此改为**按线程隔离**：注册表以 threading.get_ident() 为键，每线程各持一份
-# (pw, browser)。同线程内仍复用（保留提速收益），跨线程各自独立 Chromium
-# （每线程首次 1-2s 启动，可接受）。注册表读写由 _SYNC_LOCK 保护；线程退出后
-# 的残留由 atexit 兜底清理（跨线程 close 失败仅吞掉，管道断开 Chromium 自清）。
+# 跨线程复用或线程销毁后 TID 被复用，会踩已绑定旧线程的 greenlet 循环（曾导致
+# hciyuan 播放 0xc0000005 UAF）。因此所有 sync 调用统一收敛到**单条专用渲染线程**
+# （见下方专用渲染线程段），浏览器/事件循环生命周期与该线程绑定，彻底消除跨线程 UAF；
+# 常驻复用提速收益保留。
 _SYNC_REGS: dict = {}
 _SYNC_LOCK = threading.Lock()
+
+# --------------------------------------------------------------------------- #
+# 专用渲染线程（2026-09 崩溃修复）
+# hciyuan 播放 0xc0000005：TID 复用后新线程踩 Playwright sync 绑定的旧线程
+# greenlet 事件循环，对已释放对象做槽位替换 → python310.dll+0xc0eeb 读 0x20。
+# 根治法：所有 sync Playwright 调用收敛到**单条专用渲染线程**（队列 + Event
+# 同步取回结果）。浏览器/事件循环/greenlet 生命周期从此与该线程绑定，
+# 进程退出随 daemon 自清，彻底消除跨线程 UAF；常驻复用提速收益保留。
+# 代价：sync 类调用全局串行（排队执行），播放取流/正文渲染/搜索等业务并发
+# 时按序处理；图片批量渲染走 async API（每次独立浏览器），不经过本线程。
+_RENDER_QUEUE: "queue.Queue" = queue.Queue()
+_RENDER_THREAD: Optional[threading.Thread] = None
+_RENDER_THREAD_LOCK = threading.Lock()
+_SHUTDOWN_SENTINEL = object()
+
+
+def _render_thread_main() -> None:
+    """专用渲染线程主循环：串行执行 sync Playwright 任务，退出前关闭自己的浏览器。"""
+    tid = threading.get_ident()
+    while True:
+        item = _RENDER_QUEUE.get()
+        if item is _SHUTDOWN_SENTINEL:
+            break
+        fn, holder = item
+        try:
+            holder["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            holder["error"] = exc
+        finally:
+            holder["done"].set()
+    with _SYNC_LOCK:
+        entry = _SYNC_REGS.pop(tid, None)
+    if entry is not None:
+        try:
+            entry[1].close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            entry[0].stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _ensure_render_thread() -> None:
+    """惰性启动专用渲染线程（进程内唯一，不复用销毁，与进程同生命周期）。"""
+    global _RENDER_THREAD
+    with _RENDER_THREAD_LOCK:
+        if _RENDER_THREAD is None or not _RENDER_THREAD.is_alive():
+            _RENDER_THREAD = threading.Thread(
+                target=_render_thread_main,
+                name="claw-render",
+                daemon=True,
+            )
+            _RENDER_THREAD.start()
+
+
+def run_on_render_thread(fn: Callable[[], object]) -> object:
+    """把 fn 投递到专用渲染线程执行并阻塞等待结果（异常跨线程复抛）。
+
+    若渲染线程异常退出，等待方最多 1s 内抛出 RuntimeError，不会永久挂死。
+    """
+    _ensure_render_thread()
+    holder = {"done": threading.Event(), "result": None, "error": None}
+    _RENDER_QUEUE.put((fn, holder))
+    while True:
+        holder["done"].wait(timeout=1.0)
+        if holder["done"].is_set():
+            break
+        thread = _RENDER_THREAD
+        if thread is None or not thread.is_alive():
+            raise RuntimeError("Playwright 渲染线程异常退出，任务未完成")
+    if holder["error"] is not None:
+        raise holder["error"]  # 异常对象跨线程复抛，保留原 traceback
+    return holder["result"]
+
+
+def _on_render_thread(fn: Callable) -> Callable:
+    """装饰器：把 `*_sync` 函数整体放到专用渲染线程中执行。"""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return run_on_render_thread(lambda: fn(*args, **kwargs))
+    return wrapper
 
 
 @atexit.register
 def _close_sync_browser() -> None:
-    """进程退出时关闭全部线程的常驻浏览器，避免残留 Chromium 子进程。
+    """进程退出时通知渲染线程关闭常驻浏览器，join 等待自清。
 
-    Playwright 要求 stop() 与 start() 同线程——atexit 在主线程无法真正
-    stop worker 线程的浏览器，跨线程 close/stop 会抛 greenlet.error。
-    这里统一吞掉即可：进程退出时管道断开，Chromium 子进程自清。
-    能 close 的就 close，重点是避免崩溃与残留累积。
+    关闭动作须与 start() 同线程，故只在渲染线程内执行（收到 sentinel 后
+    break 循环，退出前 close+stop）。daemon 线程 + join 超时兜底，最坏
+    随进程退出管道断开由 Chromium 自清。
     """
-    with _SYNC_LOCK:
-        regs = list(_SYNC_REGS.items())
-        _SYNC_REGS.clear()
-    for _tid, (_pw, _browser) in regs:
-        try:
-            _browser.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            _pw.stop()
-        except Exception:  # noqa: BLE001
-            pass
+    global _RENDER_THREAD
+    thread = _RENDER_THREAD
+    if thread is None or not thread.is_alive():
+        return
+    try:
+        _RENDER_QUEUE.put(_SHUTDOWN_SENTINEL)
+        thread.join(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+    _RENDER_THREAD = None
 
 
 @contextlib.contextmanager
 def _sync_browser(proxy: Optional[str] = None):
-    """获取当前线程可用 sync Playwright 的 (p, browser)。
+    """获取专用渲染线程上 sync Playwright 的连接与浏览器。
 
-    proxy 指定时单独启动（代理不能与常驻浏览器混用，避免污染复用实例）；
-    无代理时复用**本线程**的常驻 headless Chromium（跨线程互不共享：
-    Playwright sync API 的 fiber 绑定在首次 start() 的线程上，跨线程复用
-    在 new_context 时抛 greenlet.error，故按线程隔离，每线程首次 1-2s 启动）。
-    同线程内仍复用（保留启动一次免启动的提速收益）；锁只保护注册表读写，
-    拿到本线程实例后即释放，各线程用自己的浏览器并行安全。
+    所有 sync 调用经 run_on_render_thread 收敛到**专用渲染线程**执行，故此处
+    只由该线程进入：TID 命中的常驻 (pw, browser) 恒为本线程实例，Playwright
+    sync 的事件循环/greenlet fiber 自始绑定渲染线程，生命周期与线程一致，
+    进程退出时随线程清理（根除原按线程隔离 + 跨线程 atexit close 的 UAF）。
+
+    proxy 指定时在同一条连接上另启带代理的独立浏览器（代理不能复用常驻
+    实例，避免污染复用池）；用完仅 close 该浏览器、不 stop 连接（连接仍被
+    常驻浏览器使用）。无代理时复用常驻 headless Chromium（跨调用免启动提速）。
     """
     from playwright.sync_api import sync_playwright
 
-    if proxy:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True, args=["--no-sandbox", f"--proxy-server={proxy}"]
-            )
-            try:
-                yield p, browser
-            finally:
-                try:
-                    browser.close()
-                except Exception:  # noqa: BLE001
-                    pass
-        return
     tid = threading.get_ident()
-    with _SYNC_LOCK:  # 仅注册表查询/写入串行；拿到本线程实例后锁即释放
+    with _SYNC_LOCK:  # 注册表读写串行；拿到本线程实例后锁即释放
         entry = _SYNC_REGS.get(tid)
         alive = False
         if entry is not None:
             try:
                 alive = entry[1].is_connected()
-            except Exception:  # 跨线程残留（线程退出后 tid 复用）→ 视为不可用
+            except Exception:  # 浏览器进程已崩溃/连接异常 → 视为不可用
                 alive = False
         if entry is None or not alive:
-            if entry is not None:
-                # 本线程浏览器已断开/残留 → 关掉并从注册表移除，重新启动
+            if entry is not None:  # Chromium 崩溃自愈：关掉残留重新启动
                 _SYNC_REGS.pop(tid, None)
                 try:
                     entry[1].close()
@@ -135,7 +202,19 @@ def _sync_browser(proxy: Optional[str] = None):
                 raise
             entry = (pw, browser)
             _SYNC_REGS[tid] = entry
-    # 锁已释放：本线程只用自己持有的浏览器，与其他线程并行安全
+    if proxy:
+        proxy_browser = entry[0].chromium.launch(
+            headless=True,
+            args=["--no-sandbox", f"--proxy-server={proxy}"],
+        )
+        try:
+            yield entry[0], proxy_browser
+        finally:
+            try:
+                proxy_browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return
     yield entry[0], entry[1]
 
 
@@ -904,6 +983,7 @@ def fetch_rendered_pages_batch_sync(
 # ------------------------------------------------------------------ #
 # 渲染后提取正文文本（SPA 小说站用）
 # ------------------------------------------------------------------ #
+@_on_render_thread
 def evaluate_js_sync(expr: str) -> object:
     """在常驻浏览器中用 evaluate 执行一段 JS 表达式并取回结果。
 
@@ -919,6 +999,7 @@ def evaluate_js_sync(expr: str) -> object:
             return page.evaluate(expr)
 
 
+@_on_render_thread
 def fetch_rendered_text_sync(
     url: str,
     selector: str,
@@ -952,6 +1033,7 @@ def fetch_rendered_text_sync(
             return "\n".join(texts)
 
 
+@_on_render_thread
 def fetch_rendered_items_sync(
     url: str,
     root_selector: str,
@@ -1010,6 +1092,7 @@ def fetch_rendered_items_sync(
             return items
 
 
+@_on_render_thread
 def fetch_rendered_search_sync(
     home_url: str,
     keyword: str,
@@ -1074,6 +1157,7 @@ def fetch_rendered_search_sync(
             return items
 
 
+@_on_render_thread
 def fetch_rendered_video_sync(
     url: str,
     wait_until: str = "networkidle",
@@ -1089,6 +1173,22 @@ def fetch_rendered_video_sync(
     try:
         with _sync_browser(proxy) as (p, browser):
             with _sync_page(browser) as page:
+                # 捕获网络层真实媒体请求（blob/MSE 播放器的 m3u8/mp4 直链）。
+                # 部分解析站（voe.sx/eugenemakedraw 等 JWPlayer）会把 HLS 源塞进
+                # blob: URL，video src 拿不到 http 直链，但播放器会向 CDN 请求
+                # master.m3u8/具体 .mp4 —— 从这些请求里取真实可播地址。
+                media_hits: List[str] = []
+
+                def _on_request(request):
+                    try:
+                        u = request.url
+                        low = u.lower()
+                        if ".m3u8" in low or (".mp4" in low and "ping" not in low):
+                            media_hits.append(u)
+                    except Exception:
+                        pass
+
+                page.on("request", _on_request)
                 page.goto(url, timeout=timeout_ms, wait_until=wait_until)
                 page.wait_for_timeout(extra_delay_ms)
                 # 遍历全部 frame（含 iframe 解析站）找 video src
@@ -1116,7 +1216,12 @@ def fetch_rendered_video_sync(
                                 return found_mp4
                         except Exception:
                             continue
+                    # video src 为 blob 的播放器：等待其真正发出的媒体请求出现
+                    if media_hits:
+                        return media_hits[0]
                     page.wait_for_timeout(4000)
+                if media_hits:
+                    return media_hits[0]
                 return ""
     except Exception as exc:  # noqa: BLE001
         # 内部异常（greenlet.error / TimeoutError / playwright 错误）归一化为

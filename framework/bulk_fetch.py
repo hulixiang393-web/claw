@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 
@@ -21,6 +22,9 @@ from .errors import SourceError
 from .events import Event, EventBus, EVENT_BULK_FETCH_PROGRESS, EVENT_BULK_FETCH_COMPLETED
 
 DEFAULT_MAX_PAGES = 20
+# 链接检查并发上限：链接数 ≥ 此阈值时降级为固定 3 线程（链接过多防爆），
+# 链接少时每链接一线程（链接数 < 阈值即满并发）。
+THREAD_CAP = 3
 
 
 class BulkFetch:
@@ -76,21 +80,51 @@ class BulkFetch:
     def _fetch_category(self, source: SourceConfig, url: str) -> List[Work]:
         """抓取一个分类的所有页（软上限 max_pages）。
 
+        页级并发：每个链接一个线程检查；链接数 ≥ THREAD_CAP（3）时降级为
+        固定 3 线程并行，防止链接过多时线程爆炸。
+
         单页网络失败不中断整个分类：跳过该页继续；连续失败 N 页才停（防死循环）。
         """
         works: List[Work] = []
         consecutive_fail = 0
+        workers = min(self._max_pages, THREAD_CAP)
+        if workers < 2:
+            # 页数太少，串行即可（也兼容 max_pages=1）
+            for page in range(1, self._max_pages + 1):
+                try:
+                    page_works = self._discovery.list_works(source, url, page)
+                except SourceError:
+                    consecutive_fail += 1
+                    if consecutive_fail >= 3:
+                        break
+                    continue
+                consecutive_fail = 0
+                if not page_works:
+                    break
+                works.extend(page_works)
+            return works
+
+        results: dict = {}  # page -> works | None(失败)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(self._discovery.list_works, source, url, p): p for p in range(1, self._max_pages + 1)}
+            for fut in as_completed(futs):
+                page = futs[fut]
+                try:
+                    results[page] = fut.result()
+                except SourceError:
+                    results[page] = None
+        # 按页序合并 + 连续 3 页失败停止语义
+        failed_streak = 0
         for page in range(1, self._max_pages + 1):
-            try:
-                page_works = self._discovery.list_works(source, url, page)
-            except SourceError:
-                consecutive_fail += 1
-                if consecutive_fail >= 3:
-                    break  # 连续 3 页失败，网络/反爬问题，停止该分类
-                continue  # 跳过单页失败，继续下一页
-            consecutive_fail = 0
+            page_works = results.get(page)
+            if page_works is None:
+                failed_streak += 1
+                if failed_streak >= 3:
+                    break
+                continue
+            failed_streak = 0
             if not page_works:
-                break  # 无更多页
+                break
             works.extend(page_works)
         return works
 

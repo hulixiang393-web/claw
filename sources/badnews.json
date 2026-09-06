@@ -1,0 +1,148 @@
+{
+  "$schema_version": 2,
+  "$id": "badnews",
+  "$type": "video",
+  "$name": "bad.news动漫",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://bad.news/dm",
+    "description": "bad.news - 动漫视频源（服务端静态HTML直出，mp4直链带5分钟签名，封面data-echo懒加载）。注意：视频URL带时间戳签名过期快，每次播放实时抓取；浏览器JS会跳转联盟站，claw静态抓取不受影响。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "动漫",
+      "动画"
+    ]
+  },
+  "transports": {
+    "base_url": "https://bad.news",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://bad.news/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/dm/page-{page}",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "动漫",
+            "url": "/dm/page-{page}"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.stui-vodlist article"
+        },
+        "fields": {
+          "title": {
+            "css": ".infor h4 a.title"
+          },
+          "url": {
+            "css": "a.post-thumb",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img[data-echo]",
+            "attr": "data-echo"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/dm/search/q-{keyword}",
+      "method": "GET",
+      "keyword_param": "q",
+      "paginator": {
+        "url_template": "/dm/search/q-{keyword}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.stui-vodlist article"
+        },
+        "fields": {
+          "title": {
+            "css": ".infor h4 a.title"
+          },
+          "url": {
+            "css": "a.post-thumb",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img[data-echo]",
+            "attr": "data-echo"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/dm/play/id-\\d+",
+      "fields": {
+        "title": {
+          "css": "div.stui-player__detail.detail h1.title"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "div.detail-content p.desc"
+        },
+        "tags": {
+          "css": "div.detail-content p.data a[href^='/dm/tag/']"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页即播放页（/dm/play/id-N），每 ID 单视频无分集。video 标签 data-source 为 mp4/m3u8 直链（带 md5+expires 签名，约5分钟过期，勿缓存）。",
+        "play_url": {
+          "selector": {
+            "css": "video.my-videos",
+            "attr": "data-source"
+          }
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "mp4",
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 80
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

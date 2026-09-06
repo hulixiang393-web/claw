@@ -292,6 +292,9 @@ class VlcStreamProxy:
             "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         )
         self._headers = {"User-Agent": ua}
+        # identity：防站点强制 zstd/br 压缩——iter_content 不解压 zstd，
+        # 压缩字节会被 _ProxyHandler 误判为媒体流透传（VLC 播放失败）
+        self._headers["Accept-Encoding"] = "identity"
         if referer:
             self._headers["Referer"] = referer
         self._srv = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)

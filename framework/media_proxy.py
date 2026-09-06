@@ -47,9 +47,10 @@ _READ_CHUNK = 64 * 1024
 #   直连失败按 host 记住 30s，后续分片直接走代理，不再逐片等直连超时。
 _PROXY_SESSION = None
 _DIRECT_SESSION = None
-_DIRECT_FAIL = {}  # {host: 直连失败时间戳}：失败后 30s 内该 host 直接走代理
-_DIRECT_FAIL_TTL = 30.0
-_DIRECT_CONNECT_TIMEOUT = 5.0  # 直连 connect 短超时：被墙主机快速回退，不拖慢播放
+_DIRECT_FAIL = {}  # {host: 直连失败时间戳}：失败后 300s 内该 host 直接走代理
+_DIRECT_FAIL_TTL = 300.0  # 被墙站（如 18mh.net 直连 TLS 挂起）失败记忆拉长，
+# 否则每 30s 就要重吃一次直连超时（播放加载慢的根因之一）
+_DIRECT_CONNECT_TIMEOUT = 3.0  # 直连 connect 短超时：被墙主机快速回退，不拖慢播放
 _PROXY_SESSION_LOCK = threading.Lock()
 _DIRECT_SESSION_LOCK = threading.Lock()
 _DIRECT_FAIL_LOCK = threading.Lock()
@@ -87,11 +88,11 @@ def _get_direct_session() -> requests.Session:
 
 
 def _fetch_upstream(target: str, headers: dict):
-    """直连优先，失败回退系统代理（按 host 记住 30s）。
+    """直连优先，失败回退系统代理（按 host 记住 300s）。
 
-    直连 connect 短超时（5s）：被墙/不可达主机快速回退，不卡住播放；回退
-    成功后该 host 30s 内直接走代理（HLS 分片都在同一 CDN host，只吃一次
-    探测代价）。直连 4xx/5xx（区域拒绝）同样回退代理换出口 IP。
+    直连 connect 短超时（3s）：被墙/不可达主机快速回退，不卡住播放；回退
+    成功后该 host 300s 内直接走代理，不再逐请求等直连超时。直连 4xx/5xx
+    （区域拒绝）同样回退代理换出口 IP。
     """
     from urllib.parse import urlparse
 
@@ -237,6 +238,11 @@ class MediaProxy:
         （播放路径广告过滤，与下载路径 filter_m3u8 一致的判定启发式）。
         """
         req_headers = dict(headers)
+        # 媒体流一律要 identity（不压缩）：部分站点（如 18mh 的 /media/m3u8
+        # 包装接口）无视 Accept-Encoding 强制回 zstd——requests/urllib3 不解压
+        # zstd，下方 raw.read 拿到压缩字节被当 m3u8 文本重写 → VLC 播放失败。
+        # m3u8 本身是 KB 级小文本、ts/mp4 通常本就不压缩，identity 无带宽代价。
+        req_headers["Accept-Encoding"] = "identity"
         # 透传客户端 Range（拖动进度 / 分片定位）。
         # 但 m3u8 播放列表必须整读：VLC 拉 m3u8 时常带 Range（如 bytes=0-1275
         # 探测大小），若透传，CDN 返回截断的 m3u8 → 只拿到部分分片 → 播放
