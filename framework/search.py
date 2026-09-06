@@ -25,6 +25,12 @@ from .utils import fill_json, fill_template, jsonpath
 
 log = logging.getLogger(__name__)
 
+# 搜索页数放开：不设默认限量（有多少加载多少，翻到站底由连续空页自然停）。
+# 此常量是引擎级硬保护——仅防"分页 URL 模板失效 → 每页都返回页首内容 → 永不
+# 触发空页停"的死循环，绝不是搜索结果限制。正常源空页即停，远达不到此值。
+# 源显式配置了 constraints.search.max_pages 则尊重源值（不覆盖）。
+_SEARCH_MAX_PAGES_HARD_CAP = 2000
+
 
 @dataclass
 class SearchResult:
@@ -160,8 +166,20 @@ class Search:
         # - 不含 {keyword} → 页码拼接片段（?page={page} 或 -{page}.html）
         # - 留空 → 默认自动 ?page=N（POST 源 body 加 page 参数）
         constraints = source.raw.get("constraints") or {}
-        max_pages = int((constraints.get("search") or {}).get("max_pages") or 3)
-        max_results = int((constraints.get("search") or {}).get("max_results") or 0)
+        # 搜索页数放开：不把 max_pages 当作搜索限制——有多少加载多少，翻到站点
+        # 页尾由「连续空页」提前停（下方 while 内 break）。
+        # - 源显式配了 max_pages/max_results 则尊重源配置（不截断/不覆盖）。
+        # - 未配置 → 无限翻页（保留引擎硬保护 _SEARCH_MAX_PAGES_HARD_CAP 防
+        #   分页模板失效死循环，并非搜索结果限制）；max_results=0 表示不按条数截断。
+        max_pages = (constraints.get("search") or {}).get("max_pages")
+        max_results = (constraints.get("search") or {}).get("max_results")
+        if not max_pages:
+            max_pages = _SEARCH_MAX_PAGES_HARD_CAP
+        max_pages = int(max_pages)
+        if not max_results:
+            max_results = 0
+        else:
+            max_results = int(max_results)
         paginator_cfg = search_cfg.get("paginator") or {}
         page_param = paginator_cfg.get("param") or "page"
         url_template = paginator_cfg.get("url_template") or ""
