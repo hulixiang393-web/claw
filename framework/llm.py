@@ -356,15 +356,16 @@ class LlmClient:
         steps: list[dict] = []
         http = HttpClient()
         try:
-            # 1) 根地址探活（返回文本仅作连通证据；401/404 等服务端 HTTP 响应
-            #    也算「可达」，鉴权由下一步 chat 判定）
+            # 1) 根地址探活（用 get_status：HTTP 响应含 401/403/404 都算可达，
+            #    服务端已响应即证地址正确、网络通；鉴权由下一步真实 chat 判定。
+            #    此前用 get_text 会把 DeepSeek 等根地址固有的 401 误判成
+            #    「鉴权失败」，导致真实 key 也报错）
             try:
-                _text = http.get_text(self._raw_base, timeout=timeout, retries=1)
-                snippet = (_text or "").strip().replace("\n", " ")[:40]
+                code = http.get_status(self._raw_base, timeout=timeout)
                 steps.append({
                     "label": "链接可达",
                     "ok": True,
-                    "detail": f"{self._raw_base} → 响应" + (f"：{snippet}" if snippet else ""),
+                    "detail": f"{self._raw_base} → HTTP {code}",
                 })
             except Exception as exc:
                 steps.append({

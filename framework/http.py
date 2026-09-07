@@ -654,6 +654,34 @@ class HttpClient:
             self._session.close()
             self._session = None
 
+    def get_status(
+        self,
+        url: str,
+        headers: Optional[dict] = None,
+        timeout: float | None = None,
+    ) -> int:
+        """GET 返回 HTTP 状态码（探活用）。
+
+        与 get_text 不同：任何 HTTP 响应（含 401/403/404）都返回码值，
+        只有网络层失败（连接拒/超时/DNS）才抛 RequestError——
+        服务端已响应即证明地址可达，鉴权是否通过由后续真实请求判定。
+        """
+        if timeout is None:
+            timeout = self.defaults.timeout
+        headers = self._headers_with_ua(headers)
+        if self._session is not None:
+            resp = self._session.get(url, headers=headers, timeout=timeout)
+            return int(resp.status_code)
+        import urllib.request
+        import urllib.error
+
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return int(resp.status)
+        except urllib.error.HTTPError as exc:
+            return int(exc.code)  # HTTP 响应即可达（含 401/40x）
+
     def __enter__(self) -> "HttpClient":
         return self
 

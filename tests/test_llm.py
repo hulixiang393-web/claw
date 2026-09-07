@@ -62,6 +62,12 @@ class _FakeHttpForLlm:
             raise self._error
         return "<html>hello</html>"
 
+    def get_status(self, url, **kwargs):
+        self._last_url = url
+        if self._error:
+            raise self._error
+        return 200
+
     def close(self):
         pass
 
@@ -339,6 +345,21 @@ def test_connection_network_failure():
     assert result["reason"] == "网络连接失败"
     assert result["steps"][0]["ok"] is False
     assert "超时" in result["steps"][0]["detail"]
+
+
+def test_connection_root_401_still_reachable():
+    """根地址返回 401（如 DeepSeek 固有行为）→ 探活算「可达」，
+    不误报鉴权失败；鉴权交给下一步 chat。"""
+    fake = _FakeHttpForLlm({
+        "choices": [{"message": {"content": "hi"}}]
+    })
+    fake.get_status = lambda url, **kw: 401  # 根地址固有 401
+    with patch("framework.llm.HttpClient", return_value=fake):
+        client = LlmClient("https://api.deepseek.com", api_key="sk-good", model="deepseek-chat")
+        result = client.test_connection()
+    assert result["steps"][0]["ok"] is True
+    assert "401" in result["steps"][0]["detail"]
+    assert result["ok"] is True  # 只要 chat 通过即整体通过
 
 
 def test_connection_chat_api_key_error():
