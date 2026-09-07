@@ -348,12 +348,6 @@ class SourceEditor(QDialog):
         self._topbar.addWidget(self.status_label)
         self._topbar.addStretch(1)
 
-        # 🤖 AI 制源按钮（所有模式都显示）
-        self._ai_btn = QPushButton("🤖 AI 制源")
-        self._ai_btn.setToolTip("用 LLM 自动分析站点并生成源配置")
-        self._ai_btn.clicked.connect(self._on_ai_source)
-        self._topbar.addWidget(self._ai_btn)
-
         # 新建模式下提供「填入示例」：用同类型的参考源填充空白字段
         if self._mode == "NEW":
             self.example_btn = _ExampleButton("🎓 填入示例")
@@ -2674,41 +2668,6 @@ class SourceEditor(QDialog):
             QMessageBox.information(self, "已导出", f"已导出到 {path}")
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"写入失败：{exc}")
-
-    # ================================================================== #
-    # 🤖 AI 制源
-    # ================================================================== #
-    def _on_ai_source(self) -> None:
-        """打开 Agent 自动制源对话框。"""
-        from gui.components.agent_dialog import AgentDialog
-
-        dlg = AgentDialog(preview=self._preview, parent=self)
-        dlg.source_added.connect(self._on_agent_source_added)
-        dlg.exec()
-
-    def _on_agent_source_added(self, result) -> None:
-        """Agent 制源成功后，加载新源到编辑器表单或通知源列表刷新。"""
-        from framework.source_agent import AgentResult
-
-        if isinstance(result, AgentResult) and result.ok:
-            if result.draft:
-                # 有草稿数据 → 加载到表单供用户检查
-                self._raw = result.draft
-                self._load_into_form()
-                self._update_status_label()
-                QMessageBox.information(
-                    self, "AI 制源成功",
-                    f"源 {result.source_id} 已生成并加载到表单。\n"
-                    "请检查各字段后点击「校验并保存」。",
-                )
-            else:
-                # 源已由 SourceAgent 直接保存到 sources/ → 通知刷新
-                QMessageBox.information(
-                    self, "AI 制源成功",
-                    f"源 {result.source_id} 已保存到源列表。\n"
-                    "关闭此对话框后可在源列表中查看。",
-                )
-                self.source_saved.emit(result.source_id)
 
     # ================================================================== #
     def _update_status_label(self) -> None:
