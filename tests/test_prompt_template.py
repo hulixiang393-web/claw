@@ -93,7 +93,7 @@ class _FakeLlm:
     def __init__(self):
         self.calls = []
 
-    def chat(self, system, user, json_mode=False, timeout=60.0):
+    def chat(self, system, user, json_mode=False, timeout=60.0, max_tokens=None, ctx_limit=None):
         self.calls.append({"system": system, "user": user})
         return "not a json"
 

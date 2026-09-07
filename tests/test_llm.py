@@ -106,6 +106,43 @@ def test_llm_client_chat_json_mode():
     assert fake._last_body["response_format"] == {"type": "json_object"}
 
 
+def test_llm_client_chat_max_tokens_in_body():
+    """正常 chat 请求体携带 max_tokens。"""
+    fake = _FakeHttpForLlm({
+        "choices": [{"message": {"content": "ok"}}]
+    })
+    with patch("framework.llm.HttpClient", return_value=fake):
+        client = LlmClient("http://test.com", model="m")
+        client.chat("sys", "usr", max_tokens=3072)
+    assert fake._last_body["max_tokens"] == 3072
+
+
+def test_llm_client_chat_truncates_oversized_prompt():
+    """超长 user 消息在客户端截断，避免 llama-server 400（超 ctx）。"""
+    fake = _FakeHttpForLlm({
+        "choices": [{"message": {"content": "ok"}}]
+    })
+    with patch("framework.llm.HttpClient", return_value=fake):
+        client = LlmClient("http://test.com", model="m")
+        # 制源场景：模板+8000字符 HTML ≈ 11K 字符，超过 ctx_limit=2000 的预算
+        user = "你" * 4000   # 4000 字符 → 远超 2000*1.5=3000 字符预算
+        client.chat("sys", user, ctx_limit=2000)
+    sent = fake._last_body["messages"][1]["content"]
+    assert len(sent) <= 3000
+    assert len(sent) >= 2000  # 截断不空
+
+
+def test_llm_client_chat_normal_prompt_not_truncated():
+    """正常长度 prompt 不截断。"""
+    fake = _FakeHttpForLlm({
+        "choices": [{"message": {"content": "ok"}}]
+    })
+    with patch("framework.llm.HttpClient", return_value=fake):
+        client = LlmClient("http://test.com", model="m")
+        client.chat("sys", "normal short msg", ctx_limit=2000)
+    assert fake._last_body["messages"][1]["content"] == "normal short msg"
+
+
 def test_llm_client_chat_api_error():
     """API 返回 error 字段 → 抛 LlmError。"""
     fake = _FakeHttpForLlm({

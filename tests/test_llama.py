@@ -145,6 +145,7 @@ class TestLlamaStart:
         assert cmd[0] == "C:/llm/llama-server.exe"
         assert cmd[1] == "-m" and cmd[2] == r"D:\models\qwen.gguf"
         assert "--port" in cmd and "11434" in cmd
+        assert "--ctx-size" in cmd and "16384" in cmd
 
     def test_start_process_exits_with_stderr(self):
         """进程提前退出 → 返回 stderr 尾作为失败原因。"""

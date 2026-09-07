@@ -259,12 +259,28 @@ class LlmClient:
         user: str,
         json_mode: bool = False,
         timeout: float = 60.0,
+        max_tokens: int = 2048,
+        ctx_limit: int = 12000,
     ) -> str:
         """发送 chat 请求，返回助手回复文本。
 
         json_mode=True 时带 response_format（部分端点支持）。
+        ctx_limit: 请求前保护——本地 llama-server 默认 ctx 较小，超长
+        user 消息会直接 400（exceed_context_size_error）；按字符/1.5
+        粗估 token，超过预算时对 user 消息截断后再发送。
         失败抛 LlmError。
         """
+        # 请求前保护：超长 user 消息在客户端截断，避免 llama-server
+        # 因超 ctx 返回 400（制源时模板+HTML采样可达 10K+ 字符）。
+        if ctx_limit > 0 and user:
+            budget = int(ctx_limit * 1.5)  # 字符预算（1字符≈0.7token 保守）
+            if len(system) + len(user) > budget:
+                trim = budget - len(system)
+                if trim > 0:
+                    user = user[:trim]
+            if not user:
+                raise LlmError("用户消息为空（超出上下文预算）")
+
         http = HttpClient()
         try:
             url = f"{self._base}/chat/completions"
@@ -280,6 +296,7 @@ class LlmClient:
             body: dict[str, Any] = {
                 "model": self._model,
                 "messages": messages,
+                "max_tokens": max_tokens,
             }
             if json_mode:
                 body["response_format"] = {"type": "json_object"}
@@ -540,7 +557,14 @@ class LlamaManager:
         host = _host_from_url(self._base)
 
         # 拼命令行：llama-server -m <gguf> --host <host> --port <port>
-        cmd = [server, "-m", self._model_path, "--host", host, "--port", str(port)]
+        # --ctx-size 显式给足上下文：默认 4096，制源 prompt（模板+8000字符 HTML
+        # 采样 ≈ 7-13K token）会直接触发 llama-server 400 拒绝（ctx 超限）。
+        # Qwen 系 8B 官方支持 32K，16384 兼顾内存与能力。
+        cmd = [
+            server, "-m", self._model_path,
+            "--host", host, "--port", str(port),
+            "--ctx-size", "16384",
+        ]
         try:
             self._proc = subprocess.Popen(
                 cmd,

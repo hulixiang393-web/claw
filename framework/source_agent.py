@@ -375,9 +375,20 @@ class SourceAgent:
                 user=user_msg,
                 json_mode=True,
                 timeout=120.0,
+                # 上下文预算对齐 llama-server 16384 ctx：输入≤12000 token +
+                # 输出 2048 → 总 14048 < 16384，制源不会因超 ctx 被 400 拒绝。
+                # 旧进程（手动启动、默认 4096 ctx）会 400，此时设置页重启
+                # llama-server 即可（新启动命令带 --ctx-size 16384）。
+                ctx_limit=12000,
+                max_tokens=2048,
             )
         except LlmError as exc:
             log_fn(f"[Phase 2] LLM 调用失败：{exc}")
+            if "context" in str(exc).lower() or "exceeds" in str(exc).lower() \
+                    or "400" in str(exc):
+                log_fn("[Phase 2] 提示：本地 llama-server 上下文不足，请在设置页"
+                       "「LLM」中点击「停止」后再点「启动」重启（新版本自动启用 "
+                       "--ctx-size 16384）；或换更快/更大的模型")
             return None
 
         draft = _extract_json_from_llm(response)

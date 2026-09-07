@@ -29,7 +29,7 @@ class _FakeLlm:
         self._responses = list(responses)
         self._calls = []
 
-    def chat(self, system, user, json_mode=False, timeout=60.0):
+    def chat(self, system, user, json_mode=False, timeout=60.0, max_tokens=None, ctx_limit=None):
         self._calls.append({"system": system, "user": user})
         if not self._responses:
             raise RuntimeError("No more LLM responses")
