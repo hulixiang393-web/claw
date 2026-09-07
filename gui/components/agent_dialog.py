@@ -37,12 +37,23 @@ class _AgentWorker(QThread):
         self._category = category
 
     def run(self):
-        result = self._agent.make_source(
-            self._site_url,
-            self._content_type,
-            self._category,
-            on_log=lambda msg: self.log_signal.emit(msg),
-        )
+        from framework.source_agent import AgentResult
+
+        try:
+            result = self._agent.make_source(
+                self._site_url,
+                self._content_type,
+                self._category,
+                on_log=lambda msg: self.log_signal.emit(msg),
+            )
+        except Exception as exc:  # noqa: BLE001 —— 兜底：任何异常都必须发完成信号，
+            # 否则对话框卡在「制源中…」，且 _agent._http.close()（_on_finished）
+            # 永不执行 → HttpClient 泄漏
+            result = AgentResult(
+                ok=False,
+                logs=[f"[Exception] 制源异常：{exc}"],
+                suggestions=[f"制源过程出现未预期异常，请重试或检查网络：{exc}"],
+            )
         self.finished_signal.emit(result)
 
 

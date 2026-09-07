@@ -103,11 +103,29 @@ def find_cross_source(manager, content, detail, content_type,
     ]
 
     def _worker(source):
+        worker_http = None
         try:
-            results = search.search_one_cached(source, keyword, http=http, use_cache=False)
+            # 每 worker 独立 HttpClient（共享默认值/缓存）——requests.Session
+            # 非线程安全，跨线程复用同一 content._http 会在并发时竞态
+            # （与 framework/search.py search_type 同一模式）
+            if http is not None:
+                worker_http = http.__class__(
+                    sleeper=getattr(http, "_sleeper", None),
+                    defaults=http.defaults,
+                    cache=getattr(http, "cache", None),
+                )
+            results = search.search_one_cached(
+                source, keyword, http=worker_http, use_cache=False
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("[cross_source] 源 %s 搜索失败：%s", source.source_id, exc)
             return []
+        finally:
+            if worker_http is not None:
+                try:
+                    worker_http.close()
+                except Exception:  # noqa: BLE001
+                    pass
         out = []
         for r in results or []:
             raw_title = getattr(r, "title", "") or ""

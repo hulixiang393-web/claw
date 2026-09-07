@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -17,6 +18,16 @@ from typing import Any, Optional
 from .errors import ConfigError
 
 CONTENT_TYPES = ("novel", "comic", "video")
+
+# $id 合法字符集：仅小写字母/数字/下划线/连字符。
+# 阻断路径穿越（无 . 无法构成 .. 或 .xxx）与跨目录分隔符（无 / \ :），
+# 同时兼容既有源里的连字符串（如 18mh-novel、heavy-r）。
+VALID_SOURCE_ID_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def is_valid_source_id(value) -> bool:
+    """$id 是否可安全用作文件名（防路径穿越/任意文件覆盖）。"""
+    return isinstance(value, str) and bool(VALID_SOURCE_ID_RE.match(value))
 
 
 def _safe_weight(val) -> float:
@@ -56,6 +67,10 @@ class SourceConfig:
     def from_dict(cls, data: Any, path: str = "<memory>") -> "SourceConfig":
         _require_dict(data, path)
         source_id = _require_str(data, "$id", path)
+        if not is_valid_source_id(source_id):
+            raise ConfigError(
+                f"{path}.$id 只能包含小写字母/数字/下划线/连字符，收到 {source_id!r}"
+            )
         content_type = str(data.get("$type") or "")
         if content_type not in CONTENT_TYPES:
             raise ConfigError(

@@ -95,13 +95,26 @@ def _result_html(titles_urls):
 
 
 class _FakeHttp:
-    """按 url 前缀返回预设 HTML（一个源一个页面）；host 含 raise: 抛异常。"""
+    """按 url 前缀返回预设 HTML（一个源一个页面）；host 含 raise: 抛异常。
 
-    def __init__(self, pages: dict):
+    __init__ 兼容 HttpClient 克隆签名（concurrent worker 会以
+    http.__class__(sleeper=, defaults=, cache=) 每 worker 重建一个实例）。
+    克隆不带 pages 参数 → 回退到类级 `_shared_pages`（等价于真实 HttpClient
+    克隆共享 defaults 配置：克隆体只带配置、不带会话状态）。
+    """
+
+    _shared_pages = {}
+
+    def __init__(self, pages=None, sleeper=None, defaults=None, cache=None):
         from framework.http import NetworkDefaults
 
-        self._pages = pages  # host -> html
-        self.defaults = NetworkDefaults()
+        if pages is not None:
+            type(self)._shared_pages = pages
+            self._pages = pages
+        else:
+            self._pages = type(self)._shared_pages or {}
+        self.defaults = defaults or NetworkDefaults()
+        self._sleeper = sleeper
 
     def get_text(self, url, **kwargs):
         for key, html in self._pages.items():
@@ -196,9 +209,13 @@ def test_find_cross_source_single_source_error_keeps_others():
 
     class _OneFails:
         """http://b.com 返回结果；其他 host 抛错。"""
-        def __init__(self):
+
+        def __init__(self, pages=None, sleeper=None, defaults=None, cache=None):
             from framework.http import NetworkDefaults
-            self.defaults = NetworkDefaults()
+
+            self._pages = pages or {}
+            self.defaults = defaults or NetworkDefaults()
+            self._sleeper = sleeper
 
         def get_text(self, url, **kwargs):
             if "b.com" in url:
@@ -231,6 +248,46 @@ def test_find_cross_source_season_filtered():
     detail = Detail(source_id="src-a", content_type="video", url="http://a.com/v/1", title="测试动画 第二季")
     cands = find_cross_source(mgr, content, detail, "video")
     assert cands == []  # 第一季 vs 第二季 → 相似度<0.9
+
+
+def test_find_cross_source_uses_per_worker_http():
+    """每 worker 独立 HttpClient，不共享 content._http 的 requests.Session。
+
+    requests.Session 非线程安全；修复前 4 个 worker 复用同一 content._http，
+    并发时竞态。验证：每个被搜源各建一个独立实例、用完即关，共享实例不参与。
+    """
+    created = []
+    class _TrackHttp(_FakeHttp):
+        def __init__(self, pages=None, sleeper=None, defaults=None, cache=None):
+            super().__init__(pages, sleeper=sleeper, defaults=defaults, cache=cache)
+            self.closed = False
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+
+    src_a = SourceConfig.from_dict(_search_src_json("src-a", "源A", "http://a.com"), "<a>")
+    src_b = SourceConfig.from_dict(_search_src_json("src-b", "源B", "http://b.com"), "<b>")
+    src_c = SourceConfig.from_dict(_search_src_json("src-c", "源C", "http://c.com"), "<c>")
+    mgr = _make_manager([src_a, src_b, src_c])
+
+    shared = _TrackHttp({"b.com": _result_html([("测试动画 第一季", "/v/1.html")])})
+    content = _make_content(shared)
+
+    from framework.content import Detail
+    detail = Detail(source_id="src-a", content_type="video",
+                    url="http://a.com/v/1", title="测试动画 第一季")
+    cands = find_cross_source(mgr, content, detail, "video", concurrent=4)
+
+    assert len(cands) == 1
+    assert cands[0].source_id == "src-b"
+    # 共享实例（记录在首） + 2 个 worker（src-b / src-c）各一个独立实例
+    assert len(created) == 3, len(created)
+    assert created[0] is shared
+    workers = created[1:]
+    assert all(c is not shared for c in workers)
+    assert all(c.closed for c in workers), "每个 worker 的 HttpClient 用完即关"
+    assert not shared.closed, "共享实例不被 worker 关闭"
 
 
 # --------------------------------------------------------------------------- #

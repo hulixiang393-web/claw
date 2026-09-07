@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .config import SourceConfig, CONTENT_TYPES
+from .config import SourceConfig, CONTENT_TYPES, is_valid_source_id
 from .http import HttpClient
 from .parser import Parser
 from .llm import LlmClient, LlmError
@@ -276,8 +276,12 @@ class SourceAgent:
             _log(f"[Phase 3] {self._max_attempts} 轮验证均失败")
             suggestions = self._generate_suggestions(last_error, page_tech)
             # 保存草稿
-            draft_path = self._save_draft(draft)
-            _log(f"[Phase 3] 草稿已保存：{draft_path}")
+            try:
+                draft_path = self._save_draft(draft)
+                _log(f"[Phase 3] 草稿已保存：{draft_path}")
+            except Exception as exc:  # noqa: BLE001
+                # 草稿保存失败（磁盘/权限）→ 结果仍返回内存草稿，不中断
+                _log(f"[Phase 3] 草稿保存失败（草稿保留在内存中）：{exc}")
             return AgentResult(
                 ok=False,
                 draft=draft,
@@ -288,8 +292,26 @@ class SourceAgent:
 
         # ========== Phase 4: 保存 ==========
         source_id = draft.get("$id", "unknown")
-        source_path = self._save_source(draft)
-        _log(f"[Phase 4] 源已保存：{source_path}")
+        try:
+            source_path = self._save_source(draft)
+            _log(f"[Phase 4] 源已保存：{source_path}")
+        except Exception as exc:  # noqa: BLE001
+            # 源保存失败（$id 非法被拒 / 磁盘错误）→ 降级为草稿，仍返回内存中
+            # 的草稿供编辑器加载，不让异常逃逸出去卡死 AgentDialog worker。
+            _log(f"[Phase 4] 源保存失败：{exc}")
+            suggestions = self._generate_suggestions(f"源保存失败：{exc}", page_tech)
+            try:
+                self._save_draft(draft)
+                suggestions.append("草稿已保存，可在源编辑器中加载并手动调整")
+            except Exception as exc2:  # noqa: BLE001 —— 降级草稿也失败：草稿保留内存
+                _log(f"[Phase 4] 降级草稿保存也失败（草稿保留在内存中）：{exc2}")
+            return AgentResult(
+                ok=False,
+                draft=draft,
+                attempts=self._max_attempts if last_error else 1,
+                logs=logs,
+                suggestions=suggestions,
+            )
 
         # 添加到 SourceManager
         if self._manager is not None:
@@ -368,33 +390,35 @@ class SourceAgent:
         except Exception as exc:
             return False, f"结构校验失败：{exc}"
 
-        # 3.2 搜索验证
+        # 3.2 搜索验证 + 3.3 详情验证（每轮只搜一次：搜索结果既用于数量校验，
+        # 也用于提取详情 URL——原先同轮重复搜索会翻倍网络请求）
         if self._preview is not None:
             try:
                 results = self._preview.preview_search(config, "test")
-                if not results:
-                    log_fn("[验证] 搜索无结果（可能需要 JS 渲染或配置有误）")
-                else:
-                    log_fn(f"[验证] 搜索返回 {len(results)} 条结果")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 —— 预览实现通常吞异常返回 []，
+                # 这里作为兜底：真抛异常同样按验证失败处理
                 log_fn(f"[验证] 搜索测试异常：{exc}")
                 return False, f"搜索验证失败：{exc}"
 
-        # 3.3 详情验证（用搜索结果的第一条 URL）
-        if self._preview is not None:
+            if not results:
+                # 空结果视为验证失败（选择器失效/需 JS 渲染），回喂 LLM 修正
+                log_fn("[验证] 搜索无结果（可能需要 JS 渲染或配置有误）")
+                return False, "搜索验证失败：搜索无结果（选择器可能失效或需要 JS 渲染）"
+            log_fn(f"[验证] 搜索返回 {len(results)} 条结果")
+
+            # 3.3 详情验证（用本次搜索结果的第一条 URL）
             try:
-                # 先搜索取第一条 URL
-                results = self._preview.preview_search(config, "test")
-                if results:
-                    first_url = results[0].url if hasattr(results[0], "url") else ""
-                    if first_url:
-                        detail = self._preview.preview_detail(config, first_url)
-                        if not detail or detail.get("error"):
-                            err = detail.get("error", "详情为空") if detail else "详情为空"
-                            log_fn(f"[验证] 详情获取异常：{err}")
-                            return False, f"详情验证失败：{err}"
-                        log_fn(f"[验证] 详情获取成功，标题：{detail.get('title', '?')}")
-            except Exception as exc:
+                first_result = results[0]
+                first_url = getattr(first_result, "url", None) or ""
+                if not first_url:
+                    return False, "详情验证失败：搜索结果缺少 URL"
+                detail = self._preview.preview_detail(config, first_url)
+                if not detail or detail.get("error"):
+                    err = detail.get("error", "详情为空") if detail else "详情为空"
+                    log_fn(f"[验证] 详情获取异常：{err}")
+                    return False, f"详情验证失败：{err}"
+                log_fn(f"[验证] 详情获取成功，标题：{detail.get('title', '?')}")
+            except Exception as exc:  # noqa: BLE001
                 log_fn(f"[验证] 详情测试异常：{exc}")
                 return False, f"详情验证失败：{exc}"
 
@@ -454,12 +478,26 @@ class SourceAgent:
     # ------------------------------------------------------------------ #
     # Phase 4: 保存
     # ------------------------------------------------------------------ #
+    def _sources_dir(self) -> Path:
+        """源配置文件目录（项目根 sources/）。独立成方法便于测试重定向。"""
+        return Path(__file__).resolve().parent.parent / "sources"
+
+    def _drafts_dir(self) -> Path:
+        """失败草稿目录（项目根 data/agent_drafts/）。独立成方法便于测试重定向。"""
+        return Path(__file__).resolve().parent.parent / "data" / "agent_drafts"
+
     def _save_source(self, draft: dict) -> str:
-        """保存源配置到 sources/{id}.json。"""
-        source_id = draft.get("$id", "unknown")
-        # 找到项目根目录下的 sources/
-        root = Path(__file__).resolve().parent.parent
-        sources_dir = root / "sources"
+        """保存源配置到 sources/{id}.json。
+
+        非法 $id（可能为提示注入的路径穿越，如 "../data/llm_keys"）直接拒绝
+        抛 ValueError——调用方据此降级为草稿保存，绝不把不可控文件名落盘。
+        """
+        source_id = draft.get("$id", "")
+        if not is_valid_source_id(source_id):
+            raise ValueError(
+                f"非法 $id：{source_id!r}（仅允许小写字母/数字/下划线/连字符）"
+            )
+        sources_dir = self._sources_dir()
         sources_dir.mkdir(exist_ok=True)
         path = sources_dir / f"{source_id}.json"
         path.write_text(
@@ -469,10 +507,19 @@ class SourceAgent:
         return str(path)
 
     def _save_draft(self, draft: dict) -> str:
-        """保存失败草稿到 data/agent_drafts/{id}.json。"""
-        source_id = draft.get("$id", "unknown")
-        root = Path(__file__).resolve().parent.parent
-        drafts_dir = root / "data" / "agent_drafts"
+        """保存失败草稿到 data/agent_drafts/{id}.json。
+
+        非法 $id（可能为提示注入的路径穿越）：不写原文件名，改用内容哈希兜底
+        文件名，保证文件绝不逃逸 data/agent_drafts/ 目录。
+        """
+        source_id = draft.get("$id", "")
+        if not is_valid_source_id(source_id):
+            log.warning("[agent] 草稿 $id 非法，改用哈希兜底文件名：%r", source_id)
+            import hashlib
+
+            payload = json.dumps(draft, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            source_id = "draft_" + hashlib.sha1(payload).hexdigest()[:12]
+        drafts_dir = self._drafts_dir()
         drafts_dir.mkdir(parents=True, exist_ok=True)
         path = drafts_dir / f"{source_id}.json"
         path.write_text(

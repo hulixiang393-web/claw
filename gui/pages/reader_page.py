@@ -121,6 +121,49 @@ class _CrossSourceTask(QRunnable):
                 pass
 
 
+class _CrossSourceSearchSignals(QObject):
+    """跨源候选搜索后台任务信号。"""
+    done = Signal(object)  # list[CrossSourceCandidate]
+    error = Signal(str)
+
+
+class _CrossSourceSearchTask(QRunnable):
+    """后台搜索跨源候选（find_cross_source）。
+
+    多源并发网络请求（4 worker × 超时 × 重试），当前源挂时可能耗时数十秒——
+    必须放后台线程，完成后再由调用方在 UI 线程弹候选对话框（阻塞但不误伤 UI）。
+    """
+
+    def __init__(self, manager, content, detail, content_type,
+                 concurrent=4, top_n=10):
+        super().__init__()
+        self.signals = _CrossSourceSearchSignals()
+        self._manager = manager
+        self._content = content
+        self._detail = detail
+        self._content_type = content_type
+        self._concurrent = concurrent
+        self._top_n = top_n
+
+    def run(self) -> None:
+        try:
+            from framework import cross_source
+
+            candidates = cross_source.find_cross_source(
+                self._manager, self._content, self._detail,
+                self._content_type, concurrent=self._concurrent, top_n=self._top_n,
+            )
+            try:
+                self.signals.done.emit(candidates)
+            except RuntimeError:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.signals.error.emit(str(exc))
+            except RuntimeError:
+                pass
+
+
 class ReaderPage(BasePage):
     # 收藏/取消收藏 → App 层写书架收藏库（ui-reader.md #2 通用外壳「收藏」）
     favorite_requested = Signal(object)
@@ -307,8 +350,6 @@ class ReaderPage(BasePage):
         payload 为触发视图的当前 detail（视频/漫画/小说入口统一签名）。
         全程当前源失效场景，用 self._current_* 状态 + 当前集序号决定续读位置。
         """
-        from PySide6.QtWidgets import QMessageBox
-
         if self._content is None:
             return
         if isinstance(payload, dict):
@@ -328,25 +369,37 @@ class ReaderPage(BasePage):
         # 当前视图集/章序号：视频保留当前集（0 基），漫画/小说从第 0 章加载
         current_index = self._current_reader_index()
 
-        # 搜索候选（内部并发，UI 线程可）→ 弹对话框（阻塞）
-        try:
-            from framework import cross_source
-            from gui.components.cross_source_dialog import CrossSourceDialog
+        # 搜索候选源：多源并发网络请求（4 worker × 超时 × 重试，源挂时数十秒）
+        # → 放后台 QRunnable，完成后才弹候选对话框，搜索期间不阻塞 UI 线程
+        if getattr(self, "_cross_searching", False):
+            return  # 已有候选搜索在途：防误触连点堆叠后台任务
+        self._cross_searching = True
+        self._set_cross_source_hint("正在搜索候选源…")
+        task = _CrossSourceSearchTask(
+            self._manager, self._content, detail, content_type,
+            concurrent=4, top_n=10,
+        )
+        task.signals.done.connect(
+            lambda cands, d=detail, ct=content_type, ci=current_index:
+                self._on_cross_source_candidates(d, ct, ci, cands)
+        )
+        task.signals.error.connect(self._on_cross_source_search_failed)
+        self._cross_search_task = task  # 持有引用，防止被 GC
+        QThreadPool.globalInstance().start(task)
 
-            candidates = cross_source.find_cross_source(
-                self._manager, self._content, detail, content_type,
-                concurrent=4, top_n=10,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("[cross-source] 候选搜索失败: %s", exc)
-            QMessageBox.warning(self, "跨源换源", f"搜索候选源失败：{exc}")
-            return
+    def _on_cross_source_candidates(self, detail, content_type, current_index,
+                                    candidates) -> None:
+        """候选搜索完成（UI 线程）：弹对话框 → 用户选择 → 后台切源。"""
+        self._cross_searching = False
+        from gui.components.cross_source_dialog import CrossSourceDialog
 
         dialog = CrossSourceDialog(candidates, self)
         if dialog.exec() != CrossSourceDialog.Accepted:
+            self._set_cross_source_hint("")
             return
         selected = dialog.selected
         if selected is None:
+            self._set_cross_source_hint("")
             return
 
         # 后台切源（网络请求，不阻塞 UI）
@@ -355,6 +408,9 @@ class ReaderPage(BasePage):
         except Exception:
             new_source = selected.source_id
         if new_source is None:
+            from PySide6.QtWidgets import QMessageBox
+
+            self._set_cross_source_hint("")
             QMessageBox.warning(self, "跨源换源", f"目标源不存在：{selected.source_id}")
             return
         task = _CrossSourceTask(
@@ -364,6 +420,22 @@ class ReaderPage(BasePage):
         task.signals.error.connect(self._on_cross_source_failed)
         self._cross_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
+
+    def _on_cross_source_search_failed(self, err: str) -> None:
+        """候选搜索失败（后台任务异常兜底）→ 提示，不弹空对话框。"""
+        self._cross_searching = False
+        self._set_cross_source_hint("")
+        from PySide6.QtWidgets import QMessageBox
+
+        log.warning("[cross-source] 候选搜索失败: %s", err)
+        QMessageBox.warning(self, "跨源换源", f"搜索候选源失败：{err}")
+
+    def _set_cross_source_hint(self, text: str) -> None:
+        """跨源换源搜索期间给当前视图一个状态提示（无标签视图则忽略）。"""
+        view = self.stack.currentWidget()
+        label = getattr(view, "play_label", getattr(view, "mode_label", None))
+        if label is not None and hasattr(label, "setText"):
+            label.setText(text)
 
     def _resolve_current_detail(self) -> object:
         """兜底取当前视图的 detail（入口 payload 未带 detail 时）。"""

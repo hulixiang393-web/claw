@@ -324,6 +324,161 @@ class TestSourceAgent:
         assert len(llm._calls) == 1
         assert "玄幻" in llm._calls[0]["user"]
 
+    # ------------------------------------------------------------------ #
+    # $id 路径穿越防护（Critical 1）
+    # ------------------------------------------------------------------ #
+    def test_config_rejects_invalid_source_id(self):
+        """SourceConfig.from_dict 拒绝非法 $id（防路径穿越的第一道闸）。"""
+        from framework.config import SourceConfig
+        from framework.errors import ConfigError
+
+        draft = _make_valid_draft()
+        draft["$id"] = "../data/llm_keys"
+        with pytest.raises(ConfigError):
+            SourceConfig.from_dict(draft)
+        draft["$id"] = "safe_id"
+        assert SourceConfig.from_dict(draft).source_id == "safe_id"
+
+    def test_invalid_source_id_not_written(self, tmp_path):
+        """LLM 提示注入 $id=../data/llm_keys → 拒绝保存，不产生越界文件。"""
+        draft = _make_valid_draft("../data/llm_keys", "novel")
+        llm = _FakeLlm([json.dumps(draft, ensure_ascii=False)])
+        http = _FakeHttp("<html><body>test</body></html>")
+        preview = _FakePreview(search_results=[MagicMock(url="/v/1.html", title="Test")])
+
+        agent = SourceAgent(llm=llm, http=http, preview=preview, max_attempts=3)
+        sources_dir = tmp_path / "sources"
+        drafts_dir = tmp_path / "drafts"
+        agent._sources_dir = lambda: sources_dir
+        agent._drafts_dir = lambda: drafts_dir
+
+        result = agent.make_source("https://example.com", "novel")
+
+        assert result.ok is False
+        assert result.draft is not None
+        assert result.draft["$id"] == "../data/llm_keys"
+        # 拒绝发生在落盘之前：sources/drafts 目录都不应被创建
+        assert not sources_dir.exists()
+        assert not drafts_dir.exists()
+        # 项目根 data/ 下不得出现被覆盖的 llm_keys.json
+        root = Path(__file__).resolve().parents[1]
+        assert not (root / "data" / "llm_keys.json").exists()
+
+    def test_save_source_rejects_invalid_id(self, tmp_path):
+        """_save_source 拒绝非法 $id：抛 ValueError，不落任何文件。"""
+        agent = SourceAgent(llm=MagicMock(), http=MagicMock(), max_attempts=1)
+        sources_dir = tmp_path / "sources"
+        agent._sources_dir = lambda: sources_dir
+        draft = _make_valid_draft("../data/x", "novel")
+        with pytest.raises(ValueError):
+            agent._save_source(draft)
+        assert not sources_dir.exists()
+
+    def test_save_draft_invalid_id_sanitized(self, tmp_path):
+        """草稿保存用非法 $id → 哈希兜底文件名，绝不逃逸 drafts 目录。"""
+        agent = SourceAgent(llm=MagicMock(), http=MagicMock(), max_attempts=1)
+        drafts_dir = tmp_path / "drafts"
+        agent._drafts_dir = lambda: drafts_dir
+        draft = _make_valid_draft("../data/x", "novel")
+        path = Path(agent._save_draft(draft))
+        assert path.parent == drafts_dir
+        assert path.resolve().parent == drafts_dir.resolve()
+        assert path.name.startswith("draft_")
+        assert path.exists()
+        assert not (tmp_path / "data").exists()
+        assert not (tmp_path / "x.json").exists()
+
+    # ------------------------------------------------------------------ #
+    # 保存失败降级（Critical 4：不让写盘异常逃逸挂死 AgentDialog worker）
+    # ------------------------------------------------------------------ #
+    def test_save_failure_degrades_to_failure_result(self, tmp_path):
+        """Phase 4 源保存抛错（磁盘/权限）→ 降级草稿 + 返回失败结果，不逃逸。"""
+        draft = _make_valid_draft("writable_src", "novel")
+        llm = _FakeLlm([json.dumps(draft, ensure_ascii=False)])
+        http = _FakeHttp("<html><body>test</body></html>")
+        preview = _FakePreview(search_results=[MagicMock(url="/v/1.html", title="Test")])
+
+        agent = SourceAgent(llm=llm, http=http, preview=preview, max_attempts=1)
+        saved_drafts = []
+
+        def _boom(d):
+            raise OSError("disk full")
+
+        agent._save_source = _boom
+        agent._save_draft = lambda d: (saved_drafts.append(d) or str(tmp_path / "draft.json"))
+
+        result = agent.make_source("https://example.com", "novel")
+
+        # 流程完成（未挂起），返回失败结果 + 内存草稿
+        assert result.ok is False
+        assert result.draft is not None
+        assert any("保存失败" in m for m in result.logs)
+        assert saved_drafts, "源保存失败后应降级尝试保存草稿"
+        assert any("草稿" in s for s in result.suggestions)
+
+    def test_draft_save_failure_still_returns_result(self, tmp_path):
+        """Phase 3 草稿保存抛错 → 仍返回失败结果与内存草稿。"""
+        bad_draft = {"$id": "fail_draft_src", "$type": "novel", "$name": "Test",
+                     "transports": {"base_url": "https://example.com"}}
+        llm = _FakeLlm([
+            json.dumps(bad_draft, ensure_ascii=False),
+            json.dumps(bad_draft, ensure_ascii=False),
+        ])
+        http = _FakeHttp("<html><body>test</body></html>")
+        preview = _FakePreview(search_results=[])
+
+        agent = SourceAgent(llm=llm, http=http, preview=preview, max_attempts=2)
+        agent._save_source = lambda d: str(tmp_path / "x.json")
+        agent._save_draft = MagicMock(side_effect=OSError("disk full"))
+
+        result = agent.make_source("https://example.com", "novel")
+
+        assert result.ok is False
+        assert result.attempts == 2
+        assert result.draft is not None
+        assert any("草稿保存失败" in m for m in result.logs)
+
+    # ------------------------------------------------------------------ #
+    # 空搜索结果 = 验证失败（Critical 5）
+    # ------------------------------------------------------------------ #
+    def test_validation_fails_on_empty_search(self, tmp_path):
+        """搜索空结果 → 每轮验证失败并回喂 LLM 修正（修复前空结果不算失败）。"""
+        draft = _make_valid_draft("empty_src", "novel")
+        llm = _FakeLlm([
+            json.dumps(draft, ensure_ascii=False),
+            json.dumps(draft, ensure_ascii=False),
+        ])
+        http = _FakeHttp("<html><body>test</body></html>")
+        preview = _FakePreview(search_results=[])  # 搜索无结果
+
+        agent = SourceAgent(llm=llm, http=http, preview=preview, max_attempts=2)
+        agent._save_source = lambda d: str(tmp_path / "x.json")
+        agent._save_draft = lambda d: str(tmp_path / "drafts/x.json")
+
+        result = agent.make_source("https://example.com", "novel")
+
+        assert result.ok is False
+        assert result.attempts == 2          # 两轮都因空搜索失败
+        assert len(llm._calls) == 2          # 修正调用确实发生（失败回喂 LLM）
+        assert any("搜索" in s for s in result.suggestions)
+
+    def test_validate_searches_once_per_round(self):
+        """每轮验证只调一次 preview_search（结果复用给结果数与详情 URL 校验）。"""
+        draft = _make_valid_draft("once_src", "novel")
+        llm = _FakeLlm([json.dumps(draft, ensure_ascii=False)])
+        http = _FakeHttp("<html><body>test</body></html>")
+        preview = _FakePreview(search_results=[MagicMock(url="/v/1.html", title="Test")])
+
+        agent = SourceAgent(llm=llm, http=http, preview=preview, max_attempts=1)
+        agent._save_source = lambda d: "saved.json"
+        agent._save_draft = lambda d: "draft.json"
+
+        result = agent.make_source("https://example.com", "novel")
+
+        assert result.ok is True
+        assert len(preview._search_calls) == 1  # 一轮只搜一次（修复前同轮搜两次）
+        assert len(preview._detail_calls) == 1
+
 
 # ====================================================================== #
 # AgentResult 测试
