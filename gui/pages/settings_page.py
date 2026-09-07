@@ -495,6 +495,11 @@ class SettingsPage(BasePage):
         self._llama_recent.currentIndexChanged.connect(self._on_recent_model_selected)
         recent_row.addWidget(QLabel("最近使用:"))
         recent_row.addWidget(self._llama_recent, stretch=1)
+        self._llama_recent_del_btn = QPushButton("🗑 删除")
+        self._llama_recent_del_btn.setToolTip("删除选中的最近使用模型记录")
+        self._llama_recent_del_btn.clicked.connect(self._on_recent_model_delete)
+        self._llama_recent_del_btn.setEnabled(False)
+        recent_row.addWidget(self._llama_recent_del_btn)
         model_v.addLayout(recent_row)
         local_form.addRow("模型文件（.gguf）", model_group_box)
 
@@ -566,12 +571,44 @@ class SettingsPage(BasePage):
         if idx < 0:
             return
         data = self._llama_recent.itemData(idx)
+        self._llama_recent_del_btn.setEnabled(
+            isinstance(data, dict) and bool(data.get("model_path"))
+        )
         if not isinstance(data, dict):
             return
         if data.get("model_path"):
             self._llama_model_path.setText(data["model_path"])
         if data.get("server_path"):
             self._llama_server_path.setText(data["server_path"])
+        if data.get("port"):
+            self._llama_port.setValue(int(data["port"]))
+
+    def _on_recent_model_delete(self) -> None:
+        """删除选中的最近使用模型记录（默认项不回填路径时不删除）。"""
+        idx = self._llama_recent.currentIndex()
+        if idx < 0:
+            return
+        data = self._llama_recent.itemData(idx)
+        if not isinstance(data, dict) or not data.get("model_path"):
+            self._llama_recent_del_btn.setEnabled(False)
+            return
+        from framework.llm import LlmKeyStore
+        from PySide6.QtWidgets import QMessageBox
+
+        name = data.get("name") or Path(data.get("model_path", "")).name
+        resp = QMessageBox.question(
+            self,
+            "删除模型记录",
+            f"删除「{name}」的最近使用记录？\n（不清除模型文件本身）",
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        LlmKeyStore().remove_recent(data["model_path"])
+        self._llama_recent.removeItem(idx)
+        self._llama_recent_del_btn.setEnabled(
+            self._llama_recent.currentIndex() >= 0
+            and self._llama_recent.currentData() is not None
+        )
         if data.get("port"):
             self._llama_port.setValue(int(data["port"]))
 
@@ -622,7 +659,7 @@ class SettingsPage(BasePage):
         worker.start()
 
     def _on_test_done(self, worker) -> None:
-        """展示测试逐步结果。"""
+        """展示测试逐步结果；测试通过自动保存云端配置，制源下拉立即可用。"""
         self._llm_test_btn.setEnabled(True)
         result = getattr(worker, "result", {})
         steps = result.get("steps") or []
@@ -631,6 +668,16 @@ class SettingsPage(BasePage):
             mark = "✓" if s.get("ok") else "✗"
             lines.append(f"{mark} {s.get('label')}：{s.get('detail')}")
         self._llm_test_status.setText("\n".join(lines) or "无结果")
+        if result.get("ok"):
+            from framework.llm import LlmKeyStore
+
+            LlmKeyStore().save_cloud(
+                api_key=self._llm_api_key.text().strip(),
+                base_url=self._llm_base_url.text().strip(),
+                model=self._llm_model.text().strip(),
+            )
+            tail = lines[-1] if lines else ""
+            self._llm_test_status.setText("\n".join(lines) + "\n✓ 云端配置已保存到模型列表")
 
     # ------------------------------------------------------------------ #
     # 本地 LLAMA 启动/停止

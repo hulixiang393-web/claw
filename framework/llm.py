@@ -173,6 +173,22 @@ class LlmKeyStore:
         }
         self.save(raw)
 
+    def remove_recent(self, model_path: str | None = None) -> None:
+        """从 recent 历史删除指定 model_path 的条目（空参不操作）。"""
+        if not model_path:
+            return
+        recent = list(self.local().get("recent") or [])
+        kept = [
+            e for e in recent if str(e.get("model_path") or "") != str(model_path)
+        ]
+        if len(kept) == len(recent):
+            return
+        raw = self.load()
+        local = dict(raw.get("local") or {})
+        local["recent"] = kept
+        raw["local"] = local
+        self.save(raw)
+
 
 # ====================================================================== #
 # 提示词模板：用户可编辑（data/llm/source_builder.txt 优先，内置兜底）

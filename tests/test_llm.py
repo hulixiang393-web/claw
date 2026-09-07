@@ -265,6 +265,38 @@ class TestLlmKeyStore:
         assert len(local["recent"]) == 2
         assert local["recent"][0]["model_path"] == "D:/models/qwen.gguf"
 
+    def test_remove_recent_by_model_path(self, tmp_path):
+        """remove_recent 按 model_path 删除，其他条目保留、不影响 cloud。"""
+        path = tmp_path / "llm_keys.json"
+        store = LlmKeyStore(path)
+        store.save_local(
+            base_url="http://127.0.0.1:11434", port=11434,
+            server_path="C:/llm/llama-server.exe",
+            model_path="D:/models/qwen.gguf", model="qwen",
+        )
+        store.save_local(
+            base_url="http://127.0.0.1:11434", port=11434,
+            server_path="C:/llm/llama-server.exe",
+            model_path="D:/models/llama3.gguf", model="llama3",
+        )
+        store.save_cloud(api_key="sk-x", base_url="https://api.deepseek.com", model="deepseek-chat")
+
+        store.remove_recent("D:/models/qwen.gguf")
+        local = store.local()
+        assert len(local["recent"]) == 1
+        assert local["recent"][0]["model_path"] == "D:/models/llama3.gguf"
+
+        # 删除不存在的 model_path → 不改变
+        store.remove_recent("D:/models/nope.gguf")
+        assert len(store.local()["recent"]) == 1
+
+        # 空参数 → 不操作
+        store.remove_recent("")
+        assert len(store.local()["recent"]) == 1
+
+        # cloud 不受影响
+        assert store.cloud()["model"] == "deepseek-chat"
+
     def test_save_local_preserves_cloud(self, tmp_path):
         """save_local 不破坏 cloud 段（Key 隔离）。"""
         p = tmp_path / "keys.json"
