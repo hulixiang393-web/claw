@@ -270,6 +270,7 @@ class EpubView(QWidget):
 
         self.toc_list = QListWidget()
         self.toc_list.setFixedWidth(180)
+        self.toc_list.setWordWrap(True)  # 长标题换行完整显示，不被截断
         self.toc_list.itemClicked.connect(self._on_toc_clicked)
         self.toc_list.setVisible(False)
         body.addWidget(self.toc_list)
