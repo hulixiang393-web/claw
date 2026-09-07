@@ -334,7 +334,7 @@ class SourceAgent:
         user_msg = template.replace("{site_url}", site_url)
         user_msg = user_msg.replace("{content_type}", content_type)
         user_msg = user_msg.replace("{html_sample}", html_sample)
-        user_msg = user_msg.replace("{last_error_section}", hint_text)
+        user_msg = user_msg.replace("{last_error}", hint_text)
         if category:
             user_msg += f"\n\n## 额外信息\n- 可选类别：{category}"
 

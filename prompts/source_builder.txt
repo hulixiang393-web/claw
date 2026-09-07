@@ -9,7 +9,7 @@
 {html_sample}
 ```
 
-{last_error_section}
+{last_error}
 
 ## Schema 要求
 
