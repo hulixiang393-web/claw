@@ -533,6 +533,8 @@ class Content:
                 proxy_pool=source.proxy_pool(),
             )
         else:
+            # URL 路径占位符同样替换（同 episode 分支处理，avgood 类路径 {id} 原样发出会 404）
+            api_url = str(cfg.get("url") or "").replace("{id}", bvid).replace("{bvid}", bvid)
             for k, v in params.items():
                 filled[k] = str(v).replace("{bvid}", bvid).replace("{id}", bvid)
             sign_cfg = cfg.get("sign") or {}
