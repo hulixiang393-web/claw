@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from framework.llm import LlmClient, LlmError, LlmKeyStore, OllamaManager
+from framework.llm import LlmClient, LlmError, LlmKeyStore
 
 
 # ====================================================================== #
@@ -223,63 +223,8 @@ class TestLlmKeyStore:
 
 
 # ====================================================================== #
-# OllamaManager 测试
-# ====================================================================== #
-
-class TestOllamaManager:
-    """OllamaManager 运行探测 / 模型列表 / 启动。"""
-
-    def test_running_true(self):
-        """API 返回 models → running=True。"""
-        fake = _FakeHttpForLlm({"models": [{"name": "qwen"}]})
-        mgr = OllamaManager("http://127.0.0.1:11434")
-        with patch("framework.llm.HttpClient", return_value=fake):
-            assert mgr.running() is True
-
-    def test_running_false_on_error(self):
-        """API 异常 → running=False。"""
-        fake = _FakeHttpForLlm({}, error=ConnectionError("refused"))
-        mgr = OllamaManager()
-        with patch("framework.llm.HttpClient", return_value=fake):
-            assert mgr.running() is False
-
-    def test_models_list(self):
-        """返回模型名列表。"""
-        fake = _FakeHttpForLlm({
-            "models": [{"name": "qwen:latest"}, {"name": "llama3"}]
-        })
-        mgr = OllamaManager()
-        with patch("framework.llm.HttpClient", return_value=fake):
-            assert mgr.models() == ["qwen:latest", "llama3"]
-
-    def test_models_empty_on_error(self):
-        """网络异常 → 返回空列表。"""
-        fake = _FakeHttpForLlm({}, error=RuntimeError("timeout"))
-        mgr = OllamaManager()
-        with patch("framework.llm.HttpClient", return_value=fake):
-            assert mgr.models() == []
-
-    def test_start_already_running(self):
-        """已在运行 → 直接返回 True，不启动。"""
-        mgr = OllamaManager()
-        with patch.object(mgr, "running", return_value=True):
-            assert mgr.start() is True
-
-    def test_start_not_installed(self):
-        """ollama 未安装 → 返回 False。"""
-        mgr = OllamaManager()
-        with patch.object(mgr, "running", side_effect=[False, False]):
-            with patch("framework.llm.subprocess.Popen", side_effect=FileNotFoundError):
-                assert mgr.start() is False
-
-    def test_start_success(self):
-        """启动后探测成功 → 返回 True。"""
-        mgr = OllamaManager()
-        with patch.object(mgr, "running", side_effect=[False, True]):
-            with patch("framework.llm.subprocess.Popen"):
-                with patch("framework.llm.time.sleep"):
-                    assert mgr.start() is True
-
+# OllamaManager 测试见 tests/test_ollama.py
+# ======================================================================
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

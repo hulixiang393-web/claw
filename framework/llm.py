@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -216,7 +217,8 @@ class OllamaManager:
                 timeout=5.0,
                 retries=0,
             )
-            return isinstance(resp, dict) and "models" in resp
+            # 服务连通且返回了 JSON（{} 或含 models）即视为运行中
+            return isinstance(resp, dict)
         except Exception:
             return False
         finally:
@@ -250,6 +252,11 @@ class OllamaManager:
         """
         if self.running():
             return True
+
+        # 找不到 ollama 可执行文件 → 返回 False（调用方提示安装）
+        if shutil.which("ollama") is None:
+            log.info("未找到 ollama 可执行文件")
+            return False
 
         # 尝试启动 ollama serve
         try:
