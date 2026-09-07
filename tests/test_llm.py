@@ -56,6 +56,12 @@ class _FakeHttpForLlm:
             raise self._error
         return self._response
 
+    def get_text(self, url, **kwargs):
+        self._last_url = url
+        if self._error:
+            raise self._error
+        return "<html>hello</html>"
+
     def close(self):
         pass
 
@@ -187,6 +193,51 @@ class TestLlmKeyStore:
         assert local["base_url"] == "http://127.0.0.1:11434"
         assert local["model"] == ""
 
+    def test_save_local_records_recent(self, tmp_path):
+        """save_local 写入 local 段并记录 recent，recent 置顶去重。"""
+        p = tmp_path / "keys.json"
+        store = LlmKeyStore(p)
+        store.save_local(
+            base_url="http://127.0.0.1:11434", port=11434,
+            server_path="C:/llm/llama-server.exe",
+            model_path="D:/models/qwen.gguf", model="qwen",
+        )
+        store.save_local(
+            base_url="http://127.0.0.1:11434", port=11434,
+            server_path="C:/llm/llama-server.exe",
+            model_path="D:/models/llama3.gguf", model="llama3",
+        )
+        local = store.local()
+        assert local["model_path"] == "D:/models/llama3.gguf"
+        # recent 新到置顶
+        assert len(local["recent"]) == 2
+        assert local["recent"][0]["model_path"] == "D:/models/llama3.gguf"
+        # 再次选择旧模型 → 不重复、置顶
+        store.save_local(
+            base_url="http://127.0.0.1:11434", port=11434,
+            server_path="C:/llm/llama-server.exe",
+            model_path="D:/models/qwen.gguf", model="qwen",
+        )
+        local = store.local()
+        assert len(local["recent"]) == 2
+        assert local["recent"][0]["model_path"] == "D:/models/qwen.gguf"
+
+    def test_save_local_preserves_cloud(self, tmp_path):
+        """save_local 不破坏 cloud 段（Key 隔离）。"""
+        p = tmp_path / "keys.json"
+        store = LlmKeyStore(p)
+        store.save({"cloud": {"api_key": "sk-secret", "base_url": "https://x/v1", "model": "gpt"}})
+        store.save_local(server_path="C:/llm/llama-server.exe", model_path="D:/models/q.gguf")
+        assert store.cloud()["api_key"] == "sk-secret"
+
+    def test_save_cloud_preserves_local(self, tmp_path):
+        """save_cloud 不破坏 local 段。"""
+        p = tmp_path / "keys.json"
+        store = LlmKeyStore(p)
+        store.save_local(server_path="C:/llm/llama-server.exe", model_path="D:/models/q.gguf")
+        store.save_cloud(api_key="sk-new", base_url="https://x/v1", model="gpt")
+        assert store.local()["model_path"] == "D:/models/q.gguf"
+
     def test_cloud_and_local_merge(self, tmp_path):
         """cloud()/local() 正确提取各自段。"""
         p = tmp_path / "keys.json"
@@ -223,7 +274,109 @@ class TestLlmKeyStore:
 
 
 # ====================================================================== #
-# OllamaManager 测试见 tests/test_ollama.py
+# LlmClient.test_connection — 探活 + 打招呼
+# ====================================================================== #
+
+def test_connection_success():
+    """探活 + chat 都通过 → ok=True，两步都展示。"""
+    fake = _FakeHttpForLlm({
+        "choices": [{"message": {"content": "你好！"}}]
+    })
+    with patch("framework.llm.HttpClient", return_value=fake):
+        client = LlmClient("http://test.com/v1", api_key="sk-x", model="m")
+        result = client.test_connection()
+    assert result["ok"] is True
+    assert len(result["steps"]) == 2
+    assert result["steps"][0]["ok"] is True
+    assert result["steps"][1]["ok"] is True
+    assert fake._last_url == "http://test.com/v1/chat/completions"
+
+
+def test_connection_network_failure():
+    """探活即失败 → ok=False，reason 为网络问题。"""
+    fake = _FakeHttpForLlm({}, error=ConnectionError("timed out"))
+    with patch("framework.llm.HttpClient", return_value=fake):
+        client = LlmClient("http://test.com/v1", api_key="sk-x", model="m")
+        result = client.test_connection()
+    assert result["ok"] is False
+    assert result["reason"] == "网络连接失败"
+    assert result["steps"][0]["ok"] is False
+    assert "超时" in result["steps"][0]["detail"]
+
+
+def test_connection_chat_api_key_error():
+    """探活通过但 chat 401 → 归类为 API Key 无效。"""
+    fake = _FakeHttpForLlm({})
+    with patch("framework.llm.HttpClient", return_value=fake):
+        client = LlmClient("http://test.com/v1", api_key="sk-bad", model="m")
+        # chat 内部抛 LlmError 需在 chat 调用路径模拟 —— 用 monkeypatch client.chat
+        client.chat = lambda *a, **k: (_ for _ in ()).throw(
+            LlmError("LLM API 错误：Incorrect API key provided (HTTP 401)")
+        )
+        result = client.test_connection()
+    assert result["ok"] is False
+    assert "API Key" in result["reason"]
+
+
+def test_connection_chat_model_not_found():
+    """chat 404 模型不存在 → 归类为模型类型问题。"""
+    fake = _FakeHttpForLlm({})
+    with patch("framework.llm.HttpClient", return_value=fake):
+        client = LlmClient("http://test.com/v1", model="bad-model")
+        client.chat = lambda *a, **k: (_ for _ in ()).throw(
+            LlmError("LLM API 错误：model not found (HTTP 404)")
+        )
+        result = client.test_connection()
+    assert result["ok"] is False
+    assert "模型不存在" in result["reason"]
+
+
+# ====================================================================== #
+# 提示词模板：用户模板优先 + 恢复默认
+# ====================================================================== #
+
+def test_effective_template_builtin_when_no_user(tmp_path, monkeypatch):
+    """无用户模板 → effective_template_path 指向内置。"""
+    import framework.llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "_USER_TEMPLATE", str(tmp_path / "llm" / "source_builder.txt"))
+    monkeypatch.setattr(llm_mod, "_BUILTIN_TEMPLATE", str(tmp_path / "builtin.txt"))
+    (tmp_path / "builtin.txt").write_text("内置提示词", encoding="utf-8")
+    assert llm_mod.effective_template_path() == str(tmp_path / "builtin.txt")
+    assert llm_mod.load_effective_template() == "内置提示词"
+
+
+def test_effective_template_user_overrides(tmp_path, monkeypatch):
+    """用户模板存在 → 生效为用户模板。"""
+    import framework.llm as llm_mod
+
+    user = tmp_path / "llm" / "source_builder.txt"
+    user.parent.mkdir(parents=True)
+    user.write_text("用户定制提示词", encoding="utf-8")
+    monkeypatch.setattr(llm_mod, "_USER_TEMPLATE", str(user))
+    monkeypatch.setattr(llm_mod, "_BUILTIN_TEMPLATE", str(tmp_path / "builtin.txt"))
+    (tmp_path / "builtin.txt").write_text("内置提示词", encoding="utf-8")
+    assert llm_mod.effective_template_path() == str(user)
+    assert llm_mod.load_effective_template() == "用户定制提示词"
+
+
+def test_reset_user_template_deletes(tmp_path, monkeypatch):
+    """reset_user_template 删除用户模板并回退内置。"""
+    import framework.llm as llm_mod
+
+    user = tmp_path / "llm" / "source_builder.txt"
+    user.parent.mkdir(parents=True)
+    user.write_text("xxx", encoding="utf-8")
+    monkeypatch.setattr(llm_mod, "_USER_TEMPLATE", str(user))
+    monkeypatch.setattr(llm_mod, "_BUILTIN_TEMPLATE", str(tmp_path / "builtin.txt"))
+    (tmp_path / "builtin.txt").write_text("内置提示词", encoding="utf-8")
+    text = llm_mod.reset_user_template()
+    assert text == "内置提示词"
+    assert not user.exists()
+
+
+# ====================================================================== #
+# LlamaManager 测试见 tests/test_llama.py
 # ======================================================================
 
 if __name__ == "__main__":

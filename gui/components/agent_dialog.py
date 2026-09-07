@@ -158,7 +158,7 @@ class AgentDialog(QDialog):
         self._load_models()
 
     def _load_models(self) -> None:
-        """加载 LlmKeyStore 中的模型配置。"""
+        """加载 LlmKeyStore 中的模型配置：云端模型 + 本地 LLAMA（.gguf）。"""
         try:
             from framework.llm import LlmKeyStore
             ks = LlmKeyStore()
@@ -168,6 +168,11 @@ class AgentDialog(QDialog):
                 self._model_combo.addItem(cloud["model"])
             if local.get("model"):
                 self._model_combo.addItem(local["model"])
+            recent = local.get("recent") or []
+            for e in recent:
+                name = e.get("name") or Path(e.get("model_path", "")).name
+                if name and self._model_combo.findText(name) < 0:
+                    self._model_combo.addItem(name, e)
         except Exception:  # noqa: BLE001
             pass
 
@@ -189,6 +194,7 @@ class AgentDialog(QDialog):
             local = ks.local()
 
             model_name = self._model_combo.currentText().strip()
+            model_data = self._model_combo.currentData()
             if not model_name:
                 self._status_label.setText("请选择或输入模型名")
                 return
@@ -202,8 +208,15 @@ class AgentDialog(QDialog):
                 )
             elif local.get("model") == model_name:
                 llm = LlmClient(
-                    base_url=local.get("base_url", "http://127.0.0.1:11434"),
-                    model=model_name,
+                    base_url=local.get("base_url") or "http://127.0.0.1:11434",
+                    model=Path(local.get("model_path") or model_name).name,
+                )
+            elif model_data and model_data.get("model_path"):
+                llm = LlmClient(
+                    base_url=model_data.get("base_url")
+                    or local.get("base_url")
+                    or "http://127.0.0.1:11434",
+                    model=Path(model_data["model_path"]).name,
                 )
             else:
                 # 默认用云端

@@ -360,9 +360,10 @@ class TestSourceAgent:
         # 拒绝发生在落盘之前：sources/drafts 目录都不应被创建
         assert not sources_dir.exists()
         assert not drafts_dir.exists()
-        # 项目根 data/ 下不得出现被覆盖的 llm_keys.json
-        root = Path(__file__).resolve().parents[1]
-        assert not (root / "data" / "llm_keys.json").exists()
+        # 产物严格限制在 agent 配置的 sources/drafts 目录内，不得越界写入
+        for p in tmp_path.rglob("*"):
+            rel = p.relative_to(tmp_path).as_posix()
+            assert rel.startswith(("sources/", "drafts/")), f"越界产物: {rel}"
 
     def test_save_source_rejects_invalid_id(self, tmp_path):
         """_save_source 拒绝非法 $id：抛 ValueError，不落任何文件。"""

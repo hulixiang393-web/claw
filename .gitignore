@@ -18,6 +18,9 @@ dist/
 # 截图/临时
 nav_screenshot.png
 
+# 本地 LLAMA 模型文件（大体积，不入库）
+*.gguf
+
 # 系统
 .DS_Store
 Thumbs.db

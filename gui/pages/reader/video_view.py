@@ -679,12 +679,64 @@ class VideoView(QWidget):
 
     # ------------------------------------------------------------------ #
     def _load_ep_cover(self, detail: Detail) -> None:
-        """在侧边栏顶部显示作品封面（仅视频有 cover 时；小说/漫画无此区）。"""
+        """在侧边栏顶部显示作品封面。
+
+        兜底策略（d4107a8 前：无 cover 直接隐藏）：
+        1. 优先 detail.cover（源配置的章节页封面字段）
+        2. 为空 → 取第一集缩略图 ep.cover（部分源只配了分集封面）
+        3. 全空 → 后台 fetch_cover 从详情页重新提取
+        """
         cover = (detail.cover or "").strip()
+        if not cover:
+            cover = self._first_ep_cover(detail)
         if not cover:
             self.cover_label.hide()
             self.cover_label.clear()
+            self._fetch_cover_in_background(detail)
             return
+        self._apply_cover(cover)
+
+    def _first_ep_cover(self, detail: Detail) -> str:
+        """D 章节列表里第一张非空封面。"""
+        for ep in detail.chapters or []:
+            url = (getattr(ep, "cover", "") or "").strip()
+            if url:
+                return url
+        return ""
+
+    def _fetch_cover_in_background(self, detail: Detail) -> None:
+        """detail 与章节均无封面 → 后台请求详情页 API 重新提取一次。"""
+        source = getattr(self, "_source", None)
+        content = getattr(self, "_content", None)
+        if source is None or content is None:
+            return
+        from framework.http import HttpClient
+
+        def _run():
+            try:
+                with HttpClient() as http:
+                    url = content.fetch_cover(source, detail.url)
+            except Exception:  # noqa: BLE001
+                url = ""
+            if not url:
+                return
+
+            def _set(pm):
+                if pm is None or pm.isNull() or self.cover_label.isHidden():
+                    return
+                self.cover_label.show()
+                self.cover_label.setPixmap(pm)
+
+            from gui.components.cover_loader import CoverLoader
+
+            CoverLoader.instance().load(url, _set, cache=True, persist=False)
+
+        from PySide6.QtCore import QThreadPool
+
+        QThreadPool.globalInstance().start(_run)
+
+    def _apply_cover(self, cover: str) -> None:
+        """设置封面图（复用 CoverLoader 异步缓存）。"""
         self.cover_label.show()
 
         def _set(pm):

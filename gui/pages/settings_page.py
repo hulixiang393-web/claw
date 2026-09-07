@@ -13,18 +13,24 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+import logging
+from pathlib import Path
+
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -33,16 +39,35 @@ from PySide6.QtWidgets import (
 
 from .base_page import BasePage
 
+log = logging.getLogger(__name__)
+
 
 class _Section(QWidget):
-    """设置分区：表单布局（label → 控件）。"""
+    """设置分区：可滚动表单布局（label → 控件）。
+
+    内容超高时通过 QScrollArea 出现滚动条，避免元素被压缩堆叠、
+    字体/控件显示不全。
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._form = QFormLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer.addWidget(self._scroll)
+
+        body = QWidget()
+        self._form = QFormLayout(body)
         self._form.setContentsMargins(20, 16, 20, 16)
         self._form.setSpacing(10)
         self._form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._scroll.setWidget(body)
 
     def _row(self, label: str, widget: QWidget, hint: str = "") -> None:
         row = QHBoxLayout()
@@ -354,9 +379,14 @@ class SettingsPage(BasePage):
         self.tabs.addTab(sec, "广告规则")
 
     def _build_llm(self) -> None:
-        """LLM 设置 Tab：云端模型 + 本地 Ollama。"""
-        from PySide6.QtCore import QTimer
-        from PySide6.QtWidgets import QGroupBox, QProgressBar
+        """LLM 设置 Tab：云端模型 + 本地 LLAMA + 提示词模板。
+
+        - 云端：Base URL / API Key / 模型名 + 「测试连接」逐步验证
+        - 本地：llama-server 可执行文件（浏览选择 + PATH 探测）、.gguf 模型
+          （浏览选择 + recent 记忆列表）、端口、后台启动/停止、失败原因
+        - 提示词：制源模板用户可编辑（保存覆盖 data/llm/source_builder.txt）
+        """
+        from PySide6.QtWidgets import QFileDialog, QGroupBox, QSpinBox
 
         sec = _Section()
 
@@ -382,74 +412,289 @@ class SettingsPage(BasePage):
         self._llm_model.setProperty("key", "llm_cloud_model")
         cloud_form.addRow("模型名", self._llm_model)
 
+        cloud_test_row = QHBoxLayout()
+        self._llm_test_btn = QPushButton("🔍 测试连接")
+        self._llm_test_btn.clicked.connect(self._on_test_cloud)
+        cloud_test_row.addWidget(self._llm_test_btn)
+        self._llm_test_status = QLabel("未测试")
+        self._llm_test_status.setStyleSheet("font-size: 11px;")
+        self._llm_test_status.setWordWrap(True)
+        cloud_test_row.addWidget(self._llm_test_status, stretch=1)
+        cloud_test_row.addStretch(0)
+        cloud_form.addRow("连接测试", cloud_test_row)
+
         sec._form.addRow("云端配置", cloud_group)
 
-        # 本地模型组
-        local_group = QGroupBox("本地模型（Ollama）")
+        # 本地模型组（LLAMA = llama.cpp llama-server + .gguf）
+        local_group = QGroupBox("本地模型（LLAMA / llama-server）")
         local_form = QFormLayout(local_group)
         local_form.setContentsMargins(12, 8, 12, 8)
         local_form.setSpacing(6)
 
-        self._llm_ollama_url = QLineEdit()
-        self._llm_ollama_url.setPlaceholderText("http://127.0.0.1:11434")
-        self._llm_ollama_url.setText("http://127.0.0.1:11434")
-        self._llm_ollama_url.setProperty("key", "llm_local_base_url")
-        local_form.addRow("Ollama 地址", self._llm_ollama_url)
+        # llama-server 可执行文件
+        self._llama_server_path = QLineEdit()
+        self._llama_server_path.setPlaceholderText("浏览选择 llama-server.exe（留空自动从 PATH 探测）")
+        server_browse_row = QHBoxLayout()
+        server_browse_row.addWidget(self._llama_server_path, stretch=1)
+        self._llama_server_browse_btn = QPushButton("📁 浏览…")
+        self._llama_server_browse_btn.clicked.connect(
+            lambda: self._browse_file(self._llama_server_path, "llama-server*.exe", "可执行文件 (*.exe)")
+        )
+        server_browse_row.addWidget(self._llama_server_browse_btn)
+        server_holder = QWidget()
+        server_holder.setLayout(server_browse_row)
+        local_form.addRow("llama-server", server_holder)
 
-        self._llm_ollama_model = QComboBox()
-        self._llm_ollama_model.setEditable(True)
-        self._llm_ollama_model.setProperty("key", "llm_local_model")
-        local_form.addRow("模型", self._llm_ollama_model)
+        # 模型（.gguf）文件
+        model_group_box = QWidget()
+        model_v = QVBoxLayout(model_group_box)
+        model_v.setContentsMargins(0, 0, 0, 0)
+        model_v.setSpacing(4)
 
-        ollama_btn_row = QHBoxLayout()
-        self._llm_ollama_start_btn = QPushButton("🤖 启动 Ollama")
-        self._llm_ollama_start_btn.clicked.connect(self._on_ollama_start)
-        ollama_btn_row.addWidget(self._llm_ollama_start_btn)
-        self._llm_ollama_status = QLabel("未知")
-        self._llm_ollama_status.setStyleSheet("font-size: 11px;")
-        ollama_btn_row.addWidget(self._llm_ollama_status)
-        ollama_btn_row.addStretch(1)
-        local_form.addRow("状态", ollama_btn_row)
+        model_path_row = QHBoxLayout()
+        self._llama_model_path = QLineEdit()
+        self._llama_model_path.setPlaceholderText(r"浏览选择 .gguf 模型文件（如 Qwen3-VL-8B….gguf）")
+        model_path_row.addWidget(self._llama_model_path, stretch=1)
+        self._llama_model_browse_btn = QPushButton("📁 浏览…")
+        self._llama_model_browse_btn.clicked.connect(
+            lambda: self._browse_file(self._llama_model_path, "*.gguf", "GGUF 模型 (*.gguf)")
+        )
+        model_path_row.addWidget(self._llama_model_browse_btn)
+        model_v.addLayout(model_path_row)
 
-        refresh_row = QHBoxLayout()
-        self._llm_refresh_models_btn = QPushButton("刷新模型列表")
-        self._llm_refresh_models_btn.clicked.connect(self._on_refresh_models)
-        refresh_row.addWidget(self._llm_refresh_models_btn)
-        refresh_row.addStretch(1)
-        local_form.addRow("模型列表", refresh_row)
+        recent_row = QHBoxLayout()
+        self._llama_recent = QComboBox()
+        self._llama_recent.setEditable(False)
+        self._llama_recent.setPlaceholderText("最近使用…")
+        self._llama_recent.currentIndexChanged.connect(self._on_recent_model_selected)
+        recent_row.addWidget(QLabel("最近使用:"))
+        recent_row.addWidget(self._llama_recent, stretch=1)
+        model_v.addLayout(recent_row)
+        local_form.addRow("模型文件（.gguf）", model_group_box)
+
+        # 端口
+        self._llama_port = QSpinBox()
+        self._llama_port.setRange(1, 65535)
+        self._llama_port.setValue(11434)
+        local_form.addRow("服务端口", self._llama_port)
+
+        # 启动/停止 + 状态
+        llm_btn_row = QHBoxLayout()
+        self._llama_start_btn = QPushButton("🚀 后台启动")
+        self._llama_start_btn.clicked.connect(self._on_llama_start)
+        llm_btn_row.addWidget(self._llama_start_btn)
+        self._llama_stop_btn = QPushButton("⏹ 停止")
+        self._llama_stop_btn.setEnabled(False)
+        self._llama_stop_btn.clicked.connect(self._on_llama_stop)
+        llm_btn_row.addWidget(self._llama_stop_btn)
+        llm_btn_row.addWidget(QLabel("状态:"))
+        self._llama_status = QLabel("未知")
+        self._llama_status.setStyleSheet("font-size: 11px;")
+        self._llama_status.setWordWrap(True)
+        llm_btn_row.addWidget(self._llama_status, stretch=1)
+        llm_btn_row.addStretch(0)
+        local_form.addRow("运行控制", llm_btn_row)
 
         sec._form.addRow("本地配置", local_group)
 
+        # 提示词模板编辑（制源 prompt，用户可自定义输出控制）
+        prompt_group = QGroupBox("制源提示词模板（可编辑，影响 AI 制源输出）")
+        prompt_v = QVBoxLayout(prompt_group)
+        prompt_v.setContentsMargins(12, 8, 12, 8)
+        self._llm_prompt_edit = QPlainTextEdit()
+        self._llm_prompt_edit.setPlaceholderText(
+            "提示词模板，占位符：{site_url} {content_type} {html_sample} {last_error}"
+        )
+        self._llm_prompt_edit.setFixedHeight(160)
+        prompt_v.addWidget(self._llm_prompt_edit)
+        prompt_btn_row = QHBoxLayout()
+        self._llm_prompt_save_btn = QPushButton("💾 保存模板")
+        self._llm_prompt_save_btn.clicked.connect(self._on_save_prompt)
+        prompt_btn_row.addWidget(self._llm_prompt_save_btn)
+        self._llm_prompt_reset_btn = QPushButton("↩️ 恢复默认")
+        self._llm_prompt_reset_btn.clicked.connect(self._on_reset_prompt)
+        prompt_btn_row.addWidget(self._llm_prompt_reset_btn)
+        prompt_btn_row.addStretch(1)
+        prompt_v.addLayout(prompt_btn_row)
+        self._llm_prompt_hint = QLabel("")
+        self._llm_prompt_hint.setStyleSheet("font-size: 11px; color: palette(mid);")
+        prompt_v.addWidget(self._llm_prompt_hint)
+        sec._form.addRow("提示词", prompt_group)
+
         self.tabs.addTab(sec, "LLM")
 
-    def _on_ollama_start(self) -> None:
-        """启动 Ollama 并刷新状态。"""
-        from framework.llm import OllamaManager
-        url = self._llm_ollama_url.text().strip() or "http://127.0.0.1:11434"
-        self._llm_ollama_status.setText("启动中...")
-        self._llm_ollama_start_btn.setEnabled(False)
+    # ------------------------------------------------------------------ #
+    # 小工具
+    # ------------------------------------------------------------------ #
+    def _browse_file(self, line_edit, pattern, caption):
+        """浏览选择文件到 QLineEdit。"""
+        from PySide6.QtWidgets import QFileDialog
 
-        mgr = OllamaManager(url)
-        ok = mgr.start()
+        start = Path(line_edit.text()).parent if line_edit.text() else str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(self, caption, start, pattern)
+        if path:
+            line_edit.setText(path)
+
+    def _on_recent_model_selected(self, idx: int) -> None:
+        """选择「最近使用」里的模型 → 回填模型路径与端口。"""
+        if idx < 0:
+            return
+        data = self._llama_recent.itemData(idx)
+        if not isinstance(data, dict):
+            return
+        if data.get("model_path"):
+            self._llama_model_path.setText(data["model_path"])
+        if data.get("server_path"):
+            self._llama_server_path.setText(data["server_path"])
+        if data.get("port"):
+            self._llama_port.setValue(int(data["port"]))
+
+    def _refresh_recent_combo(self) -> None:
+        """从 LlmKeyStore 刷新「最近使用」下拉。"""
+        from PySide6.QtCore import QSignalBlocker
+
+        try:
+            from framework.llm import LlmKeyStore
+
+            recent = LlmKeyStore().local().get("recent") or []
+        except Exception:  # noqa: BLE001
+            recent = []
+        blocker = QSignalBlocker(self._llama_recent)
+        self._llama_recent.clear()
+        for e in recent:
+            name = e.get("name") or Path(e.get("model_path", "")).name or "模型"
+            self._llama_recent.addItem(name, e)
+
+    # ------------------------------------------------------------------ #
+    # 云端测试连接
+    # ------------------------------------------------------------------ #
+    def _on_test_cloud(self) -> None:
+        """测试云端连接：后台 QThread 跑探活 + 打招呼，避免卡 UI。"""
+        from PySide6.QtCore import QSignalBlocker, QThread
+        from PySide6.QtWidgets import QMessageBox
+
+        from framework.llm import LlmClient
+
+        base_url = self._llm_base_url.text().strip()
+        if not base_url:
+            self._llm_test_status.setText("请先填写 Base URL")
+            return
+        api_key = self._llm_api_key.text().strip()
+        model = self._llm_model.text().strip()
+
+        self._llm_test_btn.setEnabled(False)
+        self._llm_test_status.setText("测试中…")
+
+        class _TestWorker(QThread):
+            def run(self):
+                client = LlmClient(base_url, api_key=api_key, model=model)
+                self.result = client.test_connection()
+
+        worker = _TestWorker(self)
+        worker.finished.connect(lambda: self._on_test_done(worker))
+        self._llm_test_worker = worker
+        worker.start()
+
+    def _on_test_done(self, worker) -> None:
+        """展示测试逐步结果。"""
+        self._llm_test_btn.setEnabled(True)
+        result = getattr(worker, "result", {})
+        steps = result.get("steps") or []
+        lines = []
+        for s in steps:
+            mark = "✓" if s.get("ok") else "✗"
+            lines.append(f"{mark} {s.get('label')}：{s.get('detail')}")
+        self._llm_test_status.setText("\n".join(lines) or "无结果")
+
+    # ------------------------------------------------------------------ #
+    # 本地 LLAMA 启动/停止
+    # ------------------------------------------------------------------ #
+    def _on_llama_start(self) -> None:
+        """后台启动 llama-server（非阻塞；失败原因展示在状态行）。"""
+        from framework.llm import LlamaManager, LlmKeyStore
+
+        server_path = self._llama_server_path.text().strip()
+        model_path = self._llama_model_path.text().strip()
+        port = self._llama_port.value()
+        base_url = f"http://127.0.0.1:{port}"
+
+        mgr = LlamaManager(base_url=base_url, server_path=server_path, model_path=model_path)
+        self._llama_mgr = mgr
+        self._llama_start_btn.setEnabled(False)
+        self._llama_status.setText("启动中…")
+
+        class _StartWorker(QThread):
+            def run(self):
+                self.ok, self.reason = mgr.start(wait_seconds=25)
+
+        worker = _StartWorker(self)
+        worker.finished.connect(lambda: self._on_llama_start_done(worker))
+        # start 内部有 wait 循环，放后台线程执行，UI 不卡
+        self._llama_start_worker = worker
+        worker.start()
+
+    def _on_llama_start_done(self, worker) -> None:
+        """llama-server 启动结果。"""
+        self._llama_start_btn.setEnabled(True)
+        ok, reason = worker.ok, worker.reason
+        # 无论成败都记录本次选择到 recent
+        try:
+            from framework.llm import LlmKeyStore
+
+            port = self._llama_port.value()
+            LlmKeyStore().save_local(
+                base_url=f"http://127.0.0.1:{port}",
+                port=port,
+                server_path=self._llama_server_path.text().strip(),
+                model_path=self._llama_model_path.text().strip(),
+                model=Path(self._llama_model_path.text()).name if self._llama_model_path.text() else "",
+            )
+            self._refresh_recent_combo()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("记录 LLAMA 配置失败：%s", exc)
+
         if ok:
-            self._llm_ollama_status.setText("运行中 ✓")
-            self._on_refresh_models()
+            self._llama_status.setText(f"运行中（{reason}）")
+            self._llama_stop_btn.setEnabled(self._llama_mgr.is_managed())
         else:
-            self._llm_ollama_status.setText("启动失败（未安装？）")
-        self._llm_ollama_start_btn.setEnabled(True)
+            self._llama_status.setText(f"启动失败：{reason}")
+        # 清除超时/错误的托管引用（is_managed False 时 stop 按钮态）
+        if self._llama_mgr is not None and not self._llama_mgr.is_managed():
+            self._llama_stop_btn.setEnabled(False)
 
-    def _on_refresh_models(self) -> None:
-        """获取 Ollama 模型列表。"""
-        from framework.llm import OllamaManager
-        url = self._llm_ollama_url.text().strip() or "http://127.0.0.1:11434"
-        mgr = OllamaManager(url)
-        models = mgr.models()
-        self._llm_ollama_model.clear()
-        if models:
-            self._llm_ollama_model.addItems(models)
-            self._llm_ollama_status.setText(f"运行中（{len(models)} 模型）")
-        else:
-            self._llm_ollama_status.setText("未获取到模型列表")
+    def _on_llama_stop(self) -> None:
+        """停止托管 llama-server。"""
+        if self._llama_mgr is not None:
+            self._llama_mgr.stop()
+        self._llama_status.setText("已停止")
+        self._llama_stop_btn.setEnabled(False)
+
+    def _on_save_prompt(self) -> None:
+        """保存用户提示词模板。"""
+        from framework.llm import save_user_template
+
+        try:
+            path = save_user_template(self._llm_prompt_edit.toPlainText())
+            self._llm_prompt_hint.setText(f"已保存（将优先于内置模板使用）：{path}")
+        except OSError as exc:
+            self._llm_prompt_hint.setText(f"保存失败：{exc}")
+
+    def _on_reset_prompt(self) -> None:
+        """恢复内置提示词模板。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        from framework.llm import reset_user_template
+
+        resp = QMessageBox.question(
+            self, "恢复默认",
+            "将删除用户定制的提示词模板并回退到内置模板，确定？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        text = reset_user_template()
+        self._llm_prompt_edit.setPlainText(text)
+        self._llm_prompt_hint.setText("已恢复内置模板")
 
     # ------------------------------------------------------------------ #
     # 载入 / 保存
@@ -494,16 +739,29 @@ class SettingsPage(BasePage):
 
         # LLM 设置（来自 LlmKeyStore，不存 app_config.json 的 Key）
         try:
-            from framework.llm import LlmKeyStore
+            from framework.llm import (
+                LlmKeyStore,
+                effective_template_path,
+                load_effective_template,
+            )
+
             ks = LlmKeyStore()
             cloud = ks.cloud()
             local = ks.local()
             self._llm_api_key.setText(cloud.get("api_key", ""))
             self._llm_base_url.setText(cloud.get("base_url", ""))
             self._llm_model.setText(cloud.get("model", ""))
-            self._llm_ollama_url.setText(local.get("base_url", "http://127.0.0.1:11434"))
-            if local.get("model"):
-                self._llm_ollama_model.setCurrentText(local["model"])
+            self._llama_server_path.setText(local.get("server_path", ""))
+            self._llama_model_path.setText(local.get("model_path", ""))
+            self._llama_port.setValue(int(local.get("port") or 11434))
+            self._refresh_recent_combo()
+            self._llm_prompt_edit.setPlainText(load_effective_template())
+            is_user = (
+                effective_template_path()
+                .replace("\\", "/")
+                .endswith("llm/source_builder.txt")
+            )
+            self._llm_prompt_hint.setText("（用户定制模板）" if is_user else "（内置模板）")
         except Exception:  # noqa: BLE001
             pass
 
@@ -547,16 +805,27 @@ class SettingsPage(BasePage):
         # LLM 设置 → 写入 LlmKeyStore（data/llm_keys.json，不碰 app_config.json）
         try:
             from framework.llm import LlmKeyStore
+
             ks = LlmKeyStore()
-            existing = ks.load()
-            cloud = existing.get("cloud") or {}
+            cloud = ks.cloud()
             cloud["api_key"] = self._llm_api_key.text().strip()
             cloud["base_url"] = self._llm_base_url.text().strip()
             cloud["model"] = self._llm_model.text().strip()
-            local = existing.get("local") or {}
-            local["base_url"] = self._llm_ollama_url.text().strip() or "http://127.0.0.1:11434"
-            local["model"] = self._llm_ollama_model.currentText().strip()
-            ks.save({"cloud": cloud, "local": local})
+            ks.save_cloud(
+                api_key=self._llm_api_key.text().strip(),
+                base_url=self._llm_base_url.text().strip(),
+                model=self._llm_model.text().strip(),
+            )
+            port = self._llama_port.value()
+            server_path = self._llama_server_path.text().strip()
+            model_path = self._llama_model_path.text().strip()
+            ks.save_local(
+                base_url=f"http://127.0.0.1:{port}",
+                port=port,
+                server_path=server_path,
+                model_path=model_path,
+                model=Path(model_path).name if model_path else "",
+            )
         except Exception:  # noqa: BLE001
             pass
 

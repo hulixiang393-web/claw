@@ -343,7 +343,16 @@ class SourceAgent:
     ) -> dict | None:
         """读取提示词模板，调用 LLM 生成源配置 JSON。"""
         try:
-            template = Path(self._template_path).read_text(encoding="utf-8")
+            # 模板优先用户定制（data/llm/source_builder.txt），否则内置；
+            # 兼容测试传入的临时 template_path（存在则优先于内置读取）。
+            from .llm import load_effective_template, effective_template_path
+
+            if self._template_path and self._template_path != _DEFAULT_TEMPLATE \
+                    and os.path.exists(self._template_path):
+                template = Path(self._template_path).read_text(encoding="utf-8")
+            else:
+                _ = effective_template_path()
+                template = load_effective_template()
         except OSError as exc:
             log_fn(f"[Phase 2] 提示词模板读取失败：{exc}")
             return None
