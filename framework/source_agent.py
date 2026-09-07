@@ -342,7 +342,7 @@ class SourceAgent:
             response = self._llm.chat(
                 system="你是专业的爬虫配置工程师。根据提供的网站 HTML 片段，生成符合项目 Schema 的源配置 JSON。",
                 user=user_msg,
-                json_mode=False,
+                json_mode=True,
                 timeout=120.0,
             )
         except LlmError as exc:
