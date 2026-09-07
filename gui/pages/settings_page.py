@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -149,6 +150,7 @@ class SettingsPage(BasePage):
         self._build_library()
         self._build_diag()
         self._build_adblock()
+        self._build_llm()
         layout.addWidget(self.tabs, stretch=1)
 
         # 底部按钮
@@ -351,6 +353,104 @@ class SettingsPage(BasePage):
         self._ad_dir = sec._line("额外规则目录", "extra_rule_dir", "追加/覆盖内置规则")
         self.tabs.addTab(sec, "广告规则")
 
+    def _build_llm(self) -> None:
+        """LLM 设置 Tab：云端模型 + 本地 Ollama。"""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QGroupBox, QProgressBar
+
+        sec = _Section()
+
+        # 云端模型组
+        cloud_group = QGroupBox("云端模型（OpenAI 兼容）")
+        cloud_form = QFormLayout(cloud_group)
+        cloud_form.setContentsMargins(12, 8, 12, 8)
+        cloud_form.setSpacing(6)
+
+        self._llm_api_key = QLineEdit()
+        self._llm_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._llm_api_key.setPlaceholderText("sk-...")
+        self._llm_api_key.setProperty("key", "llm_cloud_api_key")
+        cloud_form.addRow("API Key", self._llm_api_key)
+
+        self._llm_base_url = QLineEdit()
+        self._llm_base_url.setPlaceholderText("https://api.openai.com/v1")
+        self._llm_base_url.setProperty("key", "llm_cloud_base_url")
+        cloud_form.addRow("Base URL", self._llm_base_url)
+
+        self._llm_model = QLineEdit()
+        self._llm_model.setPlaceholderText("gpt-4 / qwen-plus / ...")
+        self._llm_model.setProperty("key", "llm_cloud_model")
+        cloud_form.addRow("模型名", self._llm_model)
+
+        sec._form.addRow("云端配置", cloud_group)
+
+        # 本地模型组
+        local_group = QGroupBox("本地模型（Ollama）")
+        local_form = QFormLayout(local_group)
+        local_form.setContentsMargins(12, 8, 12, 8)
+        local_form.setSpacing(6)
+
+        self._llm_ollama_url = QLineEdit()
+        self._llm_ollama_url.setPlaceholderText("http://127.0.0.1:11434")
+        self._llm_ollama_url.setText("http://127.0.0.1:11434")
+        self._llm_ollama_url.setProperty("key", "llm_local_base_url")
+        local_form.addRow("Ollama 地址", self._llm_ollama_url)
+
+        self._llm_ollama_model = QComboBox()
+        self._llm_ollama_model.setEditable(True)
+        self._llm_ollama_model.setProperty("key", "llm_local_model")
+        local_form.addRow("模型", self._llm_ollama_model)
+
+        ollama_btn_row = QHBoxLayout()
+        self._llm_ollama_start_btn = QPushButton("🤖 启动 Ollama")
+        self._llm_ollama_start_btn.clicked.connect(self._on_ollama_start)
+        ollama_btn_row.addWidget(self._llm_ollama_start_btn)
+        self._llm_ollama_status = QLabel("未知")
+        self._llm_ollama_status.setStyleSheet("font-size: 11px;")
+        ollama_btn_row.addWidget(self._llm_ollama_status)
+        ollama_btn_row.addStretch(1)
+        local_form.addRow("状态", ollama_btn_row)
+
+        refresh_row = QHBoxLayout()
+        self._llm_refresh_models_btn = QPushButton("刷新模型列表")
+        self._llm_refresh_models_btn.clicked.connect(self._on_refresh_models)
+        refresh_row.addWidget(self._llm_refresh_models_btn)
+        refresh_row.addStretch(1)
+        local_form.addRow("模型列表", refresh_row)
+
+        sec._form.addRow("本地配置", local_group)
+
+        self.tabs.addTab(sec, "LLM")
+
+    def _on_ollama_start(self) -> None:
+        """启动 Ollama 并刷新状态。"""
+        from framework.llm import OllamaManager
+        url = self._llm_ollama_url.text().strip() or "http://127.0.0.1:11434"
+        self._llm_ollama_status.setText("启动中...")
+        self._llm_ollama_start_btn.setEnabled(False)
+
+        mgr = OllamaManager(url)
+        ok = mgr.start()
+        if ok:
+            self._llm_ollama_status.setText("运行中 ✓")
+            self._on_refresh_models()
+        else:
+            self._llm_ollama_status.setText("启动失败（未安装？）")
+        self._llm_ollama_start_btn.setEnabled(True)
+
+    def _on_refresh_models(self) -> None:
+        """获取 Ollama 模型列表。"""
+        from framework.llm import OllamaManager
+        url = self._llm_ollama_url.text().strip() or "http://127.0.0.1:11434"
+        mgr = OllamaManager(url)
+        models = mgr.models()
+        self._llm_ollama_model.clear()
+        if models:
+            self._llm_ollama_model.addItems(models)
+            self._llm_ollama_status.setText(f"运行中（{len(models)} 模型）")
+        else:
+            self._llm_ollama_status.setText("未获取到模型列表")
+
     # ------------------------------------------------------------------ #
     # 载入 / 保存
     # ------------------------------------------------------------------ #
@@ -392,6 +492,21 @@ class SettingsPage(BasePage):
 
         self._ad_dir.setText(g("adblock", "extra_rule_dir", ""))
 
+        # LLM 设置（来自 LlmKeyStore，不存 app_config.json 的 Key）
+        try:
+            from framework.llm import LlmKeyStore
+            ks = LlmKeyStore()
+            cloud = ks.cloud()
+            local = ks.local()
+            self._llm_api_key.setText(cloud.get("api_key", ""))
+            self._llm_base_url.setText(cloud.get("base_url", ""))
+            self._llm_model.setText(cloud.get("model", ""))
+            self._llm_ollama_url.setText(local.get("base_url", "http://127.0.0.1:11434"))
+            if local.get("model"):
+                self._llm_ollama_model.setCurrentText(local["model"])
+        except Exception:  # noqa: BLE001
+            pass
+
     def _on_apply(self) -> None:
         """把所有控件值写回 settings 并保存。"""
         s = self._sm
@@ -428,6 +543,22 @@ class SettingsPage(BasePage):
         s.set("sources_runtime", "selfcheck_strategy", self._diag_strategy.currentText())
 
         s.set("adblock", "extra_rule_dir", self._ad_dir.text().strip())
+
+        # LLM 设置 → 写入 LlmKeyStore（data/llm_keys.json，不碰 app_config.json）
+        try:
+            from framework.llm import LlmKeyStore
+            ks = LlmKeyStore()
+            existing = ks.load()
+            cloud = existing.get("cloud") or {}
+            cloud["api_key"] = self._llm_api_key.text().strip()
+            cloud["base_url"] = self._llm_base_url.text().strip()
+            cloud["model"] = self._llm_model.text().strip()
+            local = existing.get("local") or {}
+            local["base_url"] = self._llm_ollama_url.text().strip() or "http://127.0.0.1:11434"
+            local["model"] = self._llm_ollama_model.currentText().strip()
+            ks.save({"cloud": cloud, "local": local})
+        except Exception:  # noqa: BLE001
+            pass
 
         s.save()
         self.settings_applied.emit()
