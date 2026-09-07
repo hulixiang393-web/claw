@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import datetime
 import json
+import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QThread
@@ -24,7 +26,11 @@ from PySide6.QtWidgets import (
 
 
 class _AgentWorker(QThread):
-    """后台运行 SourceAgent，发射日志和完成信号。"""
+    """后台运行 SourceAgent，发射日志和完成信号。
+
+    日志同时写盘（logs/agent-YYYYMMDD.log），制源失败后可从文件复查——
+    UI 实时日志在对话框关闭即丢失，不落盘无据可查。
+    """
 
     log_signal = Signal(str)
     finished_signal = Signal(object)  # AgentResult
@@ -35,6 +41,46 @@ class _AgentWorker(QThread):
         self._site_url = site_url
         self._content_type = content_type
         self._category = category
+        self._log_file = None
+
+    def _open_log(self):
+        # 日志目录沿用项目约定 logs/
+        log_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "logs",
+        )
+        os.makedirs(log_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = "agent-%s-%s.log" % (stamp, self._content_type)
+        self._log_file = open(
+            os.path.join(log_dir, name), "a", encoding="utf-8", errors="replace"
+        )
+        self._log_file.write(
+            "# [%s] 制源 session site=%s type=%s category=%s\n"
+            % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+               self._site_url, self._content_type, self._category or "-")
+        )
+        self._log_file.flush()
+
+    def _write_log(self, msg: str):
+        if self._log_file is None:
+            self._open_log()
+        try:
+            self._log_file.write(
+                "[%s] %s\n"
+                % (datetime.datetime.now().strftime("%H:%M:%S"), msg)
+            )
+            self._log_file.flush()
+        except OSError:
+            pass
+
+    def _close_log(self):
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
 
     def run(self):
         from framework.source_agent import AgentResult
@@ -44,7 +90,7 @@ class _AgentWorker(QThread):
                 self._site_url,
                 self._content_type,
                 self._category,
-                on_log=lambda msg: self.log_signal.emit(msg),
+                on_log=lambda msg: (self._write_log(msg), self.log_signal.emit(msg)),
             )
         except Exception as exc:  # noqa: BLE001 —— 兜底：任何异常都必须发完成信号，
             # 否则对话框卡在「制源中…」，且 _agent._http.close()（_on_finished）
@@ -54,6 +100,8 @@ class _AgentWorker(QThread):
                 logs=[f"[Exception] 制源异常：{exc}"],
                 suggestions=[f"制源过程出现未预期异常，请重试或检查网络：{exc}"],
             )
+        self._write_log("=== 制源结束 ok=%s ===" % result.ok)
+        self._close_log()
         self.finished_signal.emit(result)
 
 
