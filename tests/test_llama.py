@@ -225,8 +225,70 @@ class TestLlamaStop:
     """stop() 托管进程终止。"""
 
     def test_stop_none(self):
+        """无托管进程且未探测到运行中的 llama-server → stop 返回 False。"""
         mgr = LlamaManager()
-        assert mgr.stop() is False
+        with patch.object(mgr, "running", return_value=False):
+            assert mgr.stop() is False
+
+    def test_stop_stops_unmanaged_running_process(self):
+        """未托管但端口有 llama-server 在运行 → 找到 PID 并终止，返回 True。"""
+        mgr = LlamaManager()
+        with patch.object(mgr, "running", side_effect=[True, False]):  # 先响应后释放
+            with patch.object(mgr, "_find_llama_pid", return_value=9999):
+                with patch.object(mgr, "_kill_pid", return_value=True) as kill:
+                    assert mgr.stop() is True
+        kill.assert_called_once_with(9999)
+
+    def test_stop_stops_unmanaged_but_kill_fails(self):
+        """非托管进程：kill 失败/端口未释放 → stop 返回 False。"""
+        mgr = LlamaManager()
+        with patch.object(mgr, "running", return_value=True):
+            with patch.object(mgr, "_find_llama_pid", return_value=9999):
+                with patch.object(mgr, "_kill_pid", return_value=False):
+                    assert mgr.stop() is False
+
+    def test_stop_stops_unmanaged_but_pid_not_found(self):
+        """非托管进程在运行，但找不到 PID → 无法停止，返回 False。"""
+        mgr = LlamaManager()
+        with patch.object(mgr, "running", return_value=True):
+            with patch.object(mgr, "_find_llama_pid", return_value=0):
+                assert mgr.stop() is False
+
+    def test_find_llama_pid(self):
+        """netstat 存在监听端口 → 返回 PID；进程名不匹配 → 返回 0。"""
+        netstat_out = (
+            "  TCP    127.0.0.1:11434    0.0.0.0:0    LISTENING    9476\n"
+            "  TCP    127.0.0.1:11435    0.0.0.0:0    LISTENING    7777\n"
+        )
+
+        class _R:
+            stdout = netstat_out
+
+        class _T:
+            stdout = '"llama-server.exe","9476","Console","1","80,000 K"\n'
+
+        with patch(
+            "framework.llm.subprocess.run",
+            side_effect=[_R(), _T()],
+        ):
+            mgr = LlamaManager(base_url="http://127.0.0.1:11434")
+            assert mgr._find_llama_pid() == 9476
+
+        # 进程名非 llama-server（如 ollama 占端口）→ 返回 0 不误杀
+        with patch(
+            "framework.llm.subprocess.run",
+            side_effect=[_R(), _T2 := type("_O", (), {"stdout": '"ollama","9476","Console","1","90,000 K"\n'})()],
+        ):
+            mgr = LlamaManager(base_url="http://127.0.0.1:11434")
+            assert mgr._find_llama_pid() == 0
+
+    def test_kill_pid_confirms_port_released(self):
+        """kill 后轮询端口释放 → 返回 True。"""
+        mgr = LlamaManager()
+        with patch("framework.llm.subprocess.run") as run:
+            run.side_effect = [MagicMock(), MagicMock(), MagicMock()]  # taskkill + 轮询
+            with patch.object(mgr, "running", side_effect=[True, True, False]):
+                assert mgr._kill_pid(9) is True
 
     def test_stop_running_proc(self):
         mgr = LlamaManager()

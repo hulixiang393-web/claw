@@ -643,30 +643,115 @@ class LlamaManager:
 
     # ------------------------------------------------------------------ #
     def stop(self) -> bool:
-        """停止托管进程并等待退出。未托管 → 直接返回 False。"""
+        """停止 llama-server 并等待退出。
+
+        优先终止托管进程；若未托管（如之前由外部/旧版启动），但 base_url
+        端口上正运行 llama-server，则按端口定位 PID 并终止，保证设置页
+        「停止」对任何运行中的 llama-server 都真的停止，而不是误报「已关闭」。
+        未找到任何进程 → 返回 False。
+        """
         proc = self._proc
-        if proc is None:
-            return False
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5.0)
-            except Exception:  # noqa: BLE001
+        if proc is not None:
+            if proc.poll() is None:
                 try:
-                    proc.kill()
+                    proc.terminate()
+                    proc.wait(timeout=5.0)
                 except Exception:  # noqa: BLE001
-                    pass
-        # 关 stderr 管道 → 后台读取线程在 readline 返回空时退出
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+            # 关 stderr 管道 → 后台读取线程在 readline 返回空时退出
+            try:
+                if proc.stderr is not None:
+                    proc.stderr.close()
+            except Exception:  # noqa: BLE001
+                pass
+            reader = getattr(self, "_reader_thread", None)
+            if reader is not None and reader.is_alive():
+                reader.join(timeout=1.0)
+            self._proc = None
+            return True
+
+        # 未托管：端口上若有正在运行的 llama-server → 找到并终止它
+        if self.running(timeout=2.0):
+            pid = self._find_llama_pid()
+            if pid:
+                return self._kill_pid(pid)
+        return False
+
+    # ------------------------------------------------------------------ #
+    def _find_llama_pid(self) -> int:
+        """定位监听 base_url 端口、且进程名匹配 llama-server 的 PID。
+
+        跨平台实现：Windows 用 netstat 查监听端口的 PID，再用 tasklist
+        校验进程名是否为 llama-server（避免误杀 ollama/其它占用同一端口的
+        进程）；非 Windows 用 lsof。找不到/无法确认 → 返回 0。
+        """
         try:
-            if proc.stderr is not None:
-                proc.stderr.close()
+            port = _port_from_url(self._base)
+        except ValueError:
+            port = 11434
+        pid = 0
+        try:
+            if os.name == "nt":
+                out = subprocess.run(
+                    ["netstat", "-ano", "-p", "tcp"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout
+                for line in out.splitlines():
+                    parts = line.split()
+                    # 形如 "TCP  127.0.0.1:11434  0.0.0.0:0  LISTENING  9476"
+                    if len(parts) >= 5 and parts[0] == "TCP" \
+                            and f":{port}" in parts[1] and "LISTENING" in line:
+                        try:
+                            pid = int(parts[-1])
+                            break
+                        except ValueError:
+                            continue
+                if pid:
+                    info = subprocess.run(
+                        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                        capture_output=True, text=True, timeout=10,
+                    ).stdout
+                    if "llama-server" not in info.lower():
+                        pid = 0  # 非 llama-server，不碰
+            else:
+                out = subprocess.run(
+                    ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout
+                for line in out.strip().splitlines():
+                    try:
+                        if int(line.strip()) > 0:
+                            pid = int(line.strip())
+                            break
+                    except ValueError:
+                        continue
+        except (OSError, subprocess.SubprocessError):  # noqa: BLE001
+            pid = 0
+        return pid
+
+    # ------------------------------------------------------------------ #
+    def _kill_pid(self, pid: int) -> bool:
+        """按 PID 终止进程，并等待端口释放确认真正停止。成功返回 True。"""
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F"],
+                    capture_output=True, timeout=10,
+                )
+            else:
+                import signal
+                os.kill(pid, signal.SIGTERM)
         except Exception:  # noqa: BLE001
-            pass
-        reader = getattr(self, "_reader_thread", None)
-        if reader is not None and reader.is_alive():
-            reader.join(timeout=1.0)
-        self._proc = None
-        return True
+            return False
+        for _ in range(10):
+            if not self.running(timeout=1.0):
+                return True  # 端口已释放，确认停止
+            import time as _t
+            _t.sleep(0.5)
+        return False  # 端口仍响应，视为停止失败
 
     # ------------------------------------------------------------------ #
     def is_managed(self) -> bool:

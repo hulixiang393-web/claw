@@ -333,16 +333,42 @@ class SettingsPage(BasePage):
                 store.flush_checked()  # 立即落盘（持久化清除状态，重启不复活）
             except Exception:  # noqa: BLE001
                 pass
+
             if pool == "shelf":
-                self._ui_shelf_usage.setText(f"0.00 GB（书架）")
+                self._ui_shelf_usage.setText("0.00 GB（书架）")
             else:
-                self._ui_search_usage.setText(f"0.00 GB（搜索&发现）")
+                self._ui_search_usage.setText("0.00 GB（搜索&发现）")
             QMessageBox.information(
                 self, "清除缓存",
                 f"已清除{label}缓存（释放约 {before / (1024 ** 3):.2f} GB）",
             )
         else:
             QMessageBox.information(self, "清除缓存", f"{label}缓存未初始化")
+
+    # 探测设置页加载时端口上是否已有 llama-server 在运行（含外部/旧版
+    # 启动）：有则启用「停止」按钮，让用户能真正停止它。
+    def _refresh_llama_status(self) -> None:
+        from framework.llm import LlamaManager
+
+        port = self._llama_port.value()
+        mgr = LlamaManager(base_url=f"http://127.0.0.1:{port}")
+
+        class _ProbeWorker(QThread):
+            def run(self):
+                self.up = mgr.running(timeout=3.0)
+
+        def _done(worker):
+            if worker.up:
+                self._llama_status.setText("本地模型：运行中")
+                self._llama_stop_btn.setEnabled(True)
+            else:
+                self._llama_status.setText("本地模型：未运行")
+                self._llama_stop_btn.setEnabled(False)
+
+        worker = _ProbeWorker(self)
+        worker.finished.connect(lambda: _done(worker))
+        self._llama_probe_worker = worker
+        worker.start()
 
     def _on_source_select(self) -> None:
         """点「源选择 / 重新下载源」→ 由 App 层打开同一个引导对话框。"""
@@ -663,11 +689,39 @@ class SettingsPage(BasePage):
             self._llama_stop_btn.setEnabled(False)
 
     def _on_llama_stop(self) -> None:
-        """停止托管 llama-server。"""
-        if self._llama_mgr is not None:
-            self._llama_mgr.stop()
-        self._llama_status.setText("已停止")
+        """停止 llama-server（含非托管的外部进程），后台执行不卡 UI。"""
+        from framework.llm import LlamaManager
+
+        # 未构建过 manager 时，按当前表单配置构建一个（用于定位端口进程）
+        if self._llama_mgr is None:
+            port = self._llama_port.value()
+            self._llama_mgr = LlamaManager(
+                base_url=f"http://127.0.0.1:{port}",
+                server_path=self._llama_server_path.text().strip(),
+                model_path=self._llama_model_path.text().strip(),
+            )
+        mgr = self._llama_mgr
         self._llama_stop_btn.setEnabled(False)
+        self._llama_status.setText("停止中…")
+
+        class _StopWorker(QThread):
+            def run(self):
+                self.stopped = mgr.stop()
+
+        worker = _StopWorker(self)
+        worker.finished.connect(lambda: self._on_llama_stop_done(worker))
+        self._llama_stop_worker = worker
+        worker.start()
+
+    def _on_llama_stop_done(self, worker) -> None:
+        """llama-server 停止结果：只有确认停止成功才显示「已关闭」。"""
+        stopped = worker.stopped
+        if stopped:
+            self._llama_status.setText("已关闭")
+        else:
+            self._llama_status.setText("停止失败：未找到正在运行的 llama-server")
+        self._llama_stop_btn.setEnabled(False)
+        self._llama_start_btn.setEnabled(True)
 
     def _on_save_prompt(self) -> None:
         """保存用户提示词模板。"""
@@ -764,6 +818,9 @@ class SettingsPage(BasePage):
             self._llm_prompt_hint.setText("（用户定制模板）" if is_user else "（内置模板）")
         except Exception:  # noqa: BLE001
             pass
+
+        # 设置页加载后探测端口 llama-server 运行状态，同步「停止」按钮可用性
+        self._refresh_llama_status()
 
     def _on_apply(self) -> None:
         """把所有控件值写回 settings 并保存。"""
