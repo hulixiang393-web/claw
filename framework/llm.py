@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -457,6 +458,8 @@ class LlamaManager:
         self._server_path = server_path.strip()
         self._model_path = model_path.strip()
         self._proc: subprocess.Popen | None = None
+        self._stderr_lock = threading.Lock()
+        self._stderr_buf: list[str] = []
 
     @property
     def base_url(self) -> str:
@@ -550,32 +553,76 @@ class LlamaManager:
         except OSError as exc:
             return False, f"启动失败（无法执行）：{exc}"
 
-        stderr_tail: list[str] = []
+        # stderr 必须丢到后台线程消化 — readline() 是阻塞读，
+        # 若在主循环里逐行读，llama-server 加载模型期间 stderr 无新行，
+        # readline() 永久阻塞 → 永远探测不到端口就绪 → 「启动中」卡死。
+        self._stderr_buf.clear()
+        self._stop_reader = threading.Event()
+        self._reader_thread = threading.Thread(
+            target=self._read_stderr_loop, daemon=True, name="llama-stderr"
+        )
+        self._reader_thread.start()
+
         start_t = time.time()
-        # 非阻塞轮询：启动期间每 0.3s 采一次 stderr 尾部，探测端口就绪
+        # 非阻塞轮询：启动期间探测端口就绪；若进程提前退出则报 stderr 尾部
         while time.time() - start_t < wait_seconds:
-            self._drain_stderr(stderr_tail)
             if self.running(timeout=1.0):
-                self._drain_stderr(stderr_tail)
                 return True, "启动成功"
             if self._proc.poll() is not None:
                 # 进程提前退出 → 用 stderr 定位失败原因
-                self._drain_stderr(stderr_tail)
-                tail = "\n".join(stderr_tail[-8:]) or "(无输出，进程即退出)"
+                tail = self._stderr_tail(-8) or "(无输出，进程即退出)"
                 return False, f"启动失败：{tail}"
             time.sleep(0.3)
 
-        self._drain_stderr(stderr_tail)
-        tail = "\n".join(stderr_tail[-8:]) or ""
+        tail = self._stderr_tail(-8) or ""
         return False, f"启动超时（{int(wait_seconds)}s 未响应探活）{('：' + tail) if tail else ''}"
+
+    # ------------------------------------------------------------------ #
+    def _read_stderr_loop(self) -> None:
+        """后台线程持续收集 llama-server stderr（阻塞读但不在主循环）。"""
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                line = proc.stderr.readline()
+                if not line:
+                    break
+                line = line.rstrip("\n")
+                if line:
+                    with self._stderr_lock:
+                        self._stderr_buf.append(line)
+                        if len(self._stderr_buf) > 200:
+                            del self._stderr_buf[:-200]
+        except Exception:  # noqa: BLE001 —— 管道被关等情形直接退出线程
+            pass
+
+    def _stderr_tail(self, n: int = -8) -> str:
+        """非阻塞读取 stderr 缓冲区尾部；进程已退出时先耗尽残留。"""
+        proc = self._proc
+        if proc is not None and proc.stderr is not None and proc.poll() is not None:
+            # 进程已退出：尽力把残余读进来（readline 在 EOF 时立即返回）
+            try:
+                while True:
+                    line = proc.stderr.readline()
+                    if not line:
+                        break
+                    line = line.rstrip("\n")
+                    if line:
+                        with self._stderr_lock:
+                            self._stderr_buf.append(line)
+            except Exception:  # noqa: BLE001
+                pass
+        with self._stderr_lock:
+            buf = list(self._stderr_buf)
+        return "\n".join(buf[n:])
 
     # ------------------------------------------------------------------ #
     def stop(self) -> bool:
         """停止托管进程并等待退出。未托管 → 直接返回 False。"""
-        if self._proc is None:
-            return False
         proc = self._proc
-        self._proc = None
+        if proc is None:
+            return False
         if proc.poll() is None:
             try:
                 proc.terminate()
@@ -585,29 +632,22 @@ class LlamaManager:
                     proc.kill()
                 except Exception:  # noqa: BLE001
                     pass
+        # 关 stderr 管道 → 后台读取线程在 readline 返回空时退出
+        try:
+            if proc.stderr is not None:
+                proc.stderr.close()
+        except Exception:  # noqa: BLE001
+            pass
+        reader = getattr(self, "_reader_thread", None)
+        if reader is not None and reader.is_alive():
+            reader.join(timeout=1.0)
+        self._proc = None
         return True
 
     # ------------------------------------------------------------------ #
     def is_managed(self) -> bool:
         """当前 LlamaManager 是否托管了一个仍在运行的进程。"""
         return self._proc is not None and self._proc.poll() is None
-
-    # ------------------------------------------------------------------ #
-    def _drain_stderr(self, buf: list[str]) -> None:
-        """把 stderr 当前可读内容追加到 buf（非阻塞，行粒度）。"""
-        if self._proc is None or self._proc.stderr is None:
-            return
-        try:
-            while True:
-                line = self._proc.stderr.readline()
-                if line:
-                    line = line.rstrip("\n")
-                    if line:
-                        buf.append(line)
-                else:
-                    break
-        except Exception:  # noqa: BLE001 —— 管道被关等情形直接忽略
-            pass
 
 
 def _port_from_url(url: str) -> int:

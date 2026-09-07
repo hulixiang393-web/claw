@@ -189,6 +189,36 @@ class TestLlamaStart:
         assert ok is False
         assert "无法执行" in reason
 
+    def test_start_stderr_silent_does_not_block(self):
+        """回归：进程存活但 stderr 静默（模型加载阶段）→ 不阻塞，窗口内正常超时。
+
+        修复前 start() 在 _drain_stderr 的 readline() 上永久阻塞，
+        永远到不了 running() 探测与超时检查 → UI「启动中」卡死。
+        """
+        import threading
+        import io
+
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None  # 进程存活
+        # stderr 是一个有内容但已耗尽 EOF 的流（模拟安静加载期）
+        fake_proc.stderr = io.StringIO("")
+        mgr = self._mgr(server="C:/llm/llama-server.exe", model=r"D:\models\qwen.gguf")
+        result = {}
+
+        def _run():
+            with patch.object(mgr, "running", return_value=False):
+                with patch("framework.llm.os.path.isfile", return_value=True):
+                    with patch("framework.llm.subprocess.Popen", return_value=fake_proc):
+                        with patch("framework.llm.time.sleep"):
+                            result["ok"], result["reason"] = mgr.start(wait_seconds=1)
+
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join(timeout=6.0)  # start 应远早于 6s 返回
+        assert not t.is_alive(), "start() 永久阻塞！stderr 静默不应卡死"
+        assert result["ok"] is False
+        assert "超时" in result["reason"]
+
 
 class TestLlamaStop:
     """stop() 托管进程终止。"""
