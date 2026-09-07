@@ -75,6 +75,52 @@ class _SwitchSourceTask(QRunnable):
                 pass
 
 
+class _CrossSourceSignals(QObject):
+    """跨源换源后台任务信号。"""
+    # (new_detail, chapters, content_type, selected, clamped_ep)
+    # clamped_ep：视频保留的当前集序号（0 基，已钳制到新源分集范围），其余类型 -1
+    done = Signal(object, object, object, object, object)
+    error = Signal(str)
+
+
+class _CrossSourceTask(QRunnable):
+    """后台跨源换源：调 cross_source.switch_to_source 抓新源详情+目录。"""
+
+    def __init__(self, content, source, detail, content_type, current_ep_no, target):
+        super().__init__()
+        self.signals = _CrossSourceSignals()
+        self._content = content
+        self._source = source
+        self._detail = detail
+        self._content_type = content_type
+        self._current_ep_no = current_ep_no
+        self._target = target
+
+    def run(self) -> None:
+        try:
+            from framework import cross_source
+
+            new_detail, chapters = cross_source.switch_to_source(
+                self._content, self._source, self._detail,
+                self._content_type, self._current_ep_no, self._target,
+            )
+            # 视频保留当前集序号（0 基，钳制到新源分集范围）；其余类型从第 0 章加载
+            clamped_ep = -1
+            if self._content_type == "video":
+                clamped_ep = cross_source.clamp_episode_no(self._current_ep_no, chapters)
+            try:
+                self.signals.done.emit(
+                    new_detail, chapters, self._content_type, self._target, clamped_ep
+                )
+            except RuntimeError:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.signals.error.emit(str(exc))
+            except RuntimeError:
+                pass
+
+
 class ReaderPage(BasePage):
     # 收藏/取消收藏 → App 层写书架收藏库（ui-reader.md #2 通用外壳「收藏」）
     favorite_requested = Signal(object)
@@ -167,6 +213,10 @@ class ReaderPage(BasePage):
 
         # ---- 换源：VideoView 切源 → 重载分集 ----
         self.video_view.source_changed.connect(self._on_source_changed)
+        # ---- 跨源换源：三视图入口信号 → 调度（A4 才加信号，此处防御连接）----
+        for _v in (self.novel_view, self.comic_view, self.video_view):
+            if hasattr(_v, "cross_source_chosen"):
+                getattr(_v, "cross_source_chosen").connect(self._on_cross_source_triggered)
         # ---- 播放器内下载：转发 App 层下载链路（与顶部「下载」一致）----
         self.video_view.download_requested.connect(self.download_requested)
 
@@ -249,6 +299,137 @@ class ReaderPage(BasePage):
     def _on_source_switch_failed(self, err: str) -> None:
         self.video_view.play_label.setText(f"换源失败：{err}")
         self.video_view.set_source_sid(self.video_view._current_sid)
+
+    # ------------------------------------------------------------------ #
+    def _on_cross_source_triggered(self, payload) -> None:
+        """跨源换源调度：搜索其他同类型源候选 → 弹对话框 → 后台切源。
+
+        payload 为触发视图的当前 detail（视频/漫画/小说入口统一签名）。
+        全程当前源失效场景，用 self._current_* 状态 + 当前集序号决定续读位置。
+        """
+        from PySide6.QtWidgets import QMessageBox
+
+        if self._content is None:
+            return
+        if isinstance(payload, dict):
+            detail = payload.get("detail")
+            content_type = payload.get("content_type") or self._current_content_type
+        else:
+            detail = payload
+            content_type = self._current_content_type
+        if detail is None:
+            detail = self._resolve_current_detail()
+        if detail is None:
+            return
+        content_type = content_type or detail.content_type or self._current_content_type
+        if not content_type:
+            return
+
+        # 当前视图集/章序号：视频保留当前集（0 基），漫画/小说从第 0 章加载
+        current_index = self._current_reader_index()
+
+        # 搜索候选（内部并发，UI 线程可）→ 弹对话框（阻塞）
+        try:
+            from framework import cross_source
+            from gui.components.cross_source_dialog import CrossSourceDialog
+
+            candidates = cross_source.find_cross_source(
+                self._manager, self._content, detail, content_type,
+                concurrent=4, top_n=10,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cross-source] 候选搜索失败: %s", exc)
+            QMessageBox.warning(self, "跨源换源", f"搜索候选源失败：{exc}")
+            return
+
+        dialog = CrossSourceDialog(candidates, self)
+        if dialog.exec() != CrossSourceDialog.Accepted:
+            return
+        selected = dialog.selected
+        if selected is None:
+            return
+
+        # 后台切源（网络请求，不阻塞 UI）
+        try:
+            new_source = self._manager.get(selected.source_id)
+        except Exception:
+            new_source = selected.source_id
+        if new_source is None:
+            QMessageBox.warning(self, "跨源换源", f"目标源不存在：{selected.source_id}")
+            return
+        task = _CrossSourceTask(
+            self._content, new_source, detail, content_type, current_index, selected
+        )
+        task.signals.done.connect(self._on_cross_source_switched)
+        task.signals.error.connect(self._on_cross_source_failed)
+        self._cross_task = task  # 持有引用，防止被 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _resolve_current_detail(self) -> object:
+        """兜底取当前视图的 detail（入口 payload 未带 detail 时）。"""
+        for view in (self.video_view, self.comic_view, self.novel_view):
+            d = getattr(view, "_detail", None)
+            if d is not None:
+                return d
+        return None
+
+    def _current_reader_index(self) -> int:
+        """当前视图集/章序号：视频用 current_episode_no()（0 基），其余 0。"""
+        if self._current_content_type == "video":
+            fn = getattr(self.video_view, "current_episode_no", None)
+            if callable(fn):
+                try:
+                    return int(fn() or 0)
+                except Exception:  # noqa: BLE001
+                    return 0
+        return 0
+
+    def _on_cross_source_switched(self, new_detail, chapters, content_type, selected, clamped_ep=-1) -> None:
+        """跨源换源成功：按目标类型转调对应视图 load（切到新源续读）。
+
+        clamped_ep：视频保留的当前集序号（0 基），-1 表示从第 0 集加载。
+        """
+        if new_detail is None:
+            return
+        try:
+            new_source = self._manager.get(selected.source_id)
+        except Exception:
+            new_source = None
+        if new_source is None:
+            new_source = getattr(self, "_current_source", None)
+        # 记录换源后的当前源状态（后续收藏/进度/再次换源用新源地址）
+        self._current_source = new_source
+        self._current_source_id = selected.source_id
+        self._current_book_url = getattr(new_detail, "url", "") or self._current_book_url
+        self.title_label.setText(getattr(new_detail, "title", "") or self.title_label.text())
+        self.source_label.setText(getattr(new_source, "source_name", "") or selected.source_id)
+        self.refresh_favorite_state()
+
+        if content_type == "novel":
+            self.stack.setCurrentWidget(self.novel_view)
+            self.novel_view.load(new_source, new_detail, "")
+        elif content_type == "comic":
+            self.stack.setCurrentWidget(self.comic_view)
+            self.comic_view.load(new_source, new_detail, "")
+        else:
+            # 视频保留当前集序号（0 基）：换源后仍从新源对应集开始
+            start_ep_url = ""
+            if 0 <= clamped_ep < len(chapters or []):
+                start_ep_url = getattr(chapters[clamped_ep], "url", "") or ""
+            self.stack.setCurrentWidget(self.video_view)
+            self.video_view.load(new_source, new_detail, start_ep_url)
+
+    def _on_cross_source_failed(self, err: str) -> None:
+        """跨源换源失败提示。"""
+        view = self.stack.currentWidget()
+        label = getattr(view, "play_label", getattr(view, "mode_label", None))
+        if label is not None and hasattr(label, "setText"):
+            label.setText(f"跨源换源失败：{err}")
+        else:
+            from PySide6.QtWidgets import QMessageBox
+
+            QMessageBox.warning(self, "跨源换源", f"换源失败：{err}")
+
 
     def _on_progress_signal(self, payload) -> None:
         """记录阅读进度（换章/换集/滚动/翻页/播放触发）。
