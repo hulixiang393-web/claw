@@ -35,7 +35,6 @@ class NovelView(QWidget):
     position_changed = Signal(object)  # (detail, title, url, position, page) 章内位置续读
     fullscreen_requested = Signal()  # 工具条 ⛶ → ReaderPage 切主窗全屏
     background_cycle_requested = Signal()  # 「背景」按钮 → ReaderPage 循环切换护眼背景色
-    cross_source_chosen = Signal(object)  # (当前 detail) → ReaderPage 跨源换源调度
 
     def __init__(self, content: Content, font_scale: float = 1.0, parent=None):
         super().__init__(parent)
@@ -81,12 +80,6 @@ class NovelView(QWidget):
         self.mode_btn.setFixedWidth(90)
         self.mode_btn.clicked.connect(self._toggle_mode)
         toolbar.addWidget(self.mode_btn)
-
-        self.source_btn = QPushButton("⇄ 换源")
-        self.source_btn.setToolTip("跨源换源：当前源失效时去其他同类型源切换")
-        self.source_btn.clicked.connect(self._emit_cross_source)
-        self.source_btn.setVisible(False)  # 默认隐藏，load(detail) 后有内容才显示
-        toolbar.addWidget(self.source_btn)
 
         self.bg_btn = QPushButton("背景")
         self.bg_btn.setFixedWidth(50)
@@ -214,7 +207,6 @@ class NovelView(QWidget):
         self._source = source
         self._detail = detail
         self._chapters = detail.chapters
-        self.source_btn.setVisible(True)  # 有 detail（可换源）才显示入口
         self._prev_prefetch_queue = []  # 换书清空向前缓存队列（旧队列指向旧书章节）
         self._prev_prefetch_idx = -2
         self._populate_toc()
@@ -347,11 +339,6 @@ class NovelView(QWidget):
     def _on_toc_clicked(self, item) -> None:
         idx = item.data(Qt.UserRole)
         self._load_chapter(idx)
-
-    def _emit_cross_source(self) -> None:
-        """⇄ 换源按钮：把当前 detail 交给 ReaderPage 调度跨源换源。"""
-        if self._detail is not None:
-            self.cross_source_chosen.emit(self._detail)
 
     def _jump_relative(self, delta: int) -> None:
         nxt = self._current_idx + delta

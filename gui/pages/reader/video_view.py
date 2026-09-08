@@ -134,7 +134,6 @@ class VideoView(QWidget):
     position_changed = Signal(object)  # (detail, 标题, URL, 播放进度 0~1, None) 续读
     source_changed = Signal(object)  # (detail, new_sid) → ReaderPage 换源
     download_requested = Signal(object)  # (source_id, detail.url, content_type) → 下载当前作品
-    cross_source_chosen = Signal(object)  # (当前 detail) → ReaderPage 跨源换源调度
 
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
@@ -515,10 +514,9 @@ class VideoView(QWidget):
         self._refresh_ep_menu()
 
     def _refresh_source_menu(self) -> None:
-        """重建播放源菜单：站内多线路（⇄）+ 跨源换源（始终可见，不依赖多线路）。
+        """重建播放源菜单：站内多线路（⇄）。
 
-        「⇄ 跨源换源」项 → cross_source_chosen.emit(当前 detail)，由
-        ReaderPage 去其他同类型源搜索并调度切换。按钮在有作品时显示。
+        按钮在有作品时显示。
         """
         self.source_menu.clear()
         self._source_actions = []
@@ -531,15 +529,10 @@ class VideoView(QWidget):
             act.triggered.connect(
                 lambda _=False, _i=i: self._select_source(_i))
             self._source_actions.append(act)
-        self.source_menu.addSeparator()
-        self.cs_action = self.source_menu.addAction("⇄ 跨源换源")
-        self.cs_action.triggered.connect(
-            lambda: self.cross_source_chosen.emit(self._detail))
-        self._source_actions.append(self.cs_action)  # 持引用防 GC
         self.source_menu.menuAction().setVisible(True)
         self.source_btn.setVisible(self._detail is not None)
         self.source_btn.setToolTip(
-            "切换播放源（含跨站换源）" if self._detail is not None else "")
+            "切换播放源" if self._detail is not None else "")
 
     def _select_source(self, idx: int) -> None:
         """播放器内换源：同步顶部下拉框触发换源流程。"""

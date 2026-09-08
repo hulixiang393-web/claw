@@ -226,74 +226,15 @@ def main():
     assert rec["position"] == 0.0, rec  # 滚动模式：位置为 0~1 比例，page 为 None
     print("  [ok] 续读记忆：重新打开恢复第二章 + position_changed 落盘")
 
-    # ---- 跨源换源调度：reader_page 弹选择器 → switch_to_source 切到第二源 ----
-    import time
-    import framework.cross_source as _cs
-    import gui.components.cross_source_dialog as _csd
-    from framework.cross_source import CrossSourceCandidate
-
-    SRC_B = {
-        "$schema_version": 2, "$id": "src-b", "$type": "novel", "$name": "备用站",
-        "transports": {"base_url": "http://b.com"},
-        "endpoints": {
-            "detail": {"fields": {"title": {"css": "h1"}}},
-            "content": {"chapter": {"list": {
-                "root_selector": {"css": ".catalog li a"},
-                "fields": {"title": {"css": "a"}, "url": {"css": "a", "attr": "href"}},
-            }, "body": {"selector": {"css": "#chaptercontent p"}}}},
-        },
-    }
-    src_b_cfg = SourceConfig.from_dict(SRC_B)
-    mgr.add(src_b_cfg)
-
-    b_candidate = CrossSourceCandidate(
-        source_id="src-b", source_name="备用站", title="测试小说",
-        url="http://b.com/book/1", cover="", similarity=0.95,
-        content_type="novel", sid="src-b",
-    )
-
-    class _StubDialog:
-        Accepted = 1
-
-        def __init__(self, *a, **k):
-            self.selected = b_candidate
-
-        def exec(self):
-            return 1
-
-    _csd.CrossSourceDialog = _StubDialog
-    _cs.find_cross_source = (
-        lambda manager, content, detail, content_type, concurrent=4, top_n=10: [b_candidate]
-    )
-
-    reader._on_cross_source_triggered(reader.novel_view._detail)
-    deadline = time.time() + 10
-    while time.time() < deadline and reader._current_source_id != "src-b":
-        app.processEvents()
-        time.sleep(0.05)
-    assert reader._current_source_id == "src-b", reader._current_source_id
-    assert reader.novel_view._detail.source_id == "src-b", \
-        reader.novel_view._detail.source_id
-    assert reader.novel_view._current_idx == 0, "换源后应从第 0 章加载"
-    reader.show()  # 需要窗口可见，按钮 isVisible() 才为真
-    app.processEvents()
-    assert reader.novel_view.source_btn.isVisible(), "换源后 ⇄ 换源按钮应可见"
-    print("  [ok] 跨源换源调度：reader_page → 候选选择 → switch_to_source → 切到 src-b")
-
-    # ---- 三视图跨源换源入口 + 列表长标题换行修复 ----
+    # ---- 三视图功能 + 列表长标题换行修复 ----
     from PySide6.QtCore import QSize
     from gui.pages.reader.video_view import VideoView
     from gui.pages.reader.epub_view import EpubView
 
-    assert hasattr(reader.video_view, "cross_source_chosen")
-    assert hasattr(reader.comic_view, "cross_source_chosen")
-    assert hasattr(reader.novel_view, "cross_source_chosen")
-
-    # 漫画：⇄ 换源按钮默认隐藏 → load(detail) 后显示，点击发出当前 detail
+    # 漫画：目录列表长标题换行
     comic4 = ComicView(content)
     comic4.resize(600, 800)
     comic4.show()
-    assert not comic4.source_btn.isVisible(), "漫画换源按钮默认应隐藏"
     comic_detail = Detail(
         source_id="demo", content_type="comic", url="http://example.com/c/1",
         title="测试漫画",
@@ -302,29 +243,18 @@ def main():
     )
     comic4.load(src_cfg, comic_detail, "")
     app.processEvents()
-    assert comic4.source_btn.isVisible(), "load(detail) 后漫画换源按钮应显示"
     assert comic4.toc_list.wordWrap(), "漫画目录列表应长标题换行"
-    got_cs = []
-    comic4.cross_source_chosen.connect(got_cs.append)
-    comic4.source_btn.click()
-    assert got_cs and got_cs[0] is comic_detail, got_cs
-    print("  [ok] 漫画：⇄ 换源按钮 隐藏→显示＋点击发当前 detail＋目录换行")
+    print("  [ok] 漫画：目录换行")
 
-    # 小说：同规则，校验长标题换行与信号 payload
+    # 小说：目录列表长标题换行
     nv4 = NovelView(content)
     nv4.resize(600, 800)
     nv4.show()
-    assert not nv4.source_btn.isVisible()
     nv4.load(object(), long_detail, "")
-    assert nv4.source_btn.isVisible(), "load(detail) 后小说换源按钮应显示"
     assert nv4.toc_list.wordWrap(), "小说目录列表应长标题换行"
-    got_n = []
-    nv4.cross_source_chosen.connect(got_n.append)
-    nv4.source_btn.click()
-    assert got_n and got_n[0] is long_detail, got_n
-    print("  [ok] 小说：⇄ 换源按钮 隐藏→显示＋点击发当前 detail＋目录换行")
+    print("  [ok] 小说：目录换行")
 
-    # 视频：ep_list 图标 76×50 + 长标题换行；current_episode_no() 0 基；「⇄ 跨源换源」菜单项
+    # 视频：ep_list 图标 76×50 + 长标题换行；current_episode_no() 0 基；站内换源菜单按钮
     vd = Detail(
         source_id="demo", content_type="video", url="http://example.com/v/1",
         title="测试动画",
@@ -345,22 +275,14 @@ def main():
     assert video4.current_episode_no() == 1
     video4._current_idx = 99
     assert video4.current_episode_no() == 0, "越界应回退 0"
-    video4._current_idx = 1
-    video4._refresh_source_menu()
-    texts = [a.text() for a in video4.source_menu.actions()]
-    assert any("跨源换源" in t for t in texts), texts
-    got_v = []
-    video4.cross_source_chosen.connect(got_v.append)
-    video4.cs_action.trigger()
-    assert got_v and got_v[0] is vd, got_v
-    print("  [ok] 视频：⇄ 换源按钮＋菜单「⇄ 跨源换源」＋ep_list 76×50 换行＋current_episode_no()")
+    print("  [ok] 视频：⇄ 换源按钮＋ep_list 76×50 换行＋current_episode_no()")
 
     # epub：目录列表长标题换行（构造签名 font_scale, parent）
     ev4 = EpubView()
     assert ev4.toc_list.wordWrap(), "epub 目录列表应长标题换行"
     print("  [ok] epub：目录列表长标题换行")
 
-    print("\n=== 阅读器离屏测试通过（含跨源换源调度 + 三视图入口 + 列表换行） ===")
+    print("\n=== 阅读器离屏测试通过（三视图＋列表换行＋续读记忆） ===")
 
 
 if __name__ == "__main__":
