@@ -7,10 +7,14 @@
 - **17k 下载不完全**：根因 = 站点强反爬，短时间约 16 次请求后返回 **HTTP 405 封禁**（持续约 90s），后续章节全失败。修：① `framework/download_queue.add_task` 支持源级 `constraints.max_concurrency` 上限；② qk17 设 `max_concurrency:1` + `interval_ms:2000`；③ `ANTI_SCRAPE_STATUSES` 加 405（→ 触发代理池换 IP）。测试 `tests/test_download_source_concurrency.py`（4）。
 - **quanben 封面**：源站已无封面数据（详情封面 `www.quanben.com` 现为停放/封锁页 503，当前域名无图）。按用户选择做**文字占位封面**：`gui/components/work_card.py` 新增 `_make_text_cover()`（标题首字 + 散列主题色渐变），无封面/加载失败时启用（`_apply_placeholder`/`resizeEvent`）。测试 `tests/test_work_card_placeholder.py`（4）。
 - **h-comic 发现页慢**：根因 = `wait_until:networkidle` 每页约 28s，3 页串行约 90s 像「打不开」。改 `domcontentloaded`（配 `wait_for`）→ 约 14s/页。测试：引擎实测 10 部/页。
+- **阅读器自动滚动晃动**：根因 = 漫画懒加载图片由占位高（600px）变实际高，视口上方内容高度变化使可视内容上下位移。修 `comic_view._relayout_gallery`：新增 `_visible_anchor()`，以视口顶部所在图为锚，重排后补偿滚动值（贴底仍跟底）。测试 `tests/test_comic_scroll_anchor.py`（2）。
+- 顺带修 `gui/_smoke_reader.py` 的 `MockHttp.get_text` 签名（缺 `direct`，既有失效）。
+### 提交状态
+- 已 commit + push 到 origin/master（`9113ce1`，含此前 57 个未推送提交）。全量 `--ignore flaky` **552 passed**。
 ### 待办（@followup）
 - 17k 需用户填 `data/proxies.json` 代理池才可绕过 405 封禁；未填则仅串行降速。
 - 用户反馈 h-comic「一页12卡片、1万多页」待确认是否仍有具体问题（引擎/分页实测正常）。
-- 未 commit（等用户确认）。
+
 
 ## 爱丽丝书屋封面不加载修复（2026-09-13，未提交）
 ### 根因（实测证据）
