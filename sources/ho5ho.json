@@ -1,0 +1,243 @@
+{
+  "$schema_version": 2,
+  "$id": "ho5ho",
+  "$type": "comic",
+  "$name": "HO5HO（全彩成人漫畫）",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.ho5ho.com",
+    "description": "HO5HO - 繁體中文全彩成人漫畫（WordPress + Madara 主題）",
+    "lang": "zh-TW",
+    "region": "tw",
+    "tags": [
+      "漫画",
+      "成人",
+      "彩色"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.ho5ho.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-TW,zh;q=0.9",
+      "Referer": "https://www.ho5ho.com/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/page/1/",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "page_placeholder": "(?<=page/)\\d+(?=/$)"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "最新漫畫",
+            "url": "/page/1/"
+          },
+          {
+            "title": "無碼",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E7%84%A1%E7%A2%BC/page/1/"
+          },
+          {
+            "title": "中字",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E4%B8%AD%E5%AD%97h%E6%BC%AB/page/1/"
+          },
+          {
+            "title": "劇情",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E5%8A%87%E6%83%85/page/1/"
+          },
+          {
+            "title": "短篇",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E7%9F%AD%E7%AF%87/page/1/"
+          },
+          {
+            "title": "長篇",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E9%95%B7%E7%AF%87/page/1/"
+          },
+          {
+            "title": "純愛",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E7%B4%94%E6%84%9B/page/1/"
+          },
+          {
+            "title": "女學生",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E5%A5%B3%E5%AD%B8%E7%94%9F/page/1/"
+          },
+          {
+            "title": "人妻",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E4%BA%BA%E5%A6%BB/page/1/"
+          },
+          {
+            "title": "制服",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E5%88%B6%E6%9C%8D/page/1/"
+          },
+          {
+            "title": "口交",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E5%8F%A3%E4%BA%A4/page/1/"
+          },
+          {
+            "title": "內射",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E5%85%A7%E5%B0%84/page/1/"
+          },
+          {
+            "title": "阿黑顏",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E9%98%BF%E9%BB%91%E9%A1%8F/page/1/"
+          },
+          {
+            "title": "爆乳",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E7%88%86%E4%B9%B3/page/1/"
+          },
+          {
+            "title": "母豬",
+            "url": "/h%E6%BC%AB%E6%A8%99%E7%B1%A4/%E6%AF%8D%E8%B1%AC/page/1/"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "article.ho5ho-v2-card"
+        },
+        "fields": {
+          "title": {
+            "css": "h3.ho5ho-v2-card-title a"
+          },
+          "url": {
+            "css": "a.ho5ho-v2-card-cover",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.ho5ho-v2-card-image",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/",
+      "method": "GET",
+      "keyword_param": "s",
+      "item": {
+        "root_selector": {
+          "css": "article.ho5ho-v2-card"
+        },
+        "fields": {
+          "title": {
+            "css": "h3.ho5ho-v2-card-title a"
+          },
+          "url": {
+            "css": "a.ho5ho-v2-card-cover",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.ho5ho-v2-card-image",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "css": "h1",
+          "fallback": [
+            {
+              "css": "h1"
+            },
+            {
+              "css": "meta[property='og:title']",
+              "attr": "content"
+            }
+          ]
+        },
+        "cover": {
+          "css": "img.attachment-medium.size-medium.skip-lazy",
+          "attr": "src",
+          "url_replace": [
+            "(.+)-\\d+x\\d+\\.x32686\\.jpg",
+            "{1}.jpg"
+          ]
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "tags": {
+          "css": "a[href*='h漫分類'], a[href*='h漫標籤']"
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": {
+            "css": "a.ho5ho-v3-read-button"
+          },
+          "fields": {
+            "title": {
+              "css": "span.ho5ho-v3-read-button-copy strong"
+            },
+            "url": {
+              "css": "a.ho5ho-v3-read-button",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "root_selector": {
+            "css": "img.wp-manga-chapter-img"
+          },
+          "fields": {
+            "url": {
+              "css": "img.wp-manga-chapter-img",
+              "attr": "src",
+              "fallback": [
+                {
+                  "css": "img.wp-manga-chapter-img",
+                  "attr": "src"
+                },
+                {
+                  "css": "img.wp-manga-chapter-img",
+                  "attr": "data-src"
+                }
+              ]
+            }
+          },
+          "paginator": {
+            "next_link": {
+              "selector": {
+                "css": "a.next_page",
+                "attr": "href"
+              }
+            },
+            "max_pages": 80
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 60
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 80
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

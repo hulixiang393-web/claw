@@ -60,16 +60,12 @@ class Discovery:
         parser: Parser,
         checker: StructureChecker,
         health_reporter=None,
-        cache=None,
     ):
         self._http = http
         self._parser = parser
         self._checker = checker
         self._health_reporter = health_reporter  # 可选：update_health(source_id, state, error)
         self._ytdlp = None  # 懒加载单例
-        # 可选 RedisLikeStore 实例（None=禁用）。键约定：
-        #   list:{source_id}:{abs_url} → work list（24h，search 池）
-        self.cache = cache
 
     # ------------------------------------------------------------------ #
     def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
@@ -231,6 +227,7 @@ class Discovery:
             interval_ms=self._interval_ms(source),
             encoding=source.transports().get("charset"),
             proxy_pool=source.proxy_pool(),
+            direct=bool(source.transports().get("direct")),
         )
 
     # ------------------------------------------------------------------ #
@@ -319,6 +316,8 @@ class Discovery:
             cats.append(Category(title=t, url=u))
         return cats
 
+
+
     # ------------------------------------------------------------------ #
     def list_works(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
         """抓取一页作品列表（懒加载用）。
@@ -344,6 +343,29 @@ class Discovery:
         # 自检移后台线程（不阻塞作品抓取）
         self._bg_check(source, self._abs_url(source, fetch_url))
         html = self._get(source, fetch_url)
+        # SPA 站发现页（SvelteKit/React 等）：首屏 HTML 为空壳，列表由 JS
+        # 渲染进 DOM。源配置 discovery.render == "playwright" 时先渲染再解析，
+        # 复用下方 works_list_item 的 CSS 选择器（不改变纯 HTTP 源行为）。
+        if disc_html.get("render") == "playwright":
+            try:
+                from .playwright_helper import fetch_rendered_html_sync
+
+                rc = disc_html.get("render_config") or {}
+                rendered = fetch_rendered_html_sync(
+                    self._abs_url(source, fetch_url),
+                    wait_for=rc.get("wait_for", ""),
+                    wait_until=rc.get("wait_until", "networkidle"),
+                    timeout_ms=int(rc.get("timeout_ms") or 30000),
+                    extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
+                    proxy=source.transports().get("proxy"),
+                    scroll_to_bottom=bool(rc.get("scroll_to_bottom", False)),
+                    scroll_step_px=int(rc.get("scroll_step_px", 800)),
+                    scroll_stale_rounds=int(rc.get("scroll_stale_rounds", 4)),
+                )
+                if rendered:
+                    html = rendered
+            except Exception as exc:  # noqa: BLE001 —— 渲染失败降级用原始 HTML
+                log.warning("[%s] 发现页 Playwright 渲染失败：%s", source.source_id, exc)
         doc = self._parser.parse(html)
 
         # 作品项选择器：优先 works_list_item（专属作品列表），
@@ -416,32 +438,20 @@ class Discovery:
         # 为空/占位的条目（解析失败静默保留原封面，容错）。
         if works and works_list_item.get("cover_state"):
             self._apply_cover_state(works, works_list_item["cover_state"], fields, html)
+        # 列表字段文本解密（如番茄 rank 榜书名/作者被 PUA 字体混淆，需 translit 还原）。
+        # 只有源配置了 decryption.targets.title/author 时才创建 Decrypter（惰性、
+        # 避免无谓开销），逐条还原后写回（未配置 → decrypt 原样返回，安全）。
+        dec_targets = (source.raw.get("decryption") or {}).get("targets") or {}
+        if dec_targets.get("title", {}).get("strategy") or dec_targets.get("author", {}).get("strategy"):
+            from .decrypter import Decrypter
+
+            dec = Decrypter(self._http)
+            for w in works:
+                w.title = dec.decrypt(source, w.title, target="title")
+                w.author = dec.decrypt(source, w.author, target="author")
         return works
 
-    def list_works_cached(
-        self,
-        source: SourceConfig,
-        url: str,
-        page: int = 1,
-        use_cache: bool = True,
-    ) -> List[Work]:
-        """带发现列表缓存的抓取：命中 list: 键直接返回，否则抓取后写（24h）。
 
-        use_cache=False 强制真实抓取。缓存键基于**真实抓取 URL**
-        （_build_page_url 结果）的 abs_url，避免同 url 不同 page 撞键。
-        """
-        if not self.cache or not use_cache:
-            return self.list_works(source, url, page)
-        fetch_url = self._build_page_url(source, url, page)
-        abs_url = self._abs_url(source, fetch_url)
-        key = f"list:{source.source_id}:{abs_url}"
-        cached = self.cache.get(key)
-        if cached is not None:
-            return cached
-        works = self.list_works(source, url, page)
-        if works is not None:
-            self.cache.set(key, works, ttl=24 * 3600)
-        return works
 
     # ------------------------------------------------------------------ #
     def decrypt_covers(self, source: SourceConfig, works: List[Work]) -> dict:
@@ -579,6 +589,10 @@ class Discovery:
             params = cfg.get("params") or {}
             filled = {k: str(v) for k, v in params.items()}
             filled = {k: v.replace("{page}", str(page)) for k, v in filled.items()}
+            # {offset} 占位：按页换算偏移量（offset = (page-1) * limit）。
+            # 覆盖 source-schema 中「API 分页」需求（fanqie rank offset=0,10,20…）。
+            _limit = int(params.get("limit") or cfg.get("page_size") or 20)
+            filled = {k: v.replace("{offset}", str((page - 1) * _limit)) for k, v in filled.items()}
             # 用分类 URL 的 query 参数覆盖占位（tids/keyword）
             for k, v in cat_params.items():
                 if f"{{{k}}}" in str(filled.get(k, "")) or k in filled:
@@ -647,6 +661,16 @@ class Discovery:
                     source_name=source.source_name,
                 )
             )
+        # 列表字段文本解密（与 HTML 分支一致）：番茄等 API 源 bookName/author 也是
+        # PUA 字体混淆密文，漏解会让 GUI 把无字形码位渲染成空洞/连续空格。
+        dec_targets = (source.raw.get("decryption") or {}).get("targets") or {}
+        if dec_targets.get("title", {}).get("strategy") or dec_targets.get("author", {}).get("strategy"):
+            from .decrypter import Decrypter
+
+            dec = Decrypter(self._http)
+            for w in works:
+                w.title = dec.decrypt(source, w.title, target="title")
+                w.author = dec.decrypt(source, w.author, target="author")
         return works
 
     def _list_works_ytdlp(self, source: SourceConfig, keyword: str) -> List[Work]:
@@ -766,7 +790,8 @@ class Discovery:
         防止链接过多时线程爆炸（用户要求：链接过多则降为 3 线程）。
         返回 [{url, ok, status, error, time_ms}]。单链接失败不影响其他。
 
-        HttpClient 非线程安全：每 worker 各建独立实例（复用源配置）。
+        HttpClient 非线程安全：每 worker 各建独立实例；复用 App 层已由 settings
+        接线的 NetworkDefaults（含 impersonate/user_agents），与主 http 一致。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import time
@@ -780,7 +805,7 @@ class Discovery:
         base_headers = self._default_headers(source)
 
         def _check_one(idx: int, u: str) -> dict:
-            http = HttpClient()
+            http = HttpClient(defaults=self._http.defaults)
             t0 = time.time()
             try:
                 # get_text 走完整反爬/重试链（GET，HEAD 对 Cloudflare 不稳）

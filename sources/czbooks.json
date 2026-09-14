@@ -1,0 +1,307 @@
+{
+  "$schema_version": 2,
+  "$id": "czbooks",
+  "$type": "novel",
+  "$name": "CZBooks",
+  "$enabled": true,
+  "$weight": 2.0,
+  "$metadata": {
+    "homepage": "https://czbooks.net",
+    "description": "CZBooks（czbooks.net，品牌「小說狂人」）繁體中文免費小說站。全站 SSR、免登入、無字體混淆，requests 直連即可抓全：搜索 /s/{keyword}（path 風格，每頁 40 條、無翻頁）、書詳情 /n/{book}（內嵌完整目錄）、章節正文 /n/{book}/{chapter} 純文本全章。站部署 Cloudflare 但質詢可控（瀏覽器 UA 直連 200）；缺封面的書統一占位圖 default_no_thumbnail.jpg。",
+    "icon": "https://czbooks.net/favicon.ico",
+    "lang": "zh-TW",
+    "region": "tw",
+    "tags": [
+      "小说",
+      "免费",
+      "繁體中文"
+    ],
+    "last_verified": "2026-09-13"
+  },
+  "transports": {
+    "base_url": "https://czbooks.net",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-HK,zh-TW;q=0.9,zh;q=0.8,en;q=0.7",
+      "Referer": "https://czbooks.net/"
+    },
+    "timeout": 20,
+    "retries": 2,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/c/xuanhuan",
+      "works_list_url": "/c/xuanhuan",
+      "list_item": {
+        "categories": [
+          {
+            "title": "玄幻奇幻",
+            "url": "/c/xuanhuan"
+          },
+          {
+            "title": "武俠仙俠",
+            "url": "/c/xianxia"
+          },
+          {
+            "title": "言情",
+            "url": "/c/yanqing"
+          },
+          {
+            "title": "軍事歷史",
+            "url": "/c/lishi"
+          },
+          {
+            "title": "科幻未來",
+            "url": "/c/wangyou"
+          },
+          {
+            "title": "靈異玄幻",
+            "url": "/c/lingyi"
+          },
+          {
+            "title": "奇幻冒險",
+            "url": "/c/fanatsy"
+          },
+          {
+            "title": "推理",
+            "url": "/c/suspense"
+          },
+          {
+            "title": "女生同人",
+            "url": "/c/tongren"
+          },
+          {
+            "title": "原創同人",
+            "url": "/c/erciyuan"
+          },
+          {
+            "title": "耽美",
+            "url": "/c/danmei"
+          },
+          {
+            "title": "百合",
+            "url": "/c/baihe"
+          },
+          {
+            "title": "日系",
+            "url": "/c/japan"
+          },
+          {
+            "title": "電視劇",
+            "url": "/c/drama"
+          },
+          {
+            "title": "經典文學",
+            "url": "/c/classicbook"
+          },
+          {
+            "title": "女性向",
+            "url": "/c/girl"
+          },
+          {
+            "title": "短篇",
+            "url": "/c/short"
+          },
+          {
+            "title": "狂人原創",
+            "url": "/c/creator"
+          },
+          {
+            "title": "精選排行",
+            "url": "/c/normal"
+          },
+          {
+            "title": "人氣榜",
+            "url": "/c/all"
+          },
+          {
+            "title": "收藏榜",
+            "url": "/c/favorite"
+          },
+          {
+            "title": "完本榜",
+            "url": "/c/finish"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.novel-item"
+        },
+        "fields": {
+          "title": {
+            "css": ".novel-item-title"
+          },
+          "url": {
+            "css": ".novel-item-cover-wrapper a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": ".novel-item-thumbnail img",
+            "attr": "src"
+          },
+          "author": {
+            "css": ".novel-item-author a"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/s/{keyword}",
+      "method": "GET",
+      "paginator": {
+        "url_template": "/s/{keyword}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.novel-item"
+        },
+        "fields": {
+          "title": {
+            "css": ".novel-item-title"
+          },
+          "url": {
+            "css": ".novel-item-cover-wrapper a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": ".novel-item-thumbnail img",
+            "attr": "src"
+          },
+          "author": {
+            "css": ".novel-item-author a"
+          },
+          "update": {
+            "css": ".novel-item-newest-chapter a"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/n/[a-z0-9]+(/[a-z0-9]+)?(\\?.*)?$",
+      "fields": {
+        "title": {
+          "css": ".novel-detail .info .title"
+        },
+        "author": {
+          "fallback": [
+            {
+              "css": ".novel-detail .info .author a"
+            },
+            {
+              "css": ".novel-detail .info .author"
+            }
+          ]
+        },
+        "cover": {
+          "css": ".novel-detail .thumbnail img",
+          "attr": "src"
+        },
+        "status": {
+          "css": ".novel-detail .state table tr:nth-child(1) td:nth-child(2)"
+        },
+        "summary": {
+          "css": ".novel-detail .description"
+        },
+        "tags": {
+          "css": "a#novel-category"
+        }
+      },
+      "clean": {
+        "title": [
+          [
+            "《",
+            ""
+          ],
+          [
+            "》",
+            ""
+          ]
+        ],
+        "author": [
+          [
+            "re:^作者[:：]?\\s*",
+            ""
+          ]
+        ],
+        "summary": [
+          [
+            "re:^作品簡介[:：]?\\s*",
+            ""
+          ]
+        ]
+      }
+    },
+    "content": {
+      "chapter": {
+        "pagination": {
+          "enabled": true,
+          "max_pages": 1
+        },
+        "list": {
+          "root_selector": {
+            "css": "ul#chapter-list li"
+          },
+          "fields": {
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": "div.content"
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 40
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 1,
+      "max_items": 5000
+    }
+  },
+  "decryption": {
+    "targets": {
+      "title": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "author": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "chapter": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "content": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "summary": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      }
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

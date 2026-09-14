@@ -38,7 +38,7 @@ python -m pip install cssselect     # lxml.cssselect 依赖，缺失时 cssselec
 装齐后 avgood 搜索合并测试 7/7 通过。
 
 ## 影响
-- 所有源（17k/avgood/dm5/haoduoman/manwa/quanben）的真机验证都受此影响
+- 所有源（17k/avgood/dm5/haoduoman/quanben）的真机验证都受此影响
 - 修复后 parser 走 lxml 引擎，CSS/XPath 查询正常
 - **打包时注意**：build.py 的 PyInstaller 需确认 lxml 被包含（--hidden-import 或依赖自动收集）
 

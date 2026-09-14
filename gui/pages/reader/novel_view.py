@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QScrollArea,
+    QSlider,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -55,6 +57,9 @@ class NovelView(QWidget):
         self._prev_prefetch_task = None  # 持引用防 GC
         self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
         self._pending_restore = None  # 打开书续读位置 (position, page)，首次显示章时定位
+        self._auto_scrolling = False  # 自动滚动开关
+        self._auto_timer = QTimer(self)  # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
+        self._auto_timer.setInterval(35)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -92,6 +97,29 @@ class NovelView(QWidget):
         self.fullscreen_btn.setToolTip("全屏阅读")
         self.fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
         toolbar.addWidget(self.fullscreen_btn)
+
+        self.auto_scroll_btn = QPushButton("▶ 自动滚动")
+        self.auto_scroll_btn.setFixedWidth(90)
+        self.auto_scroll_btn.setToolTip("开启/关闭自动滚动（Ctrl+Alt+A）")
+        self.auto_scroll_btn.clicked.connect(self._toggle_auto_scroll)
+        toolbar.addWidget(self.auto_scroll_btn)
+
+        self.auto_scroll_speed_slider = QSlider(Qt.Horizontal)
+        self.auto_scroll_speed_slider.setRange(1, 10)
+        self.auto_scroll_speed_slider.setValue(3)
+        self.auto_scroll_speed_slider.setFixedWidth(100)
+        self.auto_scroll_speed_slider.setToolTip("自动滚动速度（1最慢，10最快）")
+        self.auto_scroll_speed_slider.setEnabled(False)
+        toolbar.addWidget(self.auto_scroll_speed_slider)
+
+        self.auto_scroll_speed_label = QLabel("3")
+        self.auto_scroll_speed_label.setFixedWidth(12)
+        self.auto_scroll_speed_label.setAlignment(Qt.AlignCenter)
+        toolbar.addWidget(self.auto_scroll_speed_label)
+
+        self.auto_scroll_speed_slider.valueChanged.connect(
+            lambda v: self.auto_scroll_speed_label.setText(str(v))
+        )
 
         toolbar.addStretch(1)
         self.progress_label = QLabel("")
@@ -190,6 +218,10 @@ class NovelView(QWidget):
         if app is not None:
             app.installEventFilter(self)
 
+        # 自动滚动定时器 + 快捷键
+        self._auto_timer.timeout.connect(self._auto_scroll_tick)
+        QShortcut(QKeySequence("Ctrl+Alt+A"), self).activated.connect(self._toggle_auto_scroll)
+
     # ------------------------------------------------------------------ #
     def load(
         self,
@@ -207,6 +239,10 @@ class NovelView(QWidget):
         self._source = source
         self._detail = detail
         self._chapters = detail.chapters
+        # 换书：无条件清零续读位置——旧书若章节还在后台加载，本次 load() 的
+        # 首章显示会消费到「上一本书残留的 _pending_restore」，把新书滚动条
+        # 错滚到旧书位置（跨书串位置的 bug 根因）。清零后再按新书记录设置。
+        self._pending_restore = None
         self._prev_prefetch_queue = []  # 换书清空向前缓存队列（旧队列指向旧书章节）
         self._prev_prefetch_idx = -2
         self._populate_toc()
@@ -237,6 +273,7 @@ class NovelView(QWidget):
         """
         if self._source is None or not (0 <= idx < len(self._chapters)):
             return
+        self._stop_auto_scroll()
         self._current_idx = idx
         ch = self._chapters[idx]
 
@@ -295,21 +332,34 @@ class NovelView(QWidget):
         if self._pending_restore is not None:
             pos, page = self._pending_restore
             self._pending_restore = None
+            # 捕获当前 book detail：QTimer 触发时自校验仍为这本书（防旧书
+            # 恢复回调在用户快速换书后把新书滚动条错滚到旧书位置）
+            book = self._detail
             if page is not None:
                 self._current_page = page
                 self._pager_show_page(page)
             if pos is not None and pos > 0:
                 vbar = self.scroll.verticalScrollBar()
-                QTimer.singleShot(0, lambda: self._restore_scroll(pos))
+                QTimer.singleShot(
+                    0, lambda b=book: self._restore_scroll_if_book(pos, b)
+                )
             # 强制落盘恢复后的位置（节流会吞掉恢复事件，防下次仍回顶部/第0页）
             self._last_pos_save_ts = 0.0
             QTimer.singleShot(0, self._emit_position)
+        # 更新自动滚动滑块状态（根据模式和滚动范围）
+        QTimer.singleShot(0, self._update_auto_scroll_slider_state)
 
     def _restore_scroll(self, pos: float) -> None:
         """按 0~1 比例恢复滚动位置（打开书续读）。"""
         vbar = self.scroll.verticalScrollBar()
         if vbar.maximum() > 0:
             vbar.setValue(int(pos * vbar.maximum()))
+
+    def _restore_scroll_if_book(self, pos: float, book) -> None:
+        """恢复滚动位置，但仅当当前仍是同一本书（防换书后旧恢复回调串位置）。"""
+        if self._detail is not book:
+            return  # 用户已换书，旧书恢复定位作废
+        self._restore_scroll(pos)
 
     def _scroll_to_bottom_silently(self) -> None:
         """无触发地滚到底（blockSignals 包住，防滚动事件重入）。"""
@@ -381,6 +431,48 @@ class NovelView(QWidget):
         except RuntimeError:
             pass
 
+    # ---- 自动滚动 ----
+    def _toggle_auto_scroll(self) -> None:
+        """切换自动滚动：停止/启动，按钮文字同步更新。"""
+        if self._auto_scrolling:
+            self._stop_auto_scroll()
+        else:
+            vbar = self.scroll.verticalScrollBar()
+            if vbar.maximum() <= 0 or self._mode != "scroll":
+                return
+            self._auto_scrolling = True
+            self.auto_scroll_btn.setText("⏸ 停止")
+            self._auto_timer.start()
+
+    def _stop_auto_scroll(self) -> None:
+        """停止自动滚动并复位按钮。"""
+        if not self._auto_scrolling:
+            return
+        self._auto_scrolling = False
+        self._auto_timer.stop()
+        self.auto_scroll_btn.setText("▶ 自动滚动")
+
+    def _auto_scroll_tick(self) -> None:
+        """QTimer 回调：每次滚动 (slider_value * 5) px，高频小步进平滑滚动，到底自动停止。"""
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.value() >= vbar.maximum():
+            self._stop_auto_scroll()
+            return
+        vbar.setValue(vbar.value() + self.auto_scroll_speed_slider.value() * 5)
+
+    def _update_auto_scroll_slider_state(self) -> None:
+        """根据当前模式和滚动范围启用/禁用自动滚动速度滑块。"""
+        if self._mode == "scroll" and self.scroll.verticalScrollBar().maximum() > 0:
+            self.auto_scroll_speed_slider.setEnabled(True)
+        else:
+            self.auto_scroll_speed_slider.setEnabled(False)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        """用户普通滚轮（无 Ctrl）→ 停止自动滚动。"""
+        if self._auto_scrolling and not (event.modifiers() & Qt.ControlModifier):
+            self._stop_auto_scroll()
+        super().wheelEvent(event)
+
     @staticmethod
     def _clamp_font(size: int) -> int:
         return max(12, min(28, size))
@@ -424,6 +516,7 @@ class NovelView(QWidget):
     # ------------------------------------------------------------------ #
     def _toggle_mode(self) -> None:
         """滚动 / 翻页 模式切换。"""
+        self._stop_auto_scroll()
         if self._mode == "scroll":
             self._mode = "pager"
             self.mode_btn.setText("滚动模式")
@@ -435,6 +528,7 @@ class NovelView(QWidget):
             self.mode_btn.setText("翻页模式")
             self.body_stack.setCurrentWidget(self.scroll)
             self.scroll.verticalScrollBar().setValue(0)
+        self._update_auto_scroll_slider_state()
 
     def _repaginate(self):
         """按字数把正文拆成多页（每页约 CHARS_PER_PAGE 字）。
@@ -533,6 +627,7 @@ class NovelView(QWidget):
             elif key == Qt.Key_Up:
                 self._pager_turn(-1)
         else:
+            self._stop_auto_scroll()
             vbar = self.scroll.verticalScrollBar()
             if key in (Qt.Key_Down, Qt.Key_PageDown):
                 vbar.setValue(vbar.value() + self.scroll.height() * 2 // 3)

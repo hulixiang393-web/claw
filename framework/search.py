@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re as _re
 from dataclasses import dataclass, field
@@ -30,6 +31,21 @@ log = logging.getLogger(__name__)
 # 触发空页停"的死循环，绝不是搜索结果限制。正常源空页即停，远达不到此值。
 # 源显式配置了 constraints.search.max_pages 则尊重源值（不覆盖）。
 _SEARCH_MAX_PAGES_HARD_CAP = 2000
+
+
+def _response_pages(rc: dict, source: SourceConfig) -> int:
+    """计算响应监听模式的翻页数（番茄等单页仅 10 条、带分页条）。
+
+    render_config.response_pages（期望页数）与 constraints.search.max_results
+    （目标条数上限）共同约束：取较小者，每页按 10 条折算。缺省 1。
+    """
+    want = max(1, int(rc.get("response_pages") or 1))
+    searches = (source.raw.get("constraints") or {}).get("search") or {}
+    max_results = int(searches.get("max_results") or 0)
+    if max_results:
+        cap = max(1, -(-max_results // 10))
+        want = min(want, cap)
+    return want
 
 
 @dataclass
@@ -65,16 +81,50 @@ class Search:
         parser: Parser,
         discovery: Optional[Discovery] = None,
         concurrent: int = 1,
-        cache=None,
+        cookie_manager=None,
     ):
         self._http = http
         self._parser = parser
         self._discovery = discovery
         self._concurrent = max(1, int(concurrent or 1))
+        self._cookie_manager = cookie_manager  # 渲染搜索页注入登录 cookie
         self._ytdlp = None  # 懒加载单例
-        # 可选 RedisLikeStore 实例（None=禁用）。键约定：
-        #   search:{source_id}:{norm_query} → result list（24h，search 池）
-        self.cache = cache
+
+    # ------------------------------------------------------------------ #
+    def _search_decrypter(self, source: SourceConfig, http: Optional[HttpClient] = None):
+        """源配置了 decryption.targets.title/author 解密策略时返回 Decrypter，否则 None。
+
+        与 discovery.list_works 的列表解密同源（番茄 rank 榜/搜索/详情书名作者被
+        PUA 字体混淆，translit 还原）；未配置的源返回 None，零开销、行为不变。
+        """
+        dec_cfg = (source.raw.get("decryption") or {}).get("targets") or {}
+        if not (
+            dec_cfg.get("title", {}).get("strategy")
+            or dec_cfg.get("author", {}).get("strategy")
+        ):
+            return None
+        from .decrypter import Decrypter
+
+        return Decrypter(http or self._http)
+
+    def _decrypt_results(
+        self,
+        source: SourceConfig,
+        results: List[SearchResult],
+        http: Optional[HttpClient] = None,
+    ) -> List[SearchResult]:
+        """按源 decryption 配置批量还原搜索结果 title/author（原地写回）。
+
+        覆盖 yt-dlp / api_endpoints 引擎；HTML 引擎在 _merge_and_notify 逐条
+        解密（保证 on_page 增量回调也是明文）。
+        """
+        dec = self._search_decrypter(source, http)
+        if dec is None:
+            return results
+        for r in results:
+            r.title = dec.decrypt(source, r.title, target="title")
+            r.author = dec.decrypt(source, r.author, target="author")
+        return results
 
     # ------------------------------------------------------------------ #
     def search_one(
@@ -96,35 +146,18 @@ class Search:
         api = source.raw.get("api_endpoints") or {}
         search_cfg = api.get("search") or {}
         if search_cfg.get("engine") == "ytdlp":
-            return self._search_ytdlp(source, keyword, search_cfg, http=http)
+            return self._decrypt_results(
+                source,
+                self._search_ytdlp(source, keyword, search_cfg, http=http),
+                http,
+            )
         if search_cfg:
-            return self._search_api(source, keyword, http=http)
+            return self._decrypt_results(
+                source, self._search_api(source, keyword, http=http), http
+            )
         return self._search_html(source, keyword, http=http, on_page=on_page)
 
-    def search_one_cached(
-        self,
-        source: SourceConfig,
-        keyword: str,
-        http: Optional[HttpClient] = None,
-        on_page=None,
-        use_cache: bool = True,
-    ) -> List[SearchResult]:
-        """带搜索缓存的单源搜索：命中 search: 键直接返回，否则搜索后写（24h）。
 
-        use_cache=False 强制走真实搜索（GUI「重新搜索」等需要新鲜的入口）。
-        缓存 key 用规范化关键词（strip），不区分大小写与否由实现方定。
-        """
-        if not self.cache or not use_cache:
-            return self.search_one(source, keyword, http=http, on_page=on_page)
-        norm = (keyword or "").strip()
-        key = f"search:{source.source_id}:{norm}"
-        cached = self.cache.get(key)
-        if cached is not None:
-            return cached
-        results = self.search_one(source, keyword, http=http, on_page=on_page)
-        if results is not None:
-            self.cache.set(key, results, ttl=24 * 3600)
-        return results or []
 
     def search_type(
         self, sources: List[SourceConfig], keyword: str
@@ -138,7 +171,7 @@ class Search:
         if self._concurrent <= 1 or len(sources) <= 1:
             for source in sources:
                 try:
-                    results.extend(self.search_one_cached(source, keyword))
+                    results.extend(self.search_one(source, keyword))
                 except Exception as exc:
                     log.warning("[%s] 搜索失败: %s", source.source_id, exc)
             return results
@@ -150,10 +183,9 @@ class Search:
             worker_http = self._http.__class__(
                 sleeper=getattr(self._http, "_sleeper", None),
                 defaults=self._http.defaults,
-                cache=self.cache,
             )
             try:
-                return self.search_one_cached(source, keyword, http=worker_http)
+                return self.search_one(source, keyword, http=worker_http)
             except Exception as exc:
                 log.warning("[%s] 搜索失败: %s", source.source_id, exc)
                 return []
@@ -184,7 +216,13 @@ class Search:
         """
         http = http or self._http
         search_cfg = source.get_search_config()
-        if not search_cfg.get("item") or not search_cfg.get("item", {}).get("fields"):
+        item_cfg = search_cfg.get("item") or {}
+        # render=playwright（反爬 SPA 站）不依赖 item.fields：渲染引擎从 textContent
+        # 提取 title/url（番茄/fdzys 等只写 root_selector + render_config）。只有
+        # HTML selector 引擎需要 fields 做字段提取。
+        if not item_cfg or (
+            not item_cfg.get("fields") and search_cfg.get("render") != "playwright"
+        ):
             return []
         base_url = search_cfg.get("base_url") or source.base_url
         method = search_cfg.get("method") or "GET"
@@ -233,7 +271,14 @@ class Search:
                 kw_param=kw_param, page=1, page_param=page_param,
                 url_template=url_template, keyword_replace=keyword_replace,
             )
-            return self._search_html_rendered(source, abs_url, item_cfg, keyword)
+            return self._decrypt_results(
+                source,
+                self._search_html_rendered(source, abs_url, item_cfg, keyword),
+                http,
+            )
+
+        # 标题/作者字体混淆解密（番茄等）：decryption.targets.title/author → 逐条还原
+        dec = self._search_decrypter(source, http)
 
         def _fetch(page: int):
             """抓取并解析第 page 页，返回 (page, items)。失败返回空列表。"""
@@ -296,9 +341,73 @@ class Search:
         # 保留 transports.interval_ms 间隔（_http_get 内部已 sleep）。
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        page_items: dict = {}
+        # 合并阶段内置于波循环：每波抓完立即去重并入 results 并回调 on_page——
+        # 否则要等全部页抓完才开始回调（慢源多页搜索用户几十秒等不到第 1 页，
+        # 且结果一次性整块到达，GUI 侧表现为「一个源一长条」）。波内合并后
+        # 用户第 1 波即可看到结果，后续每波抓到即追加（配合 GUI 源级并发，
+        # 多源结果天然交错）。
         wave_size = 3
         fetched_total = 0  # 已抓取的累计条数（未去重）：达 max_results 提前停发后续波
+        results: List[SearchResult] = []
+        seen_urls: set = set()
+        # 已合并回调的最大页序（跨波递增，防重复并入/回调）
+        last_merged = 0
+
+        def _merge_and_notify(wave_items: dict) -> bool:
+            """把新抓完的页按页序去重并入 results，并逐页回调 on_page（边抓边显）。
+
+            空页（抓取失败/真实空页）跳过、后续页照常并入——防止中段失败页
+            吞掉后面所有页（历史修复，见下方终止策略）。尾部连续空页
+            触发波循环 break，不会合并进来。
+            返回 True 表示已达 max_results 上限（须停发后续波）。
+            """
+            nonlocal last_merged
+            for page in sorted(wave_items):
+                if page <= last_merged:
+                    continue
+                last_merged = page
+                items = wave_items.get(page) or []
+                if not items:
+                    continue  # 中段失败页跳过（不吞后续页）
+                page_start = len(results)
+                for it in items:
+                    title = it.get("title", "")
+                    url = it.get("url", "")
+                    if not title or not url:
+                        continue
+                    if url in seen_urls:
+                        continue  # URL 去重（trtag 等站搜索页 DOM 有重复节点）
+                    seen_urls.add(url)
+                    if dec is not None:
+                        title = dec.decrypt(source, title, target="title")
+                    results.append(
+                        SearchResult(
+                            title=title,
+                            url=url,
+                            source_id=source.source_id,
+                            source_name=source.source_name,
+                            cover=Search._clean_cover(it.get("cover", "")),
+                            author=(
+                                dec.decrypt(source, it.get("author", ""), target="author")
+                                if dec is not None
+                                else it.get("author", "")
+                            ),
+                            update=it.get("update", ""),
+                        )
+                    )
+                # 边抓边显示：本页新增结果立即回调（第 1 波秒出，后续波抓到即追加），
+                # 不再等全部页抓完才整块回吐
+                if on_page and len(results) > page_start:
+                    try:
+                        on_page(source, page, results[page_start:])
+                    except Exception:  # noqa: BLE001
+                        pass
+                # 达到结果总数上限：本页完整并入后再停（页级精确截断，
+                # 与波级 fetched_total 提前停发互补）。
+                if max_results and len(results) >= max_results:
+                    return True
+            return False
+
         with ThreadPoolExecutor(max_workers=wave_size) as pool:
             start = 1
             while start <= max_pages:
@@ -308,12 +417,16 @@ class Search:
                 for fut in as_completed(futs):
                     page, items = fut.result()
                     wave_items[page] = items
-                page_items.update(wave_items)
                 wave_count = sum(len(v) for v in wave_items.values())
                 fetched_total += wave_count
                 # 本波全空（连续空页）→ 站点已无更多结果，提前停发后续波。
                 # 单页失败返回空不会误停：只要本波内还有别的页有结果就继续。
                 if end < max_pages and wave_items and not any(wave_items.values()):
+                    break
+                # 本波抓完立即合并+回调（边抓边显的核心：不等全部页）
+                reached_cap = _merge_and_notify(wave_items)
+                # 达到结果总数上限（页级精确截断）：停发后续波。
+                if reached_cap:
                     break
                 start = end + 1
                 # 已抓够 max_results 条 → 不再发下一波。此前在合并阶段才按
@@ -323,59 +436,6 @@ class Search:
                 if max_results and fetched_total >= max_results:
                     break
 
-        # 按页序合并（第 1 页先回调 on_page 秒出），URL 去重。
-        #
-        # 终止策略（修复「结果被吞」）：
-        # - 全部页已在上面并发抓完，空页 ≠ 结果终点——单页抓取失败是网络
-        #   抖动/瞬时反爬，不是结果穷尽。若合并时遇空页即 break，中间一页
-        #   失败会吞掉后面所有页（如第 4 页失败，10 页只出 3 页）。
-        # - 以「最后一个有结果的页」为真实终点：只合并 1..last_non_empty，
-        #   中间的失败页跳过、其后续页照常并入；超出站点总页数的尾部空页
-        #   自然排除（如 avgood 某词只有 25 页，max_pages=30 时 26~30 为空）。
-        # - 关键词无结果（第 1 页即空）→ last_non_empty=0 → 快速返回 []。
-        # - max_results 是跨页总数上限：本页完整并入后再停，而不是每页内部
-        #   提前 return（否则「单页条数 >= max_results」的源第一页就返回，
-        #   真实站几十页也只显示一页；max_results 由源配置保证 >= 单页条数）。
-        results = []
-        seen_urls = set()
-        last_non_empty = max(
-            (p for p, items in page_items.items() if items), default=0
-        )
-        for page in sorted(page_items):
-            if page > last_non_empty:
-                break
-            items = page_items[page]
-            if not items:
-                continue  # 中段失败页跳过（不吞后续页）
-            page_start = len(results)  # 本页处理前的累计数（切分本页新增）
-            for it in items:
-                title = it.get("title", "")
-                url = it.get("url", "")
-                if not title or not url:
-                    continue
-                if url in seen_urls:
-                    continue  # URL 去重（trtag 等站搜索页 DOM 有重复节点）
-                seen_urls.add(url)
-                results.append(
-                    SearchResult(
-                        title=title,
-                        url=url,
-                        source_id=source.source_id,
-                        source_name=source.source_name,
-                        cover=Search._clean_cover(it.get("cover", "")),
-                        author=it.get("author", ""),
-                        update=it.get("update", ""),
-                    )
-                )
-            # 边抓边显示：本页新增结果回调给 GUI（第 1 页秒出，后续页抓到即追加）
-            if on_page:
-                try:
-                    on_page(source, page, results[page_start:])
-                except Exception:  # noqa: BLE001
-                    pass
-            # 达到结果总数上限：本页完整并入后再停。
-            if max_results and len(results) >= max_results:
-                break
         return results
 
     @staticmethod
@@ -456,9 +516,18 @@ class Search:
         keyword 非空时，结果按「标题/文本含关键词」过滤——反爬站常在搜索页
         塞入热门榜（无关项），过滤后只留真正命中关键词的结果，避免误导。
         """
-        from .playwright_helper import fetch_rendered_items_sync, fetch_rendered_search_sync
+        from .playwright_helper import (
+            fetch_rendered_items_sync,
+            fetch_rendered_search_sync,
+            fetch_search_response_json,
+        )
 
         rc = item_cfg.get("render_config") or {}
+        # 登录态 cookie 注入：GUI 登录弹窗保存的 data/cookies/<source_id>.json。
+        # 需要登录的站才注入；无需登录的源（如番茄普通搜索）不引 cookie。
+        cookies = None
+        if self._cookie_manager is not None:
+            cookies = self._cookie_manager.to_playwright_cookies(source.source_id) or None
 
         def _sel(spec) -> str:
             """root_selector 可能为 {"css": "..."} 或纯字符串。"""
@@ -466,7 +535,23 @@ class Search:
                 return spec.get("css") or spec.get("xpath") or ""
             return spec or ""
 
-        if rc.get("interact"):
+        if rc.get("response_json_url"):
+            # 响应监听模式：结果由前端调 JSON 接口异步返回（番茄类 SPA）。
+            # DOM 渲染常被自定义字体混淆/渲染异常，接口数据最可靠。
+            raw = fetch_search_response_json(
+                abs_url,
+                rc.get("response_json_url"),
+                wait_until=rc.get("wait_until") or "domcontentloaded",
+                timeout_ms=int(rc.get("timeout_ms") or 30000),
+                extra_delay_ms=int(rc.get("extra_delay_ms") or 2000),
+                proxy=(None if source.transports().get("direct")
+                       else source.transports().get("proxy")),
+                cookies=cookies,
+                warm_up_url=rc.get("response_warm_up_url") or source.base_url,
+                pages=_response_pages(rc, source),
+            )
+            items = self._items_from_response_json(raw, rc, source)
+        elif rc.get("interact"):
             # 交互式搜索：访问首页 → 填搜索框 → 提交（JS 加载真实结果）
             home = rc.get("home_url") or source.base_url
             items = fetch_rendered_search_sync(
@@ -477,18 +562,57 @@ class Search:
                 wait_until=rc.get("wait_until") or "networkidle",
                 timeout_ms=int(rc.get("timeout_ms") or 30000),
                 extra_delay_ms=int(rc.get("extra_delay_ms") or 3000),
-                proxy=source.transports().get("proxy"),
+                proxy=(None if source.transports().get("direct")
+                       else source.transports().get("proxy")),
+                cookies=cookies,
             )
         else:
-            items = fetch_rendered_items_sync(
-                abs_url,
-                _sel(item_cfg.get("root_selector")),
-                wait_for=rc.get("wait_for") or "",
-                wait_until=rc.get("wait_until") or "networkidle",
-                timeout_ms=int(rc.get("timeout_ms") or 30000),
-                extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
-                proxy=source.transports().get("proxy"),
-            )
+            fields = item_cfg.get("fields") or {}
+            if fields:
+                # 源已显式声明 item.fields：渲染 HTML 后按配置选择器解析
+                # （与发现页 works_list_item 一致），避免通用启发式把标题
+                # 取成 img[alt]（h-comic 等 SPA 搜索标题会变「h漫」）。
+                from .playwright_helper import fetch_rendered_html_sync
+
+                rendered = fetch_rendered_html_sync(
+                    abs_url,
+                    wait_for=rc.get("wait_for") or "",
+                    wait_until=rc.get("wait_until") or "networkidle",
+                    timeout_ms=int(rc.get("timeout_ms") or 30000),
+                    extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
+                    proxy=(None if source.transports().get("direct")
+                           else source.transports().get("proxy")),
+                    cookies=cookies,
+                    scroll_to_bottom=bool(rc.get("scroll_to_bottom", False)),
+                )
+                items = []
+                if rendered:
+                    doc = self._parser.parse(rendered)
+                    parsed = self._parser.parse_items(
+                        doc, item_cfg.get("root_selector"), fields, source.base_url
+                    )
+                    for p_it in parsed:
+                        if not p_it.get("url"):
+                            continue  # 无作品链接的广告/占位卡：跳过（否则被 join 成站点根）
+                        items.append({
+                            "title": p_it.get("title", ""),
+                            "href": p_it.get("url", ""),
+                            "src": p_it.get("cover", ""),
+                            "text": p_it.get("title", ""),
+                            "author": p_it.get("author", ""),
+                        })
+            else:
+                items = fetch_rendered_items_sync(
+                    abs_url,
+                    _sel(item_cfg.get("root_selector")),
+                    wait_for=rc.get("wait_for") or "",
+                    wait_until=rc.get("wait_until") or "networkidle",
+                    timeout_ms=int(rc.get("timeout_ms") or 30000),
+                    extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
+                    proxy=(None if source.transports().get("direct")
+                           else source.transports().get("proxy")),
+                    cookies=cookies,
+                )
         kw = (keyword or "").strip()
         # 关键词过滤开关：render_config.filter_keyword 显式 false 时跳过硬性过滤。
         # 默认 true 保持原行为（剔除热门榜无关项）；17k 等站搜索结果页本身按站内
@@ -515,9 +639,82 @@ class Search:
                     source_id=source.source_id,
                     source_name=source.source_name,
                     cover=Search._clean_cover(it.get("src", "")),
+                    author=str(it.get("author") or ""),
                 )
             )
+        # 需要登录的渲染源（render_config.login_required，如番茄）：未登录时
+        # 搜索页服务端给空 body/登录墙 → 渲染结果恒为空。与其显示「什么都没
+        # 搜到」，不如明确引导用户去登录（否则用户只会反复重试搜索）。
+        if not results and kw and rc.get("login_required"):
+            if (
+                self._cookie_manager is None
+                or not self._cookie_manager.is_logged_in(source.source_id)
+            ):
+                raise SourceError(
+                    f"「{source.source_name}」搜索需登录，请在「源管理 → 登录」"
+                    " 完成登录（保存 Cookie）后再搜索"
+                )
         return results
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _items_from_response_json(raw: str, rc: dict, source: SourceConfig) -> list:
+        """把 render_config.response_json_url 模式抓到的接口 JSON 转成结果项。
+
+        返回与 fetch_rendered_*_sync 同构的 [{title,href,src,text,author}]。
+        render_config.response_items 为列表的 jsonpath；response_fields 为
+        字段映射（title/author/cover/summary 取值表达式；url_template 支持
+        {base} 与 {字段名} 模板）。解析失败/空 → []。
+        """
+        items: list = []
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:  # noqa: BLE001
+            return items
+        path = str(rc.get("response_items") or "")
+        lst = jsonpath(data, path) if path else data
+        if isinstance(lst, dict):
+            lst = [lst]
+        elif lst is None:
+            lst = []
+        if not isinstance(lst, list):
+            return items
+        fields = rc.get("response_fields") or {}
+        url_tpl = str(fields.get("url_template") or fields.get("url") or "")
+
+        def _g(it: dict, expr: str) -> str:
+            expr = str(expr or "")
+            val = jsonpath(it, expr) if "." in expr or expr.startswith("$") else it.get(expr)
+            if val is None:
+                return ""
+            return str(val)
+
+        for it in lst:
+            if not isinstance(it, dict):
+                continue
+            title = _g(it, fields.get("title") or "title")
+            href = ""
+            if url_tpl:
+                try:
+                    href = url_tpl.replace("{base}", source.base_url.rstrip("/"))
+                    for k, v in it.items():
+                        href = href.replace("{%s}" % k, str(v) if v is not None else "")
+                except Exception:  # noqa: BLE001
+                    href = ""
+            cover = _g(it, fields.get("cover") or "cover")
+            author = _g(it, fields.get("author") or "author")
+            summary = _g(it, fields.get("summary") or "summary")
+            if not href.startswith("http") and href:
+                href = source.base_url.rstrip("/") + href
+            if title and href:
+                items.append({
+                    "title": title,
+                    "href": href,
+                    "src": cover,
+                    "text": summary,
+                    "author": author,
+                })
+        return items
 
     # ------------------------------------------------------------------ #
     def _search_ytdlp(
@@ -773,6 +970,7 @@ class Search:
             interval_ms=int(source.transports().get("interval_ms") or http.defaults.interval_ms),
             encoding=source.transports().get("charset"),
             proxy_pool=source.proxy_pool(),
+            direct=bool(source.transports().get("direct")),
         )
 
     def _http_post_form(

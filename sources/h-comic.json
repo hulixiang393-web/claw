@@ -1,0 +1,266 @@
+{
+  "$schema_version": 2,
+  "$id": "h-comic",
+  "$type": "comic",
+  "$name": "H-Comic（成人漫畫）",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://h-comic.com",
+    "icon": "https://h-comic.com/favicon.ico",
+    "description": "H-Comic - 免費中文成人漫畫（nhentai 鏡像）。SvelteKit SPA：列表/詳情 DOM 由 JS 渲染，資料在 /__data.json 的 devalue 扁平結構；作品詳情/閱讀路由 /comics/{id}/{chunk}，正文圖走圖床 https://h-comic.link/api/{comic_source}/{media_id}/pages/{n}。發現頁列表經 endpoints.discovery.render=playwright 渲染後按 works_list_item 選擇器解析。",
+    "lang": "zh-TW",
+    "region": "hk",
+    "tags": [
+      "漫畫",
+      "成人",
+      "免費",
+      "SPA",
+      "nhentai"
+    ],
+    "last_verified": "2026-09-14"
+  },
+  "transports": {
+    "base_url": "https://h-comic.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept-Language": "zh-TW,zh;q=0.9,zh-CN;q=0.8,en;q=0.7",
+      "Referer": "https://h-comic.com/"
+    },
+    "timeout": 20,
+    "retries": 2,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/?q=&tag=&page={page}",
+      "render": "playwright",
+      "render_config": {
+        "wait_for": "a[href*='/comics/']",
+        "wait_until": "domcontentloaded",
+        "extra_delay_ms": 3000,
+        "timeout_ms": 45000
+      },
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "全部",
+            "url": "/?q=&tag=&page={page}"
+          },
+          {
+            "title": "全彩",
+            "url": "/?q=&tag=full%20color&page={page}"
+          },
+          {
+            "title": "巨乳",
+            "url": "/?q=&tag=big%20breasts&page={page}"
+          },
+          {
+            "title": "黑絲 / 白襪",
+            "url": "/?q=&tag=stockings&page={page}"
+          },
+          {
+            "title": "NTR",
+            "url": "/?q=&tag=netorare&page={page}"
+          },
+          {
+            "title": "足交 / 腳交",
+            "url": "/?q=&tag=footjob&page={page}"
+          },
+          {
+            "title": "女學生",
+            "url": "/?q=&tag=schoolgirl%20uniform&page={page}"
+          },
+          {
+            "title": "眼鏡控",
+            "url": "/?q=&tag=glasses&page={page}"
+          },
+          {
+            "title": "口交",
+            "url": "/?q=&tag=blowjob&page={page}"
+          },
+          {
+            "title": "正太控",
+            "url": "/?q=&tag=shotacon&page={page}"
+          },
+          {
+            "title": "亂倫",
+            "url": "/?q=&tag=incest&page={page}"
+          },
+          {
+            "title": "熟女 / 人妻",
+            "url": "/?q=&tag=milf&page={page}"
+          },
+          {
+            "title": "同志 BL",
+            "url": "/?q=&tag=yaoi&page={page}"
+          },
+          {
+            "title": "黑肉",
+            "url": "/?q=&tag=dark%20skin&page={page}"
+          },
+          {
+            "title": "泳裝",
+            "url": "/?q=&tag=swimsuit&page={page}"
+          },
+          {
+            "title": "手淫",
+            "url": "/?q=&tag=masturbation&page={page}"
+          },
+          {
+            "title": "肌肉",
+            "url": "/?q=&tag=muscle&page={page}"
+          },
+          {
+            "title": "姐姐 / 妹妹",
+            "url": "/?q=&tag=sister&page={page}"
+          },
+          {
+            "title": "捆綁",
+            "url": "/?q=&tag=bondage&page={page}"
+          },
+          {
+            "title": "調教",
+            "url": "/?q=&tag=femdom&page={page}"
+          },
+          {
+            "title": "催眠",
+            "url": "/?q=&tag=mind%20control&page={page}"
+          },
+          {
+            "title": "露出",
+            "url": "/?q=&tag=exhibitionism&page={page}"
+          },
+          {
+            "title": "群交",
+            "url": "/?q=&tag=group&page={page}"
+          },
+          {
+            "title": "肛交",
+            "url": "/?q=&tag=anal&page={page}"
+          },
+          {
+            "title": "獸交",
+            "url": "/?q=&tag=bestiality&page={page}"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.card"
+        },
+        "fields": {
+          "title": {
+            "css": "div.p-4 span.text-sm"
+          },
+          "url": {
+            "css": "a[href*='/comics/']",
+            "attr": "href",
+            "url_replace": [
+              "/comics/[^?]+\\?id=(\\d+)",
+              "/comics/{1}/1?id={1}"
+            ]
+          },
+          "cover": {
+            "css": "a[href*='/comics/'] img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/?q={keyword}&tag=&page={page}",
+      "method": "GET",
+      "render": "playwright",
+      "item": {
+        "root_selector": {
+          "css": "div.card"
+        },
+        "render_config": {
+          "wait_for": "a[href*='/comics/']",
+          "wait_until": "domcontentloaded",
+          "extra_delay_ms": 3000,
+          "timeout_ms": 45000,
+          "filter_keyword": false
+        },
+        "fields": {
+          "title": {
+            "css": "div.p-4 span.text-sm"
+          },
+          "url": {
+            "css": "a[href*='/comics/']",
+            "attr": "href",
+            "url_replace": [
+              "/comics/[^?]+\\?id=(\\d+)",
+              "/comics/{1}/1?id={1}"
+            ]
+          },
+          "cover": {
+            "css": "a[href*='/comics/'] img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/comics/",
+      "fields": {
+        "title": {
+          "xpath": "//script[contains(text(),'media_id')]",
+          "regex": "title:\\{japanese:\"([^\"]*)\""
+        },
+        "cover": {
+          "xpath": "//script[contains(text(),'media_id')]",
+          "regex": "(media_id:\"[^\"]+\",comic_source:\"[^\"]+\")",
+          "url_replace": [
+            "media_id:\"([^\"]+)\",comic_source:\"([^\"]+)\"",
+            "https://h-comic.link/api/{2}/{1}"
+          ]
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "single_chapter": true,
+        "body": {
+          "render": "playwright",
+          "render_config": {
+            "wait_for": "img[src*='h-comic.link']",
+            "wait_until": "networkidle",
+            "extra_delay_ms": 2500,
+            "timeout_ms": 45000,
+            "extract_mode": "img",
+            "img_selector": "img.fixed.w-0.h-0",
+            "scroll_to_bottom": true,
+            "scroll_step_px": 900,
+            "scroll_stale_rounds": 4
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 40
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 4,
+      "max_items": 600
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

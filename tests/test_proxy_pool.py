@@ -44,6 +44,7 @@ def _make_http():
     http = HttpClient(sleeper=lambda s: None)
     if http._session is not None:
         http._session.trust_env = False
+    http._system_proxy_enabled = False
     return http
 
 

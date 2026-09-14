@@ -1,0 +1,174 @@
+{
+  "$schema_version": 2,
+  "$id": "xhentai85",
+  "$type": "comic",
+  "$name": "無限動漫H（xhentai85）",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://xhentai85.xyz",
+    "description": "xhentai85 - 日韓全彩成人漫畫（GBK，?novelN 作品）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "漫画",
+      "成人",
+      "彩色"
+    ]
+  },
+  "transports": {
+    "base_url": "https://xhentai85.xyz",
+    "charset": "gbk",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/?latest/index_2.html",
+      "list_paginator": {
+        "type": "increment",
+        "page_placeholder": "(?<=index_)\\d+(?=\\.html)"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "最新更新",
+            "url": "/?latest/index_2.html"
+          },
+          {
+            "title": "連載更新",
+            "url": "/?release/index_2.html"
+          },
+          {
+            "title": "人氣排行",
+            "url": "/?popular/index_2.html"
+          },
+          {
+            "title": "完結漫畫",
+            "url": "/?completed/index_2.html"
+          },
+          {
+            "title": "韓漫",
+            "url": "/?hanman/index_2.html"
+          },
+          {
+            "title": "日漫",
+            "url": "/?riman/index_2.html"
+          },
+          {
+            "title": "3D",
+            "url": "/?3d/index_2.html"
+          },
+          {
+            "title": "同人",
+            "url": "/?doujin/index_2.html"
+          },
+          {
+            "title": "單篇",
+            "url": "/?single/index_2.html"
+          },
+          {
+            "title": "短篇",
+            "url": "/?short/index_2.html"
+          },
+          {
+            "title": "cosplay",
+            "url": "/?cosplay/index_2.html"
+          },
+          {
+            "title": "CG",
+            "url": "/?cg/index_2.html"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.each_truyen"
+        },
+        "fields": {
+          "title": {
+            "css": "a",
+            "attr": "title"
+          },
+          "url": {
+            "css": "a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "css": "h2.single_title"
+        },
+        "cover": {
+          "css": "img.wp-post-image",
+          "attr": "src"
+        },
+        "author": {
+          "css": "a[itemprop='author']",
+          "attr": "title"
+        },
+        "summary": {
+          "css": "div.desc-text"
+        },
+        "tags": {
+          "css": "a[itemprop='genre']"
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": {
+            "css": "div#list-chapter ul.list-chapter li.chap-right5"
+          },
+          "fields": {
+            "title": {
+              "css": "span.chapter-text"
+            },
+            "url": {
+              "css": "a[href*='/chapter']",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "root_selector": {
+            "css": "img[src*='hmpic/']"
+          },
+          "fields": {
+            "url": {
+              "css": "img[src*='hmpic/']",
+              "attr": "src"
+            }
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

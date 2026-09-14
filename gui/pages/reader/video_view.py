@@ -1,6 +1,9 @@
 """视频阅读视图（video_view.py）—— VLC 内嵌播放器 + 现代化交互。
 
-- 分集列表，点击选看
+- 分集卡片网格：选集以块状卡片网格展示在播放面板下方（自适应列数），
+  点卡切集、当前集高亮；无封面的分集显示纯文字块（palette midlight 圆角）
+- 相关推荐：同源搜索当前作品（tag[0] / 标题），取前 8 条卡片同网格渲染，
+  点击经 recommend_open_requested 打开新作品；无 Search/无结果自动隐藏
 - VLC 内嵌播放区（python-vlc set_hwnd），通用支持 HLS/DASH 双流/MP4
 - 现代化播放交互（refactor-shelf-player.md P1-P10）：
   - 控制条自动隐藏（3s 无操作隐藏 + 鼠标指针跟随隐藏）
@@ -18,18 +21,18 @@ from __future__ import annotations
 
 import webbrowser
 
-from PySide6.QtCore import QSize, Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
+from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSlider,
     QToolButton,
     QVBoxLayout,
@@ -37,6 +40,8 @@ from PySide6.QtWidgets import (
 )
 
 from framework.content import Content, Detail
+
+from gui.components.hover_title import HoverTitle
 
 
 class _PlayPanel(QWidget):
@@ -127,6 +132,163 @@ class _FetchStreamTask(QRunnable):
             pass
 
 
+class _RecommendSignals(QObject):
+    finished = Signal(object, object, object, object)  # (source_id, keyword, results, err)
+
+
+class _RecommendTask(QRunnable):
+    """后台搜索当前作品的同源相关视频（推荐加载，失败静默）。"""
+
+    def __init__(self, search, source, keyword):
+        super().__init__()
+        self.signals = _RecommendSignals()
+        self._search = search
+        self._source = source
+        self._keyword = keyword
+
+    def run(self) -> None:
+        # 独立 HttpClient：requests.Session 非线程安全，后台线程不共享
+        # 全局 Search 的实例（与 search_type 的 worker 同模式）
+        http = None
+        try:
+            http = self._search._http.__class__(
+                sleeper=getattr(self._search._http, "_sleeper", None),
+                defaults=self._search._http.defaults,
+            )
+        except Exception:  # noqa: BLE001
+            http = None
+        results, err = [], None
+        try:
+            results = self._search.search_one(self._source, self._keyword, http=http)
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+        finally:
+            if http is not None:
+                try:
+                    http.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            self.signals.finished.emit(
+                getattr(self._source, "source_id", ""), self._keyword, results or [], err
+            )
+        except RuntimeError:
+            pass
+
+
+class _GridCard(QFrame):
+    """块状卡片：封面（可选）在上 + 标题在下，点击触发。
+
+    - 有封面：CoverLoader 异步回填缩略图（居中裁剪，尺寸与网格列对齐）
+    - 无封面：隐藏封面区 → 纯文字块（palette midlight 圆角），观感如床头按钮
+    - 有演员（detail.actor，源 detail.fields.actor 可选配置）：标题下增加
+      一行小字号演员；无封面时演员行跟随标题居中
+    - selected 属性：当前集高亮（亮色边框），供分集卡片选中态
+    """
+
+    clicked = Signal(object)  # 发射自身（host 按 p_data 区分分集/推荐）
+
+    def __init__(self, title: str = "", cover_url: str = "", source_id: str = "",
+                 actor: str = "", p_data=None, parent=None, source=None):
+        super().__init__(parent)
+        self.p_data = p_data
+        self.cover_url = cover_url or ""
+        self.source_id = source_id or ""
+        self.actor = actor or ""
+        self._source = source  # 所属源（供 CoverLoader 解密封面字节，私图床加密封面）
+        self._selected = False
+        self.setObjectName("mediaCard")
+        self.setCursor(Qt.PointingHandCursor)
+        card_h = 178 if self.actor else 158
+        self.setFixedHeight(card_h)
+        self.setStyleSheet(
+            "QFrame#mediaCard { background: palette(midlight);"
+            " border: 2px solid transparent; border-radius: 8px; }"
+            "QFrame#mediaCard:hover { border-color: palette(highlight); }"
+            "QFrame#mediaCard[mediaSelected=\"true\"] { border-color: palette(highlight); }"
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(6)
+        self._cover = QLabel(self)
+        self._cover.setAlignment(Qt.AlignCenter)
+        self._cover.setFixedHeight(100)
+        self._cover.setStyleSheet(
+            "background: palette(base); border-radius: 6px; color: palette(mid); font-size: 30px;"
+        )
+        self._cover.setText("▶")
+        lay.addWidget(self._cover)
+
+        self._title = HoverTitle(title or "", parent_card=self)
+        self._title.setFixedHeight(20)
+        self._title.setStyleSheet("font-size: 13px;")
+        lay.addWidget(self._title, stretch=1)
+
+        # 演员行（源 detail.fields.actor 配置；为空不显示，避免空行占位）
+        self._actor_lbl = QLabel(self.actor, self)
+        self._actor_lbl.setWordWrap(True)
+        self._actor_lbl.setStyleSheet("color: palette(dark); font-size: 12px;")
+        if self.actor:
+            lay.addWidget(self._actor_lbl)
+        else:
+            self._actor_lbl.hide()
+
+        if self.cover_url:
+            self._load_cover()
+        else:
+            self._cover.hide()
+            self._title.setAlignment(Qt.AlignCenter)
+            self._actor_lbl.setAlignment(Qt.AlignCenter)
+
+    def set_selected(self, on: bool) -> None:
+        """刷新当前集选中态（属性驱动 QSS 边框）。"""
+        on = bool(on)
+        if on == self._selected:
+            return
+        self._selected = on
+        self.setProperty("mediaSelected", on)
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
+
+    def _load_cover(self) -> None:
+        """异步加载卡片封面（CoverLoader 全局限流，居中裁剪显示）。"""
+        from gui.components.cover_loader import CoverLoader
+
+        def _on(pm):
+            if pm is None or pm.isNull():
+                return
+            import shiboken6
+
+            if not shiboken6.isValid(self._cover):
+                return  # 卡片已销毁，跳过
+            w = self._cover.width()
+            h = self._cover.height()
+            if w <= 0 or h <= 0:
+                w, h = 160, 100  # 未布局兜底
+            scaled = pm.scaled(
+                w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+            )
+            sx = max(0, (scaled.width() - w) // 2)
+            sy = max(0, (scaled.height() - h) // 2)
+            cropped = scaled.copy(sx, sy, min(w, scaled.width()), min(h, scaled.height()))
+            self._cover.setPixmap(cropped)
+            from gui.components.cover_loader import fade_in
+
+            fade_in(self._cover)
+
+        CoverLoader.instance().load(
+            self.cover_url, _on, cache=True, persist=False,
+            source_id=self.source_id, source=self._source,
+        )
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit(self)
+        super().mouseReleaseEvent(event)
+
+
 class VideoView(QWidget):
     """视频分集 + VLC 内嵌播放视图（现代化交互，支持多播放源换源）。"""
 
@@ -134,6 +296,7 @@ class VideoView(QWidget):
     position_changed = Signal(object)  # (detail, 标题, URL, 播放进度 0~1, None) 续读
     source_changed = Signal(object)  # (detail, new_sid) → ReaderPage 换源
     download_requested = Signal(object)  # (source_id, detail.url, content_type) → 下载当前作品
+    recommend_open_requested = Signal(object)  # (source_id, url, content_type) → 打开推荐视频
 
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
@@ -150,13 +313,21 @@ class VideoView(QWidget):
         "  播放器自带「恢复播放位置」，下次打开自动续播\n"
     )
 
-    def __init__(self, content: Content, parent=None):
+    def __init__(self, content: Content, parent=None, search=None):
         super().__init__(parent)
         self._content = content
+        self._search = search  # 可选：同源搜索相关推荐（未注入则不显示推荐区）
         self._source = None
         self._detail: Detail | None = None
         self._episodes = []
+        self._ep_cards = []  # 分集卡片（顺序 = 集序）
+        self._rec_cards = []  # 相关推荐卡片
+        self._last_cols = -1  # 网格上次列数（-1 强制重排）
+        self._last_col_w = -1  # 网格上次单卡宽度
+        self._col_w = 0  # 网格单卡宽度（随窗口宽度自适应）
+        self._recommend_keyword = ""  # 推荐搜索去重关键词
         self._current_idx = -1
+        self._selection_mode = False  # 多集源选集态（停选集等用户选，不自动播）
         self._current_play = ""  # 单流播放地址（展示/复制）
         self._current_audio = ""  # DASH 音频轨（外接播放器 input-slave 挂入）
         self._current_title = ""  # 当前集标题（重开播放器/浮层提示）
@@ -189,6 +360,7 @@ class VideoView(QWidget):
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
         # ---- 播放源选择（换源站显示，普通源隐藏）----
         source_row = QHBoxLayout()
@@ -202,39 +374,16 @@ class VideoView(QWidget):
         self.source_label.setVisible(False)
         self.source_combo.setVisible(False)
 
-        # ---- 主体：分集列表（含封面）+ 播放区 ----
-        body = QHBoxLayout()
+        # ---- 主体：播放面板在上，分集/推荐卡片网格在下 ----
+        body = QVBoxLayout()
         body.setSpacing(8)
-        side_wrap = QWidget()
-        side_wrap.setFixedWidth(200)
-        side = QVBoxLayout(side_wrap)
-        side.setContentsMargins(0, 0, 0, 0)
-        side.setSpacing(6)
-        # 视频分集侧边栏顶部作品封面（小说/漫画阅读界面无此区）
-        self.cover_label = QLabel()
-        self.cover_label.setFixedHeight(120)
-        self.cover_label.setScaledContents(True)
-        self.cover_label.hide()
-        self.cover_label.setStyleSheet(
-            "background: #222; border-radius: 6px;"
-        )
-        side.addWidget(self.cover_label)
-        self.ep_list = QListWidget()
-        self.ep_list.setIconSize(QSize(76, 50))  # 长标题换行修复：缩略图让出水平空间
-        self.ep_list.setWordWrap(True)  # 分集长标题换行完整显示，不被截断
-        self.ep_list.itemClicked.connect(self._on_ep_clicked)
-        side.addWidget(self.ep_list, stretch=1)
-        body.addWidget(side_wrap)
 
-        right = QVBoxLayout()
-        right.setSpacing(6)
-        self._right_layout = right  # 全屏退出后把视频区插回
-
-        # 播放面板（外部播放器方案：不再内嵌视频渲染，只做播放入口占位）
+        # 播放面板（外部播放器方案：不再内嵌视频渲染，只做播放入口占位；
+        # 播放最终跳转外部播放器，无需大的画面区 → 高度压小，让网格区更多空间）
         self._video_frame = _PlayPanel(self)
-        self._video_frame.setMinimumHeight(220)
+        self._video_frame.setMinimumHeight(140)
         self._video_frame.setFocusPolicy(Qt.StrongFocus)
-        right.addWidget(self._video_frame, stretch=1)
+        body.addWidget(self._video_frame, stretch=1)
 
         # ---- 覆盖层：中央播放按钮 / 缓冲 spinner / 帮助浮层 ----
         self._build_overlays()
@@ -251,7 +400,36 @@ class VideoView(QWidget):
         cb.setSpacing(6)
         self._build_control_bar(cb)
 
-        body.addLayout(right, stretch=1)
+        # ---- 可滚动卡片网格区（分集在上，相关推荐在下）----
+        self._cards_scroll = QScrollArea()
+        self._cards_scroll.setWidgetResizable(True)
+        self._cards_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._cards_container = QWidget()
+        self._cards_vbox = QVBoxLayout(self._cards_container)
+        self._cards_vbox.setContentsMargins(0, 0, 0, 0)
+        self._cards_vbox.setSpacing(12)
+
+        self.ep_section_label = QLabel("选集")
+        self.ep_section_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self._cards_vbox.addWidget(self.ep_section_label)
+        self._ep_grid = QGridLayout()
+        self._ep_grid.setSpacing(12)
+        self._cards_vbox.addLayout(self._ep_grid)
+
+        # 相关推荐：默认隐藏，后台搜索出结果再显示
+        self.rec_section_label = QLabel("相关推荐")
+        self.rec_section_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.rec_section_label.hide()
+        self._cards_vbox.addWidget(self.rec_section_label)
+        self._rec_grid = QGridLayout()
+        self._rec_grid.setSpacing(12)
+        self._cards_vbox.addLayout(self._rec_grid)
+
+        self._cards_vbox.addStretch(1)
+        self._cards_scroll.setWidget(self._cards_container)
+        body.addWidget(self._cards_scroll, stretch=3)
+
+        self._right_layout = body  # 全屏退出后把视频区插回（body 第 0 位）
         layout.addLayout(body, stretch=1)
         self._reposition_overlays()  # 初始定位控制条/覆盖层
         # 外部播放器方案：播放画面在独立播放器进程内，App 内不再内嵌渲染 →
@@ -419,28 +597,18 @@ class VideoView(QWidget):
         cb.addWidget(self.dl_btn)
 
     def _on_download_clicked(self) -> None:
-        """播放器内「⏬ 下载」→ 选择下载集数 → App 层批量入队。
+        """播放器内「⏬ 下载」→ 转发 App 层弹章节范围（默认当前集→末集）。
 
-        弹窗默认全部集数（无分集信息时直接全部），集数上限 = 当前源返回的分集数。
+        不再自带 QInputDialog「前 N 集」；由 App 统一弹 DownloadRangeDialog，
+        默认从当前集下到最后一集，用户可改全部/任意范围，并保留画质选择。
         """
         if self._source is None or self._detail is None:
             return
         sid = getattr(self._source, "source_id", "") or self._current_sid
-        total = len(self._episodes) if self._episodes else 0
-        ep_count = 0  # 0 = 全部
-        if total > 0:
-            from PySide6.QtWidgets import QInputDialog
-
-            ep_count, ok = QInputDialog.getInt(
-                self, "选择下载集数",
-                f"本作共 {total} 集\n下载集数（1 ~ {total}，默认全部）：",
-                total, 1, total, 1,
-            )
-            if not ok:
-                return
+        idx = self._current_idx + 1 if 0 <= self._current_idx < len(self._episodes) else 1
         self.download_requested.emit(
             (sid, self._detail.url,
-             getattr(self._detail, "content_type", ""), ep_count)
+             getattr(self._detail, "content_type", ""), idx)
         )
 
     def _disable_embedded_controls(self) -> None:
@@ -506,10 +674,15 @@ class VideoView(QWidget):
         self.ep_menu.menuAction().setVisible(bool(self._episodes))
 
     def _select_episode(self, idx: int) -> None:
-        """播放器内选集：同步左侧列表并加载该集。"""
-        if not (0 <= idx < len(self._episodes)) or idx == self._current_idx:
+        """播放器内选集：加载该集并同步卡片选中态/选集菜单。
+
+        选集态下点当前高亮集也视为选择 → 立即取流播放；
+        播放中点同一集不重载。
+        """
+        if not (0 <= idx < len(self._episodes)):
             return
-        self.ep_list.setCurrentRow(idx)
+        if idx == self._current_idx and not self._selection_mode:
+            return
         self._load_episode(idx)
         self._refresh_ep_menu()
 
@@ -644,8 +817,20 @@ class VideoView(QWidget):
         w, h = frame.width(), frame.height()
         if w <= 0 or h <= 0:
             return
-        self.center_play_btn.move((w - 96) // 2, (h - 96) // 2)
-        self.buffer_spinner.move((w - 56) // 2, (h - 56) // 2)
+        # 沉浸控制条：悬浮在视频画面底部中央（YouTube/B站 风格）。
+        # 先量尺寸：矮播放框（<196）时中央按钮与它重叠 → 上移按钮避让
+        self.control_bar.adjustSize()
+        cb_w = min(w - 32, 920)
+        self.control_bar.resize(cb_w, self.control_bar.height())
+        self.control_bar.move((w - cb_w) // 2, h - self.control_bar.height() - 12)
+        # 控制条上方安全区（留 12 间距）
+        cb_vtop = h - self.control_bar.height() - 24
+        cy = (h - 96) // 2
+        if cy + 96 > cb_vtop:
+            cy = max(0, (cb_vtop - 96) // 2)
+        self.center_play_btn.move((w - 96) // 2, cy)
+        self.buffer_spinner.move((w - 56) // 2,
+                                 max(0, (min(cb_vtop, h) - 56) // 2))
         self.help_overlay.adjustSize()
         self.help_overlay.move((w - self.help_overlay.width()) // 2,
                                (h - self.help_overlay.height()) // 2)
@@ -653,11 +838,6 @@ class VideoView(QWidget):
             self.play_label.adjustSize()
             self.play_label.move((w - self.play_label.width()) // 2,
                                  h - self.play_label.height() - 24)
-        # 沉浸控制条：悬浮在视频画面底部中央（YouTube/B站 风格）
-        self.control_bar.adjustSize()
-        cb_w = min(w - 32, 920)
-        self.control_bar.resize(cb_w, self.control_bar.height())
-        self.control_bar.move((w - cb_w) // 2, h - self.control_bar.height() - 12)
 
     def _toggle_help(self) -> None:
         """? 键：显示/隐藏快捷键帮助浮层。"""
@@ -671,109 +851,165 @@ class VideoView(QWidget):
                           if self.help_overlay.isVisible() else None)
 
     # ------------------------------------------------------------------ #
-    def _load_ep_cover(self, detail: Detail) -> None:
-        """在侧边栏顶部显示作品封面。
+    def _populate_ep_cards(self, chapters) -> None:
+        """重建分集卡片网格：每集一张卡，封面用本集缩略图、缺省回退作品封面。
 
-        兜底策略（d4107a8 前：无 cover 直接隐藏）：
-        1. 优先 detail.cover（源配置的章节页封面字段）
-        2. 为空 → 取第一集缩略图 ep.cover（部分源只配了分集封面）
-        3. 全空 → 后台 fetch_cover 从详情页重新提取
+        无封面 → 纯文字块；卡片按序入 _ep_cards，点击切集。
         """
-        cover = (detail.cover or "").strip()
-        if not cover:
-            cover = self._first_ep_cover(detail)
-        if not cover:
-            self.cover_label.hide()
-            self.cover_label.clear()
-            self._fetch_cover_in_background(detail)
-            return
-        self._apply_cover(cover)
-
-    def _first_ep_cover(self, detail: Detail) -> str:
-        """D 章节列表里第一张非空封面。"""
-        for ep in detail.chapters or []:
-            url = (getattr(ep, "cover", "") or "").strip()
-            if url:
-                return url
-        return ""
-
-    def _fetch_cover_in_background(self, detail: Detail) -> None:
-        """detail 与章节均无封面 → 后台请求详情页 API 重新提取一次。"""
-        source = getattr(self, "_source", None)
-        content = getattr(self, "_content", None)
-        if source is None or content is None:
-            return
-        from framework.http import HttpClient
-
-        def _run():
-            try:
-                with HttpClient() as http:
-                    url = content.fetch_cover(source, detail.url)
-            except Exception:  # noqa: BLE001
-                url = ""
-            if not url:
-                return
-
-            def _set(pm):
-                if pm is None or pm.isNull() or self.cover_label.isHidden():
-                    return
-                self.cover_label.show()
-                self.cover_label.setPixmap(pm)
-
-            from gui.components.cover_loader import CoverLoader
-
-            CoverLoader.instance().load(url, _set, cache=True, persist=False)
-
-        from PySide6.QtCore import QThreadPool
-
-        QThreadPool.globalInstance().start(_run)
-
-    def _apply_cover(self, cover: str) -> None:
-        """设置封面图（复用 CoverLoader 异步缓存）。"""
-        self.cover_label.show()
-
-        def _set(pm):
-            if pm is None or pm.isNull():
-                return
-            self.cover_label.setPixmap(pm)
-
-        from gui.components.cover_loader import CoverLoader
-
-        CoverLoader.instance().load(cover, _set, cache=True, persist=False)
-
-    def _populate_ep_list(self, chapters) -> None:
-        """重建分集列表；每集异步加载各自封面缩略图（无则忽略，不阻塞标题）。"""
-        self.ep_list.clear()
-        from gui.components.cover_loader import CoverLoader
-
-        def _make_item(i: int, ep) -> QListWidgetItem:
-            item = QListWidgetItem(ep.title or f"第{i+1}集")
-            item.setData(Qt.UserRole, i)
-
-            def _on_cover(pm):
-                if pm is None or pm.isNull():
-                    return
-                try:
-                    from PySide6.QtGui import QIcon
-
-                    item.setIcon(QIcon(pm))
-                except RuntimeError:
-                    pass  # item 已随列表清空销毁
-
-            url = (getattr(ep, "cover", "") or "").strip()
-            if url:
-                # cache=True：封面进共享 LRU 缓存，重开/换集不重复下载
-                CoverLoader.instance().load(url, _on_cover, cache=True, persist=False)
-            return item
-
+        for c in self._ep_cards:
+            c.deleteLater()
+        self._ep_cards.clear()
+        self._wipe_grid(self._ep_grid)
+        sid = getattr(self._source, "source_id", "") or self._current_sid
+        detail_cover = (getattr(self._detail, "cover", "") or "").strip()
+        detail_actor = (getattr(self._detail, "actor", "") or "").strip()
         for i, ep in enumerate(chapters):
-            self.ep_list.addItem(_make_item(i, ep))
+            cover = (getattr(ep, "cover", "") or "").strip()
+            if not cover:
+                cover = detail_cover
+            card = _GridCard(
+                ep.title or f"第{i + 1}集", cover_url=cover, source_id=sid,
+                actor=detail_actor, p_data=i, parent=self._cards_container,
+                source=self._source,
+            )
+            card.clicked.connect(self._on_ep_card)
+            self._ep_cards.append(card)
+        self.ep_section_label.setVisible(bool(self._ep_cards))
+        self._last_cols = -1  # 强制按当前宽度重排
+        self._reflow_cards()
+        self._paint_card_selection()
+
+    def _paint_card_selection(self) -> None:
+        """按当前集刷新分集卡片选中态高亮。"""
+        for i, card in enumerate(self._ep_cards):
+            card.set_selected(i == self._current_idx)
+
+    def _wipe_grid(self, grid) -> None:
+        """清空网格布局项（卡片对象由持有列表管理，不在此销毁）。"""
+        while grid.count():
+            grid.takeAt(0)
+
+    def _grid_columns(self) -> int:
+        """按可视宽度算列数（每列约 190px，2~8 列；窄窗口回退保最小卡宽）。"""
+        view_w = self._cards_scroll.viewport().width() or self.width() or 900
+        cols = min(8, max(2, view_w // 190))
+        while cols > 2 and (view_w - 12 * (cols - 1)) // cols < 120:
+            cols -= 1
+        self._col_w = max(120, (view_w - 12 * (cols - 1)) // cols)
+        return cols
+
+    def _reflow_cards(self) -> None:
+        """把分集/推荐卡片按当前列数重排（等宽均匀铺开，响应窗口 resize）。"""
+        cols = self._grid_columns()
+        if cols == self._last_cols and self._col_w == self._last_col_w:
+            return
+        self._last_cols = cols
+        self._last_col_w = self._col_w
+        for grid, cards in ((self._ep_grid, self._ep_cards),
+                            (self._rec_grid, self._rec_cards)):
+            self._wipe_grid(grid)
+            for i, card in enumerate(cards):
+                if card.width() != self._col_w and self._col_w > 0:
+                    card.setFixedWidth(self._col_w)
+                row, col = divmod(i, cols)
+                grid.addWidget(card, row, col)
+            for c in range(grid.columnCount()):
+                grid.setColumnStretch(c, 0)
+            for c in range(cols):
+                grid.setColumnStretch(c, 1)
+
+    # ------------------------------------------------------------------ #
+    # 相关推荐（同源搜索，未注入 Search/无结果自动隐藏）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _recommend_keyword_of(detail) -> str:
+        """推荐关键词：优先详情 tags[0]，回退标题短前缀（前 3 字）。
+
+        tags 缺失/为空（如 18mh-video 详情只有 title）时用完整标题搜索只会命中
+        自身，剔除后推荐区为空；短前缀能命中同系列/同题材的其它作品。
+        """
+        for t in (getattr(detail, "tags", None) or []):
+            t = str(t or "").strip()
+            if t:
+                return t
+        return (getattr(detail, "title", "") or "").strip()[:3]
+
+    def _maybe_load_recommendations(self) -> None:
+        """后台搜索当前作品同源相关视频（换源/换作品后重搜）。"""
+        if self._search is None or self._source is None or self._detail is None:
+            return
+        kw = self._recommend_keyword_of(self._detail)
+        if not kw or kw == self._recommend_keyword:
+            return
+        self._recommend_keyword = kw
+        task = _RecommendTask(self._search, self._source, kw)
+        task.signals.finished.connect(self._on_recommend_done)
+        self._recommend_task = task  # 防 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_recommend_done(self, source_id, keyword, results, err) -> None:
+        """推荐搜索结果落地：剔除自身 + URL 去重，取前 8 条渲染；空则隐藏推荐区。"""
+        if self._detail is None or keyword != self._recommend_keyword:
+            return  # 换作品后旧搜索后到，丢弃
+        picks = []
+        seen_urls = set()
+        for r in results or []:
+            url = getattr(r, "url", "") or ""
+            if not url or url == self._detail.url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            picks.append(r)
+            if len(picks) >= 8:
+                break
+        self._render_rec_cards(picks)
+
+    def _render_rec_cards(self, results) -> None:
+        for c in self._rec_cards:
+            c.deleteLater()
+        self._rec_cards.clear()
+        self._wipe_grid(self._rec_grid)
+        self.rec_section_label.hide()
+        if not results:
+            self._last_cols = -1
+            self._reflow_cards()
+            return
+        sid = getattr(self._source, "source_id", "") or self._current_sid
+        for r in results:
+            card = _GridCard(
+                (r.title or "")[:60], cover_url=getattr(r, "cover", "") or "",
+                source_id=sid, p_data=r, parent=self._cards_container,
+                source=self._source,
+            )
+            card.clicked.connect(self._on_rec_card)
+            self._rec_cards.append(card)
+        self.rec_section_label.show()
+        self._last_cols = -1  # 强制重排（新增推荐卡）
+        self._reflow_cards()
+
+    def _on_rec_card(self, card) -> None:
+        """点推荐卡 → 通知 ReaderPage 打开该作品（走现有 open 流程）。"""
+        if self._detail is None:
+            return
+        r = card.p_data
+        url = getattr(r, "url", "") or ""
+        if not url or url == self._detail.url:
+            return
+        sid = getattr(r, "source_id", "") or (
+            getattr(self._source, "source_id", "") or self._current_sid)
+        ctype = getattr(self._detail, "content_type", "video") or "video"
+        self.recommend_open_requested.emit((sid, url, ctype))
 
     def load(self, source, detail: Detail, start_ep_url: str = "", restore_position: float | None = None) -> None:
         self._source = source
         self._detail = detail
         self._pending_play = None  # 换书清掉旧暂存播放
+        self._has_played = False  # 未真正播放不把选集态误存为续读进度
+        self._selection_mode = False  # 换书重置选集态
         self._tuner.reset()  # 新播放会话重置卡顿统计
+        # 换书：无条件清零续读位置（旧书残留的 _pending_position 会被新书的
+        # 首个选集/播放回调消费，把新书错 seek 到旧书位置）——与 novel/comic
+        # 同模式修复跨书串位置 bug。
+        self._pending_position = None
         if restore_position is not None:
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用）。
@@ -781,19 +1017,20 @@ class VideoView(QWidget):
         self._episodes = detail.chapters
         self._stream_cache.clear()
         self._prefetch_idx = -2
-        self._load_ep_cover(detail)
+        self._recommend_keyword = ""  # 换作品强制重搜推荐
         self._populate_source_combo(detail)
         self._populate_quality_combo(source)
-        self._populate_ep_list(detail.chapters)
+        self._populate_ep_cards(detail.chapters)
         idx = 0
         if start_ep_url:
             for i, ep in enumerate(detail.chapters):
                 if ep.url == start_ep_url:
                     idx = i
                     break
-        self.ep_list.setCurrentRow(idx)
+        self._current_idx = idx if detail.chapters else -1
         self._sync_overlay_state(playing=False)
         self._refresh_ep_menu()
+        self._maybe_load_recommendations()
         if not detail.chapters:
             # 无分集（season 页）→ 直接取详情页播放地址自动播放
             self._show_status("正在获取播放流...")
@@ -804,24 +1041,47 @@ class VideoView(QWidget):
             self._stream_task = task
             QThreadPool.globalInstance().start(task)
             return
+        if len(detail.chapters) >= 2:
+            # 多集源：停在选集态，不自动取流/播放，由用户点选集数
+            self._selection_mode = True
+            self._paint_card_selection()  # 高亮当前应选中的集（默认第 0 或续读集）
+            self._show_status("请选择要播放的集数")
+            return
         self._load_episode(idx)
 
     def reload_detail(self, new_detail: Detail) -> None:
-        """换源重载分集后调用：重建列表 + 加载第 0 集（取流完成后自动播）。"""
+        """换源重载分集后调用：多集源停选集态等用户选择，单集/无分集自动取流播放。"""
         self._stop_player()  # 换源先停旧播放流
         self._detail = new_detail
         self._episodes = new_detail.chapters
         self._stream_cache.clear()
         self._prefetch_idx = -2
         self._detail_url_for_play = ""
-        self._load_ep_cover(new_detail)
-        self._populate_ep_list(new_detail.chapters)
-        self.ep_list.setCurrentRow(0)
+        self._recommend_keyword = ""  # 换源后按新源重搜推荐
+        self._has_played = False  # 新源尚未播放，不把选集态误存为续读进度
+        self._selection_mode = False  # 重置选集态
+        self._populate_ep_cards(new_detail.chapters)
         self._switching = False
         self._sync_overlay_state(playing=False)
+        self._current_idx = 0 if new_detail.chapters else -1
         self._refresh_ep_menu()
-        if new_detail.chapters:
-            self._load_episode(0)
+        self._maybe_load_recommendations()
+        if not new_detail.chapters:
+            # 无分集（season 页）→ 直接取详情页播放地址自动播放
+            self._detail_url_for_play = new_detail.url
+            self._show_status("正在获取播放流...")
+            task = _FetchStreamTask(self._content, self._source, new_detail.url, self._quality)
+            task.signals.finished.connect(self._on_stream_loaded)
+            self._stream_task = task
+            QThreadPool.globalInstance().start(task)
+            return
+        if len(new_detail.chapters) >= 2:
+            # 多集源：停在选集态，不自动取流/播放，由用户点选集数
+            self._selection_mode = True
+            self._paint_card_selection()  # 高亮当前应选中的集（默认第 0 集）
+            self._show_status("请选择要播放的集数")
+            return
+        self._load_episode(0)
 
     def current_episode_no(self) -> int:
         """当前集序号（0 基）；未加载/无分集（season 页）返回 0。
@@ -960,7 +1220,9 @@ class VideoView(QWidget):
     def _load_episode(self, idx: int) -> None:
         if self._source is None or not (0 <= idx < len(self._episodes)):
             return
+        self._selection_mode = False  # 真实选集 → 退出选集态
         self._current_idx = idx
+        self._paint_card_selection()  # 当前集卡片选中态跟随
         self._refresh_ep_menu()  # 选集菜单当前集打勾跟随
         ep = self._episodes[idx]
         self.episode_changed.emit((self._detail, ep.title, ep.url))  # 进度记忆
@@ -982,23 +1244,24 @@ class VideoView(QWidget):
         # 预拉是后台串行，本集完成后下一集大概率已缓存，连播/点下一集秒切。
         self._prefetch_next(idx)
 
-    def _on_ep_clicked(self, item) -> None:
-        idx = item.data(Qt.UserRole)
-        self._load_episode(idx)
+    def _on_ep_card(self, card) -> None:
+        """点分集卡片 → 选集加载。"""
+        idx = card.p_data if isinstance(card.p_data, int) else -1
+        if not (0 <= idx < len(self._episodes)):
+            return
+        self._select_episode(idx)
 
     def _on_prev_ep(self) -> None:
         """上一集（全屏/非全屏均可用）。"""
         idx = self._current_idx - 1
         if 0 <= idx < len(self._episodes):
-            self.ep_list.setCurrentRow(idx)
-            self._load_episode(idx)
+            self._select_episode(idx)
 
     def _on_next_ep(self) -> None:
         """下一集（全屏/非全屏均可用）。"""
         idx = self._current_idx + 1
         if 0 <= idx < len(self._episodes):
-            self.ep_list.setCurrentRow(idx)
-            self._load_episode(idx)
+            self._select_episode(idx)
 
     def _on_speed_changed(self, text: str) -> None:
         """倍速（0.5x~2.0x，VLC set_rate）。"""
@@ -1162,10 +1425,13 @@ class VideoView(QWidget):
     def _toggle_play_pause(self) -> None:
         """播放/暂停（外部播放器方案）：播放按钮 = 在外部播放器中打开当前集。
 
+        选集态（多集源未选集）下无当前流 → 先按当前高亮集取流播放。
         暂停/进度/音量由外部播放器自身接管（VLC 桌面版）；这里再次点击
         重新拉起播放器播放当前集（VLC 单实例会复用已有窗口播同 URL）。
         """
         if not self._current_play:
+            if self._selection_mode and 0 <= self._current_idx < len(self._episodes):
+                self._load_episode(self._current_idx)
             return
         self._play(self._current_play, self._current_audio, self._current_title)
 
@@ -1264,6 +1530,7 @@ class VideoView(QWidget):
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
         self._reposition_overlays()
+        self._reflow_cards()
 
     # ------------------------------------------------------------------ #
     def _prefetch_next(self, idx: int = -1) -> None:

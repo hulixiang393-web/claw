@@ -262,17 +262,22 @@ _DEFAULT_DATA_DIR = os.path.join(
 
 _shelf_singleton: Optional[RedisLikeStore] = None
 _search_singleton: Optional[RedisLikeStore] = None
+_session_singleton: Optional[RedisLikeStore] = None
 
 
 def _configure_defaults(data_dir: Optional[str] = None) -> None:
     """将两个池的落盘路径与配额重置到默认值（全局仅一次）。"""
-    global _shelf_singleton, _search_singleton
+    global _shelf_singleton, _search_singleton, _session_singleton
     base = data_dir or _DEFAULT_DATA_DIR
     _shelf_singleton = RedisLikeStore(
         quota=3 * 1024 * 1024 * 1024, persist_path=os.path.join(base, "redis_shelf.gz")
     )
     _search_singleton = RedisLikeStore(
         quota=10 * 1024 * 1024 * 1024, persist_path=os.path.join(base, "redis_search.gz")
+    )
+    # 会话级缓存：不落盘 → 退出应用即由进程回收自动清空，无需清理代码
+    _session_singleton = RedisLikeStore(
+        quota=2 * 1024 * 1024 * 1024, persist_path=None
     )
 
 
@@ -309,3 +314,20 @@ def get_search_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]
             log.warning("[cache] 搜索缓存初始化失败: %s", exc)
             _search_singleton = None
     return _ensure_loaded(_search_singleton)
+
+
+def get_session_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]:
+    """获取会话级缓存池（换源快照用）：不落盘，退出应用即自动清空。
+
+    纯内存（persist_path=None）→ 缓存从进程启动持续到进程结束，
+    退出时由进程回收自动释放，无需显式清理、不会阻塞关闭流程。
+    初始化失败返回 None → 调用方功能降级禁用。
+    """
+    global _session_singleton
+    if _session_singleton is None:
+        try:
+            _configure_defaults(data_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cache] 会话缓存初始化失败: %s", exc)
+            _session_singleton = None
+    return _ensure_loaded(_session_singleton)

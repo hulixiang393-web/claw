@@ -34,7 +34,7 @@ flowchart TB
         Flow -->|聚合结果| Cards["结果卡片流 ResultCardFlow<br/>懒加载"]
 
         Cards -->|点徽章| Filter["仅看此源 过滤"]
-        Cards -->|点卡片| Drawer["详情抽屉（复用发现）"]
+        Cards -->|点卡片| Open["→ 阅读器"]
         Cards -->|勾选| Batch["批量操作<br/>加入下载/加入书架"]
     end
 

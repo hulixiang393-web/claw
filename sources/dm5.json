@@ -10,7 +10,13 @@
     "description": "动漫屋(DM5) - 免费漫画在线阅读，支持日漫/国漫/港台漫画。正文图片经 chapterfun.ashx 接口 + JS Packer 解包获取",
     "lang": "zh-CN",
     "region": "cn",
-    "tags": ["漫画", "免费", "日漫", "国漫", "港台"],
+    "tags": [
+      "漫画",
+      "免费",
+      "日漫",
+      "国漫",
+      "港台"
+    ],
     "last_verified": "2026-08-09T00:00:00+08:00"
   },
   "transports": {
@@ -22,7 +28,8 @@
     },
     "timeout": 15,
     "retries": 2,
-    "interval_ms": 900
+    "interval_ms": 900,
+    "direct": true
   },
   "endpoints": {
     "discovery": {
@@ -35,24 +42,78 @@
       },
       "list_item": {
         "categories": [
-          { "title": "全部", "url": "/manhua-list-p{page}/" },
-          { "title": "最新", "url": "/manhua-new/" },
-          { "title": "排行", "url": "/manhua-rank/" },
-          { "title": "日漫", "url": "/manhua-jp/" },
-          { "title": "完结", "url": "/manhua-completed/" },
-          { "title": "热血", "url": "/manhua-rexue/" },
-          { "title": "冒险", "url": "/manhua-maoxian/" },
-          { "title": "魔法", "url": "/manhua-mofa/" },
-          { "title": "科幻", "url": "/manhua-kehuan/" },
-          { "title": "奇幻", "url": "/manhua-qihuan/" },
-          { "title": "竞技", "url": "/manhua-jingji/" },
-          { "title": "历史", "url": "/manhua-lishi/" },
-          { "title": "战争", "url": "/manhua-zhanzheng/" },
-          { "title": "爱情", "url": "/manhua-aiqing/" },
-          { "title": "后宫", "url": "/manhua-hougong/" },
-          { "title": "校园", "url": "/manhua-xiaoyuan/" },
-          { "title": "悬疑", "url": "/manhua-xuanyi/" },
-          { "title": "搞笑", "url": "/manhua-gaoxiao/" }
+          {
+            "title": "全部",
+            "url": "/manhua-list-p{page}/"
+          },
+          {
+            "title": "最新",
+            "url": "/manhua-new/"
+          },
+          {
+            "title": "排行",
+            "url": "/manhua-rank/"
+          },
+          {
+            "title": "日漫",
+            "url": "/manhua-jp/"
+          },
+          {
+            "title": "完结",
+            "url": "/manhua-completed/"
+          },
+          {
+            "title": "热血",
+            "url": "/manhua-rexue/"
+          },
+          {
+            "title": "冒险",
+            "url": "/manhua-maoxian/"
+          },
+          {
+            "title": "魔法",
+            "url": "/manhua-mofa/"
+          },
+          {
+            "title": "科幻",
+            "url": "/manhua-kehuan/"
+          },
+          {
+            "title": "奇幻",
+            "url": "/manhua-qihuan/"
+          },
+          {
+            "title": "竞技",
+            "url": "/manhua-jingji/"
+          },
+          {
+            "title": "历史",
+            "url": "/manhua-lishi/"
+          },
+          {
+            "title": "战争",
+            "url": "/manhua-zhanzheng/"
+          },
+          {
+            "title": "爱情",
+            "url": "/manhua-aiqing/"
+          },
+          {
+            "title": "后宫",
+            "url": "/manhua-hougong/"
+          },
+          {
+            "title": "校园",
+            "url": "/manhua-xiaoyuan/"
+          },
+          {
+            "title": "悬疑",
+            "url": "/manhua-xuanyi/"
+          },
+          {
+            "title": "搞笑",
+            "url": "/manhua-gaoxiao/"
+          }
         ]
       },
       "works_list_item": {
@@ -178,7 +239,19 @@
             "paths_regex": "pvalue=\\[([^\\]]*)\\]",
             "key_regex": "key='([^']+)'",
             "url_template": "{pix}{path}?cid={cid}&key={key}",
-            "max_pages": 500
+            "max_pages": 500,
+            "render_config": {
+              "extract_mode": "img",
+              "img_selector": "#showimage .item img",
+              "wait_for": "#cp_img img[src*='.jpg']",
+              "wait_until": "domcontentloaded",
+              "timeout_ms": 35000,
+              "extra_delay_ms": 1200
+            },
+            "parallel": {
+              "window": 8,
+              "interval_ms": 150
+            }
           }
         }
       }

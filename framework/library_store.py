@@ -138,6 +138,18 @@ class LibraryStore:
             self._save()
         return True
 
+    def set_cover(self, url: str, cover: str) -> bool:
+        """后台补写收藏封面（仅改 cover，保留收藏时间等其余元数据）。"""
+        if not url or not cover:
+            return False
+        with self._lock:
+            rec = self._data.get(url)
+            if rec is None:
+                return False
+            rec["cover"] = cover
+            self._save()
+        return True
+
     def remove(self, url: str) -> bool:
         """移除收藏（只删元数据，不删本地文件）。"""
         with self._lock:

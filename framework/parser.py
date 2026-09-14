@@ -134,6 +134,25 @@ class Parser:
             results = [_transform(r) for r in results]
         if base_url:
             results = [self._abs(base_url, r) for r in results]
+        # 字段 URL 重写（refresh/防盗链换域）：url_replace = [regex, repl]。
+        # repl 支持 {n} 引用捕获组（对齐 content._add_imgs）；无匹配保留原值。
+        ur = sel.get("url_replace")
+        if ur and results and isinstance(ur, (list, tuple)) and len(ur) == 2 and ur[0]:
+            import re as _re
+
+            ur_re = str(ur[0])
+            ur_tpl = str(ur[1])
+
+            def _rewrite(r: str) -> str:
+                m = _re.search(ur_re, r)
+                if not m:
+                    return r
+                repl = ur_tpl
+                for gi in range(1, len(m.groups()) + 1):
+                    repl = repl.replace("{%d}" % gi, m.group(gi) or "")
+                return repl
+
+            results = [_rewrite(r) for r in results]
         return results
 
     def extract_first(

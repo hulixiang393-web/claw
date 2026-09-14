@@ -141,22 +141,24 @@
     },
     "content": {
       "episode": {
-"list": {
-                    "first_page_is_current": true,
-                    "root_selector": {
-                        "css": "div.page-links a.post-page-numbers"
-                    },
-                    "chapter_order": "asc",
-                    "fields": {
-                        "title": {
-                            "css": "a.post-page-numbers"
-                        },
-                        "url": {
-                            "css": "a.post-page-numbers",
-                            "attr": "href"
-                        }
-                    }
+        "single_chapter": true,
+        "note": "单集帖（无 div.page-links）→ 回退为详情 URL 唯一分集，不再空白；分页合集帖仍按 page-links 出全集（first_page_is_current 由 framework 在 single_chapter 分支同样启用，补入第 1 集）。",
+        "list": {
+            "first_page_is_current": true,
+            "root_selector": {
+                "css": "div.page-links a.post-page-numbers"
+            },
+            "chapter_order": "asc",
+            "fields": {
+                "title": {
+                    "css": "a.post-page-numbers"
                 },
+                "url": {
+                    "css": "a.post-page-numbers",
+                    "attr": "href"
+                }
+            }
+        },
         "play_url": {
           "render": "playwright"
         },

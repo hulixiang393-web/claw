@@ -103,6 +103,47 @@ class CookieManager:
         return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
     # ------------------------------------------------------------------ #
+    def to_playwright_cookies(self, source_id: str) -> List[dict]:
+        """登录 cookie → Playwright context.add_cookies 格式（含 domain/path）。
+
+        cookies_list 里的原始条目带域名/路径/secure，可直接注入浏览器 context。
+        只存了 {name:value} 的老格式缺域名信息，无法安全注入 → 返回空。
+        供反爬 SPA 站搜索渲染（如番茄搜索页需登录 cookie 才有结果）。
+        """
+        data = self._cache.get(source_id)
+        if data is None:
+            path = self._path(source_id)
+            if not path.exists():
+                return []
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self._cache[source_id] = data
+            except (json.JSONDecodeError, OSError):
+                return []
+        out: List[dict] = []
+        seen = set()
+        for c in (data.get("cookies_list") or []):
+            name = c.get("name") or ""
+            value = c.get("value") or ""
+            domain = c.get("domain") or ""
+            if not name or not domain:
+                continue  # 无域名无法注入（not 广告位 cookie 之类）
+            key = (name, domain)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": domain.lstrip("."),
+                    "path": c.get("path") or "/",
+                    "secure": bool(c.get("secure")),
+                }
+            )
+        return out
+
+    # ------------------------------------------------------------------ #
     def logged_at(self, source_id: str) -> Optional[int]:
         """登录时间戳，未登录返回 None。"""
         cached = self._cache.get(source_id)

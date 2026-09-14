@@ -164,5 +164,50 @@ def test_url_dedup_across_pages():
     assert len(results) == 47  # 24 + 24 - 1 去重
 
 
+def _make_slow_fetch(source_desc: str, n: int = 24):
+    """构造一个逐页 fetch 会 sleep 的假 http：验证 on_page 在抓下一波前先回调。"""
+    import time
+
+    from framework.http import NetworkDefaults
+
+    class _SlowHttp:
+        defaults = NetworkDefaults()
+
+        def get_text(self, url, **kwargs):
+            import re as _r
+
+            m = _r.search(r"[?&]p=(\d+)", url)
+            page = int(m.group(1)) if m else 1
+            time.sleep(0.01)  # 模拟每页网络耗时
+            if page > 4:
+                raise RuntimeError("too late")
+            return f"<html><body>{_page_html(page, n)}</body></html>"
+
+        def post_form(self, url, form_data=None, **kwargs):
+            return self.get_text(url)
+
+    return _SlowHttp()
+
+
+def test_on_page_called_per_wave_before_search_completes():
+    """边抓边显：on_page 在抓下一波前就收到结果（而不是全部页抓完后一次性）。"""
+    src = SourceConfig.from_dict(SOURCE_JSON, "<test>")
+    src.raw["constraints"]["search"]["max_pages"] = 8
+    src.raw["constraints"]["search"]["max_results"] = 0
+    # 第 4 页起失败：若实现等全部抓完才回调，则一个回调都收不到；
+    # 新实现第 1 波（1~3 页）抓完即回调 72 条。
+    search = Search(http=_make_slow_fetch("slow"), parser=Parser())
+    pages_seen = []
+
+    def on_page(source, page, new_results):
+        pages_seen.append((page, len(new_results)))
+
+    search._search_html(src, "kw", on_page=on_page)
+    assert pages_seen, "on_page 从未回调（等全部页抓完才会一次整块回吐）"
+    # 第 1 页在第 1 波内即回调
+    assert pages_seen[0][0] == 1
+    assert pages_seen[0][1] == 24
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

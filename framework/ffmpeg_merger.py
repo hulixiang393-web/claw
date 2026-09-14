@@ -187,12 +187,15 @@ class FFmpegMerger:
                 except Exception:
                     pass
 
+            from .subprocess_no_window import no_window_kwargs
+
             proc = subprocess.Popen(
                 cmd,
                 stdout=open(log_path, "w"),
                 stderr=subprocess.STDOUT,
                 text=True,
                 errors="replace",
+                **no_window_kwargs(),  # Windows 静默，不弹控制台窗口
             )
             monitor = threading.Thread(
                 target=_monitor_progress, args=(proc,), daemon=True

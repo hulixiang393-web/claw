@@ -1,0 +1,185 @@
+{
+  "$schema_version": 2,
+  "$id": "favcomic",
+  "$type": "comic",
+  "$name": "喜漫漫画",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.favcomic.com",
+    "description": "喜漫漫画 - 免费在线漫画阅读",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "漫画",
+      "免费",
+      "日本",
+      "汉化"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.favcomic.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.favcomic.com/"
+    },
+    "timeout": 10,
+    "retries": 2,
+    "interval_ms": 600
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/boy",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "全部",
+            "url": "/boy"
+          },
+          {
+            "title": "奇幻",
+            "url": "/boy?tag=1"
+          },
+          {
+            "title": "冒险",
+            "url": "/boy?tag=4"
+          },
+          {
+            "title": "热血",
+            "url": "/boy?tag=3"
+          },
+          {
+            "title": "搞笑喜剧",
+            "url": "/boy?tag=6"
+          },
+          {
+            "title": "爱情",
+            "url": "/boy?tag=36"
+          },
+          {
+            "title": "推理悬疑",
+            "url": "/boy?tag=2"
+          },
+          {
+            "title": "校园",
+            "url": "/boy?tag=34"
+          },
+          {
+            "title": "后宫",
+            "url": "/boy?tag=40"
+          },
+          {
+            "title": "格斗",
+            "url": "/boy?tag=32"
+          },
+          {
+            "title": "穿越",
+            "url": "/boy?tag=88"
+          },
+          {
+            "title": "剧情",
+            "url": "/boy?tag=79"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "li.comic_li"
+        },
+        "fields": {
+          "title": {
+            "css": "div.brief_box div.title a"
+          },
+          "url": {
+            "css": "div.cover_box a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "div.cover_box img",
+            "attr": "data-src"
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "css": "h1"
+        },
+        "cover": {
+          "css": "img.comic_cover",
+          "attr": "data-src"
+        },
+        "author": {
+          "css": "div.right_box div.author a"
+        },
+        "summary": {
+          "css": "div.intro_box h2.txt"
+        }
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": {
+            "css": "a.item_box"
+          },
+          "chapter_order": "asc",
+          "title_clean": true,
+          "fields": {
+            "url": {
+              "css": "a.item_box",
+              "attr": "href"
+            },
+            "title": {
+              "css": "span.title"
+            }
+          }
+        },
+        "body": {
+          "root_selector": {
+            "css": "img.encrypted-image"
+          },
+          "fields": {
+            "url": {
+              "css": "img.encrypted-image",
+              "attr": "data-src"
+            }
+          }
+        }
+      }
+    }
+  },
+  "decryption": {
+    "targets": {
+      "image": {
+        "strategy": "aes_cbc",
+        "key": "6X+b6.E>bsXb}+=N",
+        "iv": "prefix",
+        "padding": "pkcs7"
+      }
+    }
+  },
+  "constraints": {
+    "detail": {
+      "max_pages": 1
+    },
+    "page": {
+      "max_pages": 500,
+      "max_items": 2000
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

@@ -226,6 +226,16 @@ QFrame#statsCard {{
     border-radius: {radius_md};
     border: 1px solid {stroke};
 }}
+/* 固定高度卡片及其内部 QLabel：屏蔽全局 QFrame padding。
+   QLabel 继承自 QFrame，QFrame 的 12px padding 会让卡片里的标题/作者/来源
+   标签各带 12px 内边距（sizeHint 膨胀），把固定高卡片挤爆、标题被顶到封面上。
+   显式归零；QLabel 带 ID 的显式 padding 规则特异性更高，不受影响。 */
+QLabel {{
+    padding: 0;
+}}
+QFrame#workCard, QFrame#shelfCard, QFrame#brokenCard {{
+    padding: 0;
+}}
 
 /* ---------- 列表 ---------- */
 QListWidget {{

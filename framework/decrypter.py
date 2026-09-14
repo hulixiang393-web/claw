@@ -35,12 +35,13 @@ class Decrypter:
         self._http = http
 
     # ------------------------------------------------------------------ #
-    def decrypt(self, source: SourceConfig, content: str, target: str = "content") -> str:
+    def decrypt(self, source: SourceConfig, content: str, target: str = "content", html: str = "") -> str:
         """按源配置的 decryption 策略解密内容。
 
         :param source: 源配置
         :param content: 待解密内容（正文 base64 / 密文）
         :param target: 解密目标（content/image/video_url）
+        :param html: 可选源页面 HTML（translit 源注入 @font-face 字体时动态建表）
         """
         dec_cfg = source.raw.get("decryption") or {}
         targets = dec_cfg.get("targets") or {}
@@ -56,9 +57,17 @@ class Decrypter:
         if strategy == "custom_endpoint":
             return self._call_endpoint(cfg, content)
         if strategy == "translit":
+            cfg = dict(cfg or {})
+            if html:
+                cfg["html"] = html
             return self._translit(content, cfg)
         if strategy == "js_custom":
             return self._js_custom(cfg, content)
+        if strategy == "zh_convert":
+            # 繁简转换（繁体源阅读界面显示简体）。cfg.to 指定目标（默认 zh-cn）。
+            from . import zh_convert
+
+            return zh_convert.convert(content, cfg.get("to") or cfg.get("locale") or "zh-cn")
         # 默认原样返回
         return content
 
@@ -96,6 +105,10 @@ class Decrypter:
         padding: "none"（JS NoPadding，要求密文长度是 16 的倍数）/
                  "pkcs7"（默认）。
         密钥/IV 可为 base64（CryptoJS.enc.Base64.parse）或明文 UTF-8。
+
+        iv 支持特殊值 "prefix" / "prefix16" / "ciphertext_prefix"：
+        表示 IV 取自密文前 16 字节（密文 = 随机 IV + AES-CBC 密文，favcomic 类），
+        此时真正参与解密的密文为 data[16:]。
         """
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -103,7 +116,16 @@ class Decrypter:
             raise DecryptError("需要安装 cryptography：pip install cryptography") from None
 
         key = self._parse_key(cfg.get("key"), 16)
-        iv = self._parse_key(cfg.get("iv"), 16)
+        iv_raw = str(cfg.get("iv") or "")
+        if iv_raw in ("prefix", "prefix16", "ciphertext_prefix"):
+            if len(data) < 32 or len(data) % 16 != 0:
+                raise DecryptError(
+                    f"AES-CBC 前缀 IV 密文长度非法：{len(data)}（需 ≥32 且为 16 的倍数）"
+                )
+            iv = data[:16]
+            data = data[16:]
+        else:
+            iv = self._parse_key(cfg.get("iv"), 16)
         if len(data) % 16 != 0:
             raise DecryptError(f"AES-CBC 密文长度 {len(data)} 不是 16 的倍数")
 
@@ -237,9 +259,23 @@ class Decrypter:
 
         映射表由 cfg["map_module"] 指定（默认 framework.data.fanqie_glyph_map），
         用 str.translate 批量替换。加载失败/异常时原样返回（不阻塞正文）。
+        cfg["html"] 提供页面 HTML 时，优先用页面 @font-face 字体动态解析
+        （fanqie_font，PUA 字形 IoU 匹配）——番茄每本/每章字体 hash 不同，
+        静态表必然过期，动态解析命中率高于静态表；动态失败再退回静态表。
         """
         if not content:
             return content
+        # 动态字体解析（增量优先）：有源页面 HTML（含 @font-face 混淆字体）时用
+        html = cfg.get("html") or ""
+        if html and any(0xE000 <= ord(c) <= 0xF8FF for c in content[:2000]):
+            try:
+                from . import fanqie_font
+
+                resolved, _ = fanqie_font.resolve_html(html, content)
+                if resolved is not None and resolved != content:
+                    return resolved
+            except Exception:  # noqa: BLE001
+                pass
         try:
             mod_name = cfg.get("map_module") or "framework.data.fanqie_glyph_map"
             import importlib

@@ -4,17 +4,18 @@
 - 顶部源选择器：只列配置了 endpoints.discovery 的源
 - 分类折叠栏：横向滚动，默认折叠；点「展开分类」进完整分类视图
 - 作品网格：多列卡片流 + 懒加载滚动（封面异步加载）
-- 详情抽屉：点作品拉详情显示右侧抽屉
+- 直进阅读：点作品后台拉详情 → 直接进入阅读器
 - 全量抓取：确认弹窗 + 进度 + JSON 索引
 """
 
 from __future__ import annotations
 
 import logging
+import time
 
 log = logging.getLogger(__name__)
 
-from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject
+from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -34,7 +35,14 @@ from framework.events import EventBus
 from framework.source_manager import SourceManager
 from framework.theme_manager import ThemeManager
 
-from gui.components import WorkCard, DetailDrawer
+from gui.components import WorkCard
+from gui.components.work_card import CARD_HEIGHT
+from framework.discover_session import (
+    make_snapshot,
+    from_snapshot,
+    register_source,
+    snapshot_key,
+)
 from .base_page import BasePage
 
 # 分类折叠栏默认显示的按钮数（其余收起，点展开显示全部）
@@ -72,6 +80,7 @@ class DiscoverPage(BasePage):
         event_bus: EventBus,
         theme_manager: ThemeManager,
         parent=None,
+        session_cache=None,      # 会话级换源缓存（可选注入；None=禁用）
     ):
         super().__init__(parent)
         self._manager = source_manager
@@ -80,6 +89,12 @@ class DiscoverPage(BasePage):
         self._bulk_fetch = bulk_fetch
         self._bus = event_bus
         self._theme_manager = theme_manager
+        self.session_cache = session_cache
+        self._pending_restore = None
+        self._scroll_timer = None
+        self._restore_rest_scheduled = False
+        self._restore_session = 0
+        self._restoring_scroll = False  # 钉底/恢复滚动位置时抑制 on_scroll 级联
         self._current_source = None
         self._current_page = 0
         self._has_more = True
@@ -164,7 +179,7 @@ class DiscoverPage(BasePage):
         self.cat_bar.setSpacing(6)
         self.cat_scroll.setWidget(self.cat_container)
 
-        # ---- 主体：作品网格（懒加载） + 右侧详情抽屉 ----
+        # ---- 主体：作品网格（懒加载） ----
         body = QHBoxLayout()
         body.setSpacing(12)
 
@@ -178,18 +193,6 @@ class DiscoverPage(BasePage):
         self.grid_layout.setContentsMargins(0, 0, 0, 0)
         self.grid_layout.setSpacing(12)
         self.scroll.setWidget(self.list_container)
-
-        # 详情抽屉
-        self.detail_drawer = DetailDrawer()
-        self.detail_drawer.read_requested.connect(self._on_read)
-        self.detail_drawer.open_url_requested.connect(self._on_open_url)
-        self.detail_drawer.download_requested.connect(self._on_download)
-        self.detail_drawer.favorite_requested.connect(self._on_favorite)
-        body.addWidget(self.detail_drawer)
-
-        # 点作品区空白处 → 关闭详情抽屉
-        self.scroll.viewport().installEventFilter(self)
-        self._close_drawer_on_outside_click = True
 
         layout.addLayout(body, stretch=1)
 
@@ -284,9 +287,49 @@ class DiscoverPage(BasePage):
             tip += f"\n{health.last_error}"
         return tip
 
+    def _save_source_snapshot(self) -> None:
+        """冻结当前源完整浏览会话（分类/作品/页数/滚动）到会话缓存。
+
+        只在切源离开/每页加载完成/滚动节流时调用。失败静默（降级）。
+
+        缓存为纯内存（persist_path=None）：从进程启动持续到进程结束，
+        退出应用即被进程回收自动清空——无需清理代码、不阻塞关闭。
+        """
+        cache = self.session_cache
+        if cache is None:
+            return
+        source = self._current_source
+        if source is None:
+            return
+        try:
+            snap = make_snapshot(
+                self._cat_buttons,
+                self._current_cat_url or "",
+                self._works,
+                list(self._loaded_pages),
+                self._has_more,
+                self._current_page,
+                self._scroll_ratio(),
+                time.time(),
+            )
+            register_source(cache, source.source_id)
+            cache.set(snapshot_key(source.source_id), snap)
+        except Exception:  # noqa: BLE001
+            pass  # 缓存失败不影响浏览
+
+    def _scroll_ratio(self) -> float:
+        vbar = self.scroll.verticalScrollBar()
+        m = vbar.maximum()
+        if m <= 0:
+            return 0.0
+        return vbar.value() / m
+
     def _on_source_changed(self, index: int) -> None:
         if index < 0:
             return
+        # 切走前冻结旧源会话（含滚动比例）——这样换回时能 0 请求还原
+        if self._current_source is not None:
+            self._save_source_snapshot()
         # 递增序号：使旧源的加载回调失效（防止快速切换竞态/卡死）
         self._source_epoch += 1
         self._current_source = self.source_combo.itemData(index)
@@ -298,8 +341,70 @@ class DiscoverPage(BasePage):
         # 立即清空旧源的作品网格，避免换源瞬间旧内容残留/溢出
         self._clear_works()
         self._clear_cat_buttons()
-        self._load_categories()
-        # 作品加载在 _on_categories_loaded 分类就绪后触发
+        # 换回该源→命中会话缓存→直接还原（0 请求）；否则正常网络加载
+        if not self._try_restore_source_snapshot():
+            self._load_categories()
+        # 作品加载在分类就绪/缓存还原后触发
+
+    def _try_restore_source_snapshot(self) -> bool:
+        """换回某源：命中会话缓存则就地还原完整浏览会话，返回 True。
+
+        命中后置 _pending_restore（_reset_works 消费）并重建分类栏；
+        不命中返回 False，调用方走正常网络加载。
+        """
+        cache = self.session_cache
+        source = self._current_source
+        if cache is None or source is None:
+            return False
+        try:
+            snap = from_snapshot(cache.get(snapshot_key(source.source_id)))
+            if snap is None:
+                return False
+            self._pending_restore = snap
+            self._render_cat_buttons_from_snapshot(snap)      # 0 请求重建分类栏
+            self._rendered_entry = True
+            register_source(cache, source.source_id)          # 命中即刷新该源 LRU 次序
+            self._reset_works()        # 消费 _pending_restore → 就地渲染（0 请求）
+            return True
+        except Exception:  # noqa: BLE001
+            self._pending_restore = None
+            return False
+
+    def _render_cat_buttons_from_snapshot(self, snap: dict) -> None:
+        """用快照 cats 重建分类按钮（不请求网络）。
+
+        与 _on_categories_loaded 的按钮构建共用 _make_cat_button/_refresh_cat_buttons：
+        按钮对象只建一次，折叠只切可见性（保持现有模式）。
+        """
+        self._clear_cat_buttons()
+        self._cat_buttons = []
+        from framework.discovery import Category
+        cats = snap.get("cats") or []
+        # 「全部」按钮（cat=None）
+        all_btn = self._make_cat_button("全部", None, False)
+        self._cat_buttons.append((all_btn, None))
+        for ctitle, cur_l in cats:
+            cat = Category(title=ctitle or "", url=cur_l or "") if ctitle else None
+            btn = self._make_cat_button(ctitle or "全部", cat, False)
+            self._cat_buttons.append((btn, cat))
+        self._cat_bar_populated = False
+        self._refresh_cat_buttons(self._default_cat_url())
+        # 选中快照 cat_url 对应的按钮（空则回退默认，防恢复后懒加载失锚）
+        target = snap.get("cat_url") or self._default_cat_url()
+        for btn, cat in self._cat_buttons:
+            selected = (getattr(cat, "url", None) or "") == target or (
+                cat is None and target == self._default_cat_url()
+            )
+            btn.setChecked(bool(selected))
+        self._current_cat_url = target
+
+    def _default_cat_url(self) -> str:
+        disc = self._current_source.get_discovery_config()
+        return (
+            disc.get("works_list_url")
+            or disc.get("list_url")
+            or self._current_source.base_url
+        )
 
     # ------------------------------------------------------------------ #
     def _clear_cat_buttons(self) -> None:
@@ -470,8 +575,122 @@ class DiscoverPage(BasePage):
             sid = self._current_source.source_id
             self._challenge_blocked_sources.discard(sid)
             self._challenge_failures.pop(sid, None)
+        if self._pending_restore is not None:
+            self._render_restored(self._pending_restore)
+            self._pending_restore = None
+            return
         for p in range(1, 1 + self._preload_ahead + 1):
             self._load_next_page(page=p)
+
+    def _render_restored(self, snap: dict) -> None:
+        """用快照渲染作品网格（0 网络请求），并恢复滚动位置。
+
+        分两段避免一次性建卡阻塞主线程（几百部作品同步建 WorkCard 会卡）：
+        先铺「首屏 + 1 屏缓冲」让用户立即看到内容，其余分批后台铺设，
+        滚动条即时可滚动。分批进行时命中 80% 不再触发网络请求，
+        全部铺完后才走 _load_next_page（缓存之外按需联网）。
+        """
+        works = list(snap.get("works") or [])
+        self._works = []
+        self._seen_urls = set()
+        fresh = []
+        for w in works:
+            if w.url in self._seen_urls:
+                continue
+            self._seen_urls.add(w.url)
+            fresh.append(w)
+        self._works.extend(fresh)
+        self._loaded_pages = set(snap.get("pages") or [])
+        self._current_page = int(snap.get("current_page") or 0) or max(self._loaded_pages or [0])
+        self._has_more = bool(snap.get("has_more"))
+        cols = self._columns()
+        # 首屏批：视口高度能容纳的卡片数 + 1 屏缓冲（保证滚动条立即可用）
+        view_h = max(1, self.scroll.viewport().height() or self.height() or 600)
+        per_screen = max(1, (view_h // (CARD_HEIGHT + 4)) * cols)
+        first_batch = min(len(fresh), per_screen * 2)
+        for w in fresh[:first_batch]:
+            self._append_card(w, cols)
+        self._apply_column_stretch(cols)
+        self._restore_rest_scheduled = False
+        if len(fresh) > first_batch:
+            self._restore_session += 1
+            sid = self._restore_session
+            self._schedule_pending_restore(sid)
+        status = f"已还原 {len(self._loaded_pages)} 页 · 共 {len(fresh)} 部（会话缓存）"
+        self.status_label.setText(status)
+        # 布局稳定后再恢复滚动（内容高度未就绪时 setValue 无效）
+        self._restore_scroll(float(snap.get("scroll") or 0.0))
+
+    def _schedule_pending_restore(self, session: int = 0) -> None:
+        """分批铺设剩余恢复作品（每 16ms 一批 ≈ 一屏，避免建卡卡顿）。
+
+        session 是恢复会话序号：用户快速切走/重载后旧分批闭包据此自弃，
+        不会把上一会话剩余作品铺进新会话的网格。
+        """
+        if self._restore_rest_scheduled and session == self._restore_session:
+            return
+        self._restore_rest_scheduled = True
+
+        def _flush() -> None:
+            self._restore_rest_scheduled = False
+            if session != self._restore_session:
+                return  # 会话已切换，旧分批作废
+            if len(self._works) <= self._work_count:
+                return  # 已铺完
+            view_h = max(1, self.scroll.viewport().height() or self.height() or 600)
+            cols = self._columns()
+            per_screen = max(1, (view_h // (CARD_HEIGHT + 4)) * cols)
+            todo = self._works[self._work_count:]
+            batch = todo[:per_screen]
+            for w in batch:
+                self._append_card(w, cols)
+            self._apply_column_stretch(cols)
+            if len(self._works) > self._work_count:
+                self._schedule_pending_restore(session)
+
+        QTimer.singleShot(16, _flush)
+
+    def _finish_append_anchor(self, was_at_bottom: bool, prev_value: int) -> None:
+        """追加批次后的滚动锚定：仅当用户本来就贴底时钉到新底部续接。
+
+        用户没有主动滚到底时**绝不** setValue：流式加载 / 多页并发返回时
+        反复按旧位置或底部 setValue，会把视口上下拉动（「加载中内容自动滚动」
+        的根因）。追加本身不改变滚动值，保持原位置即可，无需回写 prev_value。
+
+        _restoring_scroll 置位期间 on_scroll 不响应（防 setValue 触发的
+        valueChanged 级联触发「截图 + 加载下一页」）。
+        """
+        if not was_at_bottom:
+            return  # 用户未贴底：不主动改变滚动条位置
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() <= 0:
+            return
+        self._restoring_scroll = True
+        try:
+            vbar.setValue(vbar.maximum())
+        finally:
+            self._restoring_scroll = False
+
+    def _restore_scroll(self, ratio: float) -> None:
+        ratio = max(0.0, min(1.0, ratio))
+
+        def _apply() -> None:
+            try:
+                import shiboken6
+                if not shiboken6.isValid(self):
+                    return  # 页面已销毁，忽略
+            except Exception:  # noqa: BLE001
+                pass
+            vbar = self.scroll.verticalScrollBar()
+            if vbar.maximum() <= 0:
+                return
+            self._restoring_scroll = True
+            try:
+                vbar.setValue(int(ratio * vbar.maximum()))
+            finally:
+                self._restoring_scroll = False
+
+        QTimer.singleShot(0, _apply)
 
     def _clear_works(self) -> None:
         while self.grid_layout.count():
@@ -483,6 +702,8 @@ class DiscoverPage(BasePage):
         self._work_count = 0
         self._works = []
         self._seen_urls = set()
+        # 换源/清空：中止进行中的分批铺设（旧 flush 因会话号不匹配自弃）
+        self._restore_rest_scheduled = False
 
     def _clear_grid_widgets(self) -> None:
         """只清空网格卡片（保留 self._works 数据）。
@@ -603,6 +824,8 @@ class DiscoverPage(BasePage):
             return
         self._loaded_pages.add(page)
         added = self._append_works(works)
+        # 会话缓存：每页并入后更新快照（覆盖写，量小无碍）
+        self._save_source_snapshot()
         if added == 0:
             # 整页内容全部重复（源分页失效返回相同首页/页内容）：
             # 再往后翻也只会是同样的内容 → 停止加载并提示，避免空转。
@@ -764,13 +987,15 @@ class DiscoverPage(BasePage):
         # 经 CoverLoader 异步加载并刷新卡片（全局限流，裁剪与初始加载一致）
         from gui.components.cover_loader import CoverLoader
 
+        source = self._current_source
         cards = self.list_container.findChildren(WorkCard)
         for card in cards:
             cover_url = covers.get(getattr(card.work, "url", ""))
             if not cover_url:
                 continue
             CoverLoader.instance().load(
-                cover_url, lambda pix, c=card: c.set_cover_pixmap(pix)
+                cover_url, lambda pix, c=card: c.set_cover_pixmap(pix),
+                source_id=card.work.source_id, source=source,
             )
 
     def _maybe_preload(self) -> None:
@@ -799,7 +1024,15 @@ class DiscoverPage(BasePage):
         return self.grid_columns(view_w)
 
     def _apply_column_stretch(self, cols: int) -> None:
-        """让网格每列等宽，卡片均匀分布（避免某列标题长导致列宽参差）。"""
+        """让网格每列等宽，卡片均匀分布（避免某列标题长导致列宽参差）。
+
+        列数不变时跳过：setColumnStretch 会触发整网格重排，分批懒加载时每批
+        都调一次等于每批全量重排 → 卡片反复跳动/闪屏（与 search_page 同因）。
+        列数由 _columns() 随视口宽度计算，变化时才重排。
+        """
+        if cols == self._last_columns:
+            return
+        self._last_columns = cols
         self.apply_column_stretch(self.grid_layout, cols)
 
     def _append_card(self, w, cols) -> None:
@@ -825,7 +1058,6 @@ class DiscoverPage(BasePage):
         cols = self._columns()
         if cols == self._last_columns:
             return
-        self._last_columns = cols
         self._clear_grid_widgets()
         self._work_count = 0
         for w in self._works:
@@ -842,6 +1074,11 @@ class DiscoverPage(BasePage):
         跨页按 URL 去重：分页异常/并发预加载时同一作品可能重复出现
         （如 maccms 分页失效返回相同内容），已显示过的跳过，不重复渲染。
         返回实际新增条数（整页全重复时为 0，调用方据此停止加载）。
+
+        分批铺设：一页可能有 20~30 张卡，主线程一次全建会卡顿（漫画源
+        首屏整页同步建卡即卡顿之源）。改为「首屏可视区同步铺 + 剩余
+        QTimer 分批补」（setValue/时长与恢复分批一致，主线程峰值可控），
+        滚动时 _fetch_more_cached 会加速补插已就绪的卡。
         """
         fresh = []
         for w in works:
@@ -853,14 +1090,28 @@ class DiscoverPage(BasePage):
             return 0
         self._works.extend(fresh)
         cols = self._columns()
-        for w in fresh:
+        view_h = max(1, self.scroll.viewport().height() or self.height() or 600)
+        per_screen = max(1, (view_h // (CARD_HEIGHT + 4)) * cols)
+        # 懒加载钉底锚定：追加前记录位置。贴底时（value≥旧 max）追加后钉到
+        # 新底部续接，让新内容从视野下方持续进来；否则保持原位置不跳屏。
+        vbar = self.scroll.verticalScrollBar()
+        prev_value = vbar.value()
+        was_at_bottom = vbar.maximum() > 0 and prev_value >= vbar.maximum() - 8
+        sync_batch = fresh[:per_screen]
+        for w in sync_batch:
             self._append_card(w, cols)
         self._apply_column_stretch(cols)
+        # 布局完成（scrollbar 范围更新）后再恢复，锚定一个视口用的才是新范围
+        QTimer.singleShot(0, lambda: self._finish_append_anchor(was_at_bottom, prev_value))
+        if len(self._works) > self._work_count:
+            # 首屏已铺，剩余走定时器分批（中途滚动会被 _fetch_more_cached 加速）
+            self._restore_session += 1
+            self._schedule_pending_restore(self._restore_session)
         return len(fresh)
 
     # ------------------------------------------------------------------ #
     def _on_work_clicked(self, work: Work) -> None:
-        """点作品 → 后台拉详情 → 显示右侧抽屉（不阻塞 UI）。"""
+        """点作品 → 后台拉详情 → 直接进入阅读器（不阻塞 UI）。"""
         self.status_label.setText(f"加载详情：{work.title}")
         source = self._manager.get(work.source_id) if work.source_id else self._current_source
         if source is None:
@@ -881,7 +1132,7 @@ class DiscoverPage(BasePage):
             else:
                 self.status_label.setText(f"详情加载失败：{err}")
             return
-        self.detail_drawer.show_detail(detail)
+        self.read_requested.emit(detail)
         self.status_label.setText("")
 
     def _on_bulk_fetch(self) -> None:
@@ -921,58 +1172,49 @@ class DiscoverPage(BasePage):
         self._bulk_task = task  # 持引用防 GC
         QThreadPool.globalInstance().start(task)
 
-    def _on_read(self, detail) -> None:
-        """开始阅读 → 跳阅读器 Tab（占位）。"""
-        self.read_requested.emit(detail)
-
-    def _on_open_url(self, url: str) -> None:
-        """打开源详情页（浏览器）。"""
-        import webbrowser
-
-        webbrowser.open(url)
-
-    def _on_download(self, detail) -> None:
-        """下载 → 转发给 App 层（弹章节范围对话框并入队）。"""
-        self.download_requested.emit(detail)
-
-    def _on_favorite(self, detail) -> None:
-        """收藏/取消收藏 → 转发给 App 层（写书架收藏库）。"""
-        self.favorite_requested.emit(detail)
-
     def _on_scroll(self, value: int) -> None:
         """滚动到 80% 触发加载下一页（懒加载 + 预加载缓冲）。
 
         提前到 80% 而非贴底：滚动到底前下一批已在后台抓取，视觉无停顿；
         又不一次性并发爬多页（防封面加载不过来 / 反爬）。
+        顺带节流记录滚动比例到会话缓存（恢复滚动位置用）。
+        缓存恢复分批铺设中时：只继续铺缓存，不发网络请求。
         """
+        if self._restoring_scroll:
+            return  # 钉底/恢复滚动位置中，不触发懒加载与快照写入
+        self._schedule_scroll_snapshot()
+        if self._restore_rest_scheduled or self._work_count < len(self._works):
+            # 会话还原尚未铺完：先把缓存卡片补上，网络请求留到铺完再发
+            self._fetch_more_cached()
+            return
         vbar = self.scroll.verticalScrollBar()
         if vbar.maximum() > 0 and value >= vbar.maximum() * 0.8:
             self._load_next_page()
 
-    def eventFilter(self, obj, event):  # noqa: N802
-        """点作品网格空白区域 → 关闭详情抽屉。
+    def _fetch_more_cached(self) -> None:
+        """立即再铺一批未渲染的缓存作品（滚动时增量，避免等待定时器）。"""
+        if len(self._works) <= self._work_count:
+            return
+        view_h = max(1, self.scroll.viewport().height() or self.height() or 600)
+        cols = self._columns()
+        per_screen = max(1, (view_h // (CARD_HEIGHT + 4)) * cols)
+        todo = self._works[self._work_count:]
+        batch = todo[:per_screen]
+        for w in batch:
+            self._append_card(w, cols)
+        self._apply_column_stretch(cols)
+        if len(self._works) > self._work_count and self._restore_session > 0:
+            self._schedule_pending_restore(self._restore_session)
 
-        点击任何作品卡片（含其内部子控件）都不关闭；只有真正点到
-        网格空白处才关闭。向上遍历 parent 判断是否在卡片内。
-        """
-        from PySide6.QtCore import QEvent
-        from gui.components import WorkCard
-
-        if obj is self.scroll.viewport() and event.type() == QEvent.MouseButtonPress:
-            pos = self.list_container.mapFrom(self.scroll.viewport(), event.position().toPoint())
-            hit = self.list_container.childAt(pos)
-            # 向上遍历：点击是否落在某个作品卡片（或其子控件）内
-            node = hit
-            inside_card = False
-            while node is not None:
-                if isinstance(node, WorkCard):
-                    inside_card = True
-                    break
-                node = node.parentWidget()
-            if not inside_card and self.detail_drawer.is_open():
-                self.detail_drawer.hide_detail()
-                self.status_label.setText("")
-        return super().eventFilter(obj, event)
+    def _schedule_scroll_snapshot(self) -> None:
+        """滚动比例延迟 500ms 落盘（节流，避免高频写缓存）。"""
+        if self.session_cache is None:
+            return
+        if self._scroll_timer is None:
+            self._scroll_timer = QTimer(self)
+            self._scroll_timer.setSingleShot(True)
+            self._scroll_timer.timeout.connect(self._save_source_snapshot)
+        self._scroll_timer.start(500)
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
@@ -999,7 +1241,9 @@ class _FetchWorksTask(QRunnable):
     def run(self) -> None:
         works, err = [], None
         try:
-            works = self._discovery.list_works(self._source, self._cat_url, self._page)
+            works = self._discovery.list_works(
+                self._source, self._cat_url, self._page
+            )
         except Exception as exc:  # noqa: BLE001
             err = str(exc)
         try:

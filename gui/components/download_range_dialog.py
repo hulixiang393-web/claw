@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 class DownloadRangeDialog(QDialog):
     """选择下载章节范围（视频任务可选画质）。"""
 
-    def __init__(self, book_title: str, total: int, content_type: str = "", qualities: list | None = None, parent=None):
+    def __init__(self, book_title: str, total: int, content_type: str = "", qualities: list | None = None, parent=None, default_start: int | None = None):
         super().__init__(parent)
         self.setWindowTitle("下载章节")
         self.setMinimumWidth(360)
@@ -40,7 +40,6 @@ class DownloadRangeDialog(QDialog):
 
         # 全部
         self.all_radio = QRadioButton(f"全部章节（{total} 章）")
-        self.all_radio.setChecked(True)
         layout.addWidget(self.all_radio)
 
         # 指定范围
@@ -89,6 +88,16 @@ class DownloadRangeDialog(QDialog):
 
         self.range_radio.toggled.connect(lambda on: (self.start_spin.setEnabled(on), self.end_spin.setEnabled(on)))
         self.end_spin.valueChanged.connect(self._update_hint)
+
+        # 默认范围：default_start（1 基，阅读器「当前章」）传入时 → 默认选中
+        # 「指定范围：当前章 ~ 末章」；未传（详情抽屉下载）→ 保持「全部章节」。
+        if default_start is not None and total > 1:
+            self.start_spin.setValue(max(1, min(total, int(default_start))))
+            self.range_radio.setChecked(True)  # toggled → 启用起止框
+        else:
+            self.all_radio.setChecked(True)
+            self.start_spin.setEnabled(False)
+            self.end_spin.setEnabled(False)
 
         self._update_hint()
         self._center()

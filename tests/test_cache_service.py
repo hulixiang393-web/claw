@@ -260,50 +260,68 @@ def test_content_precache_chapters():
     }
 
 
-def test_search_cache_write_and_hit():
-    from framework.search import Search
-
-    store = make_store()
-    src = _fake_source()
-    src._raw["constraints"] = {"search": {"max_pages": 1, "max_results": 999999}}
-    src._raw["endpoints"]["search"] = {
-        "item": {"root_selector": "x", "fields": {"title": {"sel": "a"}}}
-    }
-    calls = {"n": 0}
-
-    def fake_html(source, keyword, http=None, on_page=None):
-        calls["n"] += 1
-        return []
-
-    searcher = Search(_FakeHttp(), _fake_parser())
-    searcher._search_html = fake_html  # type: ignore
-    searcher.cache = store
-    searcher.search_one_cached(src, "keyw", use_cache=True)
-    assert calls["n"] == 1
-    assert store.get(f"search:{src.source_id}:keyw") == []
-    # 第二次命中
-    searcher.search_one_cached(src, "keyw", use_cache=True)
-    assert calls["n"] == 1
-
-
-def test_discovery_list_cache_hit():
-    from framework.discovery import Discovery
-
-    store = make_store()
-    http = _FakeHttp()
-    src = _fake_source()
-    disc = Discovery(http, _fake_parser(), _fake_checker(), cache=store)
-    url = "https://x.com/list"
-    fetch_url = disc._build_page_url(src, url, 1)
-    key = f"list:{src.source_id}:{fetch_url}"
-    store.set(key, [{"title": "T", "url": "u"}])
-    # 命中直接返回，不经过 _get（http.calls 为空）
-    res = disc.list_works_cached(src, url, page=1, use_cache=True)
-    assert res == [{"title": "T", "url": "u"}]
-    assert not http.calls
-
-
 def test_cover_bytes_persist_roundtrip():
     store = make_store()
     store.set("cover:s1:https://c/img.jpg", b"\x89PNG-fake-bytes")
     assert store.get("cover:s1:https://c/img.jpg") == b"\x89PNG-fake-bytes"
+
+
+def test_get_session_cache_singleton_not_persisted():
+    """会话缓存：不落盘（退出即清）、2GB 配额、单例。"""
+    from framework.cache_service import get_session_cache, RedisLikeStore
+
+    a = get_session_cache()
+    b = get_session_cache()
+    assert a is b                       # 单例
+    assert isinstance(a, RedisLikeStore)
+    assert a._persist_path is None      # 不落盘 → 进程退出自动释放，无需清理
+    assert a._quota == 2 * 1024 * 1024 * 1024
+    # 写读往返
+    a.set("disc:demo", "v")
+    assert a.get("disc:demo") == "v"
+
+
+def test_discovery_list_and_categories_never_cache():
+    """发现页改走纯实时抓取后：list_works / list_categories 不读不写缓存。"""
+    from framework.discovery import Discovery
+
+    store = make_store()
+    http = _FakeHttp()
+    disc = Discovery(http, _fake_parser(), _fake_checker())
+    # 预置假缓存键，验证 list_works 不命中缓存、仍发网络请求（首次即抓）
+    src = _src_with_discovery("s1", "https://a.example")
+    key = f"list:{src.source_id}:https://a.example/list?page=1"
+    store.set(key, [{"title": "T", "url": "u"}])
+    res = disc.list_works(src, "/list", 1)
+    assert res == []  # 真实抓取（fake parser 返回空），不读缓存
+    assert http.calls  # 确实发了网络请求
+    # 分类同理：不读缓存（cats: 键预置了假数据，但静态分类源直接返回配置），
+    # 走真实 list_categories 逻辑（静态分类来自配置，返回配置值，非缓存值）
+    cat_key = f"cats:{src.source_id}:https://a.example/list"
+    store.set(cat_key, [{"title": "C", "url": "/c"}])
+    cats = disc.list_categories(src)
+    # 返回配置里的静态分类（title="全"，非缓存里的 "C"）→ 证明不读缓存
+    assert [c.title for c in cats] == ["全"]
+    assert store.get(cat_key) == [{"title": "C", "url": "/c"}]  # 缓存未被读/覆盖
+
+
+def _src_with_discovery(sid, base):
+    from framework.config import SourceConfig
+
+    raw = {
+        "$schema_version": 1, "$id": sid, "$type": "novel", "$name": sid,
+        "$enabled": True, "$weight": 1.0,
+        "transports": {"base_url": base},
+        "endpoints": {
+            "discovery": {
+                "list_url": "/list",
+                "list_paginator": {"type": "increment", "start": 1, "step": 1},
+                "list_item": {"categories": [{"title": "全", "url": "/list"}]},
+                "works_list_item": {
+                    "root_selector": ".item",
+                    "fields": {"title": "a.title", "url": "a@href"},
+                },
+            }
+        },
+    }
+    return SourceConfig.from_dict(raw, "<mem>")

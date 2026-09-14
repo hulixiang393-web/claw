@@ -15,7 +15,7 @@ import threading
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QScrollArea,
+    QSlider,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -30,8 +31,8 @@ from PySide6.QtWidgets import (
 
 from framework.content import Content, Detail
 
-# 预加载后续话数：只预加载下一话（读到 70% 才触发，不加载过多）
-PREFETCH_COUNT = 2  # 预渲染后续话数：连看时下一话已就绪、再下一话开始预渲染，切话更顺
+# 预加载后续话数：当前话加载完成即预渲染后续 PREFETCH_COUNT 话（串行队列，不抢当前话首屏）
+PREFETCH_COUNT = 3  # 预渲染后续话数：连看时下一话已就绪、再下一话开始预渲染，切话更顺
 PREFETCH_BACK = 3  # 向前缓存话数：向上翻话命中缓存秒开（以当前话为基点前 3 话）
 # 懒加载：首屏渲染页数 / 滚动增量渲染每批页数
 INITIAL_RENDER_COUNT = 10
@@ -66,8 +67,13 @@ class ComicView(QWidget):
         self._pending_swap = False  # 换话保留旧画面：新话首批图就绪后再清空替换
         self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
         self._pending_position = None  # 打开书续读位置（0~1 滚动比例），话加载后定位
+        self._scroll_to_top = False  # 换话归零标记：期间禁止按比例恢复把视口拉走
+        self._scroll_epoch = 0  # 滚动恢复代际：换话自增，使上一话残留的恢复任务作废
         self._reading_bg = ""  # 阅读区独立背景色（空=透明跟随主题）
         self._reading_fg = ""  # 夜间黑等深色背景下的前景色（漫画以图为主，预留）
+        self._auto_scrolling = False  # 自动滚动开关
+        self._auto_timer = QTimer(self)  # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
+        self._auto_timer.setInterval(35)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -101,6 +107,29 @@ class ComicView(QWidget):
         self.fullscreen_btn.setToolTip("全屏阅读")
         self.fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
         toolbar.addWidget(self.fullscreen_btn)
+
+        self.auto_scroll_btn = QPushButton("▶ 自动滚动")
+        self.auto_scroll_btn.setFixedWidth(90)
+        self.auto_scroll_btn.setToolTip("开启/关闭自动滚动（Ctrl+Alt+A）")
+        self.auto_scroll_btn.clicked.connect(self._toggle_auto_scroll)
+        toolbar.addWidget(self.auto_scroll_btn)
+
+        self.auto_scroll_speed_slider = QSlider(Qt.Horizontal)
+        self.auto_scroll_speed_slider.setRange(1, 10)
+        self.auto_scroll_speed_slider.setValue(3)
+        self.auto_scroll_speed_slider.setFixedWidth(100)
+        self.auto_scroll_speed_slider.setToolTip("自动滚动速度（1最慢，10最快）")
+        self.auto_scroll_speed_slider.setEnabled(False)
+        toolbar.addWidget(self.auto_scroll_speed_slider)
+
+        self.auto_scroll_speed_label = QLabel("3")
+        self.auto_scroll_speed_label.setFixedWidth(12)
+        self.auto_scroll_speed_label.setAlignment(Qt.AlignCenter)
+        toolbar.addWidget(self.auto_scroll_speed_label)
+
+        self.auto_scroll_speed_slider.valueChanged.connect(
+            lambda v: self.auto_scroll_speed_label.setText(str(v))
+        )
 
         toolbar.addStretch(1)
         self.progress_label = QLabel("")
@@ -156,6 +185,9 @@ class ComicView(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+        # 自动滚动定时器 + 快捷键
+        self._auto_timer.timeout.connect(self._auto_scroll_tick)
+        QShortcut(QKeySequence("Ctrl+Alt+A"), self).activated.connect(self._toggle_auto_scroll)
         # 键盘焦点（支持←→↑↓翻话/翻图）
         self.setFocusPolicy(Qt.StrongFocus)
 
@@ -190,6 +222,10 @@ class ComicView(QWidget):
         self._source = source
         self._detail = detail
         self._chapters = detail.chapters
+        # 换书：无条件清零续读位置——旧书若仍在后台加载，首个章加载完成后的
+        # _finish_episode_load 会消费到「上一本书残留的 _pending_position」，
+        # 把新书滚动条错滚到旧书位置。清零后再按新书记录设置。
+        self._pending_position = None
         self._populate_toc()
         if restore_position is not None:
             self._pending_position = restore_position
@@ -220,6 +256,12 @@ class ComicView(QWidget):
     def _load_episode(self, idx: int) -> None:
         if self._source is None or not (0 <= idx < len(self._chapters)):
             return
+        self._stop_auto_scroll()
+        # 换话统一归零到顶部：置标记 + 递增代际。_apply_zoom 在此期间的按比例
+        # 恢复用的是上一话残留位置（读到底部时 ratio≈1），会把新话直接拉到底部
+        # ——「上一话滚到最低端」的根因。标记期间跳过比例恢复，代际使旧任务作废。
+        self._scroll_to_top = True
+        self._scroll_epoch += 1
         self._current_idx = idx
         # 切换话：重置增量渲染计数（gallery 将清空重建，防旧计数错乱）
         self._rendered_count = 0
@@ -282,23 +324,36 @@ class ComicView(QWidget):
         # 避免预渲染抢资源拖慢当前话首屏。
 
     def _finish_episode_load(self, ch) -> None:
-        """加载完成后统一收尾：定位顶部 + 续读信号。"""
+        """加载完成后统一收尾：定位顶部 + 续读信号 + 预渲染后续话。"""
         self.chapter_changed.emit((self._detail, ch.title, ch.url))
+        # 换话统一归零到顶部（纵向画廊/横向翻页都复位）。blockSignals 防误触发
+        # 滚动懒加载/位置存盘；归零后清标记，后续 resize/缩放的按比例恢复恢复
+        # 正常（此时 ratio 已是当前话顶部，不会再把视口拉到底部）。
         vbar = self.scroll.verticalScrollBar()
+        hbar = self.scroll.horizontalScrollBar()
         vbar.blockSignals(True)
+        hbar.blockSignals(True)
         vbar.setValue(0)
+        hbar.setValue(0)
         vbar.blockSignals(False)
-        # 续读定位：打开书恢复到上次滚动位置（重试链随懒加载高度增长逐步到位）
+        hbar.blockSignals(False)
+        self._scroll_to_top = False
+        # 续读定位：打开书恢复到上次滚动位置（重试链随懒加载高度增长逐步到位）。
+        # 仅首次 load 设置 _pending_position，换话时为 None → 保持在顶部。
         if self._pending_position is not None:
             pos = self._pending_position
             self._pending_position = None
             if pos > 0:
                 self._restore_position_with_retry(pos)
-        # 预渲染下一话不在加载后立即发起：等读到当前话 70%（_on_scroll_prefetch）
-        # 再预渲染，避免提前占用 Playwright 资源拖慢当前话。
-        # 向前缓存例外：本话已渲染完成，后台预渲染前 PREFETCH_BACK 话，
-        # 向上翻话命中缓存秒开（与后续话共用串行队列，排在最后不抢资源）。
+        # 当前话加载完成即预渲染后续 PREFETCH_COUNT 话（串行队列，不抢当前话
+        # 首屏；读到 70% 的 _on_scroll_prefetch 保留作兜底）。后续话插队首、
+        # 优先于向前缓存：连看时下一话最先就绪。
+        self._prefetch_future(self._current_idx, PREFETCH_COUNT)
+        # 向前缓存：后台预渲染前 PREFETCH_BACK 话，向上翻话命中缓存秒开
+        #（与后续话共用串行队列，排在后续话之后不抢资源）。
         self._prefetch_prev(self._current_idx)
+        # 更新自动滚动滑块状态（根据模式和滚动范围）
+        QTimer.singleShot(0, self._update_auto_scroll_slider_state)
 
     def _on_images_loaded(self, gen, ch, images, err) -> None:
         # 代际过期：换书后旧书取流任务后到 → 整单丢弃，避免旧书结果覆盖新书
@@ -354,10 +409,15 @@ class ComicView(QWidget):
         同一时间只预渲染 1 话（否则并发起多个 Playwright Chromium 实例
         会抢占内存、拖慢当前话加载），完成后自动取队列下一个。
         预渲染结果写 _prefetched[url]["images"]，_load_episode 命中则秒开。
+
+        后续话插到队首（优先于向前缓存）：acgxmh 等限流源上向前预取与后续
+        预取共用站点带宽，读到 70% 触发的「下一话」应优先就绪，而非排在
+        向前缓存几话之后（否则连看时下一话仍要现场抓）。
         """
         if self._source is None:
             return
-        # 队尾追加需要预渲染的话
+        # 队首追加需要预渲染的话（保持顺序：近的在前）
+        new_urls = []
         for k in range(idx + 1, min(idx + 1 + n, len(self._chapters))):
             ch = self._chapters[k]
             if ch.url in self._prefetched:
@@ -367,9 +427,11 @@ class ComicView(QWidget):
                     "images": ch._cached_images, "count": len(ch._cached_images)
                 }
                 continue
-            if ch.url in self._prefetch_queue:
+            if ch.url in self._prefetch_queue or ch.url in new_urls:
                 continue  # 已在队列
-            self._prefetch_queue.append(ch.url)
+            new_urls.append(ch.url)
+        if new_urls:
+            self._prefetch_queue = new_urls + self._prefetch_queue
         # 若空闲则启动第一个
         if not self._prefetch_busy and self._prefetch_queue:
             self._start_next_prefetch()
@@ -427,13 +489,14 @@ class ComicView(QWidget):
             self._rendered_header = True
         # 首屏只渲染前 INITIAL_RENDER_COUNT 张，其余交给滚动懒加载分批补全；
         # 横向翻页模式无纵向滚动懒加载 → 一次全量渲染
-        # 正文图 Referer 由 CoverLoader 按图床域名规则推导（_REFERER_RULES）：
-        # 不再传章节 URL——dm5 图床（cdndm5.com）拒绝章节页 Referer（404 假图），
-        # manben 无 Referer 也可访问；统一走域名规则最安全。
+        # 正文图防盗链：统一透传当前章节页 URL 作 Referer——manben 等站图床
+        # 校验精确章节页 Referer（仅域名/站根会 403）；CoverLoader 显式
+        # referer 优先，_infer_referer 域名规则仅是空值兜底。
         images = self._images or []
+        referer = self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else ""
         limit = len(images) if self._mode == "flip" else min(INITIAL_RENDER_COUNT, len(images))
         for url in images[:limit]:
-            lbl = _ComicImageLabel(url)
+            lbl = _ComicImageLabel(url, referer=referer, source=self._source)
             lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
@@ -465,11 +528,11 @@ class ComicView(QWidget):
             self.gallery_layout.addWidget(header)
             self._rendered_header = True
         target = len(images) if force_full else min(self._rendered_count + LAZY_BATCH, len(images))
+        referer = self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else ""
         while self._rendered_count < target:
             url = images[self._rendered_count]
-            # 正文图 Referer 由 CoverLoader 域名规则推导（同 _render_images，
-            # 不传章节 URL——dm5 图床拒绝章节 Referer 返回 404 假图）
-            lbl = _ComicImageLabel(url)
+            # 同 _render_images：透传当前章节页 URL 作正文图 Referer
+            lbl = _ComicImageLabel(url, referer=referer, source=self._source)
             lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
@@ -500,13 +563,50 @@ class ComicView(QWidget):
         self._relayout_pending = False
         self._relayout_gallery()
 
+    def _visible_anchor(self, value: int):
+        """取视口顶部所在的那张图（或话头）作为滚动锚点。
+
+        返回 (widget, offset)：offset = 滚动值 - widget.y()，即视口顶部相对
+        该 widget 顶部的偏移。重排后可用 widget.y() + offset 还原同一可视内容。
+        """
+        layout = self.gallery.layout()
+        if layout is None:
+            return None
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if w is None or not w.isVisible():
+                continue
+            y = w.y()
+            if y <= value < y + w.height():
+                return (w, value - y)
+        return None
+
     def _relayout_gallery(self) -> None:
-        """按内容重算 gallery 高度（widgetResizable=False 不会自动跟随）。"""
+        """按内容重算 gallery 高度（widgetResizable=False 不会自动跟随）。
+
+        滚动锚定：懒加载图片由占位高（600px）变为实际高后，当前可视内容会随
+        上方高度变化上下位移——自动滚动/手动滚动时表现为「晃动」。以视口顶部
+        所在的那张图为锚，重排后把滚动值补偿回它原来的相对位置，保持可视内容
+        不动（贴底时仍跟随底部）。
+        """
         if self.gallery.layout() is not None:
+            vbar = self.scroll.verticalScrollBar()
+            old_value = vbar.value()
+            old_max = vbar.maximum()
+            at_bottom = old_max > 0 and old_value >= old_max - 8
+            anchor = self._visible_anchor(old_value)
             self.gallery.adjustSize()
-        # 刷新滚动范围（高度变化后滚动条最大值跟着更新）
-        vbar = self.scroll.verticalScrollBar()
-        vbar.setValue(min(vbar.value(), vbar.maximum()))
+            self.gallery.layout().activate()  # 立即生效，保证 widget.y() 已更新
+            if at_bottom:
+                vbar.setValue(vbar.maximum())  # 贴底跟随底部（无限滚动语义）
+            elif anchor is not None:
+                widget, offset = anchor
+                vbar.setValue(max(0, min(widget.y() + offset, vbar.maximum())))
+            else:
+                vbar.setValue(min(old_value, vbar.maximum()))
+        else:
+            vbar = self.scroll.verticalScrollBar()
+            vbar.setValue(min(vbar.value(), vbar.maximum()))
         # 懒加载安全网：内容不足一屏（maximum==0）时没有滚动事件可触发，
         # 主动补一批直至可滚动，避免短页/小图章节读到后面缺图。
         if (
@@ -538,6 +638,7 @@ class ComicView(QWidget):
 
     # ------------------------------------------------------------------ #
     def _toggle_mode(self) -> None:
+        self._stop_auto_scroll()
         self._mode = "flip" if self._mode == "gallery" else "gallery"
         self.mode_btn.setText("切换横向模式" if self._mode == "gallery" else "切换画廊模式")
         self._apply_mode()
@@ -545,6 +646,7 @@ class ComicView(QWidget):
             # 横向翻页模式无纵向滚动懒加载 → 补齐剩余图片
             # （换话等待中 _images 仍是旧话，等新话就绪后按需全量渲染）
             self._render_incremental(force_full=True)
+        self._update_auto_scroll_slider_state()
 
     def _apply_mode(self) -> None:
         if self._mode == "flip":
@@ -678,13 +780,57 @@ class ComicView(QWidget):
         except RuntimeError:
             pass
 
+    # ---- 自动滚动 ----
+    def _toggle_auto_scroll(self) -> None:
+        """切换自动滚动：停止/启动，按钮文字同步更新。"""
+        if self._auto_scrolling:
+            self._stop_auto_scroll()
+        else:
+            vbar = self.scroll.verticalScrollBar()
+            if vbar.maximum() <= 0 or self._mode != "gallery":
+                return
+            self._auto_scrolling = True
+            self.auto_scroll_btn.setText("⏸ 停止")
+            self._auto_timer.start()
+
+    def _stop_auto_scroll(self) -> None:
+        """停止自动滚动并复位按钮。"""
+        if not self._auto_scrolling:
+            return
+        self._auto_scrolling = False
+        self._auto_timer.stop()
+        self.auto_scroll_btn.setText("▶ 自动滚动")
+
+    def _auto_scroll_tick(self) -> None:
+        """QTimer 回调：每次滚动 (slider_value * 5) px，高频小步进平滑滚动，到底自动停止。"""
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.value() >= vbar.maximum():
+            self._stop_auto_scroll()
+            return
+        vbar.setValue(vbar.value() + self.auto_scroll_speed_slider.value() * 5)
+
+    def _update_auto_scroll_slider_state(self) -> None:
+        """根据当前模式和滚动范围启用/禁用自动滚动速度滑块。"""
+        if self._mode == "gallery" and self.scroll.verticalScrollBar().maximum() > 0:
+            self.auto_scroll_speed_slider.setEnabled(True)
+        else:
+            self.auto_scroll_speed_slider.setEnabled(False)
+
     def _restore_position_with_retry(self, pos: float, tries: int = 8) -> None:
         """按 0~1 比例恢复滚动位置，重试链随懒加载高度增长逐步到位。
 
         漫画懒加载：目标位置下方图片未渲染前 maximum 偏小，直接滚会停在
         中间。每隔 500ms 重设一次（setValue 触发懒加载渲染补全），最多 8 次
         （约 4s），图片通常已就绪，最终精准落在上次阅读的图。
+
+        首次调用时捕获当前 book：触发时校验仍为同一本（防换书后旧书恢复
+        重试链继续滚动新书——跨书串位置的 bug 根因）。非同一本直接终止。
         """
+        book = self._detail
+        self._restore_position_with_retry_for(pos, tries, book)
+
+    def _restore_position_with_retry_for(self, pos: float, tries: int, book) -> None:
+        """_restore_position_with_retry 的实际执行，book 贯穿整条重试链。"""
         vbar = self.scroll.verticalScrollBar()
         hbar = self.scroll.horizontalScrollBar()
         if self._mode == "flip":
@@ -693,7 +839,12 @@ class ComicView(QWidget):
         elif vbar.maximum() > 0:
             vbar.setValue(int(pos * vbar.maximum()))
         if tries > 1:
-            QTimer.singleShot(500, lambda: self._restore_position_with_retry(pos, tries - 1))
+            def _retry():
+                if self._detail is not book:
+                    return  # 用户已换书，旧书恢复重试链作废
+                self._restore_position_with_retry_for(pos, tries - 1, book)
+
+            QTimer.singleShot(500, _retry)
 
     # ------------------------------------------------------------------ #
     # Ctrl+滚轮缩放（事件过滤器，抢在子控件 wheelEvent 之前）
@@ -739,6 +890,7 @@ class ComicView(QWidget):
             self._apply_zoom()
             event.accept()
         else:
+            self._stop_auto_scroll()
             super().wheelEvent(event)
 
     def _apply_zoom(self) -> None:
@@ -747,8 +899,14 @@ class ComicView(QWidget):
         调整前记录当前阅读比例（滚动值/最大值），等图片重排稳定后按比例
         恢复——否则懒加载下内容高度短暂小于视口时 scrollbar 最大值归零、
         滚动值被强制清零，窗口 resize / Ctrl+滚轮缩放后跳回第一页。
+
+        换话归零期间（_scroll_to_top）不恢复比例：此时 ratio 是上一话的残留
+        位置（读到底部≈1），160ms 后恢复会把新话直接拉到底部——「上一话滚到
+        最低端」与「加载中视口被上下拉动」的根因。代际 epoch 使换话前排定的
+        恢复任务作废。
         """
         ratio = self._scroll_ratio()
+        epoch = self._scroll_epoch
         base = self._current_base_width()
         target = max(200, int(base * self._zoom))
         self.gallery.setFixedWidth(target)
@@ -756,7 +914,10 @@ class ComicView(QWidget):
         self._update_zoom_indicator()
         QTimer.singleShot(0, self._relayout_gallery)
         # 图片重排（已加载图按新宽度 _fit）约一个事件循环内完成，160ms 后恢复
-        QTimer.singleShot(160, lambda: self._restore_scroll_ratio(ratio))
+        if not self._scroll_to_top:
+            QTimer.singleShot(
+                160, lambda r=ratio, e=epoch: self._restore_scroll_ratio(r, e)
+            )
 
     def _scroll_ratio(self) -> float:
         """当前阅读比例：滚动值 / 最大值（内容不足一屏返回 0）。"""
@@ -765,8 +926,14 @@ class ComicView(QWidget):
             return 0.0
         return vbar.value() / vbar.maximum()
 
-    def _restore_scroll_ratio(self, ratio: float) -> None:
-        """按阅读比例恢复滚动位置（resize/缩放后防跳回第一页）。"""
+    def _restore_scroll_ratio(self, ratio: float, epoch: int | None = None) -> None:
+        """按阅读比例恢复滚动位置（resize/缩放后防跳回第一页）。
+
+        epoch 为排定时的滚动代际：若已换话（代际变化）则丢弃，避免上一话
+        排定的恢复任务把新话视口拉走。
+        """
+        if epoch is not None and epoch != self._scroll_epoch:
+            return
         if ratio <= 0:
             return
         vbar = self.scroll.verticalScrollBar()
@@ -787,6 +954,7 @@ class ComicView(QWidget):
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         """键盘导航：上下键滚动，左右键切话（画廊模式）。"""
+        self._stop_auto_scroll()
         key = event.key()
         if self._mode == "gallery":
             vbar = self.scroll.verticalScrollBar()
@@ -850,10 +1018,11 @@ class _ComicImageLabel(QLabel):
 
     loaded = Signal()
 
-    def __init__(self, url, referer="", parent=None):
+    def __init__(self, url, referer="", parent=None, source=None):
         super().__init__(parent)
         self.url = url
         self._referer = referer  # 防盗链 Referer（当前章节页 URL），传 CoverLoader
+        self._source = source  # 所属源（供 CoverLoader 持久化键 source_id 用）
         self.setAlignment(Qt.AlignCenter)
         self._loading = True
         self._orig: QPixmap | None = None  # 原始像素图（缩放基准）
@@ -894,9 +1063,14 @@ class _ComicImageLabel(QLabel):
         from gui.components.cover_loader import CoverLoader
 
         # cache=False：漫画正文长图不进共享封面 LRU（流式阅读重看概率低，
-        # 且一张长图几个 MB，会挤掉封面缓存；正文图内存由页面随滚动释放）
+        # 且一张长图几个 MB，会挤掉封面缓存；正文图内存由页面随滚动释放）。
+        # persist=True：图片字节存 Redis cover: 键（永久，shelf 池），重启/重开
+        # 同一话命中缓存免重复下载（重新打开收藏漫画不再整话重新加载）。
         CoverLoader.instance().load(
-            self.url, self._on_image, referer=self._referer or None, cache=False
+            self.url, self._on_image, referer=self._referer or None, cache=False,
+            persist=True,
+            source_id=(self._source.source_id if self._source else ""),
+            source=self._source,
         )
 
     def _decode_async(self, data: bytes) -> None:

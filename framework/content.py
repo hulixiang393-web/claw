@@ -35,7 +35,7 @@ _AD_IMAGE_RE = _re.compile(
 
 from .config import SourceConfig
 from .errors import ContentMissingError
-from .http import HttpClient
+from .http import AntiScrapeError, HttpClient
 from .parser import Parser
 from .selfcheck import StructureChecker
 from . import utils
@@ -90,6 +90,7 @@ class Detail:
     cover: str = ""
     status: str = ""
     summary: str = ""
+    actor: str = ""  # 演员（detail.fields.actor 可选，未配置为空）
     tags: List[str] = field(default_factory=list)
     chapters: List[Chapter] = field(default_factory=list)
     # 播放源列表（换源站）：[{sid, name, from_, ps, parse}]；无换源配置时为空
@@ -222,6 +223,7 @@ class Content:
             interval_ms=self._interval_ms(source),
             encoding=source.transports().get("charset"),
             proxy_pool=source.proxy_pool(),
+            direct=bool(source.transports().get("direct")),
         )
 
     def _get_detail_html(self, source: SourceConfig, url: str, abs_url: str) -> str:
@@ -270,7 +272,12 @@ class Content:
             cover_sel = (detail_cfg.get("fields") or {}).get("cover")
             if not cover_sel:
                 return ""
-            return self._parser.extract_first(doc, cover_sel, source.base_url)
+            # 与 fetch_detail 同链路：选择器命中但 src 为空/占位（如番茄详情页
+            # <img class="book-cover-img"> 的 src 被 SSR 模板清空，真实封面在
+            # window.__INITIAL_STATE__ 的 "image":[...] JS0N）→ 走 regex/state 兜底，
+            # 否则书架补封面会写回 base_url 垃圾值（表现为「收藏没封面」）。
+            cover = self._parser.extract_first(doc, cover_sel, source.base_url)
+            return self._extract_cover_fallback(source, html, cover_sel, cover)
         except Exception:  # noqa: BLE001
             return ""
 
@@ -336,7 +343,19 @@ class Content:
             cover=cover,
             status=self._parser.extract_first(doc, fields.get("status")),
             summary=self._parser.extract_first(doc, fields.get("summary")),
+            actor=self._parser.extract_first(doc, fields.get("actor")),
         )
+        # 标题/作者文本解密（番茄等：列表/详情书名作者被 PUA 字体混淆，需 translit
+        # 还原；解密配置与 discovery 列表同源：decryption.targets.title/author）。
+        # 未配置解密策略的源 Decrypter 原样返回，零影响。
+        if self._decrypter is not None:
+            if detail.title:
+                detail.title = self._decrypter.decrypt(source, detail.title, target="title", html=html)
+            if detail.author:
+                detail.author = self._decrypter.decrypt(source, detail.author, target="author", html=html)
+            # 简介繁简转换（繁体源，如 CZBooks：detail 简介也需随正文转简体）
+            if detail.summary:
+                detail.summary = self._decrypter.decrypt(source, detail.summary, target="summary", html=html)
         # 标签（可空）
         tags = self._parser.extract(doc, fields.get("tags"))
         detail.tags = tags
@@ -487,6 +506,7 @@ class Content:
             cover=d.get("cover") or "",
             status=d.get("status") or "",
             summary=d.get("summary") or "",
+            actor=d.get("actor") or "",
         )
         chapters = d.get("chapters") or []
         detail.chapters = [Chapter(title=c.get("title") or "", url=c.get("url") or url) for c in chapters]
@@ -572,6 +592,7 @@ class Content:
             cover=str(self._jsonpath(data, extractors.get("cover")) or ""),
             status=str(self._jsonpath(data, extractors.get("status")) or ""),
             summary=str(self._jsonpath(data, extractors.get("summary")) or ""),
+            actor=str(self._jsonpath(data, extractors.get("actor")) or ""),
         )
         # 标签（可空，逗号分隔列表）
         tags = self._jsonpath(data, extractors.get("tags"))
@@ -616,6 +637,12 @@ class Content:
             placeholder 共享占位封面标记（子串/正则，命中视为无有效封面 → 触发兜底）
         尝试顺序：regex → state。
         """
+        # 选择器命中但节点无有效 src（如番茄详情页 SSR 模板把 src 清空）时
+        # extract_first 会把 base_url 当作落点返回；这类退化值必须视为无封面
+        # 继续走兜底，否则垃圾 URL 会写进收藏库且永远不再重补。
+        base = (getattr(source, "base_url", "") or "").rstrip("/")
+        if (current or "").rstrip("/") == base:
+            current = ""
         if current and not self._is_placeholder_cover(current, cover_cfg):
             return current
         cfg = cover_cfg or {}
@@ -692,6 +719,49 @@ class Content:
         return None
 
     # ------------------------------------------------------------------ #
+    def _prepend_first_page(
+        self, source: SourceConfig, doc, list_cfg: dict,
+        detail_url: str, chapters: List[Chapter],
+    ) -> None:
+        """WordPress 帖子分页 current 页码补全（常规列表与 single_chapter
+        播放清單共用）：详情页自身是 <span class="current">（无 href），列表
+        只提取后续页 <a> → 缺第 1 集。启用 first_page_is_current 时读 current
+        页号，若小于列表最小页号，把详情 URL 作为该页补入头部。就地修改
+        chapters，无匹配/异常静默跳过。"""
+        if not list_cfg.get("first_page_is_current") or not detail_url:
+            return
+        try:
+            cur_vals = self._parser.extract(
+                doc,
+                {"css": "div.page-links span.current, div.page-links span.post-page-numbers"},
+            )
+            cur_num = -1
+            for cv in cur_vals:
+                cv = (cv or "").strip()
+                if cv.isdigit():
+                    cur_num = int(cv)
+                    break
+            if cur_num <= 0:
+                return
+            nums = []
+            for ch in chapters:
+                m = _re.match(r"^\s*(\d+)\s*$", ch.title or "")
+                if m:
+                    nums.append(int(m.group(1)))
+            if not nums or cur_num < min(nums):
+                chapters.insert(
+                    0,
+                    Chapter(
+                        title=str(cur_num),
+                        url=detail_url,
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "[%s] current 页码补全失败，跳过：%s", source.source_id, exc
+            )
+
+    # ------------------------------------------------------------------ #
     def _fetch_chapters(
         self,
         source: SourceConfig,
@@ -758,6 +828,10 @@ class Content:
                             )
                         )
                     if chapters:
+                        # 帖子分页 first_page_is_current：详情页自身（<span> 无
+                        # href）不在播放清單里 → 复用常规列表的同款补全，避免合集
+                        # 丢失第 1 集（如 hciyuan 合集帖：清單只有 2..N 页）。
+                        self._prepend_first_page(source, doc, list_cfg, detail_url, chapters)
                         # 当前视频置首（用户打开的那一集放列表顶部）
                         own = (detail_url or "").rstrip("/").lower()
                         if own:
@@ -878,40 +952,9 @@ class Content:
         # <span class="...current">（无 href），列表只提取后续页 <a> 链接 →
         # 第一集丢失。first_page_is_current: 启用时读 current span 的页号，
         # 若小于已提取的最小页号（即列表缺第 1 页），把详情 URL 作为该页补入
-        # 列表头部（详情页本身即第 1 页内容）。
-        if list_cfg.get("first_page_is_current") and detail_url:
-            try:
-                cur_vals = self._parser.extract(
-                    doc,
-                    {"css": "div.page-links span.current, div.page-links span.post-page-numbers"},
-                )
-                cur_num = -1
-                for cv in cur_vals:
-                    try:
-                        cv = cv.strip()
-                        if cv.isdigit():
-                            cur_num = int(cv)
-                            break
-                    except ValueError:
-                        continue
-                if cur_num > 0:
-                    nums = []
-                    for ch in chapters:
-                        m = _re.match(r"^\s*(\d+)\s*$", ch.title)
-                        if m:
-                            nums.append(int(m.group(1)))
-                    if not nums or cur_num < min(nums):
-                        chapters.insert(
-                            0,
-                            Chapter(
-                                title=str(cur_num),
-                                url=detail_url,
-                            ),
-                        )
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "[%s] current 页码补全失败，跳过：%s", source.source_id, exc
-                )
+        # 列表头部（详情页本身即第 1 页内容）。常规列表与 single_chapter
+        # 播放清單共用 _prepend_first_page。
+        self._prepend_first_page(source, doc, list_cfg, detail_url, chapters)
 
         # 倒序反转（HTML 倒序 → 正序）
         order = list_cfg.get("chapter_order", "asc")
@@ -1231,7 +1274,7 @@ class Content:
             text = self._normalize_para_indent(text)
             # 字符映射解密（番茄小说字体混淆等）：decryption.targets.chapter.strategy=translit
             if self._decrypter is not None:
-                text = self._decrypter.decrypt(source, text, "chapter")
+                text = self._decrypter.decrypt(source, text, "chapter", html=html)
         # 正文广告行过滤（ad_block 引擎：剔除「广告/推广/点击领取」等特征行）
         try:
             from .adblock import adblock_for
@@ -1446,14 +1489,17 @@ class Content:
         # 图片列表优先 body，兼容旧 list
         list_cfg = body_cfg or block.get("list") or {}
         urls = self._fetch_comic_page_imgs(
-            source, list_cfg, chapter_url, cancel_evt=cancel_evt
+            source, list_cfg, chapter_url, cancel_evt=cancel_evt, on_page=on_page
         )
         # 图片解密源（如 18mh AES-CBC 加密图）：下载并把每张解密成 data URI，
         # 使阅读器/下载器无需改动即可显示/保存解密图。
         if urls and source.raw.get("decryption", {}).get("targets", {}).get("image"):
             return self._decrypt_image_urls(source, urls, on_page)
         if on_page and urls:
-            on_page(list(urls))
+            try:
+                on_page(list(urls))
+            except Exception:  # noqa: BLE001 —— 回调异常不影响抓取结果
+                pass
         return urls
 
     def _decrypt_image_urls(self, source: SourceConfig, urls: List[str], on_page=None) -> List[str]:
@@ -1526,7 +1572,7 @@ class Content:
 
     def _fetch_comic_page_imgs(
         self, source: SourceConfig, list_cfg: dict, chapter_url: str,
-        cancel_evt=None,
+        cancel_evt=None, on_page=None,
     ) -> List[str]:
         """从单话 HTML 提取全部图片 URL，支持图片列表翻页（含并行翻页加速）。
 
@@ -1547,7 +1593,7 @@ class Content:
         image_api = list_cfg.get("image_api") or {}
         if image_api:
             return self._fetch_comic_image_api(
-                source, image_api, chapter_url, cancel_evt=cancel_evt
+                source, image_api, chapter_url, cancel_evt=cancel_evt, on_page=on_page
             )
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
@@ -1576,6 +1622,18 @@ class Content:
         seen_img: set = set()   # 已收集的图片 URL（跨页去重）
         _seq_counter = [0]  # {seq} 顺序编号器（被闭包共享）
 
+        # 提取阶段的 fields 剥离 url_replace：parser.extract 的 url_replace 只
+        # 支持 {1}..{n} 捕获组，不支持 {seq} —— 若在此阶段重写会把字面 {seq}
+        # 残留进 URL，导致 _add_imgs 的重写正则（面向缩略图 URL）不再命中而
+        # 原样输出 404（wnacg img5.qy0.ru {seq}.webp 即此坑）。故统一交由下方
+        # _add_imgs（支持 {seq} 顺序编号）做唯一一次重写。
+        fields_pt = fields
+        if isinstance(fields.get("url"), dict) and fields["url"].get("url_replace"):
+            fields_pt = dict(fields)
+            f_url = dict(fields["url"])
+            f_url.pop("url_replace", None)
+            fields_pt["url"] = f_url
+
         # 共用小函数：抓单页 → (本页图片列表, 下一页链接)。顺序与并行翻页都复用。
         def _fetch_page(page_url: str, http=None) -> tuple:
             html = self._get(source, page_url, http=http)
@@ -1584,7 +1642,7 @@ class Content:
             # 每个 root 项内按 fields.url 取属性，自动 data-src 懒加载兜底）。
             # 无 root_selector 时回退整页提取。
             items = self._parser.parse_items(
-                doc, root_sel, fields, source.base_url
+                doc, root_sel, fields_pt, source.base_url
             )
             page_imgs = [it.get("url") or "" for it in items]
             page_imgs = [u for u in page_imgs if u]
@@ -1630,33 +1688,64 @@ class Content:
                     """第 n 页 URL（第 1 页即章节 URL 本身，从 first_page 起预测）。"""
                     return self._abs_url(source, tpl.format(base=base, page=n))
 
-                # 第 1 页：抓章节 URL，收集图片 + 取 next 链接 nxt1
-                p1_imgs, nxt1 = _fetch_page(chapter_url)
+                # 第 1 页：抓章节 URL，收集图片 + 取 next 链接 nxt1。
+                # 第 1 页也走限流退避重试（并发翻页偶发 429 时，首页失败会触发
+                # 整个并行路径回退顺序 → 更慢，务必补抓而非直接放弃）。
+                p1_imgs, nxt1 = ([], "")
+                for _attempt in range(3):
+                    try:
+                        p1_imgs, nxt1 = _fetch_page(chapter_url)
+                        break
+                    except AntiScrapeError:
+                        if _attempt < 2:
+                            self._http._sleeper(1.0 * (2 ** _attempt))
+                    except Exception:  # noqa: BLE001 —— 非限流异常交给外层回退顺序
+                        raise
                 # 模板验证（安全网）：nxt1 必须等于 pred(2)，否则模板错 → 回退顺序
                 if not nxt1 or self._abs_url(source, nxt1) != pred(2):
                     raise ValueError("parallel URL 模板与站点分页不符")
                 _add_imgs(p1_imgs)
+                if on_page and urls:
+                    try:
+                        on_page(list(urls))  # 首图就绪即回调，阅读器秒出首屏
+                    except Exception:  # noqa: BLE001
+                        pass
 
                 def _fetch_page_retry(p: int) -> tuple:
                     """抓第 p 页；独立 HttpClient（requests.Session 非线程安全，
-                    每页一个实例避免并发竞态），失败/图片为空重试 1 次，仍失败记空
-                    （保守：当页跳过，交给 wave 末页 next 判定是否继续）。"""
+                    每页一个实例避免并发竞态）。
+
+                    429/5xx 限流响应退避重试（1s/2s，最多 3 次）——并发翻页偶发
+                    限流时补抓该页，而非直接丢页（丢页会导致话内容不全）。4xx 等
+                    确定性失败不重试（末页探测靠 next 判定，无需重试）。
+                    """
                     page_http = self._http.__class__(
                         sleeper=getattr(self._http, "_sleeper", None),
                         defaults=self._http.defaults,
                     )
                     try:
                         last = ([], "")
-                        for attempt in range(2):
+                        for attempt in range(3):
                             try:
                                 imgs, nxt = _fetch_page(pred(p), http=page_http)
+                            except AntiScrapeError as exc:
+                                last = ([], "")
+                                if attempt < 2:
+                                    self._http._sleeper(1.0 * (2 ** attempt))
+                                    continue
+                                log.debug("[%s] 分页 %d 限流重试耗尽：%s", source.source_id, p, exc)
                             except Exception:  # noqa: BLE001
                                 last = ([], "")
-                                continue
-                            last = (imgs, nxt)
-                            if imgs:
-                                break  # 拿到图即成功
-                            # 图片为空：可能是瞬时失败（并发下偶发丢响应），再试 1 次
+                                if attempt < 2:
+                                    self._http._sleeper(0.5 * (attempt + 1))
+                                    continue
+                            else:
+                                last = (imgs, nxt)
+                                if imgs:
+                                    break  # 拿到图即成功
+                                # 图片为空：可能是瞬时失败（并发下偶发丢响应），再试
+                                if attempt < 2:
+                                    self._http._sleeper(0.5 * (attempt + 1))
                         return last
                     finally:
                         try:
@@ -1680,6 +1769,13 @@ class Content:
                     # 图片按页码顺序收集，与第 1 页拼接
                     for p in wave:
                         _add_imgs(results.get(p, ([], ""))[0])
+                    # 边抓边回调（连续前缀）：阅读器首批图就绪即可渲染首屏，
+                    # 无需等整话分页抓完（此前 HTML 路径全程无回调 → 21 页 20s 才出首图）。
+                    if on_page and urls:
+                        try:
+                            on_page(list(urls))
+                        except Exception:  # noqa: BLE001 —— 回调异常不影响抓取
+                            pass
                     # 停止条件：wave 最后一页的 next 自环（== 自身）/为空/
                     # ≠ pred(最后一页+1) → 章节结束停止；否则继续下一 wave。
                     last_p = wave[-1]
@@ -1719,7 +1815,7 @@ class Content:
     # ------------------------------------------------------------------ #
     def _fetch_comic_image_api(
         self, source: SourceConfig, cfg: dict, chapter_url: str,
-        cancel_evt=None,
+        cancel_evt=None, on_page=None,
     ) -> List[str]:
         """漫画图片来自 AJAX 文本接口的源（配置驱动，如 dm5 chapterfun.ashx）。
 
@@ -1794,6 +1890,37 @@ class Content:
         pix_re = str(cfg.get("pix_regex") or r'pix="([^"]+)"')
         paths_re = str(cfg.get("paths_regex") or r"pvalue=\[([^\]]*)\]")
         key_re = str(cfg.get("key_regex") or "")
+        # 渲染提取配置（如 dm5）：页面 JS 运行时动态计算图片 URL 的 key 参数，
+        # 静态接口提取到的 key 可能是固定常量/诱饵（全 403）。配置存在时先
+        # Playwright 渲染章节页，从 DOM 的 img.src 提取真实签名 key 覆盖接口
+        # 结果；渲染失败/未拿到 → 保留原接口 key（不破坏其他源）。
+        render_cfg = cfg.get("render_config") or {}
+        render_key = ""
+        if render_cfg:
+            try:
+                from .playwright_helper import fetch_rendered_images_sync
+
+                rendered = fetch_rendered_images_sync(
+                    self._abs_url(source, chapter_url),
+                    wait_for=render_cfg.get("wait_for") or "img",
+                    wait_until=render_cfg.get("wait_until") or "domcontentloaded",
+                    timeout_ms=int(render_cfg.get("timeout_ms") or 30000),
+                    extra_delay_ms=int(render_cfg.get("extra_delay_ms") or 1500),
+                    extract_mode=render_cfg.get("extract_mode") or "img",
+                    img_selector=render_cfg.get("img_selector"),
+                    proxy=(None if source.transports().get("direct")
+                           else source.transports().get("proxy")),
+                )
+                for u in rendered or []:
+                    mk = _re.search(r"[?&]key=([^&#]+)", str(u))
+                    if mk:
+                        render_key = mk.group(1)
+                        break
+            except Exception as exc:
+                log.warning(
+                    "[%s] 渲染提取 key 失败，回退接口 key：%s",
+                    source.source_id, exc,
+                )
         use_packer = bool(cfg.get("packer"))
         # 接口专用请求头（合并覆盖源头）——部分站点接口要求特定 Referer/Cookie
         api_headers = dict(self._headers(source))
@@ -1818,21 +1945,115 @@ class Content:
                 return api_url + sep + urlencode(filled)
             return _fill(api_url, page)
 
-        def _fetch_api(page: int) -> str:
+        def _fetch_api(page: int, http=None, interval_ms=None) -> str:
             """接口请求：走独立 headers，遇失败抛异常由调用方跳过该页。"""
             abs_url = self._abs_url(source, _api_url(page))
-            return self._http.get_text(
+            http = http or self._http
+            return http.get_text(
                 abs_url,
                 headers=api_headers,
                 timeout=self._timeout(source),
                 retries=self._retries(source),
-                interval_ms=self._interval_ms(source),
+                interval_ms=self._interval_ms(source)
+                if interval_ms is None
+                else interval_ms,
                 encoding=source.transports().get("charset"),
-                proxy_pool=source.proxy_pool(),
+                direct=bool(source.transports().get("direct")),
             )
 
+        # 单页接口响应 → 图片 URL 列表（解析逻辑抽出，供顺序/并行共用）
+        def _parse_page(resp_text: str, page: int, _seen: set) -> List[str]:
+            plain = self._unpack_js_packer(resp_text) if use_packer else resp_text
+            m = _re.search(pix_re, plain)
+            pix = m.group(1) if m else ""
+            mp = _re.search(paths_re, plain)
+            paths = _re.findall(r'"([^"]+)"', mp.group(1)) if mp else []
+            key = render_key or ""
+            if not key and key_re:
+                mk = _re.search(key_re, plain)
+                if mk:
+                    key = (mk.group(1) if mk.groups() else mk.group(0)).rstrip("\\")
+            out: List[str] = []
+            for p in paths:
+                full = url_tpl.replace("{pix}", pix).replace("{path}", p)
+                full = _fill(full, page).replace("{key}", key)
+                if full and full not in _seen:
+                    _seen.add(full)
+                    out.append(full)
+            return out
+
+        # 并行抓取配置（config-driven）：接口每页独立请求时按 wave 并发，
+        # 把 interval_ms 礼貌延迟从「逐页累积」压成「每 wave 平摊」——dm5 一话
+        # 数十页，顺序 ≈74s，wave 并发可压到 2-5s。
+        parallel = cfg.get("parallel") or {}
+        window = int(parallel.get("window") or 8)
+        wave_gap = (
+            float(parallel.get("interval_ms") or interval * 1000.0) / 1000.0
+        )
         urls: List[str] = []
         seen: set = set()
+        if count > 1 and window > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _fetch_page_retry(p: int, http) -> List[str]:
+                last: List[str] = []
+                for attempt in range(2):
+                    try:
+                        # 并行分支：逐页 interval 延迟由 wave 间 wave_gap 统一承担，
+                        # 请求本身不再 sleep（否则 8 并发各自 sleep 900ms → wave 内 8s）
+                        resp_text = _fetch_api(p, http=http, interval_ms=0)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    last = _parse_page(resp_text, p, seen)
+                    if last:
+                        break  # 拿到图即成功
+                return last
+
+            try:
+                n = 1
+                while n <= count:
+                    if cancel_evt and cancel_evt.is_set():
+                        break  # 换书取消：停止后续 wave，返回已收集部分
+                    wave = list(range(n, min(n + window, count + 1)))
+                    results: dict = {}
+                    with ThreadPoolExecutor(
+                        max_workers=min(window, len(wave))
+                    ) as pool:
+                        futs = {}
+                        for p in wave:
+                            page_http = self._http.__class__(
+                                sleeper=getattr(self._http, "_sleeper", None),
+                                defaults=self._http.defaults,
+                            )
+                            futs[pool.submit(_fetch_page_retry, p, page_http)] = (p, page_http)
+                        for fut in as_completed(futs):
+                            p, page_http = futs[fut]
+                            try:
+                                results[p] = fut.result()
+                            except Exception:  # noqa: BLE001
+                                results[p] = []
+                            finally:
+                                try:
+                                    page_http.close()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                    for p in wave:
+                        urls.extend(results.get(p, []))
+                    # 每 wave 完成 → 回调已就绪前缀（边抓边显示：首批到达即可
+                    # 渲染首屏，无需等整话抓完；顺序不变，后续批次续接）。
+                    if on_page and urls:
+                        on_page(list(urls))
+                    if wave_gap > 0 and n + window <= count:
+                        _time.sleep(wave_gap)
+                    n += window
+                return urls
+            except Exception as exc:  # noqa: BLE001
+                # 并行异常 → 清空重来，回退顺序循环（保证正确性）
+                log.warning("[%s] image_api 并行抓取回退顺序：%s", source.source_id, exc)
+                urls = []
+                seen = set()
+
+        # 顺序循环（单页 / 未配置 parallel / 并行回退）
         for page in range(1, count + 1):
             if cancel_evt and cancel_evt.is_set():
                 break  # 换书取消：停止逐页接口抓取（dm5 一话几十页，立即让路）
@@ -1840,22 +2061,9 @@ class Content:
                 resp_text = _fetch_api(page)
             except Exception:  # noqa: BLE001
                 continue  # 单页接口失败跳过（不整话失败）
-            plain = self._unpack_js_packer(resp_text) if use_packer else resp_text
-            m = _re.search(pix_re, plain)
-            pix = m.group(1) if m else ""
-            mp = _re.search(paths_re, plain)
-            paths = _re.findall(r'"([^"]+)"', mp.group(1)) if mp else []
-            key = ""
-            if key_re:
-                mk = _re.search(key_re, plain)
-                if mk:
-                    key = (mk.group(1) if mk.groups() else mk.group(0)).rstrip("\\")
-            for p in paths:
-                full = url_tpl.replace("{pix}", pix).replace("{path}", p)
-                full = _fill(full, page).replace("{key}", key)
-                if full and full not in seen:
-                    seen.add(full)
-                    urls.append(full)
+            urls.extend(_parse_page(resp_text, page, seen))
+            if on_page and urls:
+                on_page(list(urls))
             if interval > 0 and page < count:
                 _time.sleep(interval)
         return urls
@@ -2023,6 +2231,15 @@ class Content:
             play = self._fetch_episode_api(source, episode_url, episode_api)
             if play:
                 return play
+            if episode_api.get("url"):
+                # API 端点返回空（如 avgood 搜索链接大批过期 → {"zt":"视频不存在"}）
+                err_url = episode_api["url"].replace(
+                    "{id}", episode_url.split("/")[-1].rsplit(".", 1)[0]
+                )
+                raise ContentMissingError(
+                    f"视频播放地址已失效（API 返回空），{err_url}",
+                    source_id=source.source_id,
+                )
 
         # 换源站：默认线路失败 → 自动轮换其他线路
         if self._get_source_switch_cfg(source):

@@ -13,14 +13,17 @@ from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from framework.search import Search, SearchResult
@@ -28,6 +31,23 @@ from framework.source_manager import SourceManager
 
 from gui.components import WorkCard
 from .base_page import BasePage
+
+
+class _NonClosingMenu(QMenu):
+    """点击 checkable 菜单项不自动关闭的 QMenu，仅点击外部或 Escape 关闭。"""
+
+    def mouseReleaseEvent(self, event):
+        action = self.actionAt(event.pos())
+        if action and action.isCheckable():
+            action.setChecked(not action.isChecked())
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() != Qt.Key_Escape:
+            return
+        super().keyPressEvent(event)
+
 
 # 反爬挑战错误特征：错误文本（小写）命中任一 → 判定被站点反爬挑战拦截
 # （Cloudflare「Just a moment」Turnstile / WAF 403 / AntiScrapeError 等）。
@@ -43,9 +63,14 @@ CHALLENGE_MARKERS = (
     "http 403",
 )
 
-# 封面预加载窗口：滚动时提前触发视口下方 N 张卡片的封面加载
-# （滚动流畅、封面跟手；超过该窗口的留待接近时再加载，不挤占并发）。
-PREFETCH_COVER_EXTRA = 8
+# 封面随卡片立即加载（CoverLoader 异步限流），不做滚动 mapTo 扫描——
+# 与发现页一致（发现页滚动丝滑）。以下常量保留注释说明：
+# （原手动封面泵的预加载窗口 PREFETCH_COVER_EXTRA 已移除）
+
+# 源多选菜单限高：源行估算高度超过该阈值时菜单内出现滚动条（源多时不
+# 一屏铺满全屏）；源少时菜单随内容自适应，不含滚动条。仅限高，不改变
+# _NonClosingMenu「点行不收起、点外部/Escape 收起」行为。
+SRC_MENU_SCROLL_LIMIT = 400
 
 
 class _SearchSignals(QObject):
@@ -127,6 +152,56 @@ class _SearchCoverDecryptTask(QRunnable):
             pass
 
 
+class _SearchCoverBackfillSignals(QObject):
+    finished = Signal(object, object, object)  # (source, {result.url: cover_url}, epoch)
+
+
+class _SearchCoverBackfillTask(QRunnable):
+    """后台按需抓详情页封面（cover_backfill 源，搜索列表纯文本无封面）。
+
+    与发现页 _CoverBackfillTask 同模式：对 cover 为空的结果逐个
+    fetch_cover（轻量，只取详情封面字段，复用 Content 详情缓存免重复下载），
+    请求间带源 transports.interval_ms 反爬间隔；并发由 SearchPage._backfill_pool
+    限流（≤3）。单条失败/空 → 跳过（静默），不影响其它条目。
+
+    epoch：发起时搜索会话标记。旧搜索的回填结果后到（epoch 过期）会被
+    _on_covers_backfilled 丢弃，避免回填到新搜索的 _results/卡片。
+    """
+
+    def __init__(self, content, source, results, epoch=0):
+        super().__init__()
+        self.signals = _SearchCoverBackfillSignals()
+        self._content = content
+        self._source = source
+        self._results = results
+        self._epoch = epoch
+
+    def run(self) -> None:
+        covers = {}
+        try:
+            import time
+
+            # 反爬间隔：跟随源 transports.interval_ms（下限 0.2s）
+            interval = float(self._source.transports().get("interval_ms") or 200) / 1000.0
+            if interval < 0.2:
+                interval = 0.2
+            for i, r in enumerate(self._results):
+                if i > 0:
+                    time.sleep(interval)
+                try:
+                    cover_url = self._content.fetch_cover(self._source, r.url) or ""
+                except Exception:  # noqa: BLE001
+                    cover_url = ""
+                if cover_url:
+                    covers[r.url] = cover_url
+        except Exception:  # noqa: BLE001
+            pass  # 单条已内层容错，整批异常兜底静默
+        try:
+            self.signals.finished.emit(self._source, covers, self._epoch)
+        except RuntimeError:
+            pass  # 页面已销毁，忽略信号
+
+
 class SearchPage(BasePage):
     search_clicked = Signal(str)  # 搜索触发（首页接）
     open_requested = Signal(str, str, str)  # (source_id, url, content_type) 打开作品
@@ -134,28 +209,34 @@ class SearchPage(BasePage):
     add_to_shelf_requested = Signal(object)   # list[SearchResult]
     batch_download_requested = Signal(object)  # list[SearchResult]
 
-    def __init__(self, source_manager: SourceManager, search: Search, parent=None):
+    def __init__(self, source_manager: SourceManager, search: Search, content=None, parent=None):
         super().__init__(parent)
         self._manager = source_manager
         self._search = search
+        self._content = content  # 可选：详情封面回填（cover_backfill 源）用
         self._results = []
         self._filter_source = ""
         self._status_chips: dict = {}  # source_id → (QLabel, QLabel状态) 或组合控件
         self._pending_count = 0  # 未完成搜索的源数
         self._work_count = 0  # 当前网格卡片计数（追加/重建共用）
         self._shown_count = 0  # 已渲染到 _results 的条数（分批懒加载用）
-        self._page_size = 12  # 每批渲染条数：首屏更早出内容（12 张更快），余下滚动/预加载补
-        self._preload_depth = 2  # 预加载缓冲批次：首屏 1 批 + 再预加载 2 批填满视口（防一次建太多卡片）
+        self._page_size = 12  # 每批渲染条数：首屏更早出内容（12 张更快），余下滚动补
         self._selected: dict = {}  # 勾选批量：url → SearchResult
         self._select_mode = False  # 是否进入勾选模式
         self._cover_tasks = []  # 封面解密后台任务引用（防 GC）
         self._cover_decrypt_submitted: set = set()  # 已提交封面解密的结果 url（防逐页/done 重复触发）
+        self._backfill_pool = QThreadPool(self)  # 详情封面回填专用池（限流，≤3 并发）
+        self._backfill_pool.setMaxThreadCount(3)
+        self._cover_backfill_tasks: list = []  # 详情封面回填任务持有（防 GC）
+        self._cover_backfill_submitted: set = set()  # 已提交回填的 url（防逐页/done 重复）
         self._streamed: set = set()  # 已边抓边渲染的源（finished 不重复追加）
         self._search_epoch = 0  # 搜索会话标记：换源/换关键词自增，过期任务结果丢弃
         self._results_display = None  # 合并模式渲染列表；None 时用 _results（新搜索须重置）
-        self._deferred_covers = []  # 封面延迟加载队列：待进入视口才 load_cover 的卡片
-        self._cover_pump_queued = False  # 封面泵标志：同轮事件循环只泵一次
-        self._render_all_pending = False  # 完成后全量渲染分批标志（防重入）
+        self._more_pending = False  # 滚动加载合并标记：同一事件循环内的连续滚动事件只铺一批
+        self._restoring_scroll = False  # 懒加载锚定/重建恢复滚动位置时抑制 on_scroll 级联
+        self._last_columns = 0  # 已应用的网格列数：列数不变时跳过重复列拉伸（避免每批全量重排）
+        self._all_action = None  # 源菜单「全部」QAction 引用（就地同步勾选态，不重建菜单）
+        self._src_rows: dict = {}  # source_id → 源行 QPushButton（就地同步勾选态，不重建菜单）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -170,10 +251,25 @@ class SearchPage(BasePage):
         self.type_combo.addItem("全部类型", "")
         for t in ("novel", "comic", "video"):
             self.type_combo.addItem(t, t)
-        self.src_combo = QComboBox()
-        self.src_combo.addItem("全部源", "")
-        for s in source_manager.enabled_sources():
-            self.src_combo.addItem(s.source_name, s)
+        self._all_selected: bool = True
+        self._selected_sources: set = set()
+        self.src_btn = QPushButton("源：全部")
+        self._src_menu = _NonClosingMenu(self.src_btn)
+        # 「全部」QAction 走 QMenu 默认渲染：显式声明字色/选中背景，
+        # 避免与源行按钮的 QSS 混用后出现菜单项看不清或选中态跳变。
+        self._src_menu.setStyleSheet(
+            "QMenu { background: palette(window); border: 1px solid palette(mid);"
+            " border-radius: 8px; padding: 4px; }"
+            "QMenu::item { color: palette(text); padding: 7px 24px 7px 12px;"
+            " border-radius: 6px; }"
+            "QMenu::item:selected { background: palette(highlight);"
+            " color: palette(highlightedText); }"
+            "QMenu::item:disabled { color: palette(mid); }"
+            "QMenu::separator { height: 1px; background: palette(midlight);"
+            " margin: 4px 8px; }"
+        )
+        self.src_btn.setMenu(self._src_menu)
+        self._rebuild_sources_menu()
         self.merge_check = QCheckBox("合并相似")
         self.merge_check.setToolTip("按书名+作者模糊匹配，合并同书多源版本（默认关）")
         self.merge_check.setChecked(False)
@@ -182,7 +278,7 @@ class SearchPage(BasePage):
         self.search_btn.clicked.connect(self._on_search)
         top.addWidget(self.keyword_input, stretch=1)
         top.addWidget(self.type_combo)
-        top.addWidget(self.src_combo)
+        top.addWidget(self.src_btn)
         top.addWidget(self.merge_check)
         top.addWidget(self.search_btn)
         layout.addLayout(top)
@@ -277,19 +373,24 @@ class SearchPage(BasePage):
         self._results_display = None
         self._shown_count = 0
         self._cover_decrypt_submitted = set()
+        self._cover_backfill_submitted = set()  # 新一轮会话可重新回填封面
+        self._cover_backfill_tasks = []  # 清空旧回填任务引用（防回到旧结果）
         self._selected = {}
         self.batch_bar.setVisible(False)
         self.select_all_check.setChecked(False)
 
-        # 选择目标源：源范围下拉选中具体源则只搜该源，否则全部源+类型筛选
+        # 选择目标源
         selected_type = self.type_combo.currentData()
-        selected_src = self.src_combo.currentData()
-        if selected_src:
-            sources = [selected_src]
-        else:
+        if self._all_selected:
             sources = self._manager.enabled_sources()
-            if selected_type:
-                sources = [s for s in sources if s.content_type == selected_type]
+        elif self._selected_sources:
+            sources = [s for s in self._manager.enabled_sources()
+                       if s.source_id in self._selected_sources]
+        else:
+            self.status_label.setText("未选择任何源")
+            return
+        if selected_type:
+            sources = [s for s in sources if s.content_type == selected_type]
 
         if not sources:
             self.status_label.setText("没有可搜索的源")
@@ -373,6 +474,8 @@ class SearchPage(BasePage):
         # 加密站（18mh 类）：边抓边显示首批就触发封面解密，不等全部页 done——
         # 否则源搜索慢（多页）时封面整场是加密 URL 加载不出。逐页去重提交。
         self._submit_cover_decrypt(source, new_results)
+        # cover_backfill 源（搜索列表纯文本无封面）：逐页后台抓详情封面回填。
+        self._submit_cover_backfill(source, new_results)
         self._update_batch_status()
 
     def _on_source_done(self, source, results, err, epoch) -> None:
@@ -407,6 +510,9 @@ class SearchPage(BasePage):
             # 边抓边显示的页已逐批提交（_on_source_page → _submit_cover_decrypt），
             # done 这里只补提交未解密过的剩余结果（_cover_decrypt_submitted 去重）。
             self._submit_cover_decrypt(source, results or [])
+            # cover_backfill 源：done 补提交（_cover_backfill_submitted 去重，
+            # 只补未回填过的剩余结果——on_page 缺省/未流式时一次性补全）。
+            self._submit_cover_backfill(source, results or [])
         self._pending_count -= 1
         if self._pending_count <= 0:
             self._on_all_done()
@@ -483,6 +589,87 @@ class SearchPage(BasePage):
         self._cover_tasks.append(task)  # 持引用防 GC
         QThreadPool.globalInstance().start(task)
 
+    # ------------------------------------------------------------------ #
+    # 详情封面回填（cover_backfill 源：搜索列表纯文本无封面，后台按详情页补回）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _needs_cover_backfill(source) -> bool:
+        """该源搜索列表是否纯文本无封面（需详情页回填封面）。
+
+        优先看 endpoints.search.item.cover_backfill；搜索未显式配时
+        兼容 discovery.works_list_item.cover_backfill——同一站点列表页
+        纯文本无封面，搜索列表通常同样无封面，两处同启。
+        """
+        try:
+            search_item = (source.raw.get("endpoints") or {}).get("search", {}).get("item") or {}
+            if search_item.get("cover_backfill"):
+                return True
+            disc = (source.raw.get("endpoints") or {}).get("discovery") or {}
+            return bool((disc.get("works_list_item") or {}).get("cover_backfill"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _submit_cover_backfill(self, source, results) -> None:
+        """为 cover 为空的结果后台抓详情页封面（cover_backfill 源）。
+
+        边抓边显示逐页到达与 done 全量到达都走这里，用 _cover_backfill_submitted
+        按 url 去重：同一批结果只提交一次。仅提交 cover 为空且 url 非空的结果
+        （搜索结果自带封面的源不额外抓详情）。未注入 content（非 GUI 入口 /
+        无 Content 可用）直接跳过。失败静默。
+        """
+        if not results or not self._needs_cover_backfill(source):
+            return
+        if self._content is None:
+            return
+        pending = [
+            r for r in results
+            if getattr(r, "url", "") and not getattr(r, "cover", "")
+            and r.url not in self._cover_backfill_submitted
+        ]
+        if not pending:
+            return
+        for r in pending:
+            self._cover_backfill_submitted.add(r.url)
+        task = _SearchCoverBackfillTask(
+            self._content, source, pending, epoch=self._search_epoch
+        )
+        task.signals.finished.connect(self._on_covers_backfilled)
+        self._cover_backfill_tasks.append(task)  # 持引用防 GC（与解密任务分开，互不干扰）
+        self._backfill_pool.start(task)
+
+    def _on_covers_backfilled(self, source, covers, epoch) -> None:
+        """详情封面回填完成：回写 SearchResult.cover + 经 CoverLoader 刷新对应卡片。
+
+        epoch 不匹配（已被新搜索替代）→ 丢弃；空结果跳过。合并模式下
+        卡片 work 是合并代表（url 与原始结果一致），按 url 匹配刷新。
+        """
+        if epoch != self._search_epoch or not covers:
+            return
+        for r in self._results:
+            url = getattr(r, "url", "")
+            if url in covers and covers[url]:
+                r.cover = covers[url]
+        # 经 CoverLoader 异步加载并刷新卡片（全局限流，与初始加载一致）
+        from gui.components.cover_loader import CoverLoader
+
+        import shiboken6
+
+        for card in self.grid_container.findChildren(WorkCard):
+            try:
+                if not shiboken6.isValid(card):
+                    continue
+                cover_url = covers.get(getattr(card.work, "url", ""))
+                if not cover_url:
+                    continue
+                CoverLoader.instance().load(
+                    cover_url,
+                    lambda pix, c=card: c.set_cover_pixmap(pix),
+                    source_id=source.source_id,
+                    source=source,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+
     def _on_merge_toggled(self, checked: bool) -> None:
         """合并相似开关切换：对当前结果重新合并渲染（结果已加载时）。"""
         if self._results:
@@ -501,24 +688,25 @@ class SearchPage(BasePage):
         else:
             self._results_display = list(self._results)
         self._shown_count = 0
+        ratio = self._scroll_ratio()
         self._clear_grid()
-        # 分批渲染：先渲染第一批
+        # 只渲染首屏（能填满一个视口的批次数），剩余滚动懒加载——
+        # 不像以前全量渲染剩余卡片（几百张同帧建卡导致首屏/下滑卡顿）。
         self._append_displayed_batch()
-        # 重建后全量渲染剩余（防"只有首屏三页"，滚动触发失效时也能看到全部）
-        self._render_all_remaining()
+        # 合并开关切换时内容条数可能骤变：按比例恢复，避免网格重建后
+        # 贴回顶部/跳到底（合并前滚动位置的相对视觉保持不变）。
+        self._restore_scroll_ratio(ratio)
 
     def _append_displayed_batch(self) -> None:
-        """按 _results_display 渲染下一批（合并后走此路径）。
+        """按 _results_display 渲染首屏（能填满一个视口的批次数）。
 
-        每次只渲染一批（_page_size 条），不自动补足视口——防止搜索完
-        一次性插入大量卡片闪屏。首屏一屏内容 + 滚动到 80% 逐批加载
-        （_on_scroll），与发现页懒加载一致。
+        剩余结果留待滚动到 80%（_on_scroll）逐批渲染，不提前全量建卡。
         """
         display = getattr(self, "_results_display", None)
         if display is None:
             return
         cols = self._columns()
-        new_shown = min(len(display), self._shown_count + self._page_size)
+        new_shown = min(len(display), self._first_screen_limit())
         while self._shown_count < new_shown:
             r = display[self._shown_count]
             self._append_card(r, cols)
@@ -526,64 +714,29 @@ class SearchPage(BasePage):
         self._apply_column_stretch(cols)
         self._update_batch_status()
         self._maybe_preload_results()
-        self._pump_visible_covers()
 
     def _on_all_done(self) -> None:
         """全部源搜索结束。
 
         非合并模式：边抓边显示已渲染首屏，直接更新状态（不重建网格，
         避免搜索完成瞬间清空重插导致闪屏）；合并模式：结果一直在累积
-        未渲染，统一合并后渲染首屏，剩余滚动懒加载。
+        未渲染，统一合并后只渲染首屏。
 
-        完成后把剩余结果全部渲染（_render_all_remaining）：此前首屏只
-        渲染预加载深度 2 屏（约 3 屏卡片），剩余靠滚动 80% 逐批加载；
-        若滚动触发失效（布局未刷新/滚动条未出现/用户未滚动到 80%），
-        用户只能看到首屏几十张（"只有三页"）。完成后一次性渲染全部，
-        滚动条必然出现、用户一定能看到所有结果（分批渲染防闪屏）。
+        剩余结果不在这里渲染——严格按滚动到 80%（_on_scroll）逐批加载
+        （每批 _page_size 条），避免搜索完成瞬间全量建卡导致首屏/下滑
+        卡顿，用户只看到已在视口内的卡片。仅当首屏还没填满（边抓边显示
+        异常 on_page 缺省 / 结果不足一屏）时兜底补齐首屏，绝不提前渲染
+        视口外结果。
         """
         if not self._results:
             self.status_label.setText("搜不到这个哦，换个词试试？")
             return
         if self.merge_check.isChecked():
             self._rebuild_results_with_merge()
-        elif self._shown_count == 0:
-            # 兜底：边抓边显示异常（on_page 缺省）→ 直接渲染首屏
+        elif self._shown_count < self._first_screen_limit():
+            # 兜底补齐首屏：渲染到填满一个视口为止（结果不足一屏则全渲染）
             self._append_results(self._results)
-        self._render_all_remaining()
         self._update_batch_status()
-
-    def _render_all_remaining(self) -> None:
-        """把尚未渲染的结果全部渲染（分批 QTimer，防一次性大量建卡闪屏）。
-
-        结果累积到 _results（_on_source_page 边抓边渲染首屏），搜索完成后
-        调本方法把剩余结果全量渲染进网格；分批（_page_size*2 张/批）延到
-        布局完成再渲染下一批，避免几百张卡片同帧插入闪屏/跳动。封面仍由
-        _pump_visible_covers 懒加载（视口内才拉），不挤占 CoverLoader。
-        """
-        if self._render_all_pending:
-            return
-        display = self._current_display()
-        if self._shown_count >= len(display):
-            return
-        self._render_all_pending = True
-        self._render_all_tick()
-
-    def _render_all_tick(self) -> None:
-        """全量渲染分批步进：渲染一批后若无剩余则结束，否则延下一轮。"""
-        display = self._current_display()
-        cols = self._columns()
-        end = min(len(display), self._shown_count + self._page_size * 2)
-        while self._shown_count < end:
-            r = display[self._shown_count]
-            self._append_card(r, cols)
-            self._shown_count += 1
-        self._apply_column_stretch(cols)
-        self._update_batch_status()
-        self._pump_visible_covers()
-        if self._shown_count < len(display):
-            QTimer.singleShot(0, self._render_all_tick)
-        else:
-            self._render_all_pending = False
 
     def _update_batch_status(self) -> None:
         """更新状态文本：已显示 X / 共 Y 条。"""
@@ -597,75 +750,23 @@ class SearchPage(BasePage):
         else:
             self.status_label.setText(f"已显示 {self._shown_count} / {total} 条，滚动加载更多...")
 
-    def _pump_visible_covers(self) -> None:
-        """触发视口内卡片的封面加载（封面懒加载泵）。
-
-        每次只处理视口内 + 预加载窗口（视口下方 PREFETCH_COVER_EXTRA 张）
-        的卡片，其余留待滚动接近时再加载——首屏一批卡片不同时挤占
-        CoverLoader 并发，可见的封面先出、滚到的封面跟上。
-        """
-        if self._cover_pump_queued or not self._deferred_covers:
-            return
-        self._cover_pump_queued = True
-        QTimer.singleShot(0, self._pump_visible_covers_now)
-
-    def _pump_visible_covers_now(self) -> None:
-        """封面泵实际执行：按视口位置分批触发。"""
-        self._cover_pump_queued = False
-        if not self._deferred_covers:
-            return
-        view = self.scroll.viewport()
-        # 视口/预加载窗口统一用「视口相对坐标」：card.mapTo(view).y() 是
-        # 卡片相对视口的位置（内容滚动越深 y 越小，甚至为负）。切勿用
-        # scrollbar.value()（内容滚动坐标）当视口顶——两种坐标系混用会
-        # 导致滚动后视口内/预加载窗口内卡片永远判定「不在视口」→ 封面
-        # 一直不加载（历史 bug：滚动后整页无封面，看起来像搜索变慢/坏掉）。
-        # 视口相对坐标下视口顶恒为 0，底为 view.height()。
-        viewport_top = 0
-        viewport_bottom = view.height()
-        # 预加载窗口：视口下方额外提前加载 PREFETCH_COVER_EXTRA 张封面
-        prefetch_bottom = viewport_bottom + PREFETCH_COVER_EXTRA * self._card_step()
-        remaining = []
-        for idx, card in enumerate(self._deferred_covers):
-            y = card.mapTo(view, card.rect().topLeft()).y()
-            if y > prefetch_bottom:
-                # 网格自上而下有序入队，本卡及之后都在预加载窗口下方 →
-                # 整段保留，不再逐卡 mapTo（结果多时每帧滚动省去大量坐标计算）
-                remaining.extend(self._deferred_covers[idx:])
-                break
-            if y + card.height() < viewport_top:
-                # 已滚过视口上方的卡片：正常都已加载并移出队列，此处仅防
-                # 大幅跳滚残留的未加载卡片，继续保留
-                remaining.append(card)
-                continue
-            # 视口内或预加载窗口内 → 触发封面加载（并从待加载中移除）
-            card.load_cover()
-        self._deferred_covers = remaining
-
-    @staticmethod
-    def _card_step() -> int:
-        """卡片行高（封面懒加载窗口间距用）。"""
-        return 292  # 与 WorkCard.CARD_HEIGHT 一致
-
     def _append_results(self, items) -> None:
         """把一批结果卡片追加到网格尾部（按当前列数排），首屏懒加载。
 
         结果累积到 _results（_on_source_page），这里只渲染到首屏
-        （_page_size 条）；不自动补足视口——避免边抓边显示时一次性
-        插入几百张卡片导致闪屏/跳动（与发现页懒加载一致）。其余结果
-        留待滚动到 80%（_on_scroll）再逐批渲染。
+        （填满一个视口 + 最后多留一行）；不自动补足视口——避免边抓边
+        显示时一次性插入几百张卡片导致闪屏/跳动（与发现页懒加载一致）。
+        其余结果留待滚动到 80%（_on_scroll）再逐批渲染。
         """
         if not items:
             return
         display = self._current_display()
         cols = self._columns()
         # 首屏渲染量：填满视口（而非固定 _page_size 条）——否则结果多时
-        # 只渲染十几张、布局未刷新前滚动条不出现，用户看不到更多（"只显示
-        # 第一页"）。按视口高估算行数（卡片高约 292px，4 列）再留一屏缓冲，
-        # 让首屏渲染后滚动条必然出现；仍保留上限防一次性建几百张卡片闪屏。
-        rows = max(1, self.scroll.viewport().height() // 292 + 1)
-        first_batch = max(self._page_size, rows * cols)
-        new_shown = min(len(display), first_batch)
+        # 只渲染一页、布局未刷新前滚动条不出现，用户看不到更多。按视口
+        # 高估算行数（卡片高约 292px，4 列）再留一行缓冲，让首屏渲染后
+        # 滚动条必然出现；仍保留上限防一次性建太多卡片闪屏。
+        new_shown = min(len(display), self._first_screen_limit())
         while self._shown_count < new_shown:
             r = display[self._shown_count]
             self._append_card(r, cols)
@@ -673,7 +774,16 @@ class SearchPage(BasePage):
         self._apply_column_stretch(cols)
         self._update_batch_status()
         self._maybe_preload_results()
-        self._pump_visible_covers()  # 新批卡片进入视口 → 触发封面加载
+
+    def _first_screen_limit(self) -> int:
+        """能填满一个视口的首屏渲染量（最后多留一行，滚动条必然出现）。
+
+        结果再多也只建这么多张卡片：首屏之后严格按滚动到 80%（_on_scroll）
+        逐批渲染，避免搜索完成/边抓边显示瞬间一次性建几百张卡片闪屏/卡顿。
+        """
+        cols = max(1, self._columns())
+        rows = max(1, self.scroll.viewport().height() // 292 + 1)
+        return max(self._page_size, rows * cols)
 
     def _current_display(self):
         """当前渲染源：合并后为 _results_display，否则 _results。"""
@@ -682,12 +792,61 @@ class SearchPage(BasePage):
             display = self._results
         return display
 
+    def _scroll_ratio(self) -> float:
+        """滚动位置占滚动条比例（0~1）。maximum<=0 → 0。"""
+        vbar = self.scroll.verticalScrollBar()
+        return (vbar.value() / vbar.maximum()) if vbar.maximum() > 0 else 0.0
+
+    def _restore_scroll_ratio(self, ratio: float) -> None:
+        """下个事件循环按比例恢复滚动位置（重建/换词后布局未刷新，需延后）。
+
+        抑制 on_scroll：恢复动作本身不触发下一批懒加载（否则恢复位置
+        恰在 80% 以上会同步递归连铺，回到「全量滚动卡顿」老坑）。
+        """
+        ratio = max(0.0, min(1.0, ratio))
+
+        def _apply() -> None:
+            try:
+                import shiboken6
+                if not shiboken6.isValid(self):
+                    return  # 页面已销毁，忽略
+            except Exception:  # noqa: BLE001
+                pass
+            vbar = self.scroll.verticalScrollBar()
+            if vbar.maximum() <= 0:
+                return
+            self._restoring_scroll = True
+            try:
+                vbar.setValue(int(round(ratio * vbar.maximum())))
+            finally:
+                self._restoring_scroll = False
+
+        QTimer.singleShot(0, _apply)
+
     def _load_more_results(self) -> None:
-        """滚动加载下一批结果。"""
+        """滚动加载下一批结果（一次滚动只铺一批，铺完即停）。
+
+        滚动到 80% 触发（_on_scroll）。一次同步铺 _page_size 张（12）；
+        立即看看视口下方是否还有明显的空白缓冲（_maybe_preload_results
+        只补足首屏），但**绝不**一次性/持续铺完全部结果——那会让网格里
+        堆积几百上千张卡片，滚动绘制本身就卡（历史教训：上一版 flush 链
+        一次触发后 16ms 一批铺到全部，滚动中途即严重卡顿）。
+        用户继续滚动到下一批 80% 再触发下一批，网格卡片数保持贴近
+        「已读 + 缓冲」量级，滚动始终轻量。
+
+        滚动锚定（懒加载不跳屏）：追加前记录位置；追加后若用户已在底部
+        （value==旧 max）则钉到新的底部继续看新内容，否则保持原位置，
+        避免「内容补齐后视觉被顶上去/跳回来」。
+        """
+        if self._more_pending:
+            return  # 上一次触发的分批尚未完成，本次滚动到的 80% 交给其后
         display = self._current_display()
         if self._shown_count >= len(display):
             return
         cols = self._columns()
+        vbar = self.scroll.verticalScrollBar()
+        prev_value = vbar.value()
+        was_at_bottom = vbar.maximum() > 0 and prev_value >= vbar.maximum() - 8
         new_shown = min(len(display), self._shown_count + self._page_size)
         while self._shown_count < new_shown:
             r = display[self._shown_count]
@@ -696,35 +855,54 @@ class SearchPage(BasePage):
         self._apply_column_stretch(cols)
         self._update_batch_status()
         self._maybe_preload_results()
-        self._pump_visible_covers()
+        # 恢复动作排在预加载/布局之后：单帧内 scrollbar 范围已含全部新加入的
+        # 卡片，锚定用新范围计算，底部钉底/中间保持才不偏
+        QTimer.singleShot(
+            0,
+            lambda: self._finish_more_anchor(was_at_bottom, prev_value),
+        )
+
+    def _finish_more_anchor(self, was_at_bottom: bool, prev_value: int) -> None:
+        """追加批次后的滚动恢复：底部钉底续接，否则保持原位置。"""
+        try:
+            import shiboken6
+            if not shiboken6.isValid(self):
+                return  # 页面已销毁，忽略
+        except Exception:  # noqa: BLE001
+            pass
+        vbar = self.scroll.verticalScrollBar()
+        self._restoring_scroll = True
+        try:
+            if was_at_bottom and vbar.maximum() > 0:
+                vbar.setValue(vbar.maximum())
+            elif vbar.value() != prev_value:
+                vbar.setValue(prev_value)
+        finally:
+            self._restoring_scroll = False
 
     def _maybe_preload_results(self) -> None:
-        """视口未填满 → 继续渲染下一批（有限预加载深度，与发现页 _maybe_preload 同思路）。
+        """视口未填满 → 同步补足首屏（绝不改动滚动条位置）。
 
-        首屏一批渲染完视口没填满（结果较少时）继续补渲染，让首屏尽快填满、
-        滚动流畅；只预加载有限批次（_preload_depth 缓冲），到顶后停止，剩下
-        交给滚动 80%（_on_scroll）。不自动无限补足——防止搜索完成/边抓边显示
-        瞬间一次性建大量卡片闪屏（历史 bug，见 _append_results 注释）。
-
-        QTimer.singleShot(0) 延到布局完成后再查视口：addWidget 后 scrollbar
-        范围要等下一轮布局才更新，立即判断会误以为未填满、一次性预加载过多
-        卡片闪屏。布局稳定后按真实视口填满度决定是否补一批。
+        首屏一批渲染完视口没填满（结果较少 / 布局未刷新时）继续补渲染，
+        让首屏尽快填满、滚动条出现；补到首屏上限即停，剩下交给滚动 80%
+        （_on_scroll）。这里**只同步补卡、不触发滚动锚定**：用户没有滚动时
+        绝不主动 setValue（流式追加期间上下跳动的根因之一）。绝不调用
+        _load_more_results（那条路径带锚定且属于用户滚动语义）。
         """
         display = self._current_display()
         if self._shown_count >= len(display):
             return
-        # 预加载深度：按视口填满度（首屏一批 + 缓冲若干屏）而非固定 _page_size
-        # 倍数——固定倍数（如 12*3=36）在结果多时只补 36 条就停，布局未刷新前
-        # 滚动条不出现，用户看到"只第一页"。按视口估算"已渲染量 ≥ 数屏"再停，
-        # 保证首屏后滚动条必然出现、用户可继续滚动加载。
-        cols = max(1, self._columns())
-        vp_rows = max(1, self.scroll.viewport().height() // 292)
-        fill_rows = (self._shown_count + cols - 1) // cols  # 已渲染占几行
-        if fill_rows >= vp_rows * (1 + self._preload_depth):
-            return  # 已渲染 ≥ 视口 1+_preload_depth 屏，等滚动触发
-        if self.scroll.verticalScrollBar().maximum() >= self.scroll.height():
-            return  # 视口已填满，等滚动触发
-        QTimer.singleShot(0, self._load_more_results)
+        limit = self._first_screen_limit()
+        if self._shown_count >= limit:
+            return  # 首屏已填满，等滚动触发
+        cols = self._columns()
+        new_shown = min(len(display), limit)
+        while self._shown_count < new_shown:
+            r = display[self._shown_count]
+            self._append_card(r, cols)
+            self._shown_count += 1
+        self._apply_column_stretch(cols)
+        self._update_batch_status()
 
     def _columns(self) -> int:
         """搜索结果固定 4 列。
@@ -738,7 +916,15 @@ class SearchPage(BasePage):
         return 4
 
     def _apply_column_stretch(self, cols: int) -> None:
-        """每列等宽，卡片均匀分布。"""
+        """每列等宽，卡片均匀分布。
+
+        列数不变时跳过：setColumnStretch 会触发整网格重排，分批懒加载时
+        每批都调一次等于每批全量重排（滚动卡顿来源之一）。列数固定 4，
+        实际只在首屏/重建后应用一次。
+        """
+        if cols == self._last_columns:
+            return
+        self._last_columns = cols
         self.apply_column_stretch(self.grid_layout, cols)
 
     def _append_card(self, r, cols) -> None:
@@ -755,6 +941,7 @@ class SearchPage(BasePage):
 
     def _show_results(self) -> None:
         """按当前筛选重建结果网格（来源角标筛选用）。"""
+        ratio = self._scroll_ratio()
         self._clear_grid()
         display = self._current_display()
         items = display
@@ -767,7 +954,8 @@ class SearchPage(BasePage):
             self._append_card(r, cols)
         self._apply_column_stretch(cols)
         self._update_batch_status()
-        self._pump_visible_covers()
+        # 筛选切换同样按比例恢复，不跳回顶部
+        self._restore_scroll_ratio(ratio)
 
     def _emit_open(self, result) -> None:
         """点搜索结果卡片 → 打开 reader 播放/阅读。"""
@@ -785,17 +973,16 @@ class SearchPage(BasePage):
     def _make_card(self, r):
         """创建勾选模式卡片并连接信号。
 
-        封面延迟加载：卡片创建不立即拉封面（_deferred_covers 登记），
-        由 _pump_visible_covers 在滚动/批次渲染后触发视口内卡片加载，
-        首屏一批卡片不挤占 CoverLoader 并发，可见卡片先出封面。
+        封面随卡片创建立即加载（CoverLoader 全局限流异步，不阻塞 UI；
+        与发现页一致——发现页滚动丝滑即源于此，不做滚动 mapTo 全扫）。
         """
-        card = WorkCard(r, selectable=True, defer_cover=True)
+        card = WorkCard(r, selectable=True)
         card.clicked.connect(lambda _, rr=r: self._emit_open(rr))
         card.checked.connect(self._on_card_checked)
+        card.set_source_filterable(True)
+        card.source_clicked.connect(self._set_filter)
         if r.url in self._selected:
             card.set_checked(True)
-        if getattr(r, "cover", ""):
-            self._deferred_covers.append(card)
         return card
 
     def _on_card_checked(self, work, checked: bool) -> None:
@@ -874,8 +1061,8 @@ class SearchPage(BasePage):
                 w.setParent(None)
                 w.deleteLater()
         self._work_count = 0
-        # 清空封面延迟加载队列（旧卡片已销毁，残留引用会让封面泵操作已删卡片）
-        self._deferred_covers = []
+        self._more_pending = False  # 换词/重建网格：中止旧滚动分批链
+        self._last_columns = 0  # 重建后需重新应用一次列拉伸
 
     def _set_filter(self, source_id: str) -> None:
         """来源角标筛选。"""
@@ -897,24 +1084,193 @@ class SearchPage(BasePage):
 
         提前到 80% 而非贴底：滚动到底前下一批已在渲染，视觉无停顿；
         又不一次性把全部结果建卡（防闪屏/封面加载不过来）。
+
+        合并同一事件循环内的连续滚动事件：一次滚动/惯性滑动会连发多个
+        valueChanged，逐个同步铺批会让主线程一帧内建几十张卡（卡顿），
+        并排队多个 _finish_more_anchor 互相 setValue（内容上下跳动）。
+        这里只置位 _more_pending 并延到下一事件循环铺一批，铺批期间到达
+        的滚动事件直接合并丢弃。
         """
-        self._pump_visible_covers()  # 滚动时触发视口内封面加载
         vbar = self.scroll.verticalScrollBar()
+        if self._restoring_scroll:
+            return  # 懒加载锚定/重建恢复滚动位置中，不触发下一批加载
         if vbar.maximum() > 0 and value >= vbar.maximum() * 0.8:
-            self._load_more_results()
+            if self._more_pending:
+                return  # 本事件循环已排定一批，连续滚动事件合并
+            self._more_pending = True
+            QTimer.singleShot(0, self._flush_more)
+
+    def _flush_more(self) -> None:
+        """执行被合并的滚动铺批（清除合并标记后同步铺一批）。"""
+        self._more_pending = False
+        self._load_more_results()
 
     def refresh(self) -> None:
-        """重建源范围下拉（源选择变更后，禁用源不再列出）。"""
-        self._rebuild_src_combo()
+        """重建源选择菜单（源选择变更后，禁用源不再列出）。"""
+        self._rebuild_sources_menu()
 
-    def _rebuild_src_combo(self) -> None:
-        """按当前启用的源重建 src_combo，尽量保持原选中源。"""
-        current = self.src_combo.currentData()
-        self.src_combo.blockSignals(True)
-        self.src_combo.clear()
-        self.src_combo.addItem("全部源", "")
-        for s in self._manager.enabled_sources():
-            self.src_combo.addItem(s.source_name, s)
-        idx = self.src_combo.findData(current) if current is not None else 0
-        self.src_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.src_combo.blockSignals(False)
+    def _rebuild_sources_menu(self) -> None:
+        """按当前启用的源重建 src_btn 弹出菜单，保留已勾选状态。
+
+        源列表放在 QScrollArea（限高 SRC_MENU_SCROLL_LIMIT）的 QWidgetAction
+        里：源多时菜单内滚动（源一屏放不下不再铺满全屏），源少时菜单随内容
+        自适应（含"全部"行 + 源行，不含滚动条）。QMenu 内置滚动只在拆分菜单
+        超屏幕时出现，限高需由内嵌滚动区承担，实测 setMaximumHeight 只会截断
+        不滚动。点源行（内嵌控件）天然不收起菜单，"全部"仍是 QAction 由
+        _NonClosingMenu 保持不收起；点外部 / Escape 收起不变。
+        """
+        self._src_menu.clear()
+        self._src_rows = {}
+
+        enabled = self._manager.enabled_sources()
+        enabled_ids = {s.source_id for s in enabled}
+        self._selected_sources &= enabled_ids
+
+        all_action = self._src_menu.addAction("全部")
+        all_action.setCheckable(True)
+        all_action.blockSignals(True)
+        all_action.setChecked(self._all_selected)
+        all_action.blockSignals(False)
+        all_action.setData("all")
+        all_action.toggled.connect(self._on_all_source_toggled)
+        self._all_action = all_action
+        self._src_menu.addSeparator()
+
+        # 源清单：QScrollArea 内嵌（限高滚动），每行一个可勾选按钮
+        container = QWidget()
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(2)
+        for s in enabled:
+            checked = self._all_selected or s.source_id in self._selected_sources
+            row = QPushButton(("✓ " if checked else "") + (s.source_name or s.source_id))
+            row.setCheckable(True)
+            row.setChecked(checked)
+            row.setCursor(Qt.PointingHandCursor)
+            row.setToolTip(s.source_id)
+            row.setStyleSheet(
+                "QPushButton { text-align: left; border: 1px solid transparent;"
+                " border-radius: 6px; padding: 7px 10px;"
+                " color: palette(text); background: palette(base); }"
+                "QPushButton:hover { background: palette(midlight);"
+                " color: palette(text); }"
+                "QPushButton:checked { background: palette(highlight);"
+                " color: palette(highlightedText); font-weight: bold;"
+                " border: 1px solid palette(highlight); }"
+            )
+            row.clicked.connect(
+                lambda checked_, src=s: self._on_source_toggled(src, checked_)
+            )
+            lay.addWidget(row)
+            self._src_rows[s.source_id] = row
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(container)
+        scroll.setMinimumWidth(220)
+        scroll.setMaximumWidth(320)
+        scroll.setMaximumHeight(SRC_MENU_SCROLL_LIMIT)
+        scroll.setFrameShape(QFrame.NoFrame)  # 融入菜单外观，不显边框
+        wa = QWidgetAction(self._src_menu)
+        wa.setDefaultWidget(scroll)
+        self._src_menu.addAction(wa)
+
+        self._update_src_button_label()
+
+    def _update_src_button_label(self) -> None:
+        """按当前选择就地更新源按钮文字（不重建菜单）。"""
+        if self._all_selected:
+            self.src_btn.setText("源：全部")
+        else:
+            n = len(self._selected_sources)
+            self.src_btn.setText(f"源：{n}个" if n else "源：无")
+
+    def _sync_all_action(self) -> None:
+        """就地同步「全部」QAction 勾选态（blockSignals 防递归，不重建菜单）。"""
+        act = getattr(self, "_all_action", None)
+        if act is None:
+            return
+        act.blockSignals(True)
+        act.setChecked(self._all_selected)
+        act.blockSignals(False)
+
+    def _sync_source_rows(self) -> None:
+        """就地同步源行按钮勾选态（blockSignals 防递归，不重建菜单/不重置滚动）。"""
+        for sid, row in self._src_rows.items():
+            row.blockSignals(True)
+            row.setChecked(self._all_selected or sid in self._selected_sources)
+            row.blockSignals(False)
+
+    def _clear_results_for_source_change(self) -> None:
+        """源选择变更：作废旧搜索、清空旧结果，等待用户点「搜索」。
+
+        - 递增 _search_epoch：旧任务回调（page/finished/封面）因 epoch 过期被丢弃；
+        - 清网格与渲染状态（_results / _results_display / _shown_count / _streamed）；
+        - 清状态 chip、批量栏、来源筛选；
+        - 状态提示改为「已更换源，请点击搜索」，**不发起新搜索**。
+        """
+        self._search_epoch += 1
+        self._clear_grid()
+        self._results = []
+        self._results_display = None
+        self._shown_count = 0
+        self._streamed = set()
+        self._selected = {}
+        self._pending_count = 0
+        self._filter_source = ""
+        self.filter_bar_widget.setVisible(False)
+        self.batch_bar.setVisible(False)
+        self.select_all_check.blockSignals(True)
+        self.select_all_check.setChecked(False)
+        self.select_all_check.blockSignals(False)
+        while self.status_bar_layout.count():
+            item = self.status_bar_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._status_chips = {}
+        self.status_bar.setVisible(False)
+        self.status_label.setText("已更换源，请点击搜索")
+
+    def _on_all_source_toggled(self, checked: bool) -> None:
+        """点「全部」：checked=True 全选，checked=False 全部取消。
+
+        就地更新菜单（不重建 → 不重置菜单滚动位置），且不自动搜索：
+        仅更新选择状态/按钮文字并清空旧结果，等用户点「搜索」。
+        """
+        if checked:
+            self._all_selected = True
+            self._selected_sources.clear()
+        else:
+            self._all_selected = False
+            self._selected_sources.clear()
+        self._sync_all_action()
+        self._sync_source_rows()
+        self._update_src_button_label()
+        self._clear_results_for_source_change()
+
+    def _on_source_toggled(self, source, checked: bool) -> None:
+        """勾选/取消单个源（就地更新，不重建菜单、不自动搜索）。
+
+        所有源勾满 → 恢复全选态；全部取消 → 按钮显示「源：无」。
+        仅更新选择状态与按钮文字，并清空旧结果；必须点「搜索」才发起搜索。
+        """
+        enabled = self._manager.enabled_sources()
+        enabled_ids = {s.source_id for s in enabled}
+        if self._all_selected:
+            # 从「全部」进入部分选择：先铺满全部源，再按本次点击增删
+            self._selected_sources = set(enabled_ids)
+        if checked:
+            self._selected_sources.add(source.source_id)
+        else:
+            self._selected_sources.discard(source.source_id)
+        if self._selected_sources >= enabled_ids:
+            self._all_selected = True
+            self._selected_sources.clear()
+        else:
+            self._all_selected = False
+        self._sync_all_action()
+        self._update_src_button_label()
+        self._clear_results_for_source_change()

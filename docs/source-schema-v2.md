@@ -196,7 +196,7 @@
 | `fields.summary` | `selector` | 简介 / 描述 |
 | `fields.status` | `selector` | 状态 |
 | `fields.tags` | `selector` | 标签 |
-| `fields.gallery` | `selector`（多值） | 图文集：详情页内嵌的图片序列（如 video 页的截图集），多值提取为绝对 URL 列表，详情抽屉以横向缩略图条展示 |
+| `fields.gallery` | `selector`（多值） | 图文集：详情页内嵌的图片序列（如 video 页的截图集），多值提取为绝对 URL 列表 |
 | `fields.meta` | `object` | 自定义额外字段 |
 | `fields.clean` | `object` | 字段清洗：`{字段名: [[pattern, repl], ...]}`，pattern 以 `re:` 开头按正则替换（如 summary 去"最新章节推荐地址"尾巴）；支持 author / status / summary / tags |
 

@@ -172,6 +172,8 @@
     },
     "content": {
       "episode": {
+        "single_chapter": true,
+        "note": "详情页即单个线上视频（无真分集/选集结构，仅相关推荐链接）。list 取详情页 iframe#video-player 的 src（/remote_play/video/play/{id}.html）作唯一分集 URL——播放地址必须走 api_endpoints.episode 用该播放 id 换 playlink m3u8，因此不能回退为详情 URL（详情 id 不同于播放 id，接口取不到流）。single_chapter 分支下：正常页 list 解析成功 → 1 集可播；若页面无播放器（磁力下载页 /c/ 无 iframe）→ 回退详情 URL 唯一分集，分集区不空白（该页本身不可播，属站点结构）。",
         "list": {
           "root_selector": {
             "css": "div.content-container"
@@ -219,6 +221,9 @@
     "hls": {
       "workers": 4
     }
+  },
+  "ad_block": {
+    "enabled": true
   },
   "constraints": {
     "search": {

@@ -52,7 +52,7 @@ SRC = {
 
 
 class MockHttp(HttpClient):
-    def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3, interval_ms=0, encoding=None, proxy_pool=None):
+    def get_text(self, url, *args, **kwargs):
         if "1.html" in url or "2.html" in url:
             return CHAPTER_HTML
         return DETAIL_HTML
@@ -108,6 +108,22 @@ def main():
     assert "第一章正文开始" in text, text
     print("目录章节数:", novel.toc_list.count())
     assert novel.toc_list.count() == 2
+
+    # ---- 自动滚动按钮 + 快捷键断言 ----
+    assert hasattr(novel, "auto_scroll_btn"), "小说应有 auto_scroll_btn"
+    assert novel.auto_scroll_btn.text() == "▶ 自动滚动"
+    assert not novel._auto_scrolling
+    novel.scroll.verticalScrollBar().setRange(0, 1000)  # 短正文 → 手动撑开滚动范围
+    _ = novel.auto_scroll_btn  # 触点
+    assert novel.auto_scroll_btn.text() == "▶ 自动滚动"
+    novel._load_chapter(0)  # 不触发
+    novel._toggle_auto_scroll()  # 开启
+    assert novel._auto_scrolling, "自动滚动应开启"
+    assert novel.auto_scroll_btn.text() == "⏸ 停止"
+    novel._stop_auto_scroll()  # 停止
+    assert not novel._auto_scrolling
+    assert novel.auto_scroll_btn.text() == "▶ 自动滚动"
+    print("  [ok] 小说：自动滚动按钮存在 + toggle 翻转")
 
     # ---- 双向翻章测试（小说翻页模式） ----
     # 切到翻页模式
@@ -227,7 +243,6 @@ def main():
     print("  [ok] 续读记忆：重新打开恢复第二章 + position_changed 落盘")
 
     # ---- 三视图功能 + 列表长标题换行修复 ----
-    from PySide6.QtCore import QSize
     from gui.pages.reader.video_view import VideoView
     from gui.pages.reader.epub_view import EpubView
 
@@ -243,6 +258,10 @@ def main():
     )
     comic4.load(src_cfg, comic_detail, "")
     app.processEvents()
+    assert hasattr(comic4, "auto_scroll_btn"), "漫画应有 auto_scroll_btn"
+    assert comic4.auto_scroll_btn.text() == "▶ 自动滚动"
+    assert not comic4._auto_scrolling
+    print("  [ok] 漫画：自动滚动按钮存在")
     assert comic4.toc_list.wordWrap(), "漫画目录列表应长标题换行"
     print("  [ok] 漫画：目录换行")
 
@@ -254,7 +273,7 @@ def main():
     assert nv4.toc_list.wordWrap(), "小说目录列表应长标题换行"
     print("  [ok] 小说：目录换行")
 
-    # 视频：ep_list 图标 76×50 + 长标题换行；current_episode_no() 0 基；站内换源菜单按钮
+    # 视频：分集卡片网格 + 当前集高亮；current_episode_no() 0 基；站内换源菜单按钮
     vd = Detail(
         source_id="demo", content_type="video", url="http://example.com/v/1",
         title="测试动画",
@@ -268,14 +287,16 @@ def main():
     video4.load(src_cfg, vd, "")
     app.processEvents()
     assert video4.source_btn.isVisible(), "load(detail) 后视频换源按钮应显示"
-    assert video4.ep_list.iconSize() == QSize(76, 50), video4.ep_list.iconSize()
-    assert video4.ep_list.wordWrap(), "视频分集列表应长标题换行"
+    assert len(video4._ep_cards) == 2, f"分集卡片数应=集数，got {len(video4._ep_cards)}"
+    assert not video4.ep_section_label.isHidden(), "选集区标题应显示"
+    assert video4._ep_cards[0]._selected, "加载后第 0 集卡片应为选中态"
     assert video4.current_episode_no() == 0
     video4._current_idx = 1
     assert video4.current_episode_no() == 1
     video4._current_idx = 99
     assert video4.current_episode_no() == 0, "越界应回退 0"
-    print("  [ok] 视频：⇄ 换源按钮＋ep_list 76×50 换行＋current_episode_no()")
+    assert not video4.rec_section_label.isVisible(), "未注入 Search 时推荐区应隐藏"
+    print("  [ok] 视频：⇄ 换源按钮＋分集卡片网格＋current_episode_no()＋推荐区缺省隐藏")
 
     # epub：目录列表长标题换行（构造签名 font_scale, parent）
     ev4 = EpubView()

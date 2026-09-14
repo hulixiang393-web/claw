@@ -99,9 +99,11 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
         if audio_url:
             args.append(f":input-slave={audio_url}")
         try:
+            from .subprocess_no_window import no_window_kwargs
+
             subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                close_fds=True
+                close_fds=True, **no_window_kwargs()  # Windows 静默，不弹控制台窗口
             )
             return "已用外部播放器打开"
         except Exception:  # noqa: BLE001 —— VLC 启动失败降级系统默认

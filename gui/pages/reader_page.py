@@ -92,10 +92,12 @@ class ReaderPage(BasePage):
         reading_progress=None,
         font_scale: float = 1.0,
         parent=None,
+        search=None,
     ):
         super().__init__(parent)
         self._manager = source_manager
         self._content = content
+        self._search = search  # 可选：视频阅读页相关推荐（同源搜索）
         self._reading_progress = reading_progress
         self._font_scale = float(font_scale or 1.0)
         self._current_source_id = None
@@ -144,7 +146,7 @@ class ReaderPage(BasePage):
         self.stack = QStackedWidget()
         self.novel_view = NovelView(content, font_scale=self._font_scale)
         self.comic_view = ComicView(content)
-        self.video_view = VideoView(content)
+        self.video_view = VideoView(content, search=self._search)
         self.epub_view = EpubView(font_scale=self._font_scale)
         self.stack.addWidget(self.novel_view)
         self.stack.addWidget(self.comic_view)
@@ -169,6 +171,8 @@ class ReaderPage(BasePage):
         self.video_view.source_changed.connect(self._on_source_changed)
         # ---- 播放器内下载：转发 App 层下载链路（与顶部「下载」一致）----
         self.video_view.download_requested.connect(self.download_requested)
+        # ---- 相关推荐：点推荐卡 → 打开该作品（复用 open 流程）----
+        self.video_view.recommend_open_requested.connect(self._on_recommend_open)
 
         # ---- 全屏阅读：小说/漫画/epub 工具条 ⛶ → 切主窗全屏（视频自带全屏不重复）----
         self._fullscreen = False
@@ -220,6 +224,14 @@ class ReaderPage(BasePage):
         if self._fullscreen:
             self._exit_fullscreen()
         super().hideEvent(event)
+
+    def _on_recommend_open(self, payload) -> None:
+        """点视频页相关推荐卡 → 打开该作品（复用 open 流程，自动落盘当前进度）。"""
+        if not isinstance(payload, (tuple, list)) or len(payload) < 3:
+            return
+        sid, url, ctype = payload[0], payload[1], payload[2]
+        if sid and url:
+            self.open(sid, url, ctype)
 
     def _on_source_changed(self, payload) -> None:
         """换源：重新抓取该源详情 + 刷新 VideoView 分集。"""
@@ -341,6 +353,7 @@ class ReaderPage(BasePage):
         self._current_book_url = book_url
         self._current_start_url = start_chapter_url
         self._current_content_type = content_type
+        self._current_detail = None  # 详情就绪后由 _on_detail 填充（收藏复用完整元数据）
         self.dl_btn.setEnabled(True)
         self.title_label.setText(f"加载中...")
         self.source_label.setText(source.source_name)
@@ -369,6 +382,7 @@ class ReaderPage(BasePage):
         # 切走视频视图前释放播放资源：换小说/漫画/另一部视频都不在后台
         # 继续播放、不堆积播放缓存（stop_playback 幂等，非视频时无副作用）
         self.video_view.stop_playback()
+        self._current_detail = detail  # 收藏时复用完整详情（含封面/作者/标签）
         self.title_label.setText(detail.title or "无标题")
         self.refresh_favorite_state()  # 按当前书 URL 刷新收藏按钮
         # 按类型切视图（续读位置随 load 传入，首次显示后定位到页）
@@ -431,28 +445,41 @@ class ReaderPage(BasePage):
         self._favorite_checker = cb
         self.refresh_favorite_state()
 
+    def _current_chapter_index(self) -> int:
+        """当前章/集 1 基序号（阅读器下载默认范围起点；无则 1）。"""
+        view = self.stack.currentWidget()
+        idx = getattr(view, "_current_idx", -1)
+        if not isinstance(idx, int) or idx < 0:
+            return 1
+        return idx + 1
+
     def _on_download_clicked(self) -> None:
-        """点「⬇ 下载」→ 转发给 App 层拉详情入下载队列（当前书整本）。"""
+        """点「⬇ 下载」→ 转发 App 层：拉详情后弹章节范围（默认当前章→末章）。"""
         if not self._current_book_url:
             return
         self.download_requested.emit(
             (self._current_source_id or "", self._current_book_url,
-             self._current_content_type or "")
+             self._current_content_type or "", self._current_chapter_index())
         )
 
     def _on_favorite_clicked(self) -> None:
-        """点收藏/取消收藏 → 转发给 App 层写收藏库。"""
-        if self._current_book_url:
-            # 构造最小 Detail（App 层 _on_favorite 只需 url/title 等）
-            from framework.content import Detail
+        """点收藏/取消收藏 → 转发给 App 层写收藏库（复用完整详情元数据）。"""
+        if not self._current_book_url:
+            return
+        from framework.content import Detail
 
-            detail = Detail(
-                source_id=self._current_source_id or "",
-                content_type=self._current_content_type or "",
-                url=self._current_book_url,
-                title=self.title_label.text() or self._current_book_url,
-            )
-            self.favorite_requested.emit(detail)
+        cur = self._current_detail
+        detail = Detail(
+            source_id=self._current_source_id or "",
+            content_type=self._current_content_type or "",
+            url=self._current_book_url,
+            title=(getattr(cur, "title", "") or "") 
+            or (self.title_label.text() or self._current_book_url),
+            cover=(getattr(cur, "cover", "") or "") or "",
+            author=(getattr(cur, "author", "") or "") or "",
+            tags=list(getattr(cur, "tags", None) or ()) if cur else [],
+        )
+        self.favorite_requested.emit(detail)
 
     def refresh_favorite_state(self) -> None:
         """按当前书 URL 刷新收藏按钮状态（☆收藏 / ★已收藏）。"""

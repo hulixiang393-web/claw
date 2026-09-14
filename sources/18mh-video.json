@@ -125,6 +125,10 @@
       "fields": {
         "title": {
           "css": "h1"
+        },
+        "tags": {
+          "css": "meta[property='video:tag']",
+          "attr": "content"
         }
       }
     },

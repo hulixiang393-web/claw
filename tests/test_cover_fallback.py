@@ -1,120 +1,165 @@
-"""视频阅读封面三级兜底测试（detail.cover → 章节封面 → 后台重取）。
+# -*- coding: utf-8 -*-
+"""详情封面兜底链路测试（test_cover_fallback.py）。
 
-纯逻辑级：object.__new__(VideoView)，避开 VLC/QTimer 初始化，
-patch _apply_cover / _fetch_cover_in_background 收集调用。
+覆盖「收藏/书架缺封面」修复：
+- fetch_cover 与 fetch_detail 同链路：选择器封面为空/占位/base_url 垃圾值时，
+  按源 cover 配置的 regex / state 从 SSR JSON 抽真实封面；
+- _extract_cover_fallback 对「current == base_url」的退化值强制走兜底，
+  防止把 base_url 写进收藏库（历史 bug：番茄收藏 cover 被写成 https://fanqienovel.com）。
+
+真实站点取证（2026-09-12）：番茄小说详情页 <img class="book-cover-img">
+的 src 被 SSR 模板清空 → extract_first 退化返回 base_url；真实封面位于
+window.__INITIAL_STATE__ / "image":["https://..."] 的 JSON-LD。
 """
-import os
+from __future__ import annotations
+
 import sys
-from unittest.mock import patch
+from pathlib import Path
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pytest
+from framework.config import SourceConfig
+from framework.content import Content
+from framework.parser import Parser
 
-QAPP = None
+RAW = {
+    "$schema_version": 2,
+    "$id": "fanqie-fake",
+    "$type": "novel",
+    "$name": "番茄(假)",
+    "$enabled": True,
+    "$weight": 1.0,
+    "transports": {"base_url": "https://x.example"},
+    "endpoints": {
+        "detail": {
+            "fields": {
+                "cover": {
+                    "css": ".cover img",
+                    "attr": "src",
+                    "placeholder": "5cb03bd",
+                    "regex": '"image":\\["(https://[^"]+)"\\]',
+                    "state": "page.thumbUri",
+                }
+            }
+        }
+    },
+}
+
+_REAL_IMG = "https://cdn.x.example/real.jpg"
+_SCRIPT_IMAGES = (
+    '<script>window.__INITIAL_STATE__={"a":1};document.q={};'
+    f'"image":["{_REAL_IMG}"]</script>'
+)
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _qapp():
-    global QAPP
-    from PySide6.QtWidgets import QApplication
-
-    if QAPP is None:
-        QAPP = QApplication([])
-    return QAPP
+class _Checker:
+    pass
 
 
-def _make_view(detail, cover="", content=None, source=object()):
-    """构造轻量 VideoView（不跑 __init__ 的播放器部分）。"""
-    from PySide6.QtWidgets import QLabel
+class _FakeHttp:
+    cache = None
 
-    from gui.pages.reader.video_view import VideoView
+    def __init__(self, html=""):
+        self.html = html
+        from framework.http import NetworkDefaults
 
-    view = VideoView.__new__(VideoView)
-    view.cover_label = QLabel()
-    view._source = source
-    view._content = content
-    view._detail = detail
-    return view
+        self.defaults = NetworkDefaults()
+
+    def get_text(self, url, **kw):
+        return self.html
+
+    def close(self):
+        pass
 
 
-def _detail_with_cover(cover, chapter_covers=None):
-    from framework.content import Chapter, Detail
+def _content(html):
+    from framework.cache_service import RedisLikeStore
 
-    chapters = [
-        Chapter(f"第{i+1}集", f"http://e/{i}", cover=ch_c or "")
-        for i, ch_c in enumerate(chapter_covers or [])
-    ]
-    return Detail(
-        source_id="demo",
-        content_type="video",
-        url="http://example.com/v/1",
-        title="作品",
-        cover=cover,
-        chapters=chapters,
+    store = RedisLikeStore(quota=1024 * 1024, persist_path=None)
+    return Content(_FakeHttp(html), Parser(), _Checker(), cache=store)
+
+
+SRC = SourceConfig.from_dict(RAW, "<mem>")
+
+
+# ------------------------------------------------------------------------- #
+def test_cover_fallback_placeholder_src():
+    """选择器命中但 src 是占位图 → regex 兜底拿真实封面。"""
+    c = _content('<div class="cover"><img src="//p1.x.example/5cb03bdabc"/></div>' + _SCRIPT_IMAGES)
+    assert c.fetch_cover(SRC, "https://x.example/book/1") == _REAL_IMG
+
+
+def test_cover_fallback_empty_src():
+    """选择器命中但 src 为空（番茄 SSR 模板清空）→ 兜底拿真实封面。"""
+    c = _content('<div class="cover"><img src=""/></div>' + _SCRIPT_IMAGES)
+    assert c.fetch_cover(SRC, "https://x.example/book/1") == _REAL_IMG
+
+
+def test_cover_valid_kept_as_is():
+    """选择器直接命中有效封面且无 regex 配置 → 原样返回。"""
+    c = _content('<div class="cover"><img src="https://cdn.x.example/good.jpg"/></div>')
+    detail_cfg = dict(SRC.get_detail_config())
+    fields = dict(detail_cfg["fields"])
+    fields["cover"] = {"css": ".cover img", "attr": "src"}
+    detail_cfg["fields"] = fields
+    from framework.config import SourceConfig
+
+    plain = SourceConfig.from_dict(
+        {k: v for k, v in RAW.items()}
+        | {"endpoints": {"detail": detail_cfg}},
+        "<mem>",
     )
+    assert c.fetch_cover(plain, "https://x.example/book/1") == "https://cdn.x.example/good.jpg"
 
 
-def test_detail_cover_priority(_qapp):
-    """detail.cover 存在 → 直接用 detail.cover。"""
-    from gui.pages.reader.video_view import VideoView
-
-    detail = _detail_with_cover("http://c/detail.jpg", ["http://c/ep1.jpg"])
-    view = _make_view(detail)
-    with patch.object(VideoView, "_apply_cover") as apply_cover, \
-         patch.object(VideoView, "_fetch_cover_in_background") as bg:
-        view._load_ep_cover(detail)
-    apply_cover.assert_called_once_with("http://c/detail.jpg")
-    bg.assert_not_called()
+def test_cover_fallback_no_match_returns_empty():
+    """带 regex 配置但无任意兜底命中（无 SSR JSON）→ 返回空，绝不写 base_url 垃圾值。"""
+    c = _content('<div class="cover"><img src="https://cdn.x.example/good.jpg"/></div>')
+    got = c.fetch_cover(SRC, "https://x.example/book/1")
+    assert got == ""
+    assert got != SRC.base_url
 
 
-def test_fallback_to_first_ep_cover(_qapp):
-    """detail.cover 空 → 用第一集非空缩略图。"""
-    from gui.pages.reader.video_view import VideoView
-
-    detail = _detail_with_cover("", ["http://c/ep1.jpg", "http://c/ep2.jpg"])
-    view = _make_view(detail)
-    with patch.object(VideoView, "_apply_cover") as apply_cover, \
-         patch.object(VideoView, "_fetch_cover_in_background") as bg:
-        view._load_ep_cover(detail)
-    apply_cover.assert_called_once_with("http://c/ep1.jpg")
-    bg.assert_not_called()
-
-
-def test_first_ep_cover_skips_empty(_qapp):
-    """_first_ep_cover 跳过空章节封面，返回第一张非空。"""
-    from gui.pages.reader.video_view import VideoView
-
-    detail = _detail_with_cover("", ["", "", "http://c/ep3.jpg"])
-    view = _make_view(detail)
-    assert view._first_ep_cover(detail) == "http://c/ep3.jpg"
+def test_cover_fallback_state_from_initial_state():
+    """regex 未配置/未命中时，state（INITIAL_STATE JSONPath）兜底。"""
+    html = (
+        '<div class="cover"><img src="//p1.x.example/5cb03bd"/></div>'
+        '<script>window.__INITIAL_STATE__ = {"page": {"thumbUri": "https://cdn.x.example/state.jpg"}};</script>'
+    )
+    c = _content(html)
+    cover_sel = (SRC.get_detail_config()["fields"])["cover"]
+    got = c._extract_cover_fallback(SRC, html, cover_sel, "https://x.example")
+    assert got == "https://cdn.x.example/state.jpg"
 
 
-def test_all_empty_triggers_background(_qapp):
-    """全部无封面 → 隐藏封面并触发后台重取。"""
-    from gui.pages.reader.video_view import VideoView
-
-    detail = _detail_with_cover("", ["", ""])
-    view = _make_view(detail, content=object())
-    with patch.object(VideoView, "_apply_cover") as apply_cover, \
-         patch.object(VideoView, "_fetch_cover_in_background") as bg:
-        view._load_ep_cover(detail)
-    apply_cover.assert_not_called()
-    bg.assert_called_once_with(detail)
-    assert view.cover_label.isHidden()
+def test_cover_fallback_baseurl_degrades_to_regex():
+    """current 退化为 base_url 本体 → 视为无效，强制走 regex 兜底。"""
+    c = _content(_SCRIPT_IMAGES)
+    cover_sel = (SRC.get_detail_config()["fields"])["cover"]
+    got = c._extract_cover_fallback(
+        SRC, _SCRIPT_IMAGES, cover_sel, "https://x.example"
+    )
+    assert got == _REAL_IMG
 
 
-def test_no_content_no_background(_qapp):
-    """无 _source/_content 引用时后台重取直接返回（防 NPE）。"""
-    from gui.pages.reader.video_view import VideoView
+def test_cover_fallback_valid_url_passthrough():
+    """非占位且非 base_url 的有效封面 → 原样返回（不绕过避免逻辑）。"""
+    c = _content(_SCRIPT_IMAGES)
+    cover_sel = (SRC.get_detail_config()["fields"])["cover"]
+    good = "https://cdn.x.example/set.jpg"
+    assert c._extract_cover_fallback(SRC, _SCRIPT_IMAGES, cover_sel, good) == good
 
-    detail = _detail_with_cover("", ["", ""])
-    view = VideoView.__new__(VideoView)
-    from PySide6.QtWidgets import QLabel
 
-    view.cover_label = QLabel()
-    view._source = None
-    view._content = None
-    view._detail = detail
-    view._fetch_cover_in_background(detail)  # 不应抛异常
+def test_fetch_cover_no_cover_config_returns_empty():
+    """源未配置 detail.fields.cover → 空（无网络、无异常）。"""
+    raw = {"$schema_version": 2, "$id": "nosrc", "$type": "novel",
+           "$name": "无封面源", "$enabled": True, "$weight": 1.0,
+           "transports": {"base_url": "https://n.example"},
+           "endpoints": {"detail": {"fields": {"title": {"css": "h1"}}}}}
+    ns = SourceConfig.from_dict(raw, "<mem>")
+    c = _content('<h1>标题</h1>')
+    assert c.fetch_cover(ns, "https://n.example/book/1") == ""
+
+
+if __name__ == "__main__":
+    sys.exit(__import__("pytest").main([__file__, "-q"]))

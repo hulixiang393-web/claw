@@ -183,17 +183,20 @@ def main():
     print("作品卡片数:", len(cards))
     assert len(cards) == 2, len(cards)
 
-    # 详情抽屉：点作品 → 后台拉详情 → 等待 → 抽屉显示
+    # 直进阅读：点作品 → 后台拉详情 → read_requested 直接发出 Detail（不经抽屉）
     from PySide6.QtCore import QEventLoop, QTimer
+    emitted = []
+    page.read_requested.connect(emitted.append)
     page._on_work_clicked(cards[0].work)
     loop2 = QEventLoop()
     QTimer.singleShot(3000, loop2.quit)
     loop2.exec()
     app.processEvents()
-    assert page.detail_drawer.is_open(), "抽屉应打开"
-    print("详情抽屉标题:", page.detail_drawer.title.text())
+    assert len(emitted) == 1, emitted
+    assert emitted[0].title == "书一", emitted[0].title
+    print("直进阅读 detail:", emitted[0].title, "/ 章节:", len(emitted[0].chapters))
 
-    # 抽屉显示后，模拟列数变化触发 reflow → 网格卡片应保留（不清空 _works）
+    # 模拟列数变化触发 reflow → 网格卡片应保留（不清空 _works）
     page._last_columns = 0  # 强制列数变化
     page._reflow()
     app.processEvents()
@@ -204,6 +207,37 @@ def main():
     # 修复后：_clear_grid_widgets 保留 _works → 卡片与 _works 一致
     assert len(cards_after) == len(page._works) and len(cards_after) > 0, \
         f"reflow 后应保留全部卡片，卡片={len(cards_after)} works={len(page._works)}"
+
+    # ---- 换源会话缓存：换走→换回 0 请求还原 ----
+    from framework.cache_service import get_session_cache
+    from framework.discover_session import snapshot_key
+
+    session = get_session_cache()
+    session.clear()
+    # 未注入时给 page 补一个，验证往返
+    if page.session_cache is None:
+        page.session_cache = session
+
+    # 保证滚动有代表值并落盘当前 demo 会话（已加载 2 部作品）
+    page._current_cat_url = "/search"
+    page._current_page = 1
+    page._save_source_snapshot()
+    assert session.get(snapshot_key("demo")) is not None
+
+    # 模拟切走：清空当前视图（真实换源会在 _on_source_changed 里清）
+    page._clear_works()
+    page._works = []
+    page._loaded_pages = set()
+
+    # 换回 demo → 命中并渲染，不触发抓取
+    page._current_source = mgr.get("demo")
+    restored = page._try_restore_source_snapshot()
+    assert restored, "应命中会话缓存"
+    assert len(page._works) == 2, len(page._works)  # 恢复 2 部作品
+    cards2 = [page.grid_layout.itemAt(i).widget() for i in range(page.grid_layout.count())]
+    cards2 = [c for c in cards2 if c is not None]
+    assert len(cards2) == 2, len(cards2)
+    print("\n换源会话缓存还原: works=%d 卡片=%d" % (len(page._works), len(cards2)))
 
     # 全量抓取（真实 bulk_fetch 逻辑，MockHttp 返回作品）
     stats = bulk.fetch_all(page._current_source)

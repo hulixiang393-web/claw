@@ -6,8 +6,8 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
-    "homepage": "https://www.alicesw.com",
-    "description": "爱丽丝书屋 - 全属性免费小说创作网站（成人）",
+    "homepage": "https://www.alicesw1.homes",
+    "description": "爱丽丝书屋 - 全属性免费小说创作网站（成人）。原 www.alicesw.com 在国内被墙/超时，官方发布页给出大陆可用域名 www.alicesw1.homes（备用 alicesw.quest / alicesw.click）。国内直连可达（transports.direct 屏蔽系统代理），列表/详情/目录/正文 SSR 全可抓。",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -17,7 +17,8 @@
     ]
   },
   "transports": {
-    "base_url": "https://www.alicesw.com",
+    "base_url": "https://www.alicesw1.homes",
+    "direct": true,
     "headers": {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -116,6 +117,7 @@
         "root_selector": {
           "css": "a[href*='/novel/']"
         },
+        "cover_backfill": true,
         "fields": {
           "title": {
             "css": "a[href*='/novel/']"

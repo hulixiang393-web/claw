@@ -27,6 +27,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.components.hover_title import HoverTitle
+from framework.series_group import (
+    group_favorites,
+    series_badge,
+    series_member_label,
+    split_series,
+)
+
 from .base_page import BasePage
 
 
@@ -86,26 +94,41 @@ class _ShelfCard(QFrame):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
 
-        # 封面（独立区域，与下方书名/作者/来源分离，不并排）
+        # 封面（独立区域：图片铺满 + 右上角系列角标，与下方信息区分离）
+        cover_box = QWidget()
+        cover_box.setFixedHeight(90)
+        cbox = QGridLayout(cover_box)
+        cbox.setContentsMargins(0, 0, 0, 0)
         cover = QLabel("📚")
         cover.setAlignment(Qt.AlignCenter)
-        cover.setFixedHeight(90)
         cover.setStyleSheet(
             "background: palette(midlight); border-radius: 8px; font-size: 36px;"
         )
-        layout.addWidget(cover)
+        cbox.addWidget(cover, 0, 0)
+        layout.addWidget(cover_box)
         self._cover = cover
         self._load_cover(rec.get("cover") or "")
 
-        # 书名（独立行，完整显示可换行最多 3 行，超长裁剪但 tooltip 可见全名）
+        # 系列合并角标（如「共 3 話」「第1-3季」，悬停显示成员全名）
+        if rec.get("series_badge"):
+            badge = QLabel(rec["series_badge"])
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setStyleSheet(
+                "font-size: 10px; font-weight: bold; color: white;"
+                "background: rgba(0, 0, 0, 160); border-radius: 3px;"
+                "padding: 1px 6px;"
+            )
+            cbox.addWidget(badge, 0, 0, Qt.AlignTop | Qt.AlignRight)
+        if rec.get("series_tooltip"):
+            self.setToolTip("该系列成员：\n" + rec["series_tooltip"])
+
+        # 书名（独立单行，超长省略；悬停滑出完整标题浮层）
         title_text = rec.get("title") or "无题"
-        title = QLabel(title_text)
-        title.setWordWrap(True)
-        title.setFixedHeight(66)
-        title.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        title = HoverTitle(title_text, parent_card=self)
+        title.setFixedHeight(20)
         title.setStyleSheet("font-size: 15px; font-weight: bold;")
-        title.setToolTip(title_text)
         layout.addWidget(title)
+        self._title = title
 
         # 作者（独立行；本地书无元数据则不显示）
         author_text = (rec.get("author") or "").strip()
@@ -148,6 +171,8 @@ class _ShelfCard(QFrame):
         meta.setToolTip(meta_text)
         state.addWidget(meta, stretch=1)
         layout.addLayout(state)
+        # 标题收紧为单行后多余高度 → 底部 stretch（卡片等高不破）
+        layout.addStretch(1)
 
         self._apply_style()
 
@@ -172,7 +197,11 @@ class _ShelfCard(QFrame):
             return
         from gui.components.cover_loader import CoverLoader
 
-        CoverLoader.instance().load(url, self._on_cover_ready)
+        CoverLoader.instance().load(
+            url, self._on_cover_ready,
+            source_id=self.rec.get("source_id") or "",
+            persist=True,  # 书架封面持久化：Redis cover: 键命中免重复下载
+        )
 
     def _on_cover_ready(self, pixmap) -> None:
         import shiboken6
@@ -188,9 +217,10 @@ class _ShelfCard(QFrame):
         sy = max(0, (scaled.height() - 90) // 2)
         cropped = scaled.copy(sx, sy, min(210, scaled.width()), min(90, scaled.height()))
         self._cover.setPixmap(cropped)
-        from gui.components.cover_loader import fade_in
+        from gui.components.cover_loader import CoverLoader, fade_in
 
-        fade_in(self._cover)
+        if not CoverLoader.instance().busy():
+            fade_in(self._cover)
 
     def _meta_text(self) -> str:
         rec = self.rec
@@ -257,6 +287,7 @@ class LibraryPage(BasePage):
         reading_progress=None,
         shelf_export_dir: str | Path = "library",
         shelf_service=None,
+        cover_backfiller=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -273,6 +304,8 @@ class LibraryPage(BasePage):
         self._store = library_store
         self._shelf_export_dir = Path(shelf_export_dir) if shelf_export_dir else Path("library")
         self._scan_task = None  # 后台扫描任务持有引用（防 GC）
+        # 缺封面收藏后台补写回调（App 层注入：内容层 fetch_cover → store.set_cover）
+        self._cover_backfiller = cover_backfiller
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -380,9 +413,33 @@ class LibraryPage(BasePage):
         favorites = [b for b in books if b.get("kind") == "favorite"]
         self.count_label.setText(f"共 {len(books)} 本 · 本地{len(locals_)} / 收藏{len(favorites)}")
         if locals_:
-            self._add_group("本地", locals_)
+            self._add_group("本地", [{"rec": b} for b in locals_])
         if favorites:
-            self._add_group("收藏", favorites)
+            # 收藏先按系列合并（同源+同主书名 → 一张卡）→ 再从每条开卡
+            items: list[dict] = []
+            for grp in group_favorites(favorites):
+                items.append(self._to_shelf_item(grp))
+            self._add_group("收藏", items)
+        self._maybe_backfill_covers(favorites)
+
+    def _maybe_backfill_covers(self, favorites: list[dict]) -> None:
+        """收藏记录封面无效 → 后台补详情封面（幂等、失败静默、不阻塞渲染）。
+
+        有效性判定交给 App 层 backfiller（空 / 等于 base_url / 命中占位图都
+        算无效——历史 bug 曾把 base_url 这类垃圾写进收藏库）。每次书架渲染都
+        触发：已补齐的记录 cover 已写回不再进 need；补写失败的记录下次渲染
+        重试。真实网络只在详情页缓存缺失时发生（fetch_cover 复用 page: 缓存），
+        串行后台执行不压垮站点。
+        """
+        if self._cover_backfiller is None:
+            return
+        need = [b for b in favorites
+                if b.get("source_id") and b.get("url")]
+        if need:
+            try:
+                self._cover_backfiller(need)
+            except Exception:  # noqa: BLE001 —— 补封面失败不影响书架显示
+                pass
 
     def _visible_combo_state(self) -> bool:
         ctype = self.type_combo.currentText()
@@ -415,19 +472,49 @@ class LibraryPage(BasePage):
         LibraryPage._wipe(self.body)
 
     # ------------------------------------------------------------------ #
-    def _add_group(self, title: str, books: list[dict]) -> None:
+    def _add_group(self, title: str, items: list[dict]) -> None:
+        """渲染一组卡片。items 每项为 {"rec": 记录, "members"?=系列成员列表}。
+
+        members>1 → 合并卡（点开弹成员选集）；否则普通卡。
+        """
         header = QLabel(title)
         header.setStyleSheet("font-size: 14px; font-weight: bold; color: palette(text);")
         self.body.addWidget(header)
         grid = QGridLayout()
         grid.setSpacing(12)
-        for i, rec in enumerate(books):
-            card = _ShelfCard(rec)
-            card.clicked.connect(self._on_card_clicked)
-            card.menu_requested.connect(self._show_card_menu)
+        for i, item in enumerate(items):
+            card = _ShelfCard(item["rec"])
+            # clicked 信号携带 rec 参数 → 首参吞掉它，闭包 it=item 才能拿到条目
+            card.clicked.connect(
+                lambda _rec, it=item: self._on_card_clicked(it)
+            )
+            card.menu_requested.connect(
+                lambda r, p, it=item: self._show_card_menu(it["rec"], p)
+            )
             row, col = divmod(i, 3)
             grid.addWidget(card, row, col)
         self.body.addLayout(grid)
+
+    @staticmethod
+    def _to_shelf_item(group: list[dict]) -> dict:
+        """系列组 → 书架条目（{"rec", "members"?}）。
+
+        单本组 → 普通条目 {rec}；多本合并 → 显示记录为首部（标题换成主书名，
+        去系列后缀），注入 series_badge（角标）与 series_tooltip（悬停成员
+        列表）。存储不动——收藏仍各自独立，右键操作落在首部记录上。
+        """
+        if len(group) <= 1:
+            return {"rec": group[0]}
+        leader = dict(group[0])
+        base, _ = split_series(leader.get("title") or "")
+        if base:
+            leader["title"] = base
+        leader["series_badge"] = series_badge(group)
+        leader["series_tooltip"] = "\n".join(
+            series_member_label(m) or (m.get("title") or "未命名")
+            for m in group
+        )
+        return {"rec": leader, "members": group}
 
     def _add_empty(self) -> None:
         empty = QLabel("书架还空着，去发现里找点好东西吧\n（可搜索、可分类、本地书可直接离线阅读）")
@@ -606,12 +693,44 @@ class LibraryPage(BasePage):
         QMessageBox.information(self, "导出书架", f"已导出到：\n{out}")
 
     # ------------------------------------------------------------------ #
-    def _on_card_clicked(self, rec: dict) -> None:
-        """点击：本地优先加载（视频播本地、epub 读本地），无本地才走网络。
+    def _on_card_clicked(self, item: dict) -> None:
+        """点击书架卡片。item = {"rec": 记录, "members"?=系列成员列表}。
+
+        系列合并卡（members>1）→ 弹成员选集列表，逐个打开；
+        单本 → 原打开逻辑（本地优先加载，无本地走网络）。
+        """
+        members = item.get("members")
+        if members:
+            self._pick_series_member(item["rec"], members)
+            return
+        self._open_rec(item["rec"])
+
+    def _pick_series_member(self, leader: dict, members: list[dict]) -> None:
+        """系列合并卡：弹出该系列各话/各季成员列表，选一个打开。"""
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        for m in members:
+            label = series_member_label(m) or (m.get("title") or "未命名")
+            title = (m.get("title") or "").strip()
+            if title and label != title:
+                label = f"{label}（{title}）"  # 主名带全名（防重名歧义）
+            act = menu.addAction(label)
+            act.triggered.connect(
+                lambda checked=False, mm=m: self._open_rec(mm)
+            )
+        menu.setTitle(f"《{leader.get('title', '')}》选集")
+        menu.exec()  # 默认显示在光标处
+
+    def _open_rec(self, rec: dict) -> None:
+        """打开单个书架记录：本地优先加载（视频播本地、epub 读本地），无本地才走网络。
 
         一个文件夹多本 epub（episode_paths>1）→ 弹下拉框选读哪本（同视频选集）。
         """
+        if not rec:
+            return
         if rec.get("kind") == "local":
+            # 本地优先；但收藏组并卡时 serial members 可能不是本地
             if rec.get("content_type") == "video" and rec.get("episode_paths"):
                 self.play_local_video_requested.emit(rec)
             elif rec.get("episode_paths") and len(rec["episode_paths"]) > 1:

@@ -158,7 +158,11 @@
           },
           "cover": {
             "css": "amp-img",
-            "attr": "src"
+            "attr": "src",
+            "url_replace": [
+              "https?://static-tw\\.(?:baozimh|bzimg)\\.com([^?#]*)",
+              "https://static-tw.bzmgcn.com{1}"
+            ]
           }
         }
       }
@@ -182,7 +186,11 @@
           },
           "cover": {
             "css": "amp-img",
-            "attr": "src"
+            "attr": "src",
+            "url_replace": [
+              "https?://static-tw\\.(?:baozimh|bzimg)\\.com([^?#]*)",
+              "https://static-tw.bzmgcn.com{1}"
+            ]
           }
         }
       }
@@ -199,7 +207,11 @@
         },
         "cover": {
           "css": "amp-img[alt], .comics-card__poster amp-img",
-          "attr": "src"
+          "attr": "src",
+          "url_replace": [
+            "https?://static-tw\\.(?:baozimh|bzimg)\\.com([^?#]*)",
+            "https://static-tw.bzmgcn.com{1}"
+          ]
         },
         "summary": {
           "css": "meta[name='description']",

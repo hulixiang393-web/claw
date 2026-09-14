@@ -188,6 +188,7 @@ class _TaskCard(QFrame):
             )
         elif t.status == TaskStatus.FAILED:
             self.btn_row.addWidget(_btn("重试", lambda: q.retry_task(tid)))
+            self.btn_row.addWidget(_btn("重新下载", lambda: q.restart_task(tid), warn=True))
             self.btn_row.addWidget(
                 _btn("忽略", lambda: q.remove_done(tid), warn=True)
             )
@@ -357,6 +358,29 @@ class DownloadPage(BasePage):
         toolbar.addWidget(_btn("全暂停", self._queue.pause_all))
         toolbar.addWidget(_btn("全继续", self._queue.resume_all))
         toolbar.addWidget(_btn("全取消", self._queue.cancel_all))
+
+        def _clear_done():
+            self._queue.clear_done()
+            self._full_rebuild()
+
+        def _clear_all():
+            from PySide6.QtWidgets import QMessageBox
+
+            resp = QMessageBox.question(
+                self,
+                "确认清空",
+                "确定清空所有下载记录吗？\n"
+                "仅清除记录，不影响已下载的本地文件。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+            self._queue.clear_all()
+            self._full_rebuild()
+
+        toolbar.addWidget(_btn("清除已完成", _clear_done))
+        toolbar.addWidget(_btn("清除记录", _clear_all))
         toolbar.addStretch()
 
         # 筛选

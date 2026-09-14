@@ -75,6 +75,8 @@ class Ytdlp:
         tmp.close()
         tmp_err.close()
         try:
+            from .subprocess_no_window import no_window_kwargs
+
             with open(log_path, "w", encoding="utf-8", errors="replace") as f, \
                  open(err_path, "w", encoding="utf-8", errors="replace") as ef:
                 proc = subprocess.run(
@@ -84,6 +86,7 @@ class Ytdlp:
                     text=True,
                     errors="replace",
                     timeout=self._timeout,
+                    **no_window_kwargs(),  # Windows 静默，不弹控制台窗口
                 )
             try:
                 with open(log_path, "r", encoding="utf-8", errors="replace") as f:
@@ -257,6 +260,7 @@ class Ytdlp:
         取消/暂停：kill 进程并清理残留临时文件，抛 MergeCancelled/MergePaused。
         """
         from .ffmpeg_merger import MergeCancelled, MergePaused
+        from .subprocess_no_window import no_window_kwargs
         import os
         import subprocess
         import tempfile
@@ -278,6 +282,7 @@ class Ytdlp:
             stderr=subprocess.STDOUT,
             text=True,
             errors="replace",
+            **no_window_kwargs(),  # Windows 静默，不弹控制台窗口
         )
 
         def _tmp_size() -> int:

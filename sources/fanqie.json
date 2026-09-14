@@ -34,17 +34,191 @@
     "discovery": {
       "list_url": "/",
       "works_list_url": "/",
+      "list_item": {
+        "categories": [
+          {
+            "title": "男频·西方奇幻",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=1141"
+          },
+          {
+            "title": "男频·东方仙侠",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=1140"
+          },
+          {
+            "title": "男频·科幻末世",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=8"
+          },
+          {
+            "title": "男频·都市日常",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=261"
+          },
+          {
+            "title": "男频·都市修真",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=124"
+          },
+          {
+            "title": "男频·都市高武",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=1014"
+          },
+          {
+            "title": "男频·历史古代",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=273"
+          },
+          {
+            "title": "男频·战神赘婿",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=27"
+          },
+          {
+            "title": "男频·都市种田",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=263"
+          },
+          {
+            "title": "男频·传统玄幻",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=258"
+          },
+          {
+            "title": "男频·历史脑洞",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=272"
+          },
+          {
+            "title": "男频·悬疑脑洞",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=539"
+          },
+          {
+            "title": "男频·都市脑洞",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=262"
+          },
+          {
+            "title": "男频·玄幻脑洞",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=257"
+          },
+          {
+            "title": "男频·悬疑灵异",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=751"
+          },
+          {
+            "title": "男频·抗战谍战",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=504"
+          },
+          {
+            "title": "男频·游戏体育",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=746"
+          },
+          {
+            "title": "男频·动漫衍生",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=718"
+          },
+          {
+            "title": "男频·男频衍生",
+            "url": "/api/rank/category/list?gender=1&rankMold=2&category_id=1016"
+          },
+          {
+            "title": "女频·古风世情",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=1139"
+          },
+          {
+            "title": "女频·科幻末世",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=8"
+          },
+          {
+            "title": "女频·游戏体育",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=746"
+          },
+          {
+            "title": "女频·女频衍生",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=1015"
+          },
+          {
+            "title": "女频·玄幻言情",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=248"
+          },
+          {
+            "title": "女频·种田",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=23"
+          },
+          {
+            "title": "女频·年代",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=79"
+          },
+          {
+            "title": "女频·现言脑洞",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=267"
+          },
+          {
+            "title": "女频·宫斗宅斗",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=246"
+          },
+          {
+            "title": "女频·悬疑脑洞",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=539"
+          },
+          {
+            "title": "女频·古言脑洞",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=253"
+          },
+          {
+            "title": "女频·快穿",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=24"
+          },
+          {
+            "title": "女频·青春甜宠",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=749"
+          },
+          {
+            "title": "女频·星光璀璨",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=745"
+          },
+          {
+            "title": "女频·女频悬疑",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=747"
+          },
+          {
+            "title": "女频·职场婚恋",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=750"
+          },
+          {
+            "title": "女频·豪门总裁",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=748"
+          },
+          {
+            "title": "女频·民国言情",
+            "url": "/api/rank/category/list?gender=0&rankMold=2&category_id=1017"
+          }
+        ]
+      },
       "works_list_item": {
         "root_selector": {
-          "css": "a.muye-bottom-choiceness-item"
+          "css": "a.muye-bottom-choiceness-item, div.rank-book-item, tr.update-list-item"
         },
         "fields": {
           "title": {
-            "css": "h3.title"
+            "fallback": [
+              {
+                "css": "h3.title"
+              },
+              {
+                "css": "div.title"
+              },
+              {
+                "css": "td.book-name a"
+              }
+            ]
           },
           "url": {
-            "xpath": "@href",
-            "attr": "href"
+            "fallback": [
+              {
+                "xpath": "@href",
+                "attr": "href"
+              },
+              {
+                "css": "td.book-name a",
+                "attr": "href"
+              },
+              {
+                "css": "a",
+                "attr": "href"
+              }
+            ]
           },
           "cover": {
             "css": "img.book-cover-img",
@@ -52,13 +226,24 @@
             "placeholder": "5cb03bd"
           },
           "author": {
-            "css": "h4.author"
+            "fallback": [
+              {
+                "css": "h4.author"
+              },
+              {
+                "css": "div.author"
+              },
+              {
+                "css": "td.author-name a"
+              }
+            ]
           }
         },
         "cover_state": {
           "lists": [
             "home.boyList",
-            "home.girlList"
+            "home.girlList",
+            "rank.book_list"
           ],
           "cover_key": "thumbUri"
         }
@@ -75,11 +260,22 @@
         "root_selector": {
           "css": "a[href*='/page/']"
         },
-        "render_config": {
+"render_config": {
           "wait_for": "a[href*='/page/']",
           "wait_until": "networkidle",
           "timeout_ms": 30000,
-          "extra_delay_ms": 3000
+          "extra_delay_ms": 3000,
+          "response_pages": 3,
+          "response_json_url": "/api/author/search/search_book/v1",
+          "response_items": "data.search_book_data_list",
+          "response_fields": {
+            "title": "book_name",
+            "author": "author",
+            "cover": "thumb_url",
+            "summary": "book_abstract",
+            "url_template": "{base}/page/{book_id}"
+          },
+          "filter_keyword": false
         }
       }
     },
@@ -155,12 +351,41 @@
     "targets": {
       "chapter": {
         "strategy": "translit"
+      },
+      "title": {
+        "strategy": "translit"
+      },
+      "author": {
+        "strategy": "translit"
       }
     }
   },
   "diagnostics": {
     "selfcheck": {
       "strategy": "off"
+    }
+  },
+  "api_endpoints": {
+    "discovery": {
+      "url": "/api/rank/category/list",
+      "method": "GET",
+      "params": {
+        "app_id": 2503,
+        "rank_list_type": 3,
+        "offset": "{offset}",
+        "limit": 10,
+        "category_id": "{category_id}",
+        "rank_version": "",
+        "gender": "{gender}",
+        "rankMold": "{rankMold}"
+      },
+      "response_path": "data.book_list",
+      "item_fields": {
+        "title": "bookName",
+        "url": "/page/{bookId}",
+        "cover": "thumbUri",
+        "author": "author"
+      }
     }
   }
 }

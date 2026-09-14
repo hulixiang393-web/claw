@@ -29,46 +29,49 @@
   },
   "endpoints": {
     "discovery": {
-      "list_url": "/",
+      "list_url": "/index.html",
       "list_paginator": {
         "type": "increment",
         "start": 1,
-        "step": 1,
-        "page_placeholder": "\\d+(?=\\.html)"
+        "step": 1
       },
       "list_item": {
         "categories": [
           {
+            "title": "汉化中文",
+            "url": "/language/chinese-{page}.html"
+          },
+          {
             "title": "最新",
-            "url": "/"
+            "url": "/index-{page}.html"
           },
           {
             "title": "漫画",
-            "url": "/h/"
+            "url": "/h/index-{page}.html"
           },
           {
             "title": "图集",
-            "url": "/hentai/"
+            "url": "/hentai/index-{page}.html"
           },
           {
             "title": "动画",
-            "url": "/animation/"
+            "url": "/animation/index-{page}.html"
           },
           {
             "title": "全彩",
-            "url": "/tags/full-color.html"
+            "url": "/tags/full-color-{page}.html"
           },
           {
             "title": "网漫",
-            "url": "/webtoon/"
+            "url": "/webtoon/index-{page}.html"
           },
           {
             "title": "西漫",
-            "url": "/western/"
+            "url": "/western/index-{page}.html"
           },
           {
             "title": "写真",
-            "url": "/cos/"
+            "url": "/cos/index-{page}.html"
           }
         ]
       },
@@ -132,6 +135,7 @@
     },
     "content": {
       "page": {
+        "single_chapter": true,
         "list": {
           "root_selector": {
             "css": ".page.bigpage"

@@ -18,12 +18,17 @@ def main():
     base = pathlib.Path(tempfile.mkdtemp())
     store = LibraryStore(base / "lib.json")
 
-    # 收藏 + 收藏夹
-    store.add("src", "http://a/1", "收藏1", content_type="novel", author="甲")
-    store.add("src", "http://b/2", "收藏2", content_type="comic", author="乙")
+    # 收藏 + 收藏夹（阅读器/详情收藏会带 cover 持久化到书架卡片）
+    store.add("src", "http://a/1", "收藏1", content_type="novel", author="甲",
+              cover="http://a/1/cover.jpg")
+    store.add("src", "http://b/2", "收藏2", content_type="comic", author="乙",
+              cover="http://a/2/cover.jpg")
     store.add("src", "http://c/3", "收藏3", content_type="comic", author="丙")
     store.create_folder("玄幻")
     store.add("src", "http://d/4", "收藏4", content_type="video", folder="玄幻")
+
+    # 补写封面（旧收藏无封面：后台 fetch_cover 成功 → set_cover 只改封面）
+    assert store.set_cover("http://c/3", "http://a/3/cover.jpg") is True
 
     page = LibraryPage(
         output_dir=base / "dl",
@@ -37,6 +42,12 @@ def main():
     # 收藏数
     assert store.count() == 4, store.count()
     print("收藏数 OK:", store.count())
+
+    # 封面元数据（新收藏 vs set_cover 补写）
+    rec = store.get("http://c/3")
+    assert rec["cover"] == "http://a/3/cover.jpg", rec
+    assert rec["favorited_at"]  # set_cover 不刷新收藏时间
+    print("封面补写 OK（保留收藏时间）")
 
     # 收藏夹
     folders = store.list_folders()

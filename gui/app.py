@@ -29,7 +29,7 @@ from framework.settings_manager import SettingsManager
 from framework.source_manager import SourceManager
 from framework.search_history import SearchHistory
 from framework.theme_manager import ThemeManager
-from framework.http import HttpClient
+from framework.http import HttpClient, NetworkDefaults
 from framework.parser import Parser
 from framework.selfcheck import StructureChecker
 from framework.discovery import Discovery
@@ -64,12 +64,76 @@ IMPLEMENTED_TABS = {
 }
 
 
+def network_defaults_from_settings(settings) -> NetworkDefaults:
+    """从 settings（app_config network.*）构造 NetworkDefaults。
+
+    新增键：impersonate（curl_cffi TLS/JA3 伪装档位，null=关闭）、user_agents
+    （UA 轮换列表，空/缺失=关闭）。默认关闭，不改变现有源的请求行为。
+    """
+    return NetworkDefaults(
+        timeout=float(settings.get("network", "default_timeout", 10)),
+        retries=int(settings.get("network", "default_retries", 3)),
+        interval_ms=int(settings.get("network", "default_request_interval", 0)),
+        proxy=settings.get("network", "proxy") or None,
+        user_agent=settings.get("network", "default_user_agent", "") or None,
+        impersonate=settings.get("network", "impersonate") or None,
+        user_agents=settings.get("network", "user_agents") or None,
+    )
+
+
 def _app_base_dir() -> Path:
     """应用根目录：PyInstaller 打包后为 exe 所在目录（sources/data/docs 随 exe 旁），
     开发运行时为项目根（gui/ 的上一级）。"""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
+
+
+def _pick_favorite_folder(parent, store) -> str:
+    """弹「收藏到分类」对话框，返回所选收藏夹名。
+
+    阅读器 / 详情抽屉新增收藏共用此入口：
+    - 选「全部」或取消 → 返回 ""（未归类，书架「全部」视图显示）
+    - 选已有收藏夹 → 返回该夹名
+    - 输入新名字 → 自动建夹后返回该名字
+    """
+    from PySide6.QtWidgets import (
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QLabel,
+        QVBoxLayout,
+    )
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("收藏到分类")
+    layout = QVBoxLayout(dlg)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(10)
+    layout.addWidget(QLabel("收藏到哪个收藏夹？"))
+
+    combo = QComboBox()
+    combo.setEditable(True)
+    combo.addItem("全部")
+    combo.addItems(store.list_folders() if store is not None else [])
+    combo.setCurrentIndex(0)
+    layout.addWidget(combo)
+
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    buttons.button(QDialogButtonBox.Ok).setText("收藏")
+    buttons.button(QDialogButtonBox.Cancel).setText("取消")
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    layout.addWidget(buttons)
+
+    if dlg.exec() != QDialog.Accepted:
+        return ""
+    name = combo.currentText().strip()
+    if not name or name == "全部":
+        return ""  # 「全部」/ 未填写 → 未归类
+    if store is not None and name not in store.list_folders():
+        store.create_folder(name)  # 输入新名字 → 自动建夹
+    return name
 
 
 class _CentralArea(QWidget):
@@ -164,16 +228,8 @@ class MainWindow(QMainWindow):
         )
         self.reading_progress.prune(shelf_cb=self._favorite_has)  # 启动清理（收藏保留）
 
-        # 爬取执行链（网络默认值从 settings 接线）
-        from framework.http import NetworkDefaults
-
-        self.http = HttpClient(defaults=NetworkDefaults(
-            timeout=float(self.settings.get("network", "default_timeout", 10)),
-            retries=int(self.settings.get("network", "default_retries", 3)),
-            interval_ms=int(self.settings.get("network", "default_request_interval", 0)),
-            proxy=self.settings.get("network", "proxy") or None,
-            user_agent=self.settings.get("network", "default_user_agent", "") or None,
-        ))
+        # 爬取执行链（网络默认值从 settings 接线：impersonate/user_agents 默认关闭）
+        self.http = HttpClient(defaults=network_defaults_from_settings(self.settings))
         self.parser = Parser()
         self.checker = StructureChecker(
             self.http, self.parser,
@@ -195,6 +251,7 @@ class MainWindow(QMainWindow):
         self.search = Search(
             self.http, self.parser, self.discovery,
             concurrent=int(self.settings.get("network", "concurrent_search_sources", 4)),
+            cookie_manager=self.cookie_manager,
         )
         self.download_queue = DownloadQueue(
             content=self.content,
@@ -202,6 +259,7 @@ class MainWindow(QMainWindow):
             settings=self.settings,
             source_manager=self.source_manager,
             event_bus=self.event_bus,
+            history_path=base_dir / "data" / "downloads.json",
         )
         # 下载完成/新增 → 刷新书架（新下载的书出现在本地组）；收藏变化在 _on_favorite 刷新
         self.event_bus.subscribe(self._on_download_event)
@@ -222,6 +280,12 @@ class MainWindow(QMainWindow):
             self.settings.get("ui", "cover_cache_size_mb", 256),
             shelf_cache=shelf_cache,
         )
+        # 正文图/封面下载收敛到框架 HttpClient：共享实例带 CF cookie / impersonate 等能力
+        CoverLoader.instance().use_http(self.http)
+        # 登记全部源：列表/搜索封面回填只传 source_id，需据此补源级 direct
+        # （爱丽丝等直连源封面经系统代理会失败/变慢 → 封面空白）
+        for _src in self.source_manager.all():
+            CoverLoader.instance().register_source(_src)
 
         # Tab 索引映射
         self._tab_index = {key: i for i, (_, key) in enumerate(TABS)}
@@ -297,11 +361,12 @@ class MainWindow(QMainWindow):
             content=self.content,
             reading_progress=self.reading_progress,
             font_scale=float(self.settings.get("ui", "font_scale", 1.0)),
+            search=self.search,
         )
         # 阅读器「收藏」→ 写书架收藏库（与发现详情抽屉同一入口 _on_favorite）
         self.reader.favorite_requested.connect(self._on_favorite)
-        # 阅读器「⬇ 下载」→ 拉详情入下载队列（复用书架下载入口）
-        self.reader.download_requested.connect(self._download_from_shelf)
+        # 阅读器「⬇ 下载」→ 拉详情后弹章节范围对话框（默认当前章→末章）
+        self.reader.download_requested.connect(self._download_from_reader)
         # 收藏判断回调：LibraryStore.has(url)（书架库未构建时先构建）
         self.reader.set_favorite_checker(self._favorite_has)
         # 阅读器全屏：隐藏/恢复 Tab 栏（沉浸阅读，退出全屏还原）
@@ -361,6 +426,7 @@ class MainWindow(QMainWindow):
             return None
 
     def _build_discover(self) -> DiscoverPage:
+        from framework.cache_service import get_session_cache
         page = DiscoverPage(
             source_manager=self.source_manager,
             discovery=self.discovery,
@@ -368,10 +434,12 @@ class MainWindow(QMainWindow):
             bulk_fetch=self.bulk_fetch,
             event_bus=self.event_bus,
             theme_manager=self.theme_manager,
+            session_cache=get_session_cache(),
         )
         page.read_requested.connect(self._open_reader)
         page.download_requested.connect(self._open_download_dialog)
         page.favorite_requested.connect(self._on_favorite)
+        self.discover_page = page
         return page
 
     def _on_favorite(self, detail) -> None:
@@ -385,12 +453,17 @@ class MainWindow(QMainWindow):
         if store.has(url):
             store.remove(url)
         else:
+            # 新增收藏：弹「收藏到分类」选收藏夹（全部/取消 → 未归类）
+            folder = _pick_favorite_folder(self, store)
             store.add(
                 getattr(detail, "source_id", ""),
                 url,
                 getattr(detail, "title", "") or url,
                 content_type=getattr(detail, "content_type", ""),
                 cover=getattr(detail, "cover", ""),
+                author=getattr(detail, "author", "") or "",
+                tags=list(getattr(detail, "tags", None) or ()) if detail else [],
+                folder=folder,
             )
         # 刷新书架（若已构建）
         page = getattr(self, "library_page", None)
@@ -433,7 +506,7 @@ class MainWindow(QMainWindow):
                 getattr(r, "source_id", ""),
                 url,
                 getattr(r, "title", "") or url,
-                content_type="",
+                content_type=getattr(r, "content_type", "") or "",
                 cover=getattr(r, "cover", ""),
                 author=getattr(r, "author", ""),
             )
@@ -503,10 +576,21 @@ class MainWindow(QMainWindow):
         self._dl_pending -= 1
         if self._dl_pending > 0:
             return
-        # 全部就绪：对每个有章节的结果入队（可只下载前 N 集）
+        # 全部就绪：对每个有章节的结果入队（阅读器下载弹范围选框，批量下载取前 N 集）
         ok = 0
         for r, source, url, detail in self._dl_results:
             if detail is None or not getattr(detail, "chapters", None):
+                continue
+            # 阅读器下载：弹章节范围对话框（默认当前章→末章）
+            if getattr(r, "range_dialog", False):
+                picked = self._reader_download_selection(
+                    detail, getattr(r, "current_idx", 1) or 1
+                )
+                if picked is None:
+                    continue  # 用户取消
+                selected, quality = picked
+                self.download_queue.add_task(detail, selected=selected, quality=quality)
+                ok += 1
                 continue
             ep_count = getattr(r, "ep_count", 0) or 0
             if ep_count > 0 and len(detail.chapters) > ep_count:
@@ -531,6 +615,7 @@ class MainWindow(QMainWindow):
         page = SearchPage(
             source_manager=self.source_manager,
             search=self.search,
+            content=self.content,
         )
         page.open_requested.connect(self._open_from_search)
         page.add_to_shelf_requested.connect(self._on_batch_add_shelf)
@@ -582,6 +667,7 @@ class MainWindow(QMainWindow):
             library_store=self.library_store,
             reading_progress=self.reading_progress,
             shelf_export_dir=shelf_export_dir,
+            cover_backfiller=self._backfill_favorite_covers,
         )
         # 点本地 epub → 内置阅读器打开（续读）
         self.library_page.open_epub_requested.connect(self._open_epub)
@@ -592,6 +678,76 @@ class MainWindow(QMainWindow):
         # 点本地视频书 → 弹集选择播本地 mp4（离线）
         self.library_page.play_local_video_requested.connect(self._play_local_video)
         return self.library_page
+
+    def _backfill_favorite_covers(self, recs) -> None:
+        """书架渲染后：对封面无效的收藏记录后台补详情封面（失败静默，不阻塞书架）。
+
+        fetch_cover 复用 page: 详情缓存——详情页已在缓存/重启前抓过则零网络；
+        仅真无缓存时才发一次详情 GET（串行后台执行，不并发压站）。补齐后写回
+        收藏库，下次渲染不再重复补。
+
+        「无效封面」判定：空 / 等于源 base_url（历史 bug 曾写回 base_url 垃圾值）
+        / 命中源 cover 配置的占位标记——判定只是内存比对，无需网络；只对无效的
+        发起 fetch_cover。
+        """
+        if not recs:
+            return
+        store = self._ensure_library_store()
+        content = getattr(self, "content", None)
+        source_manager = getattr(self, "source_manager", None)
+        if store is None or content is None or source_manager is None:
+            return
+        from PySide6.QtCore import QThreadPool, QRunnable
+
+        class _CoverBackfillTask(QRunnable):
+            def __init__(self, content, source_manager, store, recs):
+                super().__init__()
+                self._content = content
+                self._source_manager = source_manager
+                self._store = store
+                self._recs = recs
+
+            def _cover_invalid(self, cover: str, source) -> bool:
+                """封面可否直接当作有效（不触发网络重补）。"""
+                if not cover:
+                    return True
+                if source is None:
+                    return False
+                base = (getattr(source, "base_url", "") or "").rstrip("/")
+                if cover.rstrip("/") == base:
+                    return True
+                try:
+                    detail_cfg = source.get_detail_config() or {}
+                    cover_sel = (detail_cfg.get("fields") or {}).get("cover")
+                    return bool(cover_sel) and self._content._is_placeholder_cover(
+                        cover, cover_sel
+                    )
+                except Exception:  # noqa: BLE001
+                    return False
+
+            def run(self) -> None:
+                for r in self._recs:
+                    try:
+                        source = self._source_manager.get(r.get("source_id", ""))
+                        if source is None:
+                            continue
+                        if not self._cover_invalid(r.get("cover", ""), source):
+                            continue  # 已有有效封面，不重复补
+                        cover = self._content.fetch_cover(
+                            source, r.get("url", "")
+                        )
+                        if not cover or self._cover_invalid(cover, source):
+                            continue  # 仍然取不到有效封面 → 保持原样待下轮
+                        self._store.set_cover(r.get("url", ""), cover)
+                    except Exception:  # noqa: BLE001 —— 单条失败静默，继续补其它
+                        continue
+
+        # 持有任务引用防 GC（书架在 App 生命周期内常驻）
+        self._cover_backfill_tasks = getattr(self, "_cover_backfill_tasks", None) or []
+        self._cover_backfill_tasks.append(_CoverBackfillTask(
+            content, source_manager, store, recs
+        ))
+        QThreadPool.globalInstance().start(self._cover_backfill_tasks[-1])
 
     def _play_local_video(self, rec: dict) -> None:
         """播本地视频：记住上次看到哪集（下次默认定位该集）；单集直接播，多集弹选择。"""
@@ -616,7 +772,6 @@ class MainWindow(QMainWindow):
             from pathlib import Path
 
             names = [Path(p).name for p in paths]
-            from PySide6.QtWidgets import QInputDialog
 
             # 文件名模糊匹配：线上集标题（如"第5集"）未必等于文件名（如"第5集.mp4"）
             cur = 0
@@ -625,12 +780,32 @@ class MainWindow(QMainWindow):
                     if prev_title in n or n in prev_title:
                         cur = i
                         break
-            item, ok = QInputDialog.getItem(
-                self, "选择集数", "选择要播放的集：", names, cur, False
+            # 自定义弹窗替代 QInputDialog：QInputDialog.getItem 会按最长文本
+            # 自动撑得太宽（mp4 文件名通常很长），设最大宽度统一弹窗尺寸。
+            from PySide6.QtWidgets import (
+                QComboBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout,
             )
-            if not ok or not item:
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("选择集数")
+            dlg.setMaximumWidth(400)
+            layout = QVBoxLayout(dlg)
+            layout.setContentsMargins(16, 14, 16, 14)
+            layout.setSpacing(10)
+            layout.addWidget(QLabel("选择要播放的集："))
+            combo = QComboBox()
+            combo.setEditable(False)
+            combo.addItems(names)
+            combo.setCurrentIndex(cur)
+            layout.addWidget(combo)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.button(QDialogButtonBox.Ok).setText("播放")
+            buttons.accepted.connect(dlg.accept)
+            buttons.rejected.connect(dlg.reject)
+            layout.addWidget(buttons)
+            if dlg.exec() != QDialog.Accepted:
                 return
-            target = paths[names.index(item)]
+            target = paths[combo.currentIndex()]
         # 记录"看到第 N 集"（外部播放器无法回传秒数，至少记住集数续播）
         if key and self.reading_progress is not None:
             try:
@@ -678,6 +853,43 @@ class MainWindow(QMainWindow):
         item = SimpleNamespace(source_id=source_id, url=url,
                                ep_count=payload[3] if len(payload) > 3 else 0)
         self._on_batch_download([item])
+
+    def _download_from_reader(self, payload) -> None:
+        """阅读器「⬇ 下载」→ 拉详情 → 弹章节范围对话框（默认当前章→末章）→ 入队。
+
+        payload=(source_id, url, content_type, current_idx)，current_idx 为 1 基。
+        """
+        if not isinstance(payload, (tuple, list)) or len(payload) < 2:
+            return
+        source_id, url = payload[0], payload[1]
+        content_type = payload[2] if len(payload) > 2 else ""
+        current_idx = int(payload[3]) if len(payload) > 3 and payload[3] else 1
+        if not url:
+            return
+        from types import SimpleNamespace
+        item = SimpleNamespace(
+            source_id=source_id, url=url, content_type=content_type,
+            range_dialog=True, current_idx=max(1, current_idx),
+        )
+        self._on_batch_download([item])
+
+    def _reader_download_selection(self, detail, current_idx):
+        """弹阅读器章节范围对话框；返回 (selected_list, quality) 或 None（取消）。"""
+        from gui.components.download_range_dialog import (
+            DownloadRangeDialog, build_selection,
+        )
+
+        chapters = list(getattr(detail, "chapters", None) or [])
+        total = len(chapters)
+        if total <= 1:
+            return [True] * total, ""
+        dialog = DownloadRangeDialog(
+            detail.title, total, content_type=getattr(detail, "content_type", ""),
+            parent=self, default_start=current_idx,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return None
+        return build_selection(total, dialog.selection()), dialog.quality()
 
     def _build_settings(self):
         """设置页：分区 Tab 覆盖 app_config 全量字段。"""
@@ -740,6 +952,14 @@ class MainWindow(QMainWindow):
                 _app_base_dir() / "sources"
             )
         except Exception:
+            pass
+        # 源配置（含 direct）可能变化 → 刷新 CoverLoader 的源注册表
+        try:
+            from gui.components.cover_loader import CoverLoader
+
+            for _src in self.source_manager.all():
+                CoverLoader.instance().register_source(_src)
+        except Exception:  # noqa: BLE001
             pass
         if hasattr(self, "source_page"):
             self.source_page.refresh()
@@ -1005,7 +1225,7 @@ QListWidget::item:selected {{
     background-color: {_rgba(tokens.get("accent", "#FF8FAB"), 0.85)};
 }}
 /* 3) 常用卡片：低不透明度（保留层次，背景图透出） */
-QFrame#workCard, QFrame#statsCard, QFrame#detailDrawer,
+QFrame#workCard, QFrame#statsCard,
 QFrame#catBar, QFrame#sourceRow, QFrame#shelfCard, QFrame#brokenCard {{
     background-color: {card};
 }}

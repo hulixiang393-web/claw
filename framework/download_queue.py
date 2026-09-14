@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import itertools
+import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Union
 
 try:
     from PySide6.QtCore import QThreadPool, QRunnable
@@ -29,6 +31,7 @@ except ImportError:  # 纯 Python 环境（无 Qt）时降级 threading
     QRunnable = None
 
 from .downloader import Downloader
+from .download_history import DownloadHistory
 from .errors import SourceError
 from .events import (
     Event,
@@ -116,7 +119,8 @@ class DownloadTask:
 class DownloadQueue:
     """并发下载队列（线程安全）。"""
 
-    def __init__(self, content, http, settings, source_manager, event_bus=None):
+    def __init__(self, content, http, settings, source_manager, event_bus=None,
+                 history_path: Optional[Union[str, Path]] = None):
         self._content = content
         self._http = http
         self._settings = settings
@@ -125,7 +129,13 @@ class DownloadQueue:
         self._downloader = Downloader(content, http, settings)
         self._lock = threading.RLock()
         self._tasks: List[DownloadTask] = []
-        self._seq = itertools.count(1)
+        # 下载记录持久化：重启恢复「下载完成/未下载完成」的任务（data/downloads.json）
+        self._history = DownloadHistory(history_path) if history_path else None
+        if self._history is not None:
+            self._tasks.extend(self._history.load())
+            self._seq = itertools.count(self._max_task_seq() + 1)
+        else:
+            self._seq = itertools.count(1)
         self._concurrent = max(
             1, int(settings.get("download", "max_concurrent_downloads", 6))
         )
@@ -173,6 +183,17 @@ class DownloadQueue:
             task.parallel = max(
                 1, int(self._settings.get("download", "max_parallel_chapters", 3))
             )
+            # 源级并发上限（constraints.max_concurrency）：强反爬站（如 17k
+            # 短时间并发请求即 405 封禁）需串行下载，否则只下到封禁前的若干章
+            # →「下载不完全」。取设置与源上限的较小值。
+            src = self._manager.get(detail.source_id) if self._manager else None
+            if src is not None:
+                try:
+                    cap = (src.raw.get("constraints") or {}).get("max_concurrency")
+                    if cap:
+                        task.parallel = max(1, min(task.parallel, int(cap)))
+                except Exception:  # noqa: BLE001 —— 约束非法不影响入队
+                    pass
             self._tasks.append(task)
         self._emit(
             EVENT_DOWNLOAD_STARTED,
@@ -182,6 +203,7 @@ class DownloadQueue:
         # 视频任务：后台预检 m3u8 流内广告段（不阻塞入队；失败静默，下载时再过滤）
         if detail.content_type == "video" and task.total > 0:
             self._spawn_ad_precheck(task)
+        self._save()
         self._maybe_dispatch()
         return task
 
@@ -306,6 +328,7 @@ class DownloadQueue:
                 t.end_time = time.time()
         # 通知 UI：立即反映取消（下载页刷新卡片）
         self._emit_refresh(t)
+        self._save()
 
     def _emit_refresh(self, task: DownloadTask) -> None:
         """发一个进度事件驱动下载页刷新（暂停/继续/取消后按钮状态变化）。"""
@@ -320,8 +343,14 @@ class DownloadQueue:
         )
 
     def retry_task(self, task_id: str) -> None:
-        """重试失败任务：有失败章节记录时**只重下失败章节**（记忆已完成章节），
-        无记录（早期整体失败）才整本重下。"""
+        """重试失败任务：**只重下未完成/失败章节**，已完成章节记忆全部保留
+        （done/bytes_written/epub_chapters/done_chapters）——回到「出错前状态」
+        续下，绝不整本推倒重来。
+
+        - failed_idx 非空（单章失败列表正常记录）：只勾选失败章节重下，其余保留；
+        - failed_idx 为空（早期整体失败，如源炸/合成异常）：保持原勾选与已完成
+          记忆，_download_all 按 done_chapters 自动续下尚未完成的章节。
+        """
         with self._lock:
             t = self._find(task_id)
             if t is None or t.status != TaskStatus.FAILED:
@@ -331,14 +360,11 @@ class DownloadQueue:
                 # 只重试失败章节：已完成章节保留（done/epub_chapters/done_chapters 记忆）
                 for i in range(len(t.selected)):
                     t.selected[i] = i in bad
+                # done 从「已完成且非失败」处继续 → 最终回到 100%（total 保持原值）
                 t.done = len([i for i in t.done_chapters if i not in bad])
-                # total 保持原值（done 从已完成处继续 → 最终到 100%）
             else:
-                # 无失败索引（早期整体失败）：整本重下，清空记忆
-                t.done = 0
-                t.bytes_written = 0
-                t.epub_chapters = []
-                t.done_chapters = []
+                # 整体失败：不清任何记忆，进度回落到「已成功下完的章节数」续下
+                t.done = len([i for i in t.done_chapters])
             t.failed = []
             t.failed_idx = []
             t.error = ""
@@ -347,6 +373,33 @@ class DownloadQueue:
             t.end_time = 0.0
             t.cancel_evt = threading.Event()
             t.pause_evt = threading.Event()
+        self._save()
+        self._maybe_dispatch()
+
+    def restart_task(self, task_id: str) -> None:
+        """重新下载（整本从零）：清空下载记忆与已完成章节，按原选集全部重下。
+
+        与 retry_task 的区别：retry 回到出错前状态续下；restart 明确从零重来
+        （不改动用户原始章节勾选）。
+        """
+        with self._lock:
+            t = self._find(task_id)
+            if t is None or t.status != TaskStatus.FAILED:
+                return
+            t.done = 0
+            t.bytes_written = 0
+            t.epub_chapters = []
+            t.done_chapters = []
+            t.merge_progress = 0
+            t.failed = []
+            t.failed_idx = []
+            t.error = ""
+            t.status = TaskStatus.WAITING
+            t.start_time = 0.0
+            t.end_time = 0.0
+            t.cancel_evt = threading.Event()
+            t.pause_evt = threading.Event()
+        self._save()
         self._maybe_dispatch()
 
     def remove_done(self, task_id: str) -> None:
@@ -361,6 +414,24 @@ class DownloadQueue:
                 TaskStatus.CANCELED,
             ):
                 self._tasks.remove(t)
+        self._save()
+
+    def clear_done(self) -> None:
+        """清除「下载已完成」的记录（DONE 任务移除，文件保留）。"""
+        with self._lock:
+            before = len(self._tasks)
+            self._tasks[:] = [
+                t for t in self._tasks if t.status != TaskStatus.DONE
+            ]
+            changed = len(self._tasks) != before
+        if changed:
+            self._save()
+
+    def clear_all(self) -> None:
+        """清除全部下载记录（含完成/失败/未完成，文件保留）。"""
+        with self._lock:
+            self._tasks.clear()
+        self._save()
 
     # ---- 队列级控制 ---------------------------------------------------- #
     def pause_all(self) -> None:
@@ -407,6 +478,26 @@ class DownloadQueue:
     # ------------------------------------------------------------------ #
     def _find(self, task_id: str) -> Optional[DownloadTask]:
         return next((t for t in self._tasks if t.task_id == task_id), None)
+
+    def _max_task_seq(self) -> int:
+        """已恢复任务的 task_id 序号最大值（dl-N），作为 _seq 基线防冲突。"""
+        n = 0
+        for t in self._tasks:
+            m = re.search(r"dl-(\d+)$", t.task_id or "")
+            if m:
+                n = max(n, int(m.group(1)))
+        return n
+
+    def _save(self) -> None:
+        """持久化任务快照到 downloads.json（未配置 history 时 no-op）。"""
+        if self._history is None:
+            return
+        try:
+            with self._lock:
+                snap = list(self._tasks)
+            self._history.save(snap)
+        except Exception:  # noqa: BLE001 —— 落盘失败不阻塞下载
+            pass
 
     @staticmethod
     def _do_pause(t: DownloadTask) -> None:
@@ -487,6 +578,7 @@ class DownloadQueue:
                 task.dispatched = False  # 真正结束才清位（供 resume 判断）
                 self._active_workers -= 1
                 task.end_time = time.time()
+            self._save()  # 终态落定即持久化（完成/失败/取消）
             self._emit_final(task)
             self._maybe_dispatch()
 

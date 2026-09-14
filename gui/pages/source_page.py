@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -357,6 +358,14 @@ class SourcePage(BasePage):
         self.diag_all_btn.clicked.connect(self._on_diagnose_all)
         self._toolbar.addWidget(self.diag_all_btn)
 
+        # 搜索/过滤：实时按名称 / ID / 类型隐藏不匹配的源行（仅改可见性）
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("搜索源名称 / ID...")
+        self._search_input.setFixedWidth(200)
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.textChanged.connect(self._apply_source_filter)
+        self._toolbar.addWidget(self._search_input)
+
         self._toolbar.addStretch(1)
 
         # 版本信息（右侧，防挤压：允许收缩时省略，不参与 stretch）
@@ -402,6 +411,8 @@ class SourcePage(BasePage):
             self._rows.append(row)
         self.list_layout.addStretch(1)
         self._update_empty_state()
+        # 刷新后沿用当前过滤词（不重建过滤状态）
+        self._apply_source_filter(self._search_input.text())
 
     def refresh(self) -> None:
         self._rebuild_rows()
@@ -426,6 +437,29 @@ class SourcePage(BasePage):
             txt += " · " + " · ".join(parts)
         self.version_label.setText(txt)
         self.version_label.setToolTip(txt)
+
+    # ------------------------------------------------------------------ #
+    def _apply_source_filter(self, text: str) -> None:
+        """实时过滤源行可见性：名称 / ID / 类型（中英文）大小写不敏感子串匹配。
+
+        仅调用 row.setVisible(...)，不触碰启用 / 健康 / 权重等任何状态，
+        也不重建行（保留滚动位置，避免闪烁）。
+        """
+        needle = (text or "").strip().lower()
+        for row in self._rows:
+            if not needle:
+                row.setVisible(True)
+                continue
+            src = row.source()
+            ctype = getattr(src, "content_type", "") or ""
+            haystack = " ".join((
+                str(getattr(src, "source_name", "") or ""),
+                str(getattr(src, "source_id", "") or ""),
+                str(ctype),
+                TYPE_LABEL.get(ctype, ""),
+            )).lower()
+            row.setVisible(needle in haystack)
+
 
     # ------------------------------------------------------------------ #
     def _on_set_enabled(self, source_id: str, enabled: bool) -> None:
