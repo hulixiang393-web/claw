@@ -378,9 +378,10 @@ class MainWindow(QMainWindow):
         )
         # 阅读器「背景」按钮循环 → 写回设置（记忆用户护眼背景色，下次重启沿用）
         self.reader.reading_bg_changed.connect(self._on_reading_bg_changed)
-        # App 退出：先释放 VLC 播放器，再释放共享 vlc.Instance
+        # App 退出：先落盘当前阅读进度（续读记忆跨重启保留），再释放 VLC。
         from PySide6.QtWidgets import QApplication
 
+        QApplication.instance().aboutToQuit.connect(self.reader.flush_progress)
         QApplication.instance().aboutToQuit.connect(self.reader.shutdown_video)
         from framework.vlc_player import shutdown_vlc
 
@@ -486,7 +487,13 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_tab_changed(self, idx: int) -> None:
-        """Tab 切换：切到书架时重建一次（续读记忆实时更新，读完回来即看到）。"""
+        """Tab 切换：离开阅读 Tab 先落盘进度；切到书架时重建一次（续读实时更新）。"""
+        # 离开阅读 Tab → 落盘当前作品进度（切走不丢续读位置）
+        prev = getattr(self, "_last_tab_idx", None)
+        reader_idx = self._tab_index.get("reader")
+        if prev == reader_idx and idx != reader_idx and self.reader is not None:
+            self.reader.flush_progress()
+        self._last_tab_idx = idx
         page = self.tabs.widget(idx)
         if page is getattr(self, "library_page", None) and hasattr(page, "refresh"):
             page.refresh()

@@ -58,6 +58,7 @@ class NovelView(QWidget):
         self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
         self._pending_restore = None  # 打开书续读位置 (position, page)，首次显示章时定位
         self._auto_scrolling = False  # 自动滚动开关
+        self._auto_pos = 0.0  # 自动滚动记住的位置（浮点，按速度递增，重排不打断）
         self._auto_timer = QTimer(self)  # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
         self._auto_timer.setInterval(35)
 
@@ -441,6 +442,7 @@ class NovelView(QWidget):
             if vbar.maximum() <= 0 or self._mode != "scroll":
                 return
             self._auto_scrolling = True
+            self._auto_pos = float(vbar.value())  # 记住当前位置，按速度递增
             self.auto_scroll_btn.setText("⏸ 停止")
             self._auto_timer.start()
 
@@ -453,12 +455,21 @@ class NovelView(QWidget):
         self.auto_scroll_btn.setText("▶ 自动滚动")
 
     def _auto_scroll_tick(self) -> None:
-        """QTimer 回调：每次滚动 (slider_value * 5) px，高频小步进平滑滚动，到底自动停止。"""
+        """把记住的位置按设定速度递增，平滑向下滚动；到底自动停止。
+
+        用独立浮点位置累积，不读回 vbar.value()：正文/图片重排不会打断推进，
+        也不会与重排修正叠加导致跳过内容。
+        """
         vbar = self.scroll.verticalScrollBar()
-        if vbar.value() >= vbar.maximum():
+        if vbar.maximum() <= 0:
             self._stop_auto_scroll()
             return
-        vbar.setValue(vbar.value() + self.auto_scroll_speed_slider.value() * 5)
+        self._auto_pos += self.auto_scroll_speed_slider.value() * 5
+        if self._auto_pos >= vbar.maximum():
+            vbar.setValue(vbar.maximum())
+            self._stop_auto_scroll()
+            return
+        vbar.setValue(int(self._auto_pos))
 
     def _update_auto_scroll_slider_state(self) -> None:
         """根据当前模式和滚动范围启用/禁用自动滚动速度滑块。"""

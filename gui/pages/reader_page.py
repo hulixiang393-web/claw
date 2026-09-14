@@ -328,6 +328,17 @@ class ReaderPage(BasePage):
                 pos, page = view.position_snapshot()
                 self._on_progress_signal((*ctx, pos, page))
 
+    def flush_progress(self) -> None:
+        """对外：落盘当前阅读进度（App 退出 / 切走阅读 Tab 时调用）。
+
+        记忆只在「书架进入的书」上生效的要求由调用方保证；本方法对所有已打开
+        作品落盘（幂等），不改变其它行为。
+        """
+        try:
+            self._flush_current_progress()
+        except Exception:  # noqa: BLE001 —— 记忆失败不影响退出
+            pass
+
     # ------------------------------------------------------------------ #
     def open(self, source_id: str, book_url: str, content_type: str, start_chapter_url: str = "") -> None:
         """打开一部作品（续读：记忆的章节/位置优先于调用方传入）。"""

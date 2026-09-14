@@ -9,11 +9,15 @@
 - **h-comic 发现页慢**：根因 = `wait_until:networkidle` 每页约 28s，3 页串行约 90s 像「打不开」。改 `domcontentloaded`（配 `wait_for`）→ 约 14s/页。测试：引擎实测 10 部/页。
 - **阅读器自动滚动晃动**：根因 = 漫画懒加载图片由占位高（600px）变实际高，视口上方内容高度变化使可视内容上下位移。修 `comic_view._relayout_gallery`：新增 `_visible_anchor()`，以视口顶部所在图为锚，重排后补偿滚动值（贴底仍跟底）。测试 `tests/test_comic_scroll_anchor.py`（2）。
 - 顺带修 `gui/_smoke_reader.py` 的 `MockHttp.get_text` 签名（缺 `direct`，既有失效）。
+- **自动滚动改为「记住位置 + 按速度递增」**（用户要求，替换上一版滚动锚定）：`novel_view`/`comic_view` 用独立浮点 `_auto_pos` 累积，`_auto_scroll_tick` 只做 `_auto_pos += speed`；`comic_view._relayout_gallery` 在自动滚动中不改动滚动值（避免与速度推进叠加 → 跳过某页）。测试 `tests/test_comic_scroll_anchor.py`（3，无图 stub，避免异步解码 Qt 竞态）。
+- **阅读进度跨重启**：新增 `ReaderPage.flush_progress()`；`app` 在 `aboutToQuit` 与「离开阅读 Tab」时落盘当前进度（此前退出不落盘）。测试 `tests/test_reading_progress_shelf.py`（3）。
 ### 提交状态
-- 已 commit + push 到 origin/master（`9113ce1`，含此前 57 个未推送提交）。全量 `--ignore flaky` **552 passed**。
+- 已 commit + push 到 origin/master（`9113ce1` + `48d5594`）。全量 `--ignore flaky` **556 passed**。
 ### 待办（@followup）
 - 17k 需用户填 `data/proxies.json` 代理池才可绕过 405 封禁；未填则仅串行降速。
 - 用户反馈 h-comic「一页12卡片、1万多页」待确认是否仍有具体问题（引擎/分页实测正常）。
+- 阅读进度「重启后从头开始」：代码链路实测可续读（15/16 书架书 URL 命中）；已补退出落盘。若仍复现，需用户提供具体书/源/步骤（疑与打包 exe 的独立 data 目录有关）。
+
 
 
 ## 爱丽丝书屋封面不加载修复（2026-09-13，未提交）

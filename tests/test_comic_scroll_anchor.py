@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
-"""漫画阅读器滚动锚定测试（test_comic_scroll_anchor.py）。
+"""漫画阅读器自动滚动平滑性测试（test_comic_scroll_anchor.py）。
 
-背景：自动滚动/手动滚动时，懒加载图片由占位高（600px）变为实际高，当前
-可视内容随上方高度变化上下位移 → 视觉「晃动」。修复：`_relayout_gallery`
-以视口顶部所在的那张图为锚，重排后补偿滚动值，保持可视内容不动。
+背景：自动滚动需要「记住当前位置 → 按设定速度递增」，不得因图片懒加载重排
+而修正滚动值（会与速度推进叠加 → 跳过某一页/直接跳到另一页）。
 
-离线（offscreen）：mock content 返回 data URI 图片，不触达网络。
+覆盖：
+- `_auto_scroll_tick` 按速度单调递增（不跳、不回退）。
+- 自动滚动中 `_relayout_gallery` 不改动滚动值。
+- 到最大值自动停止。
+
+离线（offscreen）：不加载图片、不触达网络（直接设置滚动范围，避免异步图片
+解码的 Qt 生命周期竞态）。
 """
 from __future__ import annotations
 
-import base64
 import os
 import sys
 from pathlib import Path
@@ -18,28 +22,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
-from PySide6.QtCore import QEventLoop, QTimer, QBuffer
-from PySide6.QtGui import QImage
 
-from framework.content import Detail, Chapter
-from gui.pages.reader.comic_view import ComicView, _ComicImageLabel
-
-
-def _png_uri(w: int, h: int, color: int) -> str:
-    img = QImage(w, h, QImage.Format_RGB32)
-    img.fill(color)
-    buf = QBuffer()
-    buf.open(QBuffer.WriteOnly)
-    img.save(buf, "PNG")
-    return "data:image/png;base64," + base64.b64encode(bytes(buf.data())).decode()
+from framework.content import Chapter
+from gui.pages.reader.comic_view import ComicView
 
 
 class _MockContent:
-    def __init__(self, uris):
-        self._uris = uris
-
     def fetch_comic_pages(self, source, url, on_page=None, cancel_evt=None):
-        return list(self._uris)
+        return []
 
 
 @pytest.fixture(scope="module")
@@ -47,68 +37,64 @@ def app(_qapp):
     return _qapp
 
 
-def _wait(app, ms=50, times=1):
-    for _ in range(times):
-        loop = QEventLoop()
-        QTimer.singleShot(ms, loop.quit)
-        loop.exec()
-        app.processEvents()
+@pytest.fixture(scope="module")
+def comic(app):
+    c = ComicView(_MockContent())
+    c.resize(700, 800)
+    c.show()
+    c._chapters = [Chapter("第1话", "http://x/c/1")]
+    c._current_idx = 0
+    c._images = []
+    # 撑起 gallery 高度，让滚动范围稳定（避免空内容时 adjustSize 把范围收为 0）
+    c.gallery.setMinimumHeight(20000)
+    c.gallery.adjustSize()
+    app.processEvents()
+    yield c
+    c._stop_auto_scroll()
+    c.hide()
 
 
-def _make_comic(app):
-    uris = [_png_uri(400, 900, 0xFF000000 | (i * 1234)) for i in range(40)]
-    detail = Detail(
-        source_id="demo", content_type="comic", url="http://x/c/1",
-        title="测试漫画", chapters=[Chapter("第1话", "http://x/c/1/1")],
+def _reset(comic, value=0):
+    comic._stop_auto_scroll()
+    comic.gallery.setMinimumHeight(20000)
+    comic.gallery.adjustSize()
+    comic.scroll.verticalScrollBar().setValue(value)
+
+
+def test_tick_increments_monotonically_by_speed(app, comic):
+    _reset(comic, 0)
+    comic.auto_scroll_speed_slider.setValue(3)
+    comic._toggle_auto_scroll()
+    assert comic._auto_scrolling
+    prev = comic.scroll.verticalScrollBar().value()
+    for _ in range(20):
+        comic._auto_scroll_tick()
+        assert comic.scroll.verticalScrollBar().value() >= prev, "自动滚动值不得回退"
+        prev = comic.scroll.verticalScrollBar().value()
+    assert comic.scroll.verticalScrollBar().value() == 15 * 20, (
+        f"应按 3*5=15px/tick 递增，got {comic.scroll.verticalScrollBar().value()}"
     )
-    comic = ComicView(_MockContent(uris))
-    comic.resize(700, 800)
-    comic.show()
-    comic.load(object(), detail, "")
-    _wait(app, 50, 40)
-    comic._render_incremental(force_full=True)
-    _wait(app, 50, 40)
-    return comic
+    comic._stop_auto_scroll()
 
 
-def test_visible_anchor_returns_widget_under_viewport(app):
-    comic = _make_comic(app)
+def test_relayout_does_not_change_value_while_auto_scrolling(app, comic):
+    _reset(comic, 2000)
+    comic._toggle_auto_scroll()
+    before = comic.scroll.verticalScrollBar().value()
+    comic._relayout_gallery()  # 模拟图片懒加载重排
+    app.processEvents()
+    assert comic.scroll.verticalScrollBar().value() == before, "自动滚动中重排不得改动滚动值"
+    comic._stop_auto_scroll()
+
+
+def test_tick_stops_at_bottom(app, comic):
+    _reset(comic, 0)
     vbar = comic.scroll.verticalScrollBar()
-    assert vbar.maximum() > 0
-    vbar.setValue(vbar.maximum() // 2)
-    app.processEvents()
-    anchor = comic._visible_anchor(vbar.value())
-    assert anchor is not None
-    widget, offset = anchor
-    assert widget.y() <= vbar.value() < widget.y() + widget.height()
-    assert offset == vbar.value() - widget.y()
-    comic.deleteLater()
-    app.processEvents()
-
-
-def test_relayout_keeps_visible_content_anchored(app):
-    """视口上方图片高度变化后，可视内容（锚点相对位置）保持不动。"""
-    comic = _make_comic(app)
-    vbar = comic.scroll.verticalScrollBar()
-    labels = comic.findChildren(_ComicImageLabel)
-    vbar.setValue(vbar.maximum() // 2)
-    app.processEvents()
-    widget, offset = comic._visible_anchor(vbar.value())
-
-    above = next(
-        (l for l in labels if l.y() + l.height() <= vbar.value()), None
-    )
-    assert above is not None, "前置条件：应有视口上方的图片"
-    above.setMinimumHeight(above.height() + 700)  # 上方图片晚到、变高
-    comic._relayout_gallery()
-    app.processEvents()
-
-    new_offset = vbar.value() - widget.y()
-    assert abs(new_offset - offset) <= 2, (
-        f"锚点相对位置应保持（可视内容不动），was {offset} now {new_offset}"
-    )
-    comic.deleteLater()
-    app.processEvents()
+    vbar.setValue(vbar.maximum() - 3)
+    comic._toggle_auto_scroll()
+    comic._auto_scroll_tick()
+    assert not comic._auto_scrolling, "到底应自动停止"
+    assert vbar.value() == vbar.maximum()
 
 
 if __name__ == "__main__":

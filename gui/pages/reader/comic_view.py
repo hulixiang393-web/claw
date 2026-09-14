@@ -72,6 +72,7 @@ class ComicView(QWidget):
         self._reading_bg = ""  # 阅读区独立背景色（空=透明跟随主题）
         self._reading_fg = ""  # 夜间黑等深色背景下的前景色（漫画以图为主，预留）
         self._auto_scrolling = False  # 自动滚动开关
+        self._auto_pos = 0.0  # 自动滚动记住的位置（浮点，按速度递增，重排不打断）
         self._auto_timer = QTimer(self)  # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
         self._auto_timer.setInterval(35)
 
@@ -563,49 +564,17 @@ class ComicView(QWidget):
         self._relayout_pending = False
         self._relayout_gallery()
 
-    def _visible_anchor(self, value: int):
-        """取视口顶部所在的那张图（或话头）作为滚动锚点。
-
-        返回 (widget, offset)：offset = 滚动值 - widget.y()，即视口顶部相对
-        该 widget 顶部的偏移。重排后可用 widget.y() + offset 还原同一可视内容。
-        """
-        layout = self.gallery.layout()
-        if layout is None:
-            return None
-        for i in range(layout.count()):
-            w = layout.itemAt(i).widget()
-            if w is None or not w.isVisible():
-                continue
-            y = w.y()
-            if y <= value < y + w.height():
-                return (w, value - y)
-        return None
-
     def _relayout_gallery(self) -> None:
         """按内容重算 gallery 高度（widgetResizable=False 不会自动跟随）。
 
-        滚动锚定：懒加载图片由占位高（600px）变为实际高后，当前可视内容会随
-        上方高度变化上下位移——自动滚动/手动滚动时表现为「晃动」。以视口顶部
-        所在的那张图为锚，重排后把滚动值补偿回它原来的相对位置，保持可视内容
-        不动（贴底时仍跟随底部）。
+        自动滚动中不动滚动值：滚动位置由 `_auto_scroll_tick` 记住并按设定速度
+        独占推进；若这里再按重排结果修正，会与速度推进叠加 → 跳过某一页/直接
+        跳到另一页。非自动滚动时才把越界的值收回范围内。
         """
         if self.gallery.layout() is not None:
-            vbar = self.scroll.verticalScrollBar()
-            old_value = vbar.value()
-            old_max = vbar.maximum()
-            at_bottom = old_max > 0 and old_value >= old_max - 8
-            anchor = self._visible_anchor(old_value)
             self.gallery.adjustSize()
-            self.gallery.layout().activate()  # 立即生效，保证 widget.y() 已更新
-            if at_bottom:
-                vbar.setValue(vbar.maximum())  # 贴底跟随底部（无限滚动语义）
-            elif anchor is not None:
-                widget, offset = anchor
-                vbar.setValue(max(0, min(widget.y() + offset, vbar.maximum())))
-            else:
-                vbar.setValue(min(old_value, vbar.maximum()))
-        else:
-            vbar = self.scroll.verticalScrollBar()
+        vbar = self.scroll.verticalScrollBar()
+        if not self._auto_scrolling:
             vbar.setValue(min(vbar.value(), vbar.maximum()))
         # 懒加载安全网：内容不足一屏（maximum==0）时没有滚动事件可触发，
         # 主动补一批直至可滚动，避免短页/小图章节读到后面缺图。
@@ -790,6 +759,7 @@ class ComicView(QWidget):
             if vbar.maximum() <= 0 or self._mode != "gallery":
                 return
             self._auto_scrolling = True
+            self._auto_pos = float(vbar.value())  # 记住当前位置，按速度递增
             self.auto_scroll_btn.setText("⏸ 停止")
             self._auto_timer.start()
 
@@ -802,12 +772,21 @@ class ComicView(QWidget):
         self.auto_scroll_btn.setText("▶ 自动滚动")
 
     def _auto_scroll_tick(self) -> None:
-        """QTimer 回调：每次滚动 (slider_value * 5) px，高频小步进平滑滚动，到底自动停止。"""
+        """把记住的位置按设定速度递增，平滑向下滚动；到底自动停止。
+
+        用独立的浮点位置 `_auto_pos` 累积，不读回 `vbar.value()`：图片懒加载
+        重排不会打断推进节奏，也不会因重排修正叠加导致跳过某一页。
+        """
         vbar = self.scroll.verticalScrollBar()
-        if vbar.value() >= vbar.maximum():
+        if vbar.maximum() <= 0:
             self._stop_auto_scroll()
             return
-        vbar.setValue(vbar.value() + self.auto_scroll_speed_slider.value() * 5)
+        self._auto_pos += self.auto_scroll_speed_slider.value() * 5
+        if self._auto_pos >= vbar.maximum():
+            vbar.setValue(vbar.maximum())
+            self._stop_auto_scroll()
+            return
+        vbar.setValue(int(self._auto_pos))
 
     def _update_auto_scroll_slider_state(self) -> None:
         """根据当前模式和滚动范围启用/禁用自动滚动速度滑块。"""
