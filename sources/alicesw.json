@@ -6,8 +6,8 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
-    "homepage": "https://www.alicesw1.homes",
-    "description": "爱丽丝书屋 - 全属性免费小说创作网站（成人）。原 www.alicesw.com 在国内被墙/超时，官方发布页给出大陆可用域名 www.alicesw1.homes（备用 alicesw.quest / alicesw.click）。国内直连可达（transports.direct 屏蔽系统代理），列表/详情/目录/正文 SSR 全可抓。",
+    "homepage": "https://www.alicesw1.homes/",
+    "description": "爱丽丝书屋 - 全属性免费小说创作网站（成人）",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -41,6 +41,10 @@
         "categories": [
           {
             "title": "最新",
+            "url": "/original.html"
+          },
+          {
+            "title": "原创区",
             "url": "/original.html"
           },
           {
@@ -86,6 +90,78 @@
           {
             "title": "穿越",
             "url": "/lists/70.html"
+          },
+          {
+            "title": "反差",
+            "url": "/lists/22.html"
+          },
+          {
+            "title": "凌辱",
+            "url": "/lists/46.html"
+          },
+          {
+            "title": "堕落",
+            "url": "/lists/18.html"
+          },
+          {
+            "title": "纯爱",
+            "url": "/lists/19.html"
+          },
+          {
+            "title": "伪娘",
+            "url": "/lists/52.html"
+          },
+          {
+            "title": "萝莉",
+            "url": "/lists/48.html"
+          },
+          {
+            "title": "熟女",
+            "url": "/lists/56.html"
+          },
+          {
+            "title": "正太",
+            "url": "/lists/50.html"
+          },
+          {
+            "title": "明星",
+            "url": "/lists/72.html"
+          },
+          {
+            "title": "NTR",
+            "url": "/lists/54.html"
+          },
+          {
+            "title": "媚黑",
+            "url": "/lists/53.html"
+          },
+          {
+            "title": "调教",
+            "url": "/lists/58.html"
+          },
+          {
+            "title": "言情",
+            "url": "/lists/59.html"
+          },
+          {
+            "title": "百合",
+            "url": "/lists/47.html"
+          },
+          {
+            "title": "耽美",
+            "url": "/lists/82.html"
+          },
+          {
+            "title": "重口",
+            "url": "/lists/21.html"
+          },
+          {
+            "title": "乡村",
+            "url": "/lists/63.html"
+          },
+          {
+            "title": "其他",
+            "url": "/lists/57.html"
           }
         ]
       },
@@ -106,6 +182,14 @@
             "css": "a[href*='/novel/'] img",
             "attr": "src"
           }
+        },
+        "clean": {
+          "title": [
+            [
+              "re:^\\d+\\.\\s*",
+              ""
+            ]
+          ]
         }
       }
     },
@@ -115,9 +199,8 @@
       "keyword_param": "q",
       "item": {
         "root_selector": {
-          "css": "a[href*='/novel/']"
+          "css": "div.list-group-item h5"
         },
-        "cover_backfill": true,
         "fields": {
           "title": {
             "css": "a[href*='/novel/']"
@@ -130,6 +213,15 @@
             "css": "a[href*='/novel/'] img",
             "attr": "src"
           }
+        },
+        "cover_backfill": true,
+        "clean": {
+          "title": [
+            [
+              "re:^\\d+\\.\\s*",
+              ""
+            ]
+          ]
         }
       },
       "paginator": {
@@ -137,6 +229,7 @@
       }
     },
     "detail": {
+      "url_pattern": "/novel/[\\d]+\\.html",
       "fields": {
         "title": {
           "css": "div.novel_title"
@@ -146,8 +239,25 @@
           "attr": "data-src"
         },
         "summary": {
-          "css": "meta[name='description']",
-          "attr": "content"
+          "css": "div.jianjie p"
+        },
+        "author": {
+          "css": "div.novel_info p:first-child a"
+        },
+        "status": {
+          "css": "div.novel_info p:nth-of-type(5)"
+        },
+        "tags": {
+          "css": "div.tags_list a",
+          "regex": "#?\\s*([^#\\s]+)"
+        },
+        "clean": {
+          "status": [
+            [
+              "re:^状\\s*态[:：]\\s*",
+              ""
+            ]
+          ]
         }
       }
     },
@@ -156,7 +266,7 @@
         "list": {
           "chapters_url": "/other/chapters/id/{id}.html",
           "root_selector": {
-            "css": "a[href*='/book/']"
+            "css": "ul.mulu_list li a[href*='/book/']"
           },
           "chapter_order": "asc",
           "fields": {

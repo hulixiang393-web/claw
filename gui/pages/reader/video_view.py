@@ -774,6 +774,10 @@ class VideoView(QWidget):
         """
         if not isinstance(obj, QWidget):
             return False
+        # 视图不可见且未全屏时（如切到其他页/弹窗创建控件）直接放行，
+        # 避免对无关控件的每个事件做父链/isAncestorOf 判定卡顿弹窗。
+        if not self.isVisible() and self._fs_win is None:
+            return False
         if event.type() in (QEvent.MouseMove, QEvent.Enter):
             if obj is self._video_frame or self._video_frame.isAncestorOf(obj):
                 self._wake_controls()

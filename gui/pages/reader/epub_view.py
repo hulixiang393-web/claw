@@ -698,7 +698,9 @@ class EpubView(QWidget):
         正文 QLabel 带 TextSelectableByMouse 会吞掉子控件级鼠标事件，故用
         应用级过滤器覆盖滚动区/正文/目录等所有子控件；非本视图事件直接放行。
         """
-        if not self._is_descendant(obj):
+        # 视图不可见时（如切到其他页/弹窗创建控件）直接放行，
+        # 避免对无关控件的每个事件做父链遍历（应用级过滤器全量触发）卡顿弹窗。
+        if not self.isVisible() or not self._is_descendant(obj):
             return super().eventFilter(obj, event)
         if event.type() == event.Type.MouseButtonPress:
             btn = event.button()

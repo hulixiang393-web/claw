@@ -149,6 +149,7 @@ class WorkCard(QFrame):
                 "color: palette(dark); font-size: 10px;"
             )
             self._source_label.setCursor(Qt.PointingHandCursor)
+            self._source_label.setToolTip("点击仅看此来源")
             self._source_label.installEventFilter(self)
             layout.addWidget(self._source_label)
             if update_text:
@@ -298,6 +299,7 @@ class WorkCard(QFrame):
                 "color: palette(dark); font-size: 10px;"
             )
             self._source_label.setCursor(Qt.PointingHandCursor)
+            self._source_label.setToolTip("点击仅看此来源")
             self._source_label.installEventFilter(self)
             layout.addWidget(self._source_label)
             if update_text:

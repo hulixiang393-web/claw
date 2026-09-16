@@ -135,5 +135,20 @@ def test_filter_on_source_click(app):
     assert _sheet_ids(page) == {"site_a", "site_b"}
 
 
+def test_filter_load_more_keeps_source(app):
+    """筛选后滚动加载（_load_more_results）不得把其他源结果混进来。"""
+    page = _make_page(app)
+    page._results = _results()
+    page._results_display = list(page._results)
+    page._shown_count = len(page._results)
+    page._page_size = 2
+
+    # 首次筛选 site_a：1 屏（load_more 触发点）只应渲染该源卡片
+    page._set_filter("site_a")
+    page._shown_count = 0  # 模拟首屏只渲染了一部分、后续走滚动加载
+    page._load_more_results()
+    assert _sheet_ids(page) == {"site_a"}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

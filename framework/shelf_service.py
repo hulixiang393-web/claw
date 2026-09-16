@@ -364,6 +364,12 @@ class ShelfService:
     def favorite_remove(self, url: str) -> bool:
         return bool(self._store and self._store.remove(url))
 
+    def favorite_clear_folder(self, folder: str) -> int:
+        """一键清空某收藏夹内的全部收藏（保留收藏夹，不删本地文件）。返回移除条数。"""
+        if self._store is None:
+            return 0
+        return self._store.clear_folder(folder)
+
     def favorite_move(self, url: str, folder: str) -> bool:
         return bool(self._store and self._store.set_folder(url, folder))
 

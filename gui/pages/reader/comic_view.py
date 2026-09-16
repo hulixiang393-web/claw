@@ -14,7 +14,7 @@ from __future__ import annotations
 import threading
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
+from PySide6.QtCore import Qt, QTimer, QElapsedTimer, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -34,9 +34,16 @@ from framework.content import Content, Detail
 # 预加载后续话数：当前话加载完成即预渲染后续 PREFETCH_COUNT 话（串行队列，不抢当前话首屏）
 PREFETCH_COUNT = 3  # 预渲染后续话数：连看时下一话已就绪、再下一话开始预渲染，切话更顺
 PREFETCH_BACK = 3  # 向前缓存话数：向上翻话命中缓存秒开（以当前话为基点前 3 话）
-# 懒加载：首屏渲染页数 / 滚动增量渲染每批页数
+# 循环滚动：首屏渲染页数 / 滚动增量渲染每批页数
 INITIAL_RENDER_COUNT = 10
 LAZY_BATCH = 12
+# 自动滚动：1 档基础速度（px/s）；调速为等比数列，相邻档位相差 1.25 倍。
+# 档位 v 的速度 = BASE * 1.25^(v-1)：低档细腻、高档有力且档位间倍率均匀，
+# 调速更精准（相比线性「每档 +160」低速档感差距过大）。
+# 默认 3 档 = 90*1.25^2 ≈ 140px/s（原 480px/s 整体偏快，已下调）。
+AUTO_BASE_PX_PER_SEC = 90.0
+AUTO_RATIO = 1.25
+AUTO_TICK_MS = 16  # 高频帧驱动：对齐 60Hz 屏幕刷新，视觉连续不断顿
 
 
 class ComicView(QWidget):
@@ -73,8 +80,13 @@ class ComicView(QWidget):
         self._reading_fg = ""  # 夜间黑等深色背景下的前景色（漫画以图为主，预留）
         self._auto_scrolling = False  # 自动滚动开关
         self._auto_pos = 0.0  # 自动滚动记住的位置（浮点，按速度递增，重排不打断）
-        self._auto_timer = QTimer(self)  # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
-        self._auto_timer.setInterval(35)
+        # 自动滚动定时器：高频帧驱动（16ms≈60fps，对齐屏幕刷新），步进按真实经过
+        # 时间换算成像素，避免低频跳变（35ms+固定步进 = 一顿一顿）与定时器抖动。
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(16)
+        self._auto_timer.setTimerType(Qt.PreciseTimer)
+        self._auto_elapsed = QElapsedTimer()  # 帧间真实耗时基准（速度恒定）
+        self._auto_last_tick = 0.0  # 上一帧时间戳（单调秒），dt 基准
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -111,7 +123,7 @@ class ComicView(QWidget):
 
         self.auto_scroll_btn = QPushButton("▶ 自动滚动")
         self.auto_scroll_btn.setFixedWidth(90)
-        self.auto_scroll_btn.setToolTip("开启/关闭自动滚动（Ctrl+Alt+A）")
+        self.auto_scroll_btn.setToolTip("开启/关闭自动滚动（空格键）")
         self.auto_scroll_btn.clicked.connect(self._toggle_auto_scroll)
         toolbar.addWidget(self.auto_scroll_btn)
 
@@ -119,17 +131,19 @@ class ComicView(QWidget):
         self.auto_scroll_speed_slider.setRange(1, 10)
         self.auto_scroll_speed_slider.setValue(3)
         self.auto_scroll_speed_slider.setFixedWidth(100)
-        self.auto_scroll_speed_slider.setToolTip("自动滚动速度（1最慢，10最快）")
+        self.auto_scroll_speed_slider.setToolTip("自动滚动速度（1最慢，10最快，相邻档位相差 1.25 倍）")
         self.auto_scroll_speed_slider.setEnabled(False)
         toolbar.addWidget(self.auto_scroll_speed_slider)
 
-        self.auto_scroll_speed_label = QLabel("3")
-        self.auto_scroll_speed_label.setFixedWidth(12)
+        self.auto_scroll_speed_label = QLabel(
+            f"{self._auto_speed_px_s(self.auto_scroll_speed_slider.value()):.0f}"
+        )
+        self.auto_scroll_speed_label.setFixedWidth(28)
         self.auto_scroll_speed_label.setAlignment(Qt.AlignCenter)
         toolbar.addWidget(self.auto_scroll_speed_label)
 
         self.auto_scroll_speed_slider.valueChanged.connect(
-            lambda v: self.auto_scroll_speed_label.setText(str(v))
+            lambda v: self.auto_scroll_speed_label.setText(f"{self._auto_speed_px_s(v):.0f}")
         )
 
         toolbar.addStretch(1)
@@ -188,7 +202,9 @@ class ComicView(QWidget):
             app.installEventFilter(self)
         # 自动滚动定时器 + 快捷键
         self._auto_timer.timeout.connect(self._auto_scroll_tick)
-        QShortcut(QKeySequence("Ctrl+Alt+A"), self).activated.connect(self._toggle_auto_scroll)
+        QShortcut(QKeySequence(Qt.Key_Space), self).activated.connect(self._toggle_auto_scroll)
+        # 用户手动拖动滚动条时停止自动滚动（否则每 16ms tick 会拉回原位，无法拖动）
+        self.scroll.verticalScrollBar().sliderPressed.connect(self._on_scrollbar_user_interaction)
         # 键盘焦点（支持←→↑↓翻话/翻图）
         self.setFocusPolicy(Qt.StrongFocus)
 
@@ -760,6 +776,8 @@ class ComicView(QWidget):
                 return
             self._auto_scrolling = True
             self._auto_pos = float(vbar.value())  # 记住当前位置，按速度递增
+            self._auto_elapsed.start()
+            self._auto_last_tick = time.monotonic()
             self.auto_scroll_btn.setText("⏸ 停止")
             self._auto_timer.start()
 
@@ -771,29 +789,52 @@ class ComicView(QWidget):
         self._auto_timer.stop()
         self.auto_scroll_btn.setText("▶ 自动滚动")
 
+    def _on_scrollbar_user_interaction(self) -> None:
+        """用户手动拖动滚动条（sliderPressed）时停止自动滚动，让手动接管。"""
+        self._stop_auto_scroll()
+
     def _auto_scroll_tick(self) -> None:
-        """把记住的位置按设定速度递增，平滑向下滚动；到底自动停止。
+        """按真实经过时间推进位置，向下平滑滚动；到底自动停止。
 
         用独立的浮点位置 `_auto_pos` 累积，不读回 `vbar.value()`：图片懒加载
         重排不会打断推进节奏，也不会因重排修正叠加导致跳过某一页。
+
+        步进 = 速度(px/s) × 本帧真实耗时：即使事件循环繁忙导致 tick 抖动，
+        滚动也保持恒定速度帧间连续，不出现「按固定频率一下一下跳」的顿挫感。
         """
         vbar = self.scroll.verticalScrollBar()
         if vbar.maximum() <= 0:
             self._stop_auto_scroll()
             return
-        self._auto_pos += self.auto_scroll_speed_slider.value() * 5
+        now = time.monotonic()
+        dt = now - self._auto_last_tick
+        self._auto_last_tick = now
+        if dt > 0.1:  # 长时间挂起（切后台/卡顿恢复）不一次性猛跳
+            dt = AUTO_TICK_MS / 1000.0
+        speed_px_s = self._auto_speed_px_s(self.auto_scroll_speed_slider.value())
+        self._auto_pos += speed_px_s * dt
         if self._auto_pos >= vbar.maximum():
             vbar.setValue(vbar.maximum())
             self._stop_auto_scroll()
             return
         vbar.setValue(int(self._auto_pos))
 
+    def _auto_speed_px_s(self, level: int) -> float:
+        """档位速度（px/s）：等比数列，相邻档位相差 1.25 倍。
+
+        speed(level) = AUTO_BASE_PX_PER_SEC * AUTO_RATIO^(level-1)：
+        低速档步进细腻（可精细阅读），高速档也有力，档位切换感知均匀。
+        """
+        return AUTO_BASE_PX_PER_SEC * (AUTO_RATIO ** (level - 1))
+
     def _update_auto_scroll_slider_state(self) -> None:
-        """根据当前模式和滚动范围启用/禁用自动滚动速度滑块。"""
-        if self._mode == "gallery" and self.scroll.verticalScrollBar().maximum() > 0:
-            self.auto_scroll_speed_slider.setEnabled(True)
-        else:
-            self.auto_scroll_speed_slider.setEnabled(False)
+        """根据当前模式启用/禁用自动滚动速度滑块。
+
+        只按模式判定（不依赖 maximum>0）：漫画懒加载分批渲染，加载结束瞬间
+        maximum 可能仍为 0 造成滑块被误禁用且后续不再刷新 → 拖不动。画廊模式
+        下始终可拖（数值只是档位，无需内容高度）。
+        """
+        self.auto_scroll_speed_slider.setEnabled(self._mode == "gallery")
 
     def _restore_position_with_retry(self, pos: float, tries: int = 8) -> None:
         """按 0~1 比例恢复滚动位置，重试链随懒加载高度增长逐步到位。
@@ -839,7 +880,9 @@ class ComicView(QWidget):
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         # 应用级过滤器：先判定事件是否属于本视图（防误吞其他页面的 Ctrl+滚轮/侧键）
-        if not self._is_descendant(obj):
+        # 视图不可见时（如切到其他页/弹窗创建控件）直接放行，
+        # 避免对无关控件的每个事件做父链遍历（应用级过滤器全量触发）卡顿弹窗。
+        if not self.isVisible() or not self._is_descendant(obj):
             return super().eventFilter(obj, event)
         if event.type() == event.Type.Wheel:
             if event.modifiers() & Qt.ControlModifier:
@@ -849,6 +892,9 @@ class ComicView(QWidget):
                 self._apply_zoom()
                 event.accept()
                 return True
+            # 普通滚轮：用户手动滚动 → 停止自动滚动，交由滚动条处理
+            if self._auto_scrolling:
+                self._stop_auto_scroll()
             return False  # 普通滚动交给滚动条
         if event.type() == event.Type.MouseButtonPress:
             btn = event.button()

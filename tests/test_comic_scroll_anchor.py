@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -67,12 +68,20 @@ def test_tick_increments_monotonically_by_speed(app, comic):
     comic._toggle_auto_scroll()
     assert comic._auto_scrolling
     prev = comic.scroll.verticalScrollBar().value()
+    comic._auto_last_tick = time.monotonic() - 0.016  # 模拟 1 帧 elapsed=16ms
+    dt = 0.016
     for _ in range(20):
         comic._auto_scroll_tick()
-        assert comic.scroll.verticalScrollBar().value() >= prev, "自动滚动值不得回退"
-        prev = comic.scroll.verticalScrollBar().value()
-    assert comic.scroll.verticalScrollBar().value() == 15 * 20, (
-        f"应按 3*5=15px/tick 递增，got {comic.scroll.verticalScrollBar().value()}"
+        # 模拟下一帧：把时间基准往前拨固定 16ms，保持恒速推进
+        comic._auto_last_tick = time.monotonic() - dt
+        v = comic.scroll.verticalScrollBar().value()
+        assert v >= prev, "自动滚动值不得回退"
+        prev = v
+    from gui.pages.reader.comic_view import AUTO_BASE_PX_PER_SEC, AUTO_RATIO
+
+    speed = AUTO_BASE_PX_PER_SEC * (AUTO_RATIO ** (3 - 1))
+    assert comic.scroll.verticalScrollBar().value() == int(20 * dt * speed), (
+        f"应按 速度(px/s)*dt 线性递增，got {comic.scroll.verticalScrollBar().value()}"
     )
     comic._stop_auto_scroll()
 
@@ -92,6 +101,7 @@ def test_tick_stops_at_bottom(app, comic):
     vbar = comic.scroll.verticalScrollBar()
     vbar.setValue(vbar.maximum() - 3)
     comic._toggle_auto_scroll()
+    comic._auto_last_tick = time.monotonic() - 0.1  # 模拟经过 100ms，足够越过 3px
     comic._auto_scroll_tick()
     assert not comic._auto_scrolling, "到底应自动停止"
     assert vbar.value() == vbar.maximum()

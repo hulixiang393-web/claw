@@ -216,6 +216,7 @@ class SearchPage(BasePage):
         self._content = content  # 可选：详情封面回填（cover_backfill 源）用
         self._results = []
         self._filter_source = ""
+        self._saved_unfiltered_shown = None  # 进入来源筛选前的渲染进度（清除筛选后恢复）
         self._status_chips: dict = {}  # source_id → (QLabel, QLabel状态) 或组合控件
         self._pending_count = 0  # 未完成搜索的源数
         self._work_count = 0  # 当前网格卡片计数（追加/重建共用）
@@ -364,6 +365,7 @@ class SearchPage(BasePage):
         if not keyword:
             return
         self._filter_source = ""
+        self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(False)
         self.status_label.setText("搜索中...")
         self._clear_grid()
@@ -740,11 +742,9 @@ class SearchPage(BasePage):
 
     def _update_batch_status(self) -> None:
         """更新状态文本：已显示 X / 共 Y 条。"""
-        total = len(self._current_display())
+        total = len(self._filtered_display())
         if self._filter_source:
-            # 筛选时显示筛选后总数（_results 未过滤，需单独算）
-            filtered = sum(1 for r in self._results if r.source_id == self._filter_source)
-            self.status_label.setText(f"共 {filtered} 条结果（仅看此源）")
+            self.status_label.setText(f"共 {total} 条结果（仅看此源）")
         elif self._shown_count >= total:
             self.status_label.setText(f"共 {total} 条结果")
         else:
@@ -760,7 +760,7 @@ class SearchPage(BasePage):
         """
         if not items:
             return
-        display = self._current_display()
+        display = self._filtered_display()
         cols = self._columns()
         # 首屏渲染量：填满视口（而非固定 _page_size 条）——否则结果多时
         # 只渲染一页、布局未刷新前滚动条不出现，用户看不到更多。按视口
@@ -791,6 +791,13 @@ class SearchPage(BasePage):
         if display is None:
             display = self._results
         return display
+
+    def _filtered_display(self):
+        """按来源筛选过滤后的当前渲染列表（无筛选时返回原列表）。"""
+        display = self._current_display()
+        if not self._filter_source:
+            return display
+        return [r for r in display if r.source_id == self._filter_source]
 
     def _scroll_ratio(self) -> float:
         """滚动位置占滚动条比例（0~1）。maximum<=0 → 0。"""
@@ -840,7 +847,7 @@ class SearchPage(BasePage):
         """
         if self._more_pending:
             return  # 上一次触发的分批尚未完成，本次滚动到的 80% 交给其后
-        display = self._current_display()
+        display = self._filtered_display()
         if self._shown_count >= len(display):
             return
         cols = self._columns()
@@ -889,7 +896,7 @@ class SearchPage(BasePage):
         绝不主动 setValue（流式追加期间上下跳动的根因之一）。绝不调用
         _load_more_results（那条路径带锚定且属于用户滚动语义）。
         """
-        display = self._current_display()
+        display = self._filtered_display()
         if self._shown_count >= len(display):
             return
         limit = self._first_screen_limit()
@@ -943,15 +950,13 @@ class SearchPage(BasePage):
         """按当前筛选重建结果网格（来源角标筛选用）。"""
         ratio = self._scroll_ratio()
         self._clear_grid()
-        display = self._current_display()
-        items = display
-        if self._filter_source:
-            items = [r for r in items if r.source_id == self._filter_source]
+        display = self._filtered_display()
         cols = self._columns()
         # 筛选时全量渲染（结果通常较少）；无筛选时只渲染已加载批
-        shown = items if self._filter_source else display[:self._shown_count]
+        shown = display if self._filter_source else display[:self._shown_count]
         for r in shown:
             self._append_card(r, cols)
+        self._shown_count = len(shown)
         self._apply_column_stretch(cols)
         self._update_batch_status()
         # 筛选切换同样按比例恢复，不跳回顶部
@@ -1002,7 +1007,7 @@ class SearchPage(BasePage):
         self.batch_count.setText(f"已选 {n} 项")
         # 全选 checkbox 同步（避免信号循环）
         self.select_all_check.blockSignals(True)
-        display = self._current_display()
+        display = self._filtered_display()
         total = len(display)
         self.select_all_check.setChecked(total > 0 and n == total)
         self.select_all_check.blockSignals(False)
@@ -1011,7 +1016,7 @@ class SearchPage(BasePage):
     def _on_select_all(self, checked: bool) -> None:
         """全选/取消全选当前已显示的结果。"""
         if checked:
-            display = self._current_display()
+            display = self._filtered_display()
             for r in display:
                 if r.url:
                     self._selected[r.url] = r
@@ -1066,10 +1071,20 @@ class SearchPage(BasePage):
 
     def _set_filter(self, source_id: str) -> None:
         """来源角标筛选。"""
-        self._filter_source = source_id if source_id != self._filter_source else ""
-        if self._filter_source:
+        if source_id != self._filter_source:
+            if not self._filter_source:
+                # 首次进入筛选：保存未筛选时的渲染进度，清除筛选后恢复用
+                self._saved_unfiltered_shown = self._shown_count
+            self._filter_source = source_id
             src = self._manager.get(self._filter_source)
             self.filter_label.setText(f"仅看 {src.source_name}")
+        else:
+            # 再次点击同源 → 取消筛选，恢复未筛选时的渲染进度
+            self._filter_source = ""
+            self.filter_label.setText("")
+            if self._saved_unfiltered_shown is not None:
+                self._shown_count = self._saved_unfiltered_shown
+                self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(bool(self._filter_source))
         self._show_results()
 
@@ -1077,6 +1092,9 @@ class SearchPage(BasePage):
         self._filter_source = ""
         self.filter_label.setText("")
         self.filter_bar_widget.setVisible(False)
+        if self._saved_unfiltered_shown is not None:
+            self._shown_count = self._saved_unfiltered_shown
+            self._saved_unfiltered_shown = None
         self._show_results()
 
     def _on_scroll(self, value: int) -> None:
@@ -1219,6 +1237,7 @@ class SearchPage(BasePage):
         self._selected = {}
         self._pending_count = 0
         self._filter_source = ""
+        self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(False)
         self.batch_bar.setVisible(False)
         self.select_all_check.blockSignals(True)

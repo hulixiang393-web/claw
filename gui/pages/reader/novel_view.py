@@ -101,7 +101,7 @@ class NovelView(QWidget):
 
         self.auto_scroll_btn = QPushButton("▶ 自动滚动")
         self.auto_scroll_btn.setFixedWidth(90)
-        self.auto_scroll_btn.setToolTip("开启/关闭自动滚动（Ctrl+Alt+A）")
+        self.auto_scroll_btn.setToolTip("开启/关闭自动滚动（空格键）")
         self.auto_scroll_btn.clicked.connect(self._toggle_auto_scroll)
         toolbar.addWidget(self.auto_scroll_btn)
 
@@ -221,7 +221,9 @@ class NovelView(QWidget):
 
         # 自动滚动定时器 + 快捷键
         self._auto_timer.timeout.connect(self._auto_scroll_tick)
-        QShortcut(QKeySequence("Ctrl+Alt+A"), self).activated.connect(self._toggle_auto_scroll)
+        QShortcut(QKeySequence(Qt.Key_Space), self).activated.connect(self._toggle_auto_scroll)
+        # 用户手动拖动滚动条时停止自动滚动（否则 tick 会拉回原位，无法拖动）
+        self.scroll.verticalScrollBar().sliderPressed.connect(self._on_scrollbar_user_interaction)
 
     # ------------------------------------------------------------------ #
     def load(
@@ -454,6 +456,10 @@ class NovelView(QWidget):
         self._auto_timer.stop()
         self.auto_scroll_btn.setText("▶ 自动滚动")
 
+    def _on_scrollbar_user_interaction(self) -> None:
+        """用户手动拖动滚动条（sliderPressed）时停止自动滚动，让手动接管。"""
+        self._stop_auto_scroll()
+
     def _auto_scroll_tick(self) -> None:
         """把记住的位置按设定速度递增，平滑向下滚动；到底自动停止。
 
@@ -472,11 +478,9 @@ class NovelView(QWidget):
         vbar.setValue(int(self._auto_pos))
 
     def _update_auto_scroll_slider_state(self) -> None:
-        """根据当前模式和滚动范围启用/禁用自动滚动速度滑块。"""
-        if self._mode == "scroll" and self.scroll.verticalScrollBar().maximum() > 0:
-            self.auto_scroll_speed_slider.setEnabled(True)
-        else:
-            self.auto_scroll_speed_slider.setEnabled(False)
+        """根据当前模式启用/禁用自动滚动速度滑块。（仅按模式判定，
+        避免内容高度懒加载中 maximum==0 时误禁用后不再刷新 → 拖不动）"""
+        self.auto_scroll_speed_slider.setEnabled(self._mode == "scroll")
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         """用户普通滚轮（无 Ctrl）→ 停止自动滚动。"""
@@ -662,7 +666,9 @@ class NovelView(QWidget):
         正文 QLabel 带 TextSelectableByMouse 会吞掉子控件级鼠标事件，故用
         应用级过滤器覆盖滚动区/正文/目录等所有子控件；非本视图事件直接放行。
         """
-        if not self._is_descendant(obj):
+        # 视图不可见时（如切到其他页/弹窗创建控件）直接放行，
+        # 避免对无关控件的每个事件做父链遍历（应用级过滤器全量触发）卡顿弹窗。
+        if not self.isVisible() or not self._is_descendant(obj):
             return super().eventFilter(obj, event)
         if event.type() == event.Type.MouseButtonPress:
             btn = event.button()

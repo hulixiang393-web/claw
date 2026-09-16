@@ -150,6 +150,22 @@ class LibraryStore:
             self._save()
         return True
 
+    def clear_folder(self, folder: str) -> int:
+        """一键清空某收藏夹内的全部收藏（保留收藏夹本身，不删本地文件）。
+
+        返回移除条数；folder 为空或不存在该夹返回 0。
+        """
+        folder = folder.strip()
+        if not folder:
+            return 0
+        with self._lock:
+            urls = [u for u, v in self._data.items() if (v.get("folder") or "") == folder]
+            for u in urls:
+                del self._data[u]
+            if urls:
+                self._save()
+        return len(urls)
+
     def remove(self, url: str) -> bool:
         """移除收藏（只删元数据，不删本地文件）。"""
         with self._lock:

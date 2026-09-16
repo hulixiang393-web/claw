@@ -1085,10 +1085,11 @@ class MainWindow(QMainWindow):
                 page.on_theme_changed(theme)
 
     def _bg_image_qss_block(self) -> str:
-        """背景图合成：按主题 bg 色 + 用户图片 + 透明度 → 合成 QPixmap 注入中央区。
+        """背景图：按主题 bg 色 + 用户图片 + 透明度 → 合成后注入中央区。
 
-        背景图用 paintEvent 绘制（QWidget 的 QSS background-image 不生效），
-        本方法负责：合成 PNG（缓存）→ 加载 QPixmap → 注入 self._central_area。
+        背景图用 paintEvent 绘制（QWidget 的 QSS background-image 不生效）。
+        缓存命中的加载与缓存未命中时的整套合成（解码 + 平滑缩放 + 叠加 +
+        PNG 落盘）都不阻塞 GUI 线程：前者本就毫秒级，后者交给后台任务。
 
         返回追加 QSS 字符串（半透明覆盖块；空=不启用背景图）。
         """
@@ -1102,7 +1103,7 @@ class MainWindow(QMainWindow):
         if not bg_file.is_file():
             self._clear_bg_pixmap()
             return ""
-        opacity = float(self.settings.get("ui", "background_opacity", 0.6) or 0.6)
+        opacity = self._bg_opacity()
         tokens = self.theme_manager.current_tokens()
         bg_color = tokens.get("bg", "#FFF6F9")
         # 缓存 key
@@ -1111,40 +1112,35 @@ class MainWindow(QMainWindow):
         cache_path = cache_dir / "bg_composed.png"
         key_file = cache_dir / "bg_composed.key"
         cache_key = f"{bg_path}|{opacity}|{bg_color}"
+        # 缓存命中：直接快速加载，不阻塞
         cache_hit = False
-        # 复用已合成
         try:
             if key_file.is_file() and key_file.read_text(encoding="utf-8").strip() == cache_key:
                 if cache_path.is_file() and cache_path.stat().st_size > 0:
                     cache_hit = True
         except OSError:
             pass
-        if not cache_hit:
-            # 合成：用户图 × opacity 叠加到 bg 纯色（按当前窗口尺寸）
-            try:
-                from PySide6.QtGui import QColor, QImage, QPainter as _QP
+        if cache_hit:
+            self._load_bg_pixmap(cache_path)
+        else:
+            # 缓存未命中：大图解码 + 平滑缩放 + 叠加 + 写盘全部放后台线程
+            self._bg_compose_async(bg_file, opacity, bg_color, cache_path, key_file, cache_key)
+        return self._bg_overlay_qss()
 
-                w = max(800, self.width() or 1024)
-                h = max(600, self.height() or 768)
-                bg_q = QImage(w, h, QImage.Format_RGB32)
-                bg_q.fill(QColor(bg_color))
-                fg_q = QImage(bg_file)
-                if fg_q.isNull():
-                    self._clear_bg_pixmap()
-                    return ""
-                fg_q = fg_q.scaled(
-                    w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
-                )
-                painter = _QP(bg_q)
-                painter.setOpacity(opacity)
-                painter.drawImage(0, 0, fg_q)
-                painter.end()
-                bg_q.save(str(cache_path), "PNG")
-                key_file.write_text(cache_key, encoding="utf-8")
-            except Exception:  # noqa: BLE001
-                self._clear_bg_pixmap()
-                return ""
-        # 加载 QPixmap 并注入中央区（paintEvent 绘制）
+    def _bg_opacity(self) -> float:
+        """背景图不透明度（0.0~1.0）。
+
+        注意不能用 `... or 0.6`：用户显式设为 0.0 时 0.0 是假值，
+        会被 or 篡改成 0.6 导致「调透明度到 0 不生效」。
+        """
+        raw = self.settings.get("ui", "background_opacity", 0.6)
+        try:
+            return float(0.6 if raw is None else raw)
+        except (TypeError, ValueError):
+            return 0.6
+
+    def _load_bg_pixmap(self, cache_path) -> None:
+        """从缓存 PNG 加载 QPixmap 并注入中央区（GUI 线程）。"""
         try:
             from PySide6.QtGui import QPixmap
 
@@ -1155,7 +1151,88 @@ class MainWindow(QMainWindow):
                 self._central_area.set_bg_pixmap(pm)
         except Exception:  # noqa: BLE001
             self._clear_bg_pixmap()
-        return self._bg_overlay_qss()
+
+    def _bg_compose_async(self, bg_file, opacity, bg_color,
+                          cache_path, key_file, cache_key) -> None:
+        """后台合成背景图（QThreadPool worker + 信号回主线程注入）。
+
+        序列号防重叠：连续触发（快速换图/调透明度）只采纳最新一次结果，
+        过期任务静默退出且不写盘，避免旧参数覆盖新参数对应缓存。
+        """
+        from PySide6.QtCore import QThreadPool, QRunnable, QObject, Signal
+
+        self._bg_seq = getattr(self, "_bg_seq", 0) + 1
+        seq = self._bg_seq
+        w = max(800, self.width() or 1024)
+        h = max(600, self.height() or 768)
+
+        class _BgSignals(QObject):
+            done = Signal(int, object)  # (seq, cache_path or None)
+
+        class _BgComposeTask(QRunnable):
+            def __init__(self, signals, seq):
+                super().__init__()
+                self.signals = signals
+                self._seq = seq
+                self._bg_file = str(bg_file)
+                self._opacity = opacity
+                self._bg_color = bg_color
+                self._cache_path = str(cache_path)
+                self._key_file = str(key_file)
+                self._cache_key = cache_key
+                self._w = w
+                self._h = h
+
+            def run(self) -> None:
+                try:
+                    from PySide6.QtGui import QColor, QImage, QPainter as _QP
+
+                    bg_q = QImage(self._w, self._h, QImage.Format_RGB32)
+                    bg_q.fill(QColor(self._bg_color))
+                    fg_q = QImage(self._bg_file)
+                    if fg_q.isNull():
+                        self.signals.done.emit(self._seq, None)
+                        return
+                    fg_q = fg_q.scaled(
+                        self._w, self._h,
+                        Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
+                    )
+                    painter = _QP(bg_q)
+                    painter.setOpacity(self._opacity)
+                    painter.drawImage(0, 0, fg_q)
+                    painter.end()
+                    # 原子落盘：先写临时文件再 rename，避免读到半写 PNG
+                    tmp_png = self._cache_path + ".tmp"
+                    bg_q.save(tmp_png, "PNG")
+                    import os
+                    os.replace(tmp_png, self._cache_path)
+                    tmp_key = self._key_file + ".tmp"
+                    with open(tmp_key, "w", encoding="utf-8") as fh:
+                        fh.write(self._cache_key)
+                    os.replace(tmp_key, self._key_file)
+                    self.signals.done.emit(self._seq, self._cache_path)
+                except Exception:  # noqa: BLE001
+                    try:
+                        self.signals.done.emit(self._seq, None)
+                    except RuntimeError:
+                        pass
+
+        seq = self._bg_seq
+        signals = _BgSignals()
+        signals.done.connect(self._on_bg_composed)
+        self._bg_compose_tasks = getattr(self, "_bg_compose_tasks", []) + [_BgComposeTask(signals, seq)]
+        QThreadPool.globalInstance().start(self._bg_compose_tasks[-1])
+
+    def _on_bg_composed(self, seq, path) -> None:
+        """后台合成完成 → 仅采纳最新一次结果并注入。"""
+        self._bg_compose_tasks = []
+        if seq != getattr(self, "_bg_seq", 0):
+            return  # 过期结果
+        if path:
+            from pathlib import Path as _P
+            self._load_bg_pixmap(_P(path))
+        else:
+            self._clear_bg_pixmap()
 
     def _clear_bg_pixmap(self) -> None:
         """清除中央区背景图（无背景图或加载失败时）。"""

@@ -329,6 +329,11 @@ class LibraryPage(BasePage):
         self.new_folder_btn.clicked.connect(self._new_folder)
         top.addWidget(self.new_folder_btn)
 
+        self.clear_fav_btn = QPushButton("一键清空收藏")
+        self.clear_fav_btn.setToolTip("清空当前选中的收藏夹内全部收藏（不删本地文件）")
+        self.clear_fav_btn.clicked.connect(self._clear_folder)
+        top.addWidget(self.clear_fav_btn)
+
         top.addSpacing(12)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索书架…")
@@ -400,6 +405,14 @@ class LibraryPage(BasePage):
         idx = self.folder_combo.findText(cur)
         self.folder_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.folder_combo.blockSignals(False)
+        # 一键清空：仅在具体收藏夹下可用（对应「在具体分类中清空」）
+        cur_folder = self.folder_combo.currentText()
+        scoped = bool(cur_folder) and cur_folder != "全部"
+        self.clear_fav_btn.setEnabled(scoped)
+        self.clear_fav_btn.setToolTip(
+            f"清空收藏夹「{cur_folder}」内全部收藏（不删本地文件）" if scoped
+            else "请先在收藏夹下拉中选择一个具体收藏夹"
+        )
 
     def _render(self, books: list[dict]) -> None:
         """主线程渲染扫描结果（本地在前）。"""
@@ -646,6 +659,25 @@ class LibraryPage(BasePage):
         if resp != QMessageBox.Yes:
             return
         self._shelf.hide_local(rec.get("title", ""))
+        self._rebuild()
+
+    def _clear_folder(self) -> None:
+        """一键清空当前收藏夹内的全部收藏（仅具体收藏夹可用）。"""
+        folder = self.folder_combo.currentText()
+        if not folder or folder == "全部":
+            return
+        from PySide6.QtWidgets import QMessageBox
+
+        resp = QMessageBox.question(
+            self, "清空收藏夹",
+            f"确定清空收藏夹「{folder}」内的全部收藏吗？\n\n"
+            "仅移除收藏记录，不影响本地已下载文件。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        self._shelf.favorite_clear_folder(folder)
         self._rebuild()
 
     def _move_favorite(self, rec: dict, folder: str) -> None:
