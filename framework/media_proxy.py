@@ -277,8 +277,9 @@ class MediaProxy:
                     self._send_body(handler, resp, body)
                     return
                 text = body.decode("utf-8", "replace")
-                # 播放路径广告过滤：源配了 ad_block → 剔除 m3u8 广告段再重写
-                # （VLC 播放时不再插播广告分片；判定与下载路径 filter_m3u8 一致）
+                # 播放路径广告过滤：HLS 一律走本地代理/过滤，剔除 m3u8 广告段再
+                # 重写（不要求源配 ad_block；ad_block 显式 enabled:false 才关闭，
+                # 判定与下载路径 filter_m3u8 一致）
                 if ad_block is not None:
                     text = self._filter_ad_segments(text, target, ad_block)
                 rewritten = self._rewrite_m3u8(text, target, headers, ad_block)

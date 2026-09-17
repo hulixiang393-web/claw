@@ -269,6 +269,74 @@ class TestM3u8CueTags:
         assert "ad1.ts" not in out
         assert "a1.ts" in out
 
+    def test_cue_out_cont_keeps_trailing_content(self):
+        # CUE-OUT 后多个 -OUT-CONT 续帧之间夹广告段，CUE-IN 后回到正片：
+        # 全部广告段被剔除，且 CUE-IN 之后的内容必须保留（regression：
+        # 旧 cue_depth 计数会把续帧当嵌套开启，CUE-IN 只减一次 → 深度永不为 0）。
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/f1.ts\n"
+            "#EXTINF:5.0,\n/seg/f2.ts\n"
+            "#EXT-X-CUE-OUT:30.0\n"
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXT-X-CUE-OUT-CONT:30.0/5.0\n"
+            "#EXTINF:5.0,\n/seg/ad2.ts\n"
+            "#EXT-X-CUE-OUT-CONT:30.0/10.0\n"
+            "#EXTINF:5.0,\n/seg/ad3.ts\n"
+            "#EXT-X-CUE-IN\n"
+            "#EXTINF:5.0,\n/seg/c1.ts\n"
+            "#EXTINF:5.0,\n/seg/c2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad2.ts" not in out and "ad3.ts" not in out
+        assert "f1.ts" in out and "f2.ts" in out
+        assert "c1.ts" in out and "c2.ts" in out
+
+    def test_daterange_out_in_pair(self):
+        # DATERANGE SCTE35-OUT 开启、SCTE35-IN 关闭：广告段剔除、闭后内容保留
+        # （regression：旧代码把 SCTE35-IN 当开启，闭后内容被过度过滤）。
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/f1.ts\n"
+            "#EXTINF:5.0,\n/seg/f2.ts\n"
+            '#EXT-X-DATERANGE:ID="ad1",CLASS="com.ad",SCTE35-OUT=0xFC002000\n'
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            '#EXT-X-DATERANGE:ID="ad1",CLASS="com.ad",SCTE35-IN=0xFC002000\n'
+            "#EXTINF:5.0,\n/seg/c1.ts\n"
+            "#EXTINF:5.0,\n/seg/c2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out
+        assert "f1.ts" in out and "f2.ts" in out
+        assert "c1.ts" in out and "c2.ts" in out
+
+    def test_dual_signal_cue_out_and_daterange(self):
+        # CUE-OUT 与 DATERANGE SCTE35-OUT 双信号开启 + 单条 CUE-IN 关闭：
+        # 广告段剔除、闭后内容保留（regression：旧计数对双信号两次开启、
+        # 一次关闭 → 深度永不为 0，闭后内容被整体误删）。
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/f1.ts\n"
+            "#EXTINF:5.0,\n/seg/f2.ts\n"
+            "#EXT-X-CUE-OUT:30.0\n"
+            '#EXT-X-DATERANGE:ID="ad1",CLASS="com.ad",SCTE35-OUT=0xFC002000\n'
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXTINF:5.0,\n/seg/ad2.ts\n"
+            "#EXT-X-CUE-IN\n"
+            "#EXTINF:5.0,\n/seg/c1.ts\n"
+            "#EXTINF:5.0,\n/seg/c2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad2.ts" not in out
+        assert "f1.ts" in out and "f2.ts" in out
+        assert "c1.ts" in out and "c2.ts" in out
+
 
 class TestM3u8PreRoll:
     def test_leading_short_uniform_block_removed(self):

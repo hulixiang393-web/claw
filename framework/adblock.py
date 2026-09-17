@@ -275,6 +275,7 @@ class AdblockEngine:
         # 重置补充规则：同一实例被 configure 多次时不累积旧规则
         self._extra_regexes = []
         self._extra_domains = []
+        self._extra_css = []
         raw = getattr(source, "raw", None) or {}
         ad = raw.get("ad_block") or {}
         # 源未配置 ad_block → 按 default_on 决定是否启用内置规则
@@ -296,7 +297,6 @@ class AdblockEngine:
             if d:
                 self._extra_domains.append(d)
         # 源级补充 HTML 广告节点 CSS 选择器（schema §7.5 extra_css）
-        self._extra_css: List[str] = []
         for sel in ad.get("extra_css") or []:
             s = str(sel).strip()
             if s:
@@ -452,7 +452,7 @@ class AdblockEngine:
             if m:
                 pending_dur = float(m.group(1))
                 continue
-            if line and not line.startswith("#"):
+            if line.strip() and not line.startswith("#"):
                 joined = urljoin(base_url, line) if base_url else line
                 seg_infos.append((joined, pending_dur))
                 url_counter[joined] = url_counter.get(joined, 0) + 1
@@ -467,27 +467,29 @@ class AdblockEngine:
         blocks: List[dict] = []
         cur: Optional[dict] = None
         seg_idx = -1
-        cue_depth = 0
+        in_ad = False
         seg_cue: set = set()
         for line in lines:
             # —— R4 协议级广告标签（标签行本身不是段，continue 不干扰段解析）——
+            # 布尔区间、幂等：CUE-OUT/SCTE35-OUT（含 -OUT-CONT 续帧）开启，
+            # CUE-IN / SCTE35-IN 关闭；DATERANGE 以 SCTE35-IN 为关闭标记。
             if line.startswith("#EXT-X-CUE-OUT") or line.startswith("#EXT-X-SCTE35-OUT"):
-                cue_depth += 1
+                in_ad = True
                 continue
             if line.startswith("#EXT-X-CUE-IN") or line.startswith("#EXT-X-SCTE35-IN"):
-                cue_depth = max(0, cue_depth - 1)
+                in_ad = False
                 continue
             if line.startswith("#EXT-X-SCTE35:"):
                 # 遗留单标签：placement_opportunity(0x2/0x02) 开启，0xe/0x0e 结束
                 if re.search(r"am_splice_type=0x0?2\b", line):
-                    cue_depth += 1
+                    in_ad = True
                 elif re.search(r"am_splice_type=0x0?e\b", line):
-                    cue_depth = max(0, cue_depth - 1)
+                    in_ad = False
                 continue
             if line.startswith("#EXT-X-DATERANGE:") and (
                 "SCTE35" in line or "X-AD" in line or "X-ASSET" in line
             ):
-                cue_depth += 1
+                in_ad = "SCTE35-IN" not in line
                 continue
             if line.startswith("#EXT-X-DISCONTINUITY"):
                 if cur is not None and cur["seg"]:
@@ -498,7 +500,7 @@ class AdblockEngine:
             if m:
                 pending_dur = float(m.group(1))
                 continue
-            if line and not line.startswith("#"):
+            if line.strip() and not line.startswith("#"):
                 seg_idx += 1
                 if cur is None:
                     cur = {"seg": [], "dur": 0.0, "durs": [], "independent": False}
@@ -508,7 +510,7 @@ class AdblockEngine:
                 cur["dur"] += dur if dur is not None else 0.0
                 if dur is not None:
                     cur["durs"].append(dur)
-                if cue_depth > 0:
+                if in_ad:
                     seg_cue.add(seg_idx)
         if cur is not None and cur["seg"]:
             blocks.append(cur)
@@ -534,20 +536,22 @@ class AdblockEngine:
 
         # ---- R5：片头/片尾预滚（双信号：块占整体 <25% + 短 或 块内时长全一致） ----
         total_dur = sum(d for _joined, d in seg_infos if d is not None)
+
+        def _uniform(b: dict) -> bool:
+            durs = b["durs"]
+            return len(durs) >= 2 and all(_d == durs[0] for _d in durs)
+
         for bi, _b in enumerate(blocks):
             _segs = _b["seg"]
             if not _segs:
                 continue
             _is_first = bi == 0
             _is_last = bi == len(blocks) - 1
-            _uniform = len(_b["durs"]) >= 2 and all(
-                _d == _b["durs"][0] for _d in _b["durs"]
-            )
             if (
                 (_is_first or _is_last)
                 and total_dur >= 60.0
                 and _b["dur"] < 0.25 * total_dur
-                and (_b["dur"] <= 30.0 or _uniform)
+                and (_b["dur"] <= 30.0 or _uniform(_b))
             ):
                 ad_set.update(_segs)
 
@@ -566,14 +570,11 @@ class AdblockEngine:
             _segs = _b["seg"]
             if not _segs:
                 continue
-            _uniform = len(_b["durs"]) >= 2 and all(
-                _d == _b["durs"][0] for _d in _b["durs"]
-            )
             if (
                 0 < bi < len(blocks) - 1  # 非首非尾（前后都有 DISCONTINUITY）
                 and median_dur > 0.0
                 and _b["dur"] < median_dur / 3.0
-                and (_uniform or _b["dur"] < 10.0)
+                and (_uniform(_b) or _b["dur"] < 10.0)
             ):
                 ad_set.update(_segs)
 
@@ -587,7 +588,7 @@ class AdblockEngine:
             m = re.match(r"#EXTINF:\s*([\d.]+)", line)
             if m:
                 pending_dur = float(m.group(1))
-            if line and not line.startswith("#"):
+            if line.strip() and not line.startswith("#"):
                 seg_idx += 1
                 pending_dur = None  # 消费：EXTINF 时长只属于紧随的段
                 if seg_idx in ad_set:
@@ -625,17 +626,18 @@ class AdblockEngine:
 # ------------------------------------------------------------------ #
 # 便捷单例（无源配置时用内置规则）
 # ------------------------------------------------------------------ #
-_default_engine: Optional[AdblockEngine] = None
+_default_engines: dict = {}
 
 
 def adblock_for(source=None, default_on: bool = False) -> AdblockEngine:
     """取某源的广告引擎（读源 ad_block 配置）。缺省用内置规则。
 
     default_on：源未配置 ad_block 时是否启用内置规则（视频流路径传 True）。
+    source 为 None 时按 default_on 分别缓存内置引擎（互不干扰）。
     """
     if source is not None:
         return AdblockEngine(source, default_on=default_on)
-    global _default_engine
-    if _default_engine is None:
-        _default_engine = AdblockEngine()
-    return _default_engine
+    global _default_engines
+    if default_on not in _default_engines:
+        _default_engines[default_on] = AdblockEngine(default_on=default_on)
+    return _default_engines[default_on]
