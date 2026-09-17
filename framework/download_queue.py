@@ -221,7 +221,7 @@ class DownloadQueue:
             source = self._manager.get(task.source_id) if self._manager else None
             if source is None:
                 return
-            ad = adblock_for(source)
+            ad = adblock_for(source, default_on=True)
             if not ad.enabled:
                 return
             found: dict = {}

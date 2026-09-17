@@ -411,7 +411,7 @@ class Downloader:
         """下载 m3u8 → adblock 剔除广告段 → 写本地临时文件。失败返回 None（用原 URL）。"""
         from .adblock import adblock_for
 
-        ad = adblock_for(source)
+        ad = adblock_for(source, default_on=True)
         try:
             text = self._http.get_text(video_url, headers=source.request_headers(), timeout=20, retries=2)
         except Exception:  # noqa: BLE001
@@ -471,11 +471,12 @@ class Downloader:
                 raise RuntimeError("HLS 播放列表无分段")
 
             # 流内广告段剔除：段 URL 命中广告特征 / DISCONTINUITY 短段 → 跳过下载。
-            # 用 adblock 引擎（源级配置+内置规则）判定；无配置时跳过不误删。
+            # 用 adblock 引擎（源级配置+内置规则）判定；无 ad_block 源也启用内置规则，
+            # 仅源显式 enabled:false 才关闭。
             try:
                 from .adblock import adblock_for
 
-                ad = adblock_for(source)
+                ad = adblock_for(source, default_on=True)
                 if ad.enabled:
                     ad_segs, _cleaned = ad.detect_m3u8_ads(text, playlist_url)
                 else:
