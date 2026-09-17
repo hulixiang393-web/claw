@@ -551,6 +551,32 @@ class AdblockEngine:
             ):
                 ad_set.update(_segs)
 
+        # ---- R6：中插离群块（内部块 + 块时长远小于中位数 + 均匀/超短） ----
+        block_durs = sorted(_b["dur"] for _b in blocks if _b["seg"])
+        if block_durs:
+            mid = len(block_durs) // 2
+            median_dur = (
+                block_durs[mid]
+                if len(block_durs) % 2 == 1
+                else (block_durs[mid - 1] + block_durs[mid]) / 2.0
+            )
+        else:
+            median_dur = 0.0
+        for bi, _b in enumerate(blocks):
+            _segs = _b["seg"]
+            if not _segs:
+                continue
+            _uniform = len(_b["durs"]) >= 2 and all(
+                _d == _b["durs"][0] for _d in _b["durs"]
+            )
+            if (
+                0 < bi < len(blocks) - 1  # 非首非尾（前后都有 DISCONTINUITY）
+                and median_dur > 0.0
+                and _b["dur"] < median_dur / 3.0
+                and (_uniform or _b["dur"] < 10.0)
+            ):
+                ad_set.update(_segs)
+
         out: List[str] = []
         ad_segs: List[int] = []
         i = 0

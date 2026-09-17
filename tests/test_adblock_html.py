@@ -325,3 +325,40 @@ class TestM3u8PreRoll:
         )
         out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
         assert out == m3u8
+
+
+class TestM3u8MidRoll:
+    def test_short_uniform_interior_block_removed(self):
+        # 注意：首尾两块段名必须不同（c1-c4 / c5-c8），否则同一 URL 在列表中
+        # 出现 ≥2 次会命中 R2 重复段规则，正片段被误判广告（R2 为锁定行为）。
+        eng = AdblockEngine()
+        content = "".join(f"#EXTINF:10.0,\n/seg/c{i}.ts\n" for i in range(1, 5))
+        content2 = "".join(f"#EXTINF:10.0,\n/seg/c{i}.ts\n" for i in range(5, 9))
+        m3u8 = (
+            "#EXTM3U\n" + content
+            + "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:4.0,\n/seg/m1.ts\n"
+            "#EXTINF:4.0,\n/seg/m2.ts\n"
+            "#EXT-X-DISCONTINUITY\n" + content2
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "m1.ts" not in out and "m2.ts" not in out
+        assert "c1.ts" in out
+
+    def test_longer_varied_interior_block_kept(self):
+        # 12s 内部块（8+4 非均匀），各块中位数 80s：12 < 80/3 成立但无均匀签名
+        # 且 12 > 10 → 保留
+        eng = AdblockEngine()
+        content = "".join(f"#EXTINF:20.0,\n/seg/c{i}.ts\n" for i in range(1, 5))
+        content2 = "".join(f"#EXTINF:20.0,\n/seg/c{i}.ts\n" for i in range(5, 9))
+        m3u8 = (
+            "#EXTM3U\n" + content
+            + "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:8.0,\n/seg/m1.ts\n"
+            "#EXTINF:4.0,\n/seg/m2.ts\n"
+            "#EXT-X-DISCONTINUITY\n" + content2
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert out == m3u8
