@@ -194,3 +194,77 @@ class TestDefaultOn:
 
         assert adblock_for(self._NoAdBlock(), default_on=True).enabled is True
         assert adblock_for(self._NoAdBlock()).enabled is False
+
+
+class TestM3u8CueTags:
+    def test_cue_out_in_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-VERSION:3\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            "#EXT-X-CUE-OUT:30.0\n"
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXTINF:5.0,\n/seg/ad2.ts\n"
+            "#EXT-X-CUE-IN\n"
+            "#EXTINF:5.0,\n/seg/a2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/index.m3u8")
+        assert "ad1.ts" not in out and "ad2.ts" not in out
+        assert "a1.ts" in out and "a2.ts" in out
+
+    def test_dangling_cue_out_until_end(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXT-X-CUE-OUT:10.0\n"
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXTINF:5.0,\n/seg/ad2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad2.ts" not in out
+
+    def test_scte35_out_in_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            "#EXT-X-SCTE35-OUT\n"
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXT-X-SCTE35-IN\n"
+            "#EXTINF:5.0,\n/seg/a2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out
+        assert "a1.ts" in out and "a2.ts" in out
+
+    def test_legacy_scte35_splice(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            '#EXT-X-SCTE35:CUE="ad_id=1000, am_splice_type=0x02"\n'
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            '#EXT-X-SCTE35:CUE="am_splice_type=0x0e"\n'
+            "#EXTINF:5.0,\n/seg/a2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out
+        assert "a1.ts" in out and "a2.ts" in out
+
+    def test_daterange_ad_marker(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            '#EXT-X-DATERANGE:ID="ad1",CLASS="com.example.ad",X-ASSET="/ad",SCTE35-OUT=0xFC00\n'
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXT-X-CUE-IN\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out
+        assert "a1.ts" in out

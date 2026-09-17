@@ -459,14 +459,36 @@ class AdblockEngine:
                 pending_dur = None
         dup_urls = {u for u, c in url_counter.items() if c >= 2}
 
-        # ---- 第二遍：按 DISCONTINUITY 划分块，计算块级特征 ----
+        # ---- 第二遍：按 DISCONTINUITY 划分块 + 跟踪协议级广告标签区间 ----
         # 块 = 一段连续段序列；块前紧邻 DISCONTINUITY 视为「独立块」。
-        # 独立块且块内段总时长 <3s → 块内所有段判广告（孤立短块）。
+        # 独立块且块内段总时长 <3s → 块内所有段判广告（孤立短块，R3）。
         # 列表开头的块（前无 DISCONTINUITY）不判——整列表即短视频时不受影响。
+        # R4：服务器自带广告声明标签（CUE-OUT/SCTE35/DATERANGE），区间内段判广告。
         blocks: List[dict] = []
         cur: Optional[dict] = None
         seg_idx = -1
+        cue_depth = 0
+        seg_cue: set = set()
         for line in lines:
+            # —— R4 协议级广告标签（标签行本身不是段，continue 不干扰段解析）——
+            if line.startswith("#EXT-X-CUE-OUT") or line.startswith("#EXT-X-SCTE35-OUT"):
+                cue_depth += 1
+                continue
+            if line.startswith("#EXT-X-CUE-IN") or line.startswith("#EXT-X-SCTE35-IN"):
+                cue_depth = max(0, cue_depth - 1)
+                continue
+            if line.startswith("#EXT-X-SCTE35:"):
+                # 遗留单标签：placement_opportunity(0x2/0x02) 开启，0xe/0x0e 结束
+                if re.search(r"am_splice_type=0x0?2\b", line):
+                    cue_depth += 1
+                elif re.search(r"am_splice_type=0x0?e\b", line):
+                    cue_depth = max(0, cue_depth - 1)
+                continue
+            if line.startswith("#EXT-X-DATERANGE:") and (
+                "SCTE35" in line or "X-AD" in line or "X-ASSET" in line
+            ):
+                cue_depth += 1
+                continue
             if line.startswith("#EXT-X-DISCONTINUITY"):
                 if cur is not None and cur["seg"]:
                     blocks.append(cur)
@@ -484,6 +506,8 @@ class AdblockEngine:
                 pending_dur = None
                 cur["seg"].append(seg_idx)
                 cur["dur"] += dur if dur is not None else 0.0
+                if cue_depth > 0:
+                    seg_cue.add(seg_idx)
         if cur is not None and cur["seg"]:
             blocks.append(cur)
         short_block_segs: set = set()
@@ -503,6 +527,8 @@ class AdblockEngine:
                 ad_set.add(i0)
         # R3: DISCONTINUITY 分隔的孤立短块
         ad_set |= short_block_segs
+        # R4: 协议级广告标签区间（CUE-OUT/CUE-IN、SCTE35、DATERANGE 广告标记）
+        ad_set |= seg_cue
 
         out: List[str] = []
         ad_segs: List[int] = []
