@@ -254,27 +254,32 @@ def _css_to_regex(sel: str) -> Optional[re.Pattern]:
 class AdblockEngine:
     """广告过滤引擎。每个源一个实例（读该源的 ad_block 配置）。"""
 
-    def __init__(self, source=None):
+    def __init__(self, source=None, default_on: bool = False):
         self._block_re = _DEFAULT_URL_AD_RE
         self._block_domains = list(_DEFAULT_AD_DOMAINS)
         self._enabled = True
         self._extra_regexes: List[re.Pattern] = []
         self._extra_domains: List[str] = []
+        self._extra_css: List[str] = []
         if source is not None:
-            self.configure(source)
+            self.configure(source, default_on=default_on)
 
     # ------------------------------------------------------------------ #
-    def configure(self, source) -> None:
-        """从源配置读 ad_block，构建过滤规则。"""
+    def configure(self, source, default_on: bool = False) -> None:
+        """从源配置读 ad_block，构建过滤规则。
+
+        default_on：源未配置 ad_block 时的默认开关。默认 False（源作者没
+        声明要去广告就走关闭路径）；视频流路径传 True（内置启发式默认生效，
+        片头/中插广告在无源级配置时也过滤）。
+        """
         # 重置补充规则：同一实例被 configure 多次时不累积旧规则
         self._extra_regexes = []
         self._extra_domains = []
         raw = getattr(source, "raw", None) or {}
         ad = raw.get("ad_block") or {}
-        # 源未配置 ad_block → 默认关闭（源作者没声明要去广告，不走过滤路径，
-        # 减少无谓开销；仅显式配置了 ad_block 的源才按 enabled 启用）。
+        # 源未配置 ad_block → 按 default_on 决定是否启用内置规则
         if not raw.get("ad_block"):
-            self._enabled = False
+            self._enabled = default_on
             return
         self._enabled = bool(ad.get("enabled", True))
         if not self._enabled:
@@ -550,10 +555,13 @@ class AdblockEngine:
 _default_engine: Optional[AdblockEngine] = None
 
 
-def adblock_for(source=None) -> AdblockEngine:
-    """取某源的广告引擎（读源 ad_block 配置）。缺省用内置规则。"""
+def adblock_for(source=None, default_on: bool = False) -> AdblockEngine:
+    """取某源的广告引擎（读源 ad_block 配置）。缺省用内置规则。
+
+    default_on：源未配置 ad_block 时是否启用内置规则（视频流路径传 True）。
+    """
     if source is not None:
-        return AdblockEngine(source)
+        return AdblockEngine(source, default_on=default_on)
     global _default_engine
     if _default_engine is None:
         _default_engine = AdblockEngine()

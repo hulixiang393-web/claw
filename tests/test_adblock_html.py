@@ -164,3 +164,33 @@ class TestBackwardCompat:
         eng.configure(FakeSource2())
         assert eng._extra_css == [".b"]
         assert ".a" not in eng._extra_css
+
+
+class TestDefaultOn:
+    class _NoAdBlock:
+        raw = {"content_type": "video"}
+
+    class _Disabled:
+        raw = {"ad_block": {"enabled": False}}
+
+    def test_source_without_adblock_disabled_by_default(self):
+        assert AdblockEngine(self._NoAdBlock()).enabled is False
+
+    def test_source_without_adblock_default_on(self):
+        eng = AdblockEngine(self._NoAdBlock(), default_on=True)
+        assert eng.enabled is True
+        assert eng.is_ad_url("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js")
+
+    def test_configure_default_on_param(self):
+        eng = AdblockEngine()
+        eng.configure(self._NoAdBlock(), default_on=True)
+        assert eng.enabled is True
+
+    def test_explicit_enabled_false_respected(self):
+        assert AdblockEngine(self._Disabled(), default_on=True).enabled is False
+
+    def test_adblock_for_default_on(self):
+        from framework.adblock import adblock_for
+
+        assert adblock_for(self._NoAdBlock(), default_on=True).enabled is True
+        assert adblock_for(self._NoAdBlock()).enabled is False
