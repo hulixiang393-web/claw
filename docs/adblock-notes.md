@@ -43,3 +43,33 @@
 - extra_css：源级 .my-ad/#banner-ad 追加生效
 - filter_m3u8：剔除广告段、保留正常段
 - py_compile framework/adblock.py framework/content.py 通过
+
+---
+
+## R4/R5/R6 协议级/预滚/中插识别 + default_on（2026-09-17 追加）
+
+`detect_m3u8_ads` 在旧启发式（URL 广告特征 / 重复段 / DISCONTINUITY 孤立短块）基础上
+新增三档流内广告识别，阈值决策如下：
+
+- **R4 协议级广告标签**（服务器自声明）：`#EXT-X-CUE-OUT` / `#EXT-X-CUE-IN`、
+  `#EXT-X-SCTE35-OUT` / `#EXT-X-SCTE35-IN`、遗留单标签 `#EXT-X-SCTE35:`
+  （`am_splice_type=0x02/0x2` 开启、`0x0e/0xe` 结束）、`#EXT-X-DATERANGE`
+  （内容含 `SCTE35` / `X-AD` / `X-ASSET` 标记）→ 用 `cue_depth` 计数区间，
+  区间内所有段判广告。**语义**：站点显式声明广告位置，直接信任并整段剔除。
+- **R5 片头/片尾预滚**（首/尾块）：双信号——① 该块时长 < 整体总时长 25%；
+  ② 块时长 ≤ 30s 或「块内段时长全部一致」（广告素材常定长均匀分片）。
+  且整体总时长 ≥ 60s 才启用（避免把短视频的正常首尾误当预滚）。
+  首块（列表开头，可能无前 DISCONTINUITY）与末块（块长）均适用。
+- **R6 中插离群块**（内部块）：非首非尾（前后都有 DISCONTINUITY）+ 块时长
+  < 全部块时长**中位数 / 3** 且「块内段时长全一致 或 块时长 < 10s」→ 判广告。
+  **阈值语义**：以「正常块长度的中位数」为基准，显著短于 1/3 才认为是插入的
+  广告素材；均匀分片或超短（<10s）兜底，避免把正常中插过渡段误删。
+
+### default_on（视频链路口径）
+
+`AdblockEngine.configure(source, default_on=False)` 与 `adblock_for(source, default_on)`：
+源**未配置** `ad_block` 时，默认关闭（旧行为）；`default_on=True` 则即使无源级
+配置也启用**内置规则**（`_enabled = default_on`）。源配了 `ad_block` 时仍以
+`ad_block.enabled` 为准（显式 `enabled:false` 可关闭）。下载/播放链路均传 `True`。
+
+实现：commit `241717d`（default_on）、`faa9697`（R4）、`94fc8b1`（R5）、`8e04ee7`（R6）。

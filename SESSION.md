@@ -1,5 +1,49 @@
 # SESSION — claw（D:\code\claw）
 
+## m3u8 广告过滤加强（2026-09-17，7 任务计划已收口）
+### 改动摘要（六步 commit，全部已推送 master）
+1. **default_on**（`241717d`）：`AdblockEngine.configure(source, default_on=False)` +
+   `adblock_for(source, default_on)`——源未配置 `ad_block` 时默认关闭（旧行为）；
+   `default_on=True` 则无源级配置也启用**内置规则**（`_enabled = default_on`）；
+   源配了 `ad_block` 仍以 `ad_block.enabled` 为准（显式 `enabled:false` 可关）。
+2. **R4 协议级广告标签**（`faa9697`）：CUE-OUT/CUE-IN、SCTE35-OUT/IN、遗留单标签
+   `#EXT-X-SCTE35:`（splice 0x02 开/0x0e 闭）、DATERANGE（含 SCTE35/X-AD/X-ASSET）
+   → `cue_depth` 区间内段整段剔除。
+3. **R5 片头/片尾预滚**（`94fc8b1`）：首/尾块 且 整体总时长 ≥ 60s + 块 < 25% 整体 +
+   （块 ≤ 30s 或块内段时长全一致）。**阈值决策**：短视频（<60s）不启用防误伤；
+   「≤30s 或均匀」双信号防把正常首尾块误删。
+4. **R6 中插离群块**（`8e04ee7`）：非首非尾块 + 块时长 < 中位数/3 +（段时长全一致
+   或块 < 10s）。**阈值决策**：以正常块时长中位数为基准，1/3 以下视为插入广告素材；
+   均匀/超短兜底。
+5. **下载链路默认启用**（`a390588`）：`download_queue._spawn_ad_precheck`、
+   `downloader._download_hls` 段剔除 / `_filter_m3u8_for_download` 全部
+   `adblock_for(source, default_on=True)`。
+6. **播放链路默认启用**（`3855d42`）：`external_player.open_with_player` 对 HLS
+   一律走本地代理（即使无防盗链头）；`media_proxy._filter_ad_segments` 在
+   `ad_block=None` 时也默认过滤（`enabled:false` 关）。
+### 测试结果（Task 7 全量回归）
+- 定向 4 文件（adblock_html / downloader_ad_default / media_proxy_ad /
+  external_player_hls）：**33 passed**。
+- 全量 `tests/ -q -x` 首跑在 `test_comic_scroll_anchor.py` 夹具阶段崩溃
+  `Windows fatal exception: access violation`（comic_view eventFilter GC 竞态，
+  进程级崩溃无 pytest 报告，环境间歇性，与 2026-09-12 记录的 comic_view_referer
+  flaky 同类）。
+- 全量 `--ignore=tests/test_comic_view_referer.py`（已知 flaky 决策 A）：
+  **582 passed, 1 failed**。
+  - 唯一失败 = `test_comic_scroll_anchor.py::test_tick_increments_monotonically_by_speed`
+    （`assert == int(20*0.016*speed)`，got 44 vs 45，浮点/时序边界精确断言；单独
+    重跑 5 次均同结果；测试源自 887c4d8，本计划 6 commit 均未触碰 comic_view.py →
+    与本计划无关的既有边界失败，按约束不改动）。
+- py_compile：framework/adblock.py downloader.py download_queue.py media_proxy.py
+  external_player.py → **exit 0 无输出**。
+### 知识沉淀
+- 已追加 docs/adblock-notes.md（R4/R5/R6 阈值语义 + default_on 介绍）与
+  docs/video-ad-removal-notes.md（链路默认启用 + 实现 commit）。
+### 待办（@followup）
+- `test_comic_scroll_anchor.py` 精确断言（int 边界）在部分环境稳定失败，属既有
+  GUI 时序/浮点问题，未改（按全局约束）；后续可考虑放宽为区间断言。
+- `sources/fanqie.json.bak-fanqie-categories` 遗留 untracked 未动。
+
 ## 2026-09-14 五问题修复（ho5ho 图 / 懒加载闪屏 / 17k / quanben / h-comic）
 ### 已修复（含测试，全量 --ignore flaky 548 passed）
 - **ho5ho 阅读图全部「加载失败」**：根因 = 章节 URL 含中文（`/中字h漫/...`）未百分号编码，作为 `Referer` 头时 `requests` latin-1 编码抛 UnicodeEncodeError → 48/48 图请求全挂（实测）。修 `framework/http.py` 新增 `_latin1_header_value()`，`_headers_with_ua` 对所有头值做非 latin-1 百分号编码。实测 48/48 恢复。测试 `tests/test_http_header_encoding.py`（5）。

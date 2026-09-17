@@ -54,3 +54,26 @@
 - framework/adblock.py：新增 `detect_m3u8_ads`（filter_m3u8 重构为调用它）
 - framework/download_queue.py：`DownloadTask.has_ads/ad_segments` + `_spawn_ad_precheck`
 - framework/downloader.py：`_download_hls` 广告段跳过 + `_merge_video_ffmpeg` 移除 Referer 限制
+
+---
+
+## 加强：R4/R5/R6 识别 + 下载/播放链路默认启用（2026-09-17 追加）
+
+### adblock 引擎新增层级
+- **R4 协议级标签**：CUE-OUT/CUE-IN、SCTE35（OUT/IN 及遗留单标签
+  `am_splice_type=0x02/0x0e`）、DATERANGE（含 SCTE35/X-AD/X-ASSET）→ 区间内段剔除。
+- **R5 片头/片尾预滚**：首/尾块 且 整体 ≥ 60s + 块 < 25% 整体 +
+  （块 ≤ 30s 或段时长全一致）。
+- **R6 中插离群块**：非首尾块 且 块 < 中位数/3 +（段时长全一致 或 块 < 10s）。
+- 阈值语义详见 docs/adblock-notes.md。
+
+### 链路默认启用（无 ad_block 视频源也过滤）
+- `adblock_for(source, default_on=True)`：源未配置 `ad_block` 时启用内置规则；
+  显式 `ad_block.enabled:false` 仍关闭。
+- **下载**：`download_queue._spawn_ad_precheck` 预检 + `downloader._download_hls`
+  段剔除/`_filter_m3u8_for_download` 均传 `default_on=True`。
+- **播放**：`external_player.open_with_player` 对 HLS（`.m3u8`）一律走本地代理，
+  即使无防盗链头；`media_proxy._filter_ad_segments` 在 `ad_block=None` 时也默认启用
+  内置规则（`enabled:false` 关闭）。VLC 播放不再插播广告分片。
+
+实现：commit `a390588`（下载默认启用）、`3855d42`（播放默认启用）。
