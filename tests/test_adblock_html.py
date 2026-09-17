@@ -165,6 +165,20 @@ class TestBackwardCompat:
         assert eng._extra_css == [".b"]
         assert ".a" not in eng._extra_css
 
+    def test_configure_reset_on_no_adblock_source(self):
+        class FakeSource:
+            raw = {"ad_block": {"enabled": True, "extra_css": [".a"]}}
+
+        class FakeNoAdBlock:
+            raw = {"content_type": "video"}
+
+        eng = AdblockEngine(FakeSource())
+        assert eng._extra_css == [".a"]
+        eng.configure(FakeNoAdBlock())
+        assert eng._extra_css == []
+        assert eng._extra_regexes == []
+        assert eng._extra_domains == []
+
 
 class TestDefaultOn:
     class _NoAdBlock:
