@@ -268,3 +268,60 @@ class TestM3u8CueTags:
         out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
         assert "ad1.ts" not in out
         assert "a1.ts" in out
+
+
+class TestM3u8PreRoll:
+    def test_leading_short_uniform_block_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            + "".join(f"#EXTINF:5.0,\n/seg/ad{i}.ts\n" for i in range(1, 4))
+            + "#EXT-X-DISCONTINUITY\n"
+            + "".join(f"#EXTINF:10.0,\n/seg/{i:03d}.ts\n" for i in range(1, 11))
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad3.ts" not in out
+        segs = [ln for ln in out.splitlines() if ln and not ln.startswith("#")]
+        assert segs == [f"/seg/{i:03d}.ts" for i in range(1, 11)]
+
+    def test_trailing_short_uniform_block_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            + "".join(f"#EXTINF:10.0,\n/seg/{i:03d}.ts\n" for i in range(1, 11))
+            + "#EXT-X-DISCONTINUITY\n"
+            + "".join(f"#EXTINF:5.0,\n/seg/ad{i}.ts\n" for i in range(1, 4))
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad3.ts" not in out
+        segs = [ln for ln in out.splitlines() if ln and not ln.startswith("#")]
+        assert segs == [f"/seg/{i:03d}.ts" for i in range(1, 11)]
+
+    def test_leading_block_not_short_kept(self):
+        # 首位块占 50%（30s/60s）> 25% → 保留
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            + "".join(f"#EXTINF:10.0,\n/seg/f{i}.ts\n" for i in range(1, 4))
+            + "#EXT-X-DISCONTINUITY\n"
+            + "".join(f"#EXTINF:10.0,\n/seg/c{i}.ts\n" for i in range(1, 4))
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert out == m3u8
+
+    def test_short_video_first_block_kept(self):
+        # 整体 25s < 60s → 预滚不启用（防短视频误删）
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:10.0,\n/seg/b1.ts\n"
+            "#EXTINF:10.0,\n/seg/b2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert out == m3u8

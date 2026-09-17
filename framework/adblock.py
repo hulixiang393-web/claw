@@ -492,7 +492,7 @@ class AdblockEngine:
             if line.startswith("#EXT-X-DISCONTINUITY"):
                 if cur is not None and cur["seg"]:
                     blocks.append(cur)
-                cur = {"seg": [], "dur": 0.0, "independent": True}
+                cur = {"seg": [], "dur": 0.0, "durs": [], "independent": True}
                 continue
             m = re.match(r"#EXTINF:\s*([\d.]+)", line)
             if m:
@@ -501,11 +501,13 @@ class AdblockEngine:
             if line and not line.startswith("#"):
                 seg_idx += 1
                 if cur is None:
-                    cur = {"seg": [], "dur": 0.0, "independent": False}
+                    cur = {"seg": [], "dur": 0.0, "durs": [], "independent": False}
                 dur = pending_dur
                 pending_dur = None
                 cur["seg"].append(seg_idx)
                 cur["dur"] += dur if dur is not None else 0.0
+                if dur is not None:
+                    cur["durs"].append(dur)
                 if cue_depth > 0:
                     seg_cue.add(seg_idx)
         if cur is not None and cur["seg"]:
@@ -529,6 +531,25 @@ class AdblockEngine:
         ad_set |= short_block_segs
         # R4: 协议级广告标签区间（CUE-OUT/CUE-IN、SCTE35、DATERANGE 广告标记）
         ad_set |= seg_cue
+
+        # ---- R5：片头/片尾预滚（双信号：块占整体 <25% + 短 或 块内时长全一致） ----
+        total_dur = sum(d for _joined, d in seg_infos if d is not None)
+        for bi, _b in enumerate(blocks):
+            _segs = _b["seg"]
+            if not _segs:
+                continue
+            _is_first = bi == 0
+            _is_last = bi == len(blocks) - 1
+            _uniform = len(_b["durs"]) >= 2 and all(
+                _d == _b["durs"][0] for _d in _b["durs"]
+            )
+            if (
+                (_is_first or _is_last)
+                and total_dur >= 60.0
+                and _b["dur"] < 0.25 * total_dur
+                and (_b["dur"] <= 30.0 or _uniform)
+            ):
+                ad_set.update(_segs)
 
         out: List[str] = []
         ad_segs: List[int] = []
