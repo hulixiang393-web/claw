@@ -54,7 +54,8 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
     audio    DASH 音频轨地址（非空时以 input-slave 挂入）
     referer / user_agent / headers  防盗链透传。referer/user_agent 是兼容旧
             调用的便捷参数；headers 提供完整头（含 Cookie 等）。任何防盗链
-            头存在时走本地代理（VLC 无法设置 UA，只有代理能根治）。
+            头存在时走本地代理（VLC 无法设置 UA，只有代理能根治）。HLS 流
+            一律走本地代理（含广告段过滤），即使无防盗链头也让代理剔除广告段。
     ad_block 源 ad_block 配置，非空时代理转发 m3u8 会剔除广告段。
     """
     if not url:
@@ -67,8 +68,11 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             hdrs.setdefault("Referer", referer)
         if user_agent:
             hdrs.setdefault("User-Agent", user_agent)
-        if hdrs:
-            # 带防盗链 → 本地代理（代理打完整 headers）
+        # HLS 流一律走本地代理：即使无防盗链头也要让代理剔除 m3u8 广告段
+        # （片头/中插广告在播放路径过滤）；其余媒体有防盗链头才走代理。
+        is_hls = url.split("?", 1)[0].lower().endswith(".m3u8")
+        if hdrs or is_hls:
+            # 带防盗链头或 HLS → 本地代理（代理打完整 headers + 广告过滤）
             play_url = proxy_url_for(url, hdrs, ad_block=ad_block)
             audio_url = proxy_url_for(audio, hdrs, ad_block=ad_block) if audio else ""
         else:

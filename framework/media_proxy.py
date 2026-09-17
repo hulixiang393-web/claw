@@ -279,7 +279,7 @@ class MediaProxy:
                 text = body.decode("utf-8", "replace")
                 # 播放路径广告过滤：源配了 ad_block → 剔除 m3u8 广告段再重写
                 # （VLC 播放时不再插播广告分片；判定与下载路径 filter_m3u8 一致）
-                if ad_block:
+                if ad_block is not None:
                     text = self._filter_ad_segments(text, target, ad_block)
                 rewritten = self._rewrite_m3u8(text, target, headers, ad_block)
                 body = rewritten.encode("utf-8")
@@ -305,7 +305,7 @@ class MediaProxy:
                 # gzip 压缩时 first 已是完整解压内容（上方分支），rest 为空。
                 rest = resp.raw.read()
                 text = (first + rest).decode("utf-8", "replace")
-                if ad_block:
+                if ad_block is not None:
                     text = self._filter_ad_segments(text, target, ad_block)
                 rewritten = self._rewrite_m3u8(text, target, headers, ad_block)
                 body = rewritten.encode("utf-8")
@@ -355,14 +355,16 @@ class MediaProxy:
     def _filter_ad_segments(self, m3u8_text: str, base_url: str, ad_block: dict) -> str:
         """按源 ad_block 配置剔除 m3u8 广告段（播放路径广告过滤）。
 
-        复用 adblock 引擎的 filter_m3u8（URL 广告特征 + 重复段 + 孤立短块
-        判定，与下载路径一致）。失败/异常返回原文（不过滤不阻断播放）。
+        复用 adblock 引擎的 filter_m3u8（URL 广告特征 + 重复段 + 孤立短块 +
+        CUE/SCTE35 标签 + 片头尾/中插离群启发式，与下载路径一致）。
+        ad_block 为空/None → 内置规则默认启用；ad_block.enabled=false → 关闭。
+        失败/异常返回原文（不过滤不阻断播放）。
         """
         try:
             from .adblock import AdblockEngine
             engine = AdblockEngine()
-            # 用源 ad_block 配置构造引擎（enabled/block_domains/block_url_regex）
-            engine.configure(type("S", (), {"raw": {"ad_block": ad_block}})())
+            if ad_block:
+                engine.configure(type("S", (), {"raw": {"ad_block": ad_block}})())
             if engine.enabled:
                 return engine.filter_m3u8(m3u8_text, base_url)
         except Exception:  # noqa: BLE001 —— 过滤失败不阻断播放
