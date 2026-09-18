@@ -1,0 +1,280 @@
+{
+  "$schema_version": 2,
+  "$id": "kanav",
+  "$type": "video",
+  "$name": "KanAV（迅雷影视AV）",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://kanav.ad",
+    "description": "KanAV - 迅雷影视 AV 在线观看（苹果CMS MacCMS，YS008 模板）。纯视频站，每个 id 对应单个视频（无分集/选集），播放地址为 m3u8。播放页含 var player_aaaa（maccms encrypt=2：url 为「按字节 urlencode 后再 base64」密文）→ 需走 content.episode.source_switch 的 player 分支 + decryption.targets.video_url.strategy=maccms_url 解码出真实 m3u8（普通 play_url.regex 分支不解密）。m3u8 托管在 img.11yun.xyz / cdn6.11yun.space 等 CDN，携带来源 Referer 即可取流（实测 200）。站点无 detail 路由（/index.php/vod/detail/ 返回 1 字节），详情即播放页本身；标题/作者/日期/大小在 h1 文本串中，封面取 MacPlayer.Pic，标签取 hr-tags 块的内联 a 链接。全站分类（导航 14 类）：1 中文字幕 / 2 日韩有码 / 3 日韩无码 / 4 国产AV / 22 流出自拍(30 自拍泄密 31 探花约炮 32 主播录制) / 20 动漫番剧(25 里番 26 泡面番 27 Motion Anime 28 3D动画 29 同人作品)；类型页分页 /vod/type/id/{id}/page/{page}.html。全站聚合仅有「热映影片」/index.php/label/hot.html（48 条/单页），供「全部」默认加载；站点无全站分页列表（show 不带 id 返回系统提示错误页）。镜像 m1.kanav.fun。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "成人",
+      "影视",
+      "日韩",
+      "国产",
+      "hls",
+      "maccms"
+    ],
+    "last_verified": "2026-09-18"
+  },
+  "transports": {
+    "base_url": "https://kanav.ad",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://kanav.ad/"
+    },
+    "timeout": 15,
+    "retries": 3,
+    "interval_ms": 500,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "works_list_url": "/index.php/label/hot.html",
+      "list_url": "/index.php/label/hot.html",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "中文字幕",
+            "url": "/index.php/vod/type/id/1/page/{page}.html"
+          },
+          {
+            "title": "日韩有码",
+            "url": "/index.php/vod/type/id/2/page/{page}.html"
+          },
+          {
+            "title": "日韩无码",
+            "url": "/index.php/vod/type/id/3/page/{page}.html"
+          },
+          {
+            "title": "国产AV",
+            "url": "/index.php/vod/type/id/4/page/{page}.html"
+          },
+          {
+            "title": "流出自拍",
+            "url": "/index.php/vod/type/id/22/page/{page}.html"
+          },
+          {
+            "title": "自拍泄密",
+            "url": "/index.php/vod/type/id/30/page/{page}.html"
+          },
+          {
+            "title": "探花约炮",
+            "url": "/index.php/vod/type/id/31/page/{page}.html"
+          },
+          {
+            "title": "主播录制",
+            "url": "/index.php/vod/type/id/32/page/{page}.html"
+          },
+          {
+            "title": "动漫番剧",
+            "url": "/index.php/vod/type/id/20/page/{page}.html"
+          },
+          {
+            "title": "里番",
+            "url": "/index.php/vod/type/id/25/page/{page}.html"
+          },
+          {
+            "title": "泡面番",
+            "url": "/index.php/vod/type/id/26/page/{page}.html"
+          },
+          {
+            "title": "Motion Anime",
+            "url": "/index.php/vod/type/id/27/page/{page}.html"
+          },
+          {
+            "title": "3D动画",
+            "url": "/index.php/vod/type/id/28/page/{page}.html"
+          },
+          {
+            "title": "同人作品",
+            "url": "/index.php/vod/type/id/29/page/{page}.html"
+          },
+          {
+            "title": "热映影片（全站）",
+            "url": "/index.php/label/hot.html"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.video-item"
+        },
+        "fields": {
+          "title": {
+            "fallback": [
+              {
+                "css": "div.entry-title a",
+                "attr": "title"
+              },
+              {
+                "css": "div.entry-title a"
+              },
+              {
+                "xpath": "following-sibling::div[contains(@class,'entry-title')]/a",
+                "attr": "title"
+              },
+              {
+                "xpath": "following-sibling::div[contains(@class,'entry-title')]/a"
+              }
+            ]
+          },
+          "url": {
+            "fallback": [
+              {
+                "css": "div.entry-title a",
+                "attr": "href"
+              },
+              {
+                "xpath": "following-sibling::div[contains(@class,'entry-title')]/a",
+                "attr": "href"
+              }
+            ]
+          },
+          "cover": {
+            "css": "img.lazy",
+            "attr": "data-original"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/index.php/vod/search.html",
+      "method": "GET",
+      "keyword_param": "wd",
+      "paginator": {
+        "url_template": "/index.php/vod/search.html?wd={keyword}&by=time_add&page={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.video-item"
+        },
+        "fields": {
+          "title": {
+            "fallback": [
+              {
+                "css": "div.entry-title a",
+                "attr": "title"
+              },
+              {
+                "css": "div.entry-title a"
+              },
+              {
+                "xpath": "following-sibling::div[contains(@class,'entry-title')]/a",
+                "attr": "title"
+              },
+              {
+                "xpath": "following-sibling::div[contains(@class,'entry-title')]/a"
+              }
+            ]
+          },
+          "url": {
+            "fallback": [
+              {
+                "css": "div.entry-title a",
+                "attr": "href"
+              },
+              {
+                "xpath": "following-sibling::div[contains(@class,'entry-title')]/a",
+                "attr": "href"
+              }
+            ]
+          },
+          "cover": {
+            "css": "img.lazy",
+            "attr": "data-original"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/index\\.php/vod/play/",
+      "fields": {
+        "title": {
+          "css": "h1",
+          "regex": "(?s)标题[：:]\\s*(.*?)(?:\\s*作者[：:]|$)"
+        },
+        "cover": {
+          "regex": "MacPlayer\\.Pic\\s*=\\s*\"([^\"]+)\""
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "tags": {
+          "xpath": "//div[contains(@class,'video-countext-tags') and .//div[contains(@class,'hr-tags')]]/a"
+        },
+        "clean": {
+          "summary": [
+            ["re:\\s*-\\s*KanAV.*$", ""]
+          ]
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "每个 id 是单个视频（无分集/选集），详情即播放页。播放地址在 var player_aaaa.url：maccms encrypt:2 密文（urlencode(base64(url))），必须走 source_switch 的 player 分支+decryption maccms_url 解码（play_url.regex 分支不会解密）。",
+        "source_switch": {
+          "play_regex": "var player_aaaa=(\\{.*?\\})\\s*</script>",
+          "max_switch_attempts": 2
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    },
+    "hls": {
+      "workers": 4
+    }
+  },
+  "ad_block": {
+    "enabled": true
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 10,
+      "max_results": 240
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "decryption": {
+    "targets": {
+      "video_url": {
+        "strategy": "maccms_url",
+        "input": "text",
+        "output": "text"
+      }
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "div.video-item"
+      }
+    }
+  }
+}

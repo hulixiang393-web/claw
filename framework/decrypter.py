@@ -241,6 +241,11 @@ class Decrypter:
         兼容纯 base64 密文（无 % 编码）；b64decode 宽容模式会吞掉明文 URL 的
         非法字符（如 ://），故解码后做 round-trip 校验区分真密文：解码再编码
         与原文（忽略 padding）一致才算密文，否则（明文 m3u8 等）原样返回。
+
+        另兼容 string2base64(urlencode(url)) 变体（kanav 等站的 encrypt=2 为
+        base64(url_encode(url))，即 base64 解码后仍是 URL 编码字符串）：
+        当解码结果不含 URL scheme 且含 %XX 序列时，再做一次 unquote 还原真实
+        地址（仅当二次解码结果像 URL 才采用，避免误伤正常字符）。
         """
         import urllib.parse
 
@@ -250,7 +255,12 @@ class Decrypter:
             raw = base64.b64decode(s + "=" * (-len(s) % 4))
             if base64.b64encode(raw).rstrip(b"=") != s.encode().rstrip(b"="):
                 return content
-            return raw.decode("utf-8", errors="replace")
+            out = raw.decode("utf-8", errors="replace")
+            if "%" in out and not out.startswith(("http://", "https://", "//")):
+                out2 = urllib.parse.unquote(out)
+                if out2.startswith(("http://", "https://", "//")):
+                    return out2
+            return out
         except Exception:
             return content
 
