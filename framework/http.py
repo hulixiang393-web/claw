@@ -759,6 +759,79 @@ class HttpClient:
 
         return self._run_with_proxy_switch(_once, proxy, proxy_pool, f"POST {url}")
 
+    def post_text(
+        self,
+        url: str,
+        json_body: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        proxy: Optional[str] = None,
+        timeout: float | None = None,
+        retries: int | None = None,
+        proxy_pool: Optional[ProxyPool] = None,
+        direct: bool = False,
+    ) -> str:
+        """POST JSON 并返回响应原始文本（供 text/event-stream 的 SSE 流解析）。
+        与 post_json 唯一的区别是：不尝试 JSON 解析，直接返回文本。
+        direct: 强制直连（屏蔽默认/系统代理，显式 proxy 仍优先）。"""
+        import json as _json
+
+        if timeout is None:
+            timeout = self.defaults.timeout
+        if retries is None:
+            retries = self.defaults.retries
+        if proxy is None:
+            proxy = None if direct else self.defaults.proxy
+        self._set_last_url(url)
+        headers = self._headers_with_ua(headers)
+        self._sleeper(0.0)
+
+        def _once(current_proxy: Optional[str]) -> str:
+            proxy_eff = self._effective_proxy(current_proxy, direct)
+            last_error: Exception | None = None
+            for attempt in range(retries + 1):
+                try:
+                    post_headers = dict(headers or {})
+                    post_headers.setdefault("Content-Type", "application/json")
+                    if self._session is not None:
+                        resp = self._session.post(
+                            url,
+                            json=json_body or {},
+                            headers=post_headers,
+                            timeout=timeout,
+                            proxies={"http": proxy_eff, "https": proxy_eff} if proxy_eff else None,
+                        )
+                        if _is_anti_scrape_status(resp.status_code):
+                            raise AntiScrapeError(f"反爬响应 HTTP {resp.status_code} {url}")
+                        resp.raise_for_status()
+                        text = resp.text
+                    else:
+                        import urllib.request
+
+                        body = _json.dumps(json_body or {}).encode("utf-8")
+                        req = urllib.request.Request(
+                            url, data=body, headers=post_headers
+                        )
+                        with _urllib_opener(proxy_eff).open(req, timeout=timeout) as resp:
+                            text = resp.read().decode("utf-8", errors="replace")
+                    if _is_anti_scrape_text(text):
+                        raise AntiScrapeError(f"反爬特征响应 POST {url}")
+                    return text
+                except AntiScrapeError as exc:
+                    if proxy_pool is not None:
+                        raise
+                    last_error = exc
+                    if attempt < retries:
+                        self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    if attempt < retries:
+                        self._sleeper(min(0.5 * (2 ** attempt), 2.0))
+            if isinstance(last_error, RequestError):
+                raise last_error
+            raise RequestError(f"请求失败 POST {url}：{last_error}")
+
+        return self._run_with_proxy_switch(_once, proxy, proxy_pool, f"POST {url}")
+
     def post_form(
         self,
         url: str,
