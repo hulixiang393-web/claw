@@ -326,9 +326,10 @@ class AdblockEngine:
         # 内置 query 参数广告特征（仅参数名命中，防误伤）
         if _has_ad_query(low):
             return True
-        # 源级补充正则
+        # 源级补充正则（与内置路径特征同语义：只匹配 parsed.path，不匹配
+        # host/query；避免宽松子串如 /stream/ 命中任意 URL 段造成误伤）
         for p in self._extra_regexes:
-            if p.search(low):
+            if p.search(parsed.path):
                 return True
         return False
 
