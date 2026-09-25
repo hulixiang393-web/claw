@@ -204,7 +204,7 @@
       "fields": {
         "title": {
           "css": "h1",
-          "regex": "(?s)标题[：:]\\s*(.*?)(?:\\s*作者[：:]|$)"
+          "regex": "(?s)(?:标题[：:]\\s*)?(.*?)(?:\\s*作者[：:]|\\s*#|\\s*\\[支援|\\s*20\\d{2}年|$)"
         },
         "cover": {
           "regex": "MacPlayer\\.Pic\\s*=\\s*\"([^\"]+)\""
@@ -218,7 +218,10 @@
         },
         "clean": {
           "summary": [
-            ["re:\\s*-\\s*KanAV.*$", ""]
+            [
+              "re:\\s*-\\s*KanAV.*$",
+              ""
+            ]
           ]
         }
       }
@@ -249,14 +252,14 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 10,
-      "max_results": 240
+      "max_pages": 20,
+      "max_results": 1000
     },
     "detail": {
       "max_pages": 1
     },
     "episode": {
-      "max_pages": 1,
+      "max_pages": 8,
       "max_items": 1
     }
   },
