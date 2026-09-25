@@ -98,6 +98,11 @@ class Detail:
     # 图文集（video 详情页内嵌截图序列等，如 xasiat 的 fancybox screenshots）；
     # 由 detail.fields.gallery 多值选择器提取，详情抽屉以缩略图形式展示
     gallery: List[str] = field(default_factory=list)
+    # 站内相关推荐：详情页内嵌的相关影片（如 hanime1 #related-tabcontent 卡片、
+    # pornhub relatedVideos JS 变量）。由 detail.related 配置驱动，未配置该块
+    # 时保持空列表 → 列表页 UI 回退同源关键词搜索（其他源零影响）。
+    # 每项 dict 只含 title/url/cover 三个字符串键，均允许空串（无封面纯文字卡片）。
+    related: List[dict] = field(default_factory=list)
 
 
 class Content:
@@ -209,6 +214,22 @@ class Content:
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         return utils.abs_url(source.base_url, url)
+
+    @staticmethod
+    def _looks_like_direct_media(url: str) -> bool:
+        """URL 是否已是可直接播放的媒体文件/流（m3u8/mpd/mp4/flv/webm 等）。
+
+        用在 fetch_video_episode 的直链 passthrough：这类地址交给 HTML 解析
+        或 episode API 都没有意义（fetch 会拿到二进制/list 文本而非播放页）。
+        """
+        if not url:
+            return False
+        from urllib.parse import urlsplit as _urlsplit
+
+        path = _urlsplit(url).path.lower()
+        return path.endswith(
+            (".m3u8", ".mpd", ".mp4", ".m4v", ".flv", ".webm", ".mkv", ".mov", ".ts", ".m4a")
+        )
 
     def _get(self, source: SourceConfig, url: str, http=None) -> str:
         """抓取页面 HTML。http 可传独立 HttpClient（并行翻页时避免共享
@@ -374,6 +395,38 @@ class Content:
             elif _val is not None:
                 setattr(detail, _key, self._clean_field(_val, _pairs))
 
+        # 站内相关推荐（detail.related 块，如 hanime1 详情页 #related-tabcontent
+        # 的相关影片卡片）：优先直接用详情页内嵌的相关内容，替代同源关键词搜索。
+        # 无 related 配置/选择器未命中/任何异常 → 保持空列表（UI 回退关键词搜索）。
+        related_cfg = detail_cfg.get("related") or {}
+        if related_cfg:
+            related: List[dict] = []
+            try:
+                rel_root = related_cfg.get("root_selector")
+                rel_fields = related_cfg.get("fields") or {}
+                rel_max = int(related_cfg.get("max") or 8)
+                if rel_root and rel_fields:
+                    items = self._parser.parse_items(
+                        doc, rel_root, rel_fields, source.base_url
+                    )
+                    own = (detail.url or "").rstrip("/").lower()
+                    for it in items:
+                        r_url = (it.get("url") or "").strip()
+                        if not r_url:
+                            continue  # 无 URL 的卡片不可点，跳过
+                        if r_url.rstrip("/").lower() == own:
+                            continue  # 剔除自身
+                        related.append({
+                            "title": it.get("title") or "",
+                            "url": r_url,
+                            "cover": it.get("cover") or "",
+                        })
+                        if len(related) >= rel_max:
+                            break
+            except Exception:  # noqa: BLE001
+                related = []  # 相关推荐失败不影响主流程
+            detail.related = related
+
         # 章节列表（按类型取 content 配置，传书名用于标题清理；
         # html 供目录页 id 从详情页 HTML 提取，如 dm5 COMIC_MID）
         detail.chapters = self._fetch_chapters(
@@ -510,6 +563,45 @@ class Content:
         )
         chapters = d.get("chapters") or []
         detail.chapters = [Chapter(title=c.get("title") or "", url=c.get("url") or url) for c in chapters]
+        # 站内相关推荐（detail.related 块，如 pornhub 详情 HTML 的 relatedVideos
+        # JS 变量）：优先用详情页内嵌的相关影片，替代同源关键词搜索。详情元数据
+        # 走 ytdlp，但详情 URL 本身可 GET（复用 transports 请求头）。异常静默空。
+        related_cfg = cfg.get("related") or {}
+        if related_cfg:
+            related: List[dict] = []
+            try:
+                html = self._get(source, url)
+                pat = str(
+                    related_cfg.get("js_regex")
+                    or r"relatedVideos\s*=\s*(\[.*?\]);"
+                )
+                m = _re.search(pat, html, _re.DOTALL)
+                data = json.loads(m.group(1)) if m else None
+                if isinstance(data, list):
+                    own = (detail.url or "").rstrip("/").lower()
+                    rel_max = int(related_cfg.get("max") or 8)
+                    for it in data:
+                        if not isinstance(it, dict):
+                            continue
+                        vkey = it.get("vkey")
+                        title = it.get("title") or ""
+                        if not vkey or not title:
+                            continue  # 缺 vkey/title 无法构造卡片
+                        r_url = self._abs_url(
+                            source, "/view_video.php?viewkey=" + str(vkey)
+                        )
+                        if r_url.rstrip("/").lower() == own:
+                            continue  # 剔除自身
+                        related.append({
+                            "title": title,
+                            "url": r_url,
+                            "cover": "",  # 未知字段留空，卡片支持无封面纯文字
+                        })
+                        if len(related) >= rel_max:
+                            break
+            except Exception:  # noqa: BLE001
+                related = []  # 相关推荐失败不影响主流程
+            detail.related = related
         return detail
 
     # ------------------------------------------------------------------ #
@@ -522,21 +614,28 @@ class Content:
             title / number 每项标题/序号字段名
             url_template   章节 URL 模板（可用 {cid} / {page} / {part} 占位）
         """
-        from urllib.parse import urlencode, urljoin
+        from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
         filled = {}
-        m_bv = _re.search(r"(BV[0-9A-Za-z]+)", url)
-        bvid = m_bv.group(1) if m_bv else url.split("/")[-1]
+        # 详情 URL 的 query（?title=... 等）并入占位符：detail POST 接口需要
+        # 精确标题等额外字段（如 ikanpp /api/detail 要 title 才命中正确 vod），
+        # bvid 只取 URL 的 path 末段（BV 号优先，query 不参与）。
+        _sp = urlsplit(url)
+        m_bv = _re.search(r"(BV[0-9A-Za-z]+)", _sp.path)
+        bvid = m_bv.group(1) if m_bv else _sp.path.rstrip("/").split("/")[-1] or url
+        _ph = {"id": bvid, "bvid": bvid}
+        if _sp.query:
+            _ph.update({k: v[0] for k, v in parse_qs(_sp.query).items()})
         method = (cfg.get("method") or "GET").upper()
         if method == "POST":
-            # JSON API（GraphQL 等）：POST body 递归替换 {id}/{bvid}
+            # JSON API（GraphQL 等）：POST body 递归替换 {id}/{bvid}/{query 参数}
             body_filled = utils.fill_json(
-                cfg.get("body") or {}, id=bvid, bvid=bvid
+                cfg.get("body") or {}, **_ph
             )
             for k, v in params.items():
-                body_filled.setdefault(k, utils.fill_json(v, id=bvid, bvid=bvid))
+                body_filled.setdefault(k, utils.fill_json(v, **_ph))
             sign_cfg = cfg.get("sign") or {}
             strategy = sign_cfg.get("strategy")
             if strategy:
@@ -554,9 +653,14 @@ class Content:
             )
         else:
             # URL 路径占位符同样替换（同 episode 分支处理，avgood 类路径 {id} 原样发出会 404）
-            api_url = str(cfg.get("url") or "").replace("{id}", bvid).replace("{bvid}", bvid)
+            api_url = str(cfg.get("url") or "")
+            for _k, _v in _ph.items():
+                api_url = api_url.replace("{" + _k + "}", str(_v))
             for k, v in params.items():
-                filled[k] = str(v).replace("{bvid}", bvid).replace("{id}", bvid)
+                _val = str(v)
+                for _pk, _pv in _ph.items():
+                    _val = _val.replace("{" + _pk + "}", str(_pv))
+                filled[k] = _val
             sign_cfg = cfg.get("sign") or {}
             strategy = sign_cfg.get("strategy")
             if strategy:
@@ -2220,8 +2324,15 @@ class Content:
         （空 / ContentMissingError / 网络异常 / 播放 URL 403/404/超时）时
         自动尝试其他线路，全部失败才抛错。
         """
-        # JSON API 播放地址（api_endpoints.episode）
+        # 直链媒体 passthrough：分集 URL 已是可直接播放的媒体文件
+        # （m3u8/mpd/mp4/flv/webm 等，如 ikanpp 详情 chapters url_template
+        # 直接给出 CDN m3u8）。此时无需再走 episode API / HTML 播放页解析，
+        # 且此类 URL 被当前置 HTML 解析会误抓二进制/列表文本。仅无
+        # api_endpoints.episode 的源生效（episode API 源的分集 URL 是内容页）。
         api = source.raw.get("api_endpoints") or {}
+        if not api.get("episode") and self._looks_like_direct_media(episode_url):
+            return episode_url
+        # JSON API 播放地址（api_endpoints.episode）
         episode_api = api.get("episode") or {}
         if episode_api:
             # yt-dlp 引擎：单流播放地址（合并单流，含音视频，VLC 可直接播）
