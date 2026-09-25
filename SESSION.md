@@ -1,5 +1,65 @@
 # SESSION — claw（D:\code\claw）
 
+## ikanpp 搜索全量改造：entity-search(1条) → search-parallel SSE(25源/300+条)（2026-09-25，未 commit，663 全绿）
+### 根因（用户报告搜索只有 1 条）
+- ikanpp 站内真实搜索是 `POST /api/search-parallel`（并行聚合 25 个 MacCMS 采集源的搜索结果），返回 **text/event-stream**（SSE）；原实现用 `/api/entity-search`（TMDB 单实体，恒 1 条）。
+- SSE 响应是**非标准拆块流**：超大 JSON 事件被服务器按 200~800B 切成多物理行，仅首行带 `data:` 前缀，续行是裸 UTF-8 片段（多字节中文可能截断跨行）→ 逐行/join('\n') 解析会丢数据，必须「空行切事件块 → 仅首行带前缀则块内 join('')」。
+- 无论什么 Accept 头，该接口恒返回 text/event-stream，无法切 JSON → 框架必须支持 SSE。
+### 改动摘要
+- **`framework/http.py`**：新增 `post_text(url, json_body, ...)`（POST JSON 返回原文文本，复用 _run_with_proxy_switch/反爬/重试逻辑）。
+- **`framework/search.py`**：
+  - `_search_api` 支持 `cfg["sse"]=true` + `cfg["sse_field"]`：POST 拿 `post_text` 原文 → `_parse_sse_items` 合并所有事件的 sse_field 数组 → 走原有 item_fields → SearchResult。
+  - `_parse_sse_items`（静态方法）重写为事件块级解析（兼容标准流与拆块流，见上）。
+  - **顺带修**原 POST 非 SSE 分支 bug：POST 后无条件调 `get_json(abs_url)` 而 `abs_url` 在 POST 分支未定义 → 现在 POST 分支直接以 resp 作为 items。
+- **`sources/ikanpp.json`**：
+  - search 改 `POST /api/search-parallel` + `sse:true` + `sse_field:"videos"` + body 内嵌 **25 源数组**（巨量/光速/暴风/无尽/最大/极速/新浪/电影天堂/魔都/360/1080JSON/海豚/量子/非凡/虎牙/如意/金鹰/优酷/速博/iKun/乐子/红牛/鲸鱼/魔都影视/魔都动漫，含 baseUrl/searchPath/detailPath/priority，从浏览器真实请求捕获）。
+  - item_fields：title=vod_name、url=`/title/{vod_id}?title={vod_name}&source={source}`、cover=vod_pic、author=vod_area、update=vod_remarks。
+  - detail body `"source"` 由 `{}` 改 `"{source}"`（**重要**：搜索结果 detail 必须带源，空 {} 只能 heal 到部分 id；source 字符串/完整对象均可）。
+- **`tests/test_ikanpp.py`**：FakeHttp 加 `post_text`（模拟拆块流 SSE，800B 物理行含跨多字节截断）；`_BROWSE/_DETAIL` 不变；细节：items 加 `source` 字段、url 断言带 `&source=`、detail body source 断言字符串。新增 `test_search_parallel_sse_aggregates_sources`（2 事件 4 条 → 同 URL 去重 3 条）与 `test_search_parallel_posts_query_and_sources`（body query/page/sources=25）。
+### 验证
+- ikanpp 单测 8 passed；全量 pytest `--ignore=tests/test_comic_scroll_anchor.py` **663 passed, 1 warning**（50.9s）。
+- 真实验证（避免限频：请求间隔 ≥15s）：搜索「战狼」→ **358 条、358 唯一 URL**（~7s）；top 结果 detail → title「战狼之父亲归…」+ 分集 m3u8 直链 `https://v4.zuidazym3u8.com/.../index.m3u8` 全链路通。
+- **限频经验**：ikanpp 短连发会被 500 反爬（调试时初判 detail 全挂，实为限频）；单请求实测 200。调试被误导 ~5 轮，宜先间隔再重测。
+### 知识沉淀
+- projects/claw.md 已更新 ikanpp 案例；topics/web/claw-source-authoring.md 新增「SSE 搜索接口（拆块流）写法」小节。
+### 待办（@followup）
+- **未 commit**：本会话改动（http.py post_text + search.py SSE + ikanpp.json + test_ikanpp.py）与先行 ikanpp 制源改动及大量并行改动（media_proxy/media_cache/adblock/settings_manager/source_editor/kanav/pornhub 等）混在同一工作区，提交方案待用户确认。
+
+## ikanpp 源制源完成（2026-09-25，未 commit，验证全绿）
+### 改动摘要
+- **框架改动 (a) `_fetch_detail_api`（content.py）**：bvid 只从 URL path 末段取（urlsplit 剥 query、BV 优先）；URL query 全并入占位符 `_ph` → POST body/params、GET url/params 的 `{title}` 等可注入（仅此一源用，向后兼容）。
+- **框架改动 (b) `fetch_video_episode`（content.py）**：新增 `_looks_like_direct_media`，无 `api_endpoints.episode` 时对 `.m3u8/.mpd/.mp4/.flv/.webm/.mkv/.mov/.ts/.m4a` 直链原样返回，不走 HTML/API 解析。
+- **`sources/ikanpp.json`（新）**：6 分类 browse API 发现、entity-search 搜索（URL `/title/{id}?title={title}`）、POST /api/detail（body `{"id","source":{},"title"}` + 裸键 field_extractors + chapters `{items:"episodes",url_template:"{url}"}` 直出 CDN m3u8）、media hls、selfcheck off。
+- **`tests/test_ikanpp.py`（新）7 例**：配置形态/发现 URL 模板/搜索/详情 title 注入/直链 passthrough/_looks_like_direct_media。
+### 验证
+- 在线 probe（Temp 目录跑，规避 http.py 遮蔽）：发现 36/页 → fetch_detail 正确命中（title 注入）→ m3u8 passthrough → 搜索「生化危机」8 集全通。
+- 全量 pytest `--ignore=tests/test_comic_scroll_anchor.py` **662 passed**（该文件 Qt access violation 为既有间歇）。
+### 知识沉淀
+- projects/claw.md + topics/web/claw-source-authoring.md（ikanpp 案例 + 裸键/query 注入/直链 passthrough 写法）+ INDEX + learning-log + CONVERSATION_LOG。
+### 待办（@followup）
+- **未 commit**：本次改动（content.py 两处 + ikanpp.json + test）与 prior 并行改动（media_proxy/adblock/settings_manager/source_editor/kanav/json/test_kanav/hanime1/pornhub related、media_cache.py、多个新 test）混在一工作区，提交需与用户核对归属。
+
+## 视频磁盘缓存 + 代理看门狗（2026-09-20，未 commit）
+### 改动摘要
+- **Part 2 磁盘缓存**：新增 `framework/media_cache.py`（`MediaCache`：mp4 `<key>.mp4`、
+  HLS `<key>/` 目录 + `playlist.m3u8`，index.json LRU 默认 3 部 / 2GB，`.part` 原子写+
+  `_startup_reclaim`；`key = sha1(strip_signed_params(url))`）；`media_proxy` 集成
+  `/c/<key>/<quote(完整上游URL)>` 路由、缓存命中本地 Range serve、miss 回源 tee 落盘
+  （仅"从头 Range"建 tee），`_rewrite_m3u8`：KEY/SESSION-KEY→`/s/`，其余→`/c/`。
+- **Part 1 看门狗**：`_IDLE_TIMEOUT=600.0` + `_WATCH_INTERVAL=10.0`（模块常量，测试可
+  monkeypatch）；`self._active` 在 do_GET try/finally 里 `_begin/_end`，`stop()` 活动期
+  失效；流式循环 `_touch()` 续命。
+- `settings_manager` 加 `video_cache` 默认块（enabled=True / max_videos=3 / max_bytes_mb=2048），
+  docstring 更新为六块。
+### 测试结果
+- 新增 `tests/test_media_cache.py` 7 例（本地 ThreadingHTTPServer 假 CDN + 注入实例缓存，
+  不碰 MediaProxy.instance()）：mp4 缓存+本地 Range 不回源、HLS 分片落盘复用、签名参数
+  key 稳定、LRU 保留三部、看门狗空闲回收/活动保护/_touch 续命、无 .part 残留。
+- 定向 3 文件 **12 passed**（4.5s）。未 commit（用户未确认）。
+### 待办（@followup）
+- `#EXT-X-PRELOAD-HINT` 走 /c/（原计划 /s/）待定；嵌套变体 m3u8 经 /c/ 端到端未专门测；
+  commit 待确认。
+
 ## m3u8 广告过滤加强（2026-09-17，7 任务计划已收口）
 ### 改动摘要（六步 commit，全部已推送 master）
 1. **default_on**（`241717d`）：`AdblockEngine.configure(source, default_on=False)` +
