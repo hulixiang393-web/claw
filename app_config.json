@@ -21,7 +21,7 @@
     "default_page_size": 20,
     "background_image": "D:/code/claw/薇尔莉特.jpg",
     "background_opacity": 0.4,
-    "reading_bg": "#2B2B2B",
+    "reading_bg": "#FBF3D2",
     "reading_font_size": 0
   },
   "download": {
@@ -44,6 +44,11 @@
   },
   "adblock": {
     "extra_rule_dir": ""
+  },
+  "video_cache": {
+    "enabled": true,
+    "max_videos": 3,
+    "max_bytes_mb": 2048
   },
   "sources_runtime": {
     "broken_source_warn_interval_hours": 24,
