@@ -848,6 +848,7 @@ class Search:
                         json_body=body_filled,
                         headers=source.request_headers(),
                         timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+                        encoding=source.transports().get("charset"),
                         proxy_pool=source.proxy_pool(),
                     )
                     items = self._parse_sse_items(sse_text, sse_field or "videos")

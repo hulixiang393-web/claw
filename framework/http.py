@@ -769,10 +769,13 @@ class HttpClient:
         retries: int | None = None,
         proxy_pool: Optional[ProxyPool] = None,
         direct: bool = False,
+        encoding: Optional[str] = None,
     ) -> str:
         """POST JSON 并返回响应原始文本（供 text/event-stream 的 SSE 流解析）。
         与 post_json 唯一的区别是：不尝试 JSON 解析，直接返回文本。
-        direct: 强制直连（屏蔽默认/系统代理，显式 proxy 仍优先）。"""
+        direct: 强制直连（屏蔽默认/系统代理，显式 proxy 仍优先）。
+        encoding: 显式解码编码（SSE 响应常无 charset，requests 会按 iso-8859-1
+        兜底导致中文乱码；源声明了 charset 时传入即可）。"""
         import json as _json
 
         if timeout is None:
@@ -803,7 +806,7 @@ class HttpClient:
                         if _is_anti_scrape_status(resp.status_code):
                             raise AntiScrapeError(f"反爬响应 HTTP {resp.status_code} {url}")
                         resp.raise_for_status()
-                        text = resp.text
+                        text = self._response_text(resp, encoding)
                     else:
                         import urllib.request
 
@@ -812,7 +815,7 @@ class HttpClient:
                             url, data=body, headers=post_headers
                         )
                         with _urllib_opener(proxy_eff).open(req, timeout=timeout) as resp:
-                            text = resp.read().decode("utf-8", errors="replace")
+                            text = resp.read().decode(encoding or "utf-8", errors="replace")
                     if _is_anti_scrape_text(text):
                         raise AntiScrapeError(f"反爬特征响应 POST {url}")
                     return text

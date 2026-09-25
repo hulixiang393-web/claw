@@ -80,6 +80,7 @@ class _FakeHttp:
 
     def __init__(self):
         self.last_body = None
+        self.last_post_kw = None
 
     def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3,
                  interval_ms=0, encoding=None, proxy_pool=None, direct=False):
@@ -95,6 +96,7 @@ class _FakeHttp:
         return dict(_DETAIL)
 
     def post_text(self, url, json_body=None, **kw):
+        self.last_post_kw = dict(kw)
         if "search-parallel" in url:
             self.last_body = dict(json_body or {})
             # 模拟 ikanpp 非标准 SSE：超大 videos 事件被服务器拆成多物理行，
@@ -234,6 +236,19 @@ def test_search_parallel_posts_query_and_sources():
     assert body["query"] == "战狼"
     assert body["page"] == "1"
     assert len(body["sources"]) == 25
+
+
+def test_search_parallel_sse_passes_charset_encoding():
+    """SSE 分支 post_text 应传 transports.charset，避免 text/event-stream
+    无 charset 时 requests 按 iso-8859-1 解码导致中文标题乱码。"""
+    from framework.search import Search
+
+    http, _ = _content()
+    src = _source()
+    searcher = Search(http, Parser())
+    searcher.search_one(src, "战狼")
+    assert http.last_post_kw is not None
+    assert http.last_post_kw.get("encoding") == "utf-8"
 
 
 # --------------------------------------------------------------------------- #
