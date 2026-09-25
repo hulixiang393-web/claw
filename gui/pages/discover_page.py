@@ -186,6 +186,10 @@ class DiscoverPage(BasePage):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 竖直滚动条常显：图片加载/卡片渐增使内容高度超视口时滚动条出现会让
+        # 视口变窄→网格列数跳变→整排重排→卡片上下晃动（滚动条出现/消失振荡）。
+        # 常显固定视口宽度，列数稳定，网格不重排（与 search_page 固定列数同理）。
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         body.addWidget(self.scroll, stretch=1)
 
         self.list_container = QWidget()

@@ -360,6 +360,9 @@ class LibraryPage(BasePage):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 竖直滚动条常显：书籍封面加载不足/下载后封面补齐使内容增长时，滚动条
+        # 出现/消失→视口宽度变化→列表项重排晃动。常显固定宽度消除抖动。
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.container = QWidget()
         self.body = QVBoxLayout(self.container)
         self.body.setContentsMargins(0, 0, 0, 0)

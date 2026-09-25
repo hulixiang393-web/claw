@@ -150,5 +150,46 @@ def test_filter_load_more_keeps_source(app):
     assert _sheet_ids(page) == {"site_a"}
 
 
+def test_filter_chips_row(app):
+    """来源筛选 chips 行：结果完成后聚合来源 → 点击筛选 → 全部恢复 → 增量刷新。"""
+    page = _make_page(app)
+    page._results = _results()
+    page._results_display = list(page._results)
+    page._shown_count = len(page._results)
+    page._refresh_source_chips()
+
+    # 聚合：site_a×2 / site_b×1，chips 行可见
+    assert page._source_chip_row.isVisible() is True
+    assert set(page._source_chip_btns) == {"site_a", "site_b"}
+    assert "站点A" in page._source_chip_btns["site_a"].text()
+    assert "站点B" in page._source_chip_btns["site_b"].text()
+
+    # 点 site_a chip → 只看该源，chip 选中同步
+    page._source_chip_btns["site_a"].click()
+    assert page._filter_source == "site_a"
+    assert page._source_chip_btns["site_a"].isChecked() is True
+    assert page._source_chip_btns["site_b"].isChecked() is False
+    assert _sheet_ids(page) == {"site_a"}
+
+    # 点「全部」→ 恢复全量，chip 全部取消
+    page._all_chip_btn.click()
+    assert page._filter_source == ""
+    assert page._all_chip_btn.isChecked() is True
+    assert _sheet_ids(page) == {"site_a", "site_b"}
+
+    # 增量刷新：删除一个来源后 chips 行同步移除该按钮
+    page._results = [page._results[0], page._results[2]]  # 只剩 site_a×2
+    page._results_display = list(page._results)
+    page._refresh_source_chips()
+    assert set(page._source_chip_btns) == {"site_a"}
+
+    # 结果清空 → 整行隐藏（_current_display 优先 _results_display，两者都要清）
+    page._reset_source_chips()
+    page._results = []
+    page._results_display = []
+    page._refresh_source_chips()
+    assert page._source_chip_row.isVisible() is False
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

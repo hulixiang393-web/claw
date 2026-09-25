@@ -409,6 +409,9 @@ class VideoView(QWidget):
         self._cards_scroll = QScrollArea()
         self._cards_scroll.setWidgetResizable(True)
         self._cards_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 竖直滚动条常显：分集/相关推荐卡片含大量封面，异步加载使高度越过视口时
+        # 滚动条出现→视口变窄→卡片重排晃动。常显固定宽度。
+        self._cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self._cards_container = QWidget()
         self._cards_vbox = QVBoxLayout(self._cards_container)
         self._cards_vbox.setContentsMargins(0, 0, 0, 0)

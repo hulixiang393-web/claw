@@ -72,6 +72,24 @@ CHALLENGE_MARKERS = (
 # _NonClosingMenu「点行不收起、点外部/Escape 收起」行为。
 SRC_MENU_SCROLL_LIMIT = 400
 
+# 来源筛选 chips 样式（QPushButton checkable，选中 = 正在只看该源）
+SOURCE_CHIP_SS = (
+    "QPushButton { background: palette(midlight); border: none;"
+    " border-radius: 10px; padding: 3px 10px; font-size: 11px;"
+    " color: palette(text); }"
+    "QPushButton:hover { background: palette(light); }"
+    "QPushButton:checked { background: palette(highlight);"
+    " color: palette(highlightedText); font-weight: bold; }"
+)
+SOURCE_ALL_CHIP_SS = (
+    "QPushButton { background: palette(base); border: 1px solid palette(mid);"
+    " border-radius: 10px; padding: 3px 10px; font-size: 11px;"
+    " color: palette(text); }"
+    "QPushButton:checked { background: palette(highlight);"
+    " color: palette(highlightedText); font-weight: bold;"
+    " border: 1px solid palette(highlight); }"
+)
+
 
 class _SearchSignals(QObject):
     finished = Signal(object, object, object, object)  # (source, results, err, epoch)
@@ -217,6 +235,9 @@ class SearchPage(BasePage):
         self._results = []
         self._filter_source = ""
         self._saved_unfiltered_shown = None  # 进入来源筛选前的渲染进度（清除筛选后恢复）
+        self._source_chip_btns: dict = {}  # source_id → source chip QPushButton（结果来源筛选行）
+        self._source_chip_row = None  # 来源筛选 chips 行 widget（构建后赋值）
+        self._chip_ready = False  # 来源筛选行已构建（防御早于 _build 的调用）
         self._status_chips: dict = {}  # source_id → (QLabel, QLabel状态) 或组合控件
         self._pending_count = 0  # 未完成搜索的源数
         self._work_count = 0  # 当前网格卡片计数（追加/重建共用）
@@ -307,6 +328,24 @@ class SearchPage(BasePage):
         self.filter_bar_widget.setVisible(False)
         layout.addWidget(self.filter_bar_widget)
 
+        # ---- 来源筛选 chips 行（结果完成后聚合可筛选来源）----
+        self._source_chip_row = QWidget()
+        self._source_chip_row.setVisible(False)
+        self._source_chip_hbox = QHBoxLayout(self._source_chip_row)
+        self._source_chip_hbox.setContentsMargins(0, 0, 0, 0)
+        self._source_chip_hbox.setSpacing(6)
+        self._all_chip_btn = QPushButton("全部")
+        self._all_chip_btn.setCheckable(True)
+        self._all_chip_btn.setChecked(True)
+        self._all_chip_btn.setStyleSheet(SOURCE_ALL_CHIP_SS)
+        self._all_chip_btn.setCursor(Qt.PointingHandCursor)
+        self._all_chip_btn.setToolTip("显示所有来源的结果")
+        self._all_chip_btn.clicked.connect(self._clear_filter)
+        self._source_chip_hbox.addWidget(self._all_chip_btn)
+        self._source_chip_hbox.addStretch(1)
+        self._chip_ready = True
+        layout.addWidget(self._source_chip_row)
+
         # ---- 搜索状态 ----
         self.status_label = QLabel("")
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -317,6 +356,9 @@ class SearchPage(BasePage):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 竖直滚动条常显：scrollbar 出现/消失 → 视口宽度变化 → 列数跳变（固定 4 列
+        # 只在整除边界免疫，±15px 会触发列宽重排）→ 卡片抖动。常显宽度恒定。
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         layout.addWidget(self.scroll, stretch=1)
 
         self.grid_container = QWidget()
@@ -367,6 +409,7 @@ class SearchPage(BasePage):
         self._filter_source = ""
         self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(False)
+        self._reset_source_chips()
         self.status_label.setText("搜索中...")
         self._clear_grid()
         self._results = []
@@ -742,6 +785,7 @@ class SearchPage(BasePage):
 
     def _update_batch_status(self) -> None:
         """更新状态文本：已显示 X / 共 Y 条。"""
+        self._refresh_source_chips()  # 结果变化统一刷新来源筛选 chips（增量，防闪烁）
         total = len(self._filtered_display())
         if self._filter_source:
             self.status_label.setText(f"共 {total} 条结果（仅看此源）")
@@ -1069,8 +1113,84 @@ class SearchPage(BasePage):
         self._more_pending = False  # 换词/重建网格：中止旧滚动分批链
         self._last_columns = 0  # 重建后需重新应用一次列拉伸
 
+    # ------------------------------------------------------------------ #
+    # 来源筛选 chips 行（顶部显式入口；卡片来源角标点击入口在其下）
+    # ------------------------------------------------------------------ #
+    def _reset_source_chips(self) -> None:
+        """清空来源筛选 chips 行并隐藏（新搜索/清空时）。"""
+        if not self._chip_ready:
+            return
+        for btn in self._source_chip_btns.values():
+            self._source_chip_hbox.removeWidget(btn)
+            btn.deleteLater()
+        self._source_chip_btns = {}
+        self._source_chip_row.setVisible(False)
+
+    def _available_sources(self) -> dict:
+        """当前结果（合并后为 _results_display，否则 _results）聚合来源。
+
+        返回 {source_id: (source_name, 条数)}，顺序按首次出现保持稳定。
+        """
+        agg = {}
+        for r in self._current_display():
+            sid = getattr(r, "source_id", "") or ""
+            if not sid:
+                continue
+            name = getattr(r, "source_name", "") or sid
+            if sid in agg:
+                agg[sid] = (name, agg[sid][1] + 1)
+            else:
+                agg[sid] = (name, 1)
+        return agg
+
+    def _refresh_source_chips(self) -> None:
+        """按当前结果聚合来源，增量刷新筛选 chips（已有按钮只改计数，不重建防闪）。
+
+        每个来源按钮 → _set_filter（复用结果筛选渲染路径）；「全部」→ _clear_filter。
+        无结果时整行隐藏。chips 由 _current_display 聚合——合并/筛选不影响其来源集
+        合（始终基于全量），保证切源后 chips 行来源列表稳定。
+        """
+        if not self._chip_ready:
+            return
+        agg = self._available_sources()
+        # 删除已消失来源的按钮
+        for sid in [s for s in self._source_chip_btns if s not in agg]:
+            btn = self._source_chip_btns.pop(sid)
+            self._source_chip_hbox.removeWidget(btn)
+            btn.deleteLater()
+        # 更新计数 / 插入新来源；「全部」按钮后插入（stretch 在最右）
+        idx = self._source_chip_hbox.indexOf(self._all_chip_btn) + 1
+        for sid, (name, count) in agg.items():
+            btn = self._source_chip_btns.get(sid)
+            if btn is None:
+                btn = QPushButton(f"{name} ({count})")
+                btn.setCheckable(True)
+                btn.setStyleSheet(SOURCE_CHIP_SS)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setToolTip(f"仅看 {name} 的结果")
+                btn.clicked.connect(lambda _, s=sid: self._set_filter(s))
+                self._source_chip_hbox.insertWidget(idx, btn)
+                idx += 1
+                self._source_chip_btns[sid] = btn
+            else:
+                btn.setText(f"{name} ({count})")
+        self._source_chip_row.setVisible(bool(agg))
+        self._sync_chip_checked()
+
+    def _sync_chip_checked(self) -> None:
+        """同步 chips 选中态：全部 / 当前筛选源（blockSignals 防 setChecked 触发点击）。"""
+        if not self._chip_ready:
+            return
+        self._all_chip_btn.blockSignals(True)
+        self._all_chip_btn.setChecked(not self._filter_source)
+        self._all_chip_btn.blockSignals(False)
+        for sid, btn in self._source_chip_btns.items():
+            btn.blockSignals(True)
+            btn.setChecked(sid == self._filter_source)
+            btn.blockSignals(False)
+
     def _set_filter(self, source_id: str) -> None:
-        """来源角标筛选。"""
+        """来源筛选（chips 按钮 / 卡片来源角标共用）。"""
         if source_id != self._filter_source:
             if not self._filter_source:
                 # 首次进入筛选：保存未筛选时的渲染进度，清除筛选后恢复用
@@ -1086,6 +1206,7 @@ class SearchPage(BasePage):
                 self._shown_count = self._saved_unfiltered_shown
                 self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(bool(self._filter_source))
+        self._sync_chip_checked()
         self._show_results()
 
     def _clear_filter(self) -> None:
@@ -1095,6 +1216,7 @@ class SearchPage(BasePage):
         if self._saved_unfiltered_shown is not None:
             self._shown_count = self._saved_unfiltered_shown
             self._saved_unfiltered_shown = None
+        self._sync_chip_checked()
         self._show_results()
 
     def _on_scroll(self, value: int) -> None:
