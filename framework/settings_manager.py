@@ -1,7 +1,8 @@
 """全局应用设置（settings_manager.py）。
 
 读写 app_config.json，提供默认值合并。首页读主题、字体缩放等。
-对应 app_config.json 五块：network / ui / download / library / diagnostics。
+对应 app_config.json 六块：network / ui / download / library / diagnostics
+/ video_cache（视频播放磁盘缓存配额）。
 
 用法：
     sm = SettingsManager("app_config.json")
@@ -63,6 +64,11 @@ DEFAULTS: dict = {
     },
     "adblock": {
         "extra_rule_dir": "",
+    },
+    "video_cache": {
+        "enabled": True,
+        "max_videos": 3,
+        "max_bytes_mb": 2048,
     },
     "sources_runtime": {
         "broken_source_warn_interval_hours": 24,
