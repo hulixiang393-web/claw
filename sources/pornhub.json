@@ -123,7 +123,11 @@
   "api_endpoints": {
     "detail": {
       "engine": "ytdlp",
-      "url": "{url}"
+      "url": "{url}",
+      "related": {
+        "js_regex": "relatedVideos\\s*=\\s*(\\[.*?\\]);",
+        "max": 8
+      }
     },
     "episode": {
       "engine": "ytdlp",

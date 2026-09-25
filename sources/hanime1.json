@@ -156,6 +156,27 @@
           "css": "meta[property='og:video:duration']",
           "attr": "content"
         }
+      },
+      "related": {
+        "root_selector": {
+          "css": "div#related-tabcontent div.video-item-container"
+        },
+        "fields": {
+          "title": {
+            "css": "h4.video-title a, .video-title a"
+          },
+          "url": {
+            "css": "a[href*='watch?v=']",
+            "attr": "href"
+          },
+          "cover": {
+            "fallback": [
+              {"css": "img.main-thumb", "attr": "src"},
+              {"css": "img", "attr": "src"}
+            ]
+          }
+        },
+        "max": 8
       }
     },
     "content": {
@@ -221,6 +242,7 @@
   },
   "media": {
     "format": "mp4",
+    "proxy_mode": "force_proxy",
     "select": {
       "video": {
         "quality": "best"
