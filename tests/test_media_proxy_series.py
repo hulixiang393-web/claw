@@ -229,11 +229,15 @@ def test_episode_503_when_resolver_slots_busy(monkeypatch, proxy_ctx):
     started = threading.Barrier(mp._SERIES_SEM + 1, timeout=10)
 
     def _slow(i):
-        started.wait()          # 占满全部 _SERIES_SEM 个许可后一起放行
-        gate.wait(timeout=10)
+        # 只有 idx 0（被占满许可的那一集）参与会合与闸门：末位的 idx 1 探测请求
+        # 若也进同一个已放行的 Barrier，会空等满 timeout 再抛 BrokenBarrierError
+        # → 被 _serve_series 归成 502，测的就不是「许可有没有泄漏」了。
+        if i == 0:
+            started.wait()          # 占满全部 _SERIES_SEM 个许可后一起放行
+            gate.wait(timeout=10)
         return "https://cdn.example.com/x.m3u8", "", {}, None
 
-    key = proxy.register_series(_slow, count=1)
+    key = proxy.register_series(_slow, count=2)
     url = proxy.series_episode_url(key, 0)
     busy = [threading.Thread(target=requests.get,
                              args=(url,), kwargs={"allow_redirects": False,
@@ -249,8 +253,11 @@ def test_episode_503_when_resolver_slots_busy(monkeypatch, proxy_ctx):
         gate.set()
         for t in busy:
             t.join(timeout=10)
-    # 许可未泄漏：占满的请求都完成后，仍能再解析一集
-    r2 = requests.get(url, allow_redirects=False, timeout=5)
+    # 许可未泄漏：占满的请求都完成后，**另一集**仍能解析。
+    # 必须换一集（count=2 → 请求 idx 1）：同 key 同 idx 会命中 idx 0 刚写下的
+    # memo，根本走不到 sem.acquire，断言再对也证明不了「许可没泄漏」。
+    r2 = requests.get(proxy.series_episode_url(key, 1),
+                      allow_redirects=False, timeout=5)
     assert r2.status_code == 302
 
 
