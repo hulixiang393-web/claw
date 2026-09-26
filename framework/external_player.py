@@ -45,6 +45,11 @@ _last_proc: "subprocess.Popen | None" = None
 # 浏览器 fallback / 启动失败时不写。player_command 据此向 VLC 发控制命令。
 _control_state: dict | None = None
 
+# 最近一次 VLC 会话的播放列表快照（playlist.json 解析结果）。握手线程填它，
+# video_view 据此建立 {集下标: vlc_id} 映射。_terminate_previous 清空：
+# 旧会话的 id 对新会话无意义，留着会让 App 切集串台。
+_playlist_items: list[dict] = []
+
 
 def _locate_vlc() -> str | None:
     """定位 VLC 桌面版可执行文件（候选路径 + PATH）。"""
@@ -67,13 +72,15 @@ def _terminate_previous() -> None:
     """关闭上一次拉起的播放器进程（幂等）。
 
     换集/重开播放器时终止旧 VLC 实例；旧进程可能已退出或句柄失效
-    （用户手动关闭/播放自然结束后句柄仍在），terminate 一律 try/except
-    包裹，不抛异常、不干扰本次拉起新版。同时清空 _control_state：
-    旧实例被关后其 HTTP 控制会话即失效（换集重开会重建）。
+    （用户手动关闭/播放结束），terminate 一律 try/except
+    包裹，不抛异常、不干扰本次拉起新版。同时清空 _control_state 与
+    _playlist_items：旧实例被关后其 HTTP 控制会话即失效（换集重开会重建），
+    播放列表 id 映射同样对旧实例失效。
     """
-    global _last_proc, _control_state
+    global _last_proc, _control_state, _playlist_items
     proc, _last_proc = _last_proc, None
     _control_state = None
+    _playlist_items = []
     if proc is None:
         return
     try:
@@ -226,13 +233,16 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
     return "已在浏览器中打开"
 
 
-def player_command(command: str, val: str = "") -> bool:
+def player_command(command: str, val: str = "", item_id=None) -> bool:
     """向最近一次拉起的 VLC 发送 HTTP 控制命令。
 
     无控制会话（浏览器 fallback / 启动失败 / 播放器已关 / requests 缺失）
     或网络失败一律静默返回 False；成功（HTTP 2xx/3xx）返回 True。GUI 键盘
     事件直接转发成 VLC 命令（pl_play / pl_pause / pl_stop / pl_next /
-    pl_prev / seek +30 / volume +10…），命令名或取值由调用方给出。
+    pl_previous / seek +30 / volume +10…），命令名或取值由调用方给出。
+
+    item_id 用于需要播放列表项 id 的命令（pl_play / pl_delete）——VLC 的
+    pl_play 取值是**播放列表项 id**（非下标），必须先读 playlist.json 建映射。
     """
     state = _control_state
     if not state or requests is None:
@@ -240,6 +250,8 @@ def player_command(command: str, val: str = "") -> bool:
     params = {"command": command}
     if val:
         params["val"] = val
+    if item_id is not None:
+        params["id"] = item_id
     try:
         r = requests.get(
             f"http://127.0.0.1:{state['port']}/requests/status.xml",
@@ -247,4 +259,60 @@ def player_command(command: str, val: str = "") -> bool:
         )
         return r.status_code < 400
     except Exception:  # noqa: BLE001 —— 网络失败/端口未起：静默 False
+        return False
+
+
+def player_playlist_items(timeout: float = 2.0,
+                          refresh: bool = False) -> list[dict]:
+    """读最近一次 VLC 会话的完整播放列表（GET /requests/playlist.json）。
+
+    返回 [{id, name, uri, current}, ...]；无控制会话 / 网络失败 / 状态码
+    >=400 / 响应非 list 一律返回 []。**失败结果不缓存**（下次调用重试）。
+    refresh=True 强制重新拉（握手轮询 VLC 尚未建好列表时需要）。
+    """
+    global _playlist_items
+    if _playlist_items and not refresh:
+        return _playlist_items
+    state = _control_state
+    if not state or requests is None:
+        return []
+    try:
+        r = requests.get(
+            f"http://127.0.0.1:{state['port']}/requests/playlist.json",
+            auth=("", state["password"]), timeout=timeout,
+        )
+        if r.status_code >= 400:
+            return []
+        items = r.json()
+    except Exception:  # noqa: BLE001 —— 网络失败/未就绪/非 JSON：静默 []
+        return []
+    if not isinstance(items, list):
+        return []
+    _playlist_items = [it for it in items if isinstance(it, dict)]
+    return _playlist_items
+
+
+def player_goto(item_id: int) -> bool:
+    """跳播播放列表项 id（VLC pl_play 的 id 是项 id，非下标）。"""
+    return player_command("pl_play", item_id=item_id)
+
+
+def player_next() -> bool:
+    """下一项（VLC 内置 N）。"""
+    return player_command("pl_next")
+
+
+def player_previous() -> bool:
+    """上一项（VLC 内置 P）。命令名是 pl_previous——**没有 pl_prev**。"""
+    return player_command("pl_previous")
+
+
+def player_running() -> bool:
+    """最近拉起的播放器进程是否仍在运行（App 据此决定能否指挥 VLC 切集）。"""
+    proc = _last_proc
+    if proc is None:
+        return False
+    try:
+        return proc.poll() is None
+    except Exception:  # noqa: BLE001 —— 句柄失效：视为未运行
         return False
