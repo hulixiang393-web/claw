@@ -448,6 +448,11 @@ class MediaProxy:
         self._last_use = time.time()
         self._idle_watch: threading.Thread | None = None
         self._active = 0  # 进行中的请求数（含流式长连接）：>0 时 stop 不执行
+        # 外部播放器租约：VLC 进程存活期间持有的 lease id 集合。**非空时
+        # 空闲看门狗完全跳过回收** —— 否则用户暂停超 _IDLE_TIMEOUT 后
+        # stop() 会 _tokens.clear()，VLC 恢复播放时全部 404。VLC 退出 /
+        # 重开播放器 / App 退出时由 external_player 释放。
+        self._leases: set[str] = set()
         self._cache = cache  # 可注入测试用缓存实例；None → 懒加载单例
         # cache_ctx key → (base_url, headers, ad_block, force_proxy)（四元组）
         self._cache_ctx: dict[str, tuple] = {}
@@ -636,11 +641,34 @@ class MediaProxy:
         def _watch():
             while True:
                 time.sleep(_WATCH_INTERVAL)
-                if (self._server is not None
-                        and time.time() - self._last_use > _IDLE_TIMEOUT):
+                if self._idle_expired():
                     self.stop()
         self._idle_watch = threading.Thread(target=_watch, daemon=True)
         self._idle_watch.start()
+
+    def _idle_expired(self) -> bool:
+        """看门狗回收判据：代理已起 + 空闲超时 + **无外部播放器租约**。"""
+        with self._lock:
+            if self._leases:
+                return False
+        return (self._server is not None
+                and time.time() - self._last_use > _IDLE_TIMEOUT)
+
+    def acquire_lease(self) -> str:
+        """登记一个外部播放器租约（返回 lease id）。
+
+        只要有租约，空闲看门狗就不会 stop() 代理、不会清 token —— 播放器
+        暂停/长时间不发起请求时 URL 仍有效。成对调用 release_lease()。
+        """
+        lease_id = uuid.uuid4().hex
+        with self._lock:
+            self._leases.add(lease_id)
+        return lease_id
+
+    def release_lease(self, lease_id: str) -> None:
+        """释放租约（幂等：未知 id 静默忽略）。"""
+        with self._lock:
+            self._leases.discard(lease_id)
 
     def _touch(self) -> None:
         self._last_use = time.time()
