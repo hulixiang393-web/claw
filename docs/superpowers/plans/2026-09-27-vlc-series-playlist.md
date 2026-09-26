@@ -107,9 +107,10 @@ def test_lease_ids_unique_and_releasable():
 def test_idle_expired_skipped_while_leased(proxy_ctx, monkeypatch):
     """有租约时即使远超空闲超时也不判过期（VLC 暂停超 10 分钟不断流）。
 
-    用 monkeypatch 把 _IDLE_TIMEOUT 调小并把 _last_use 设在 patched 值之内，
-    这样断言真的证明了「判据在调用时读全局 _IDLE_TIMEOUT」，
-    而不是靠 999 秒这个魔法数在 600s 默认值下也能过。
+    用 monkeypatch 把 _IDLE_TIMEOUT 调小、并把 _last_use 设到**刚越过**该阈值
+    （`time.time() - mp._IDLE_TIMEOUT - 1`），这样断言真的证明了「判据在调用时
+    读全局 _IDLE_TIMEOUT」——999 秒那个魔法数在 600s 默认值下也能过，会让这个
+    补丁变成死代码。
     """
     monkeypatch.setattr(mp, "_IDLE_TIMEOUT", 30.0)
     proxy = proxy_ctx
@@ -1374,7 +1375,11 @@ git commit -m "feat(player): 外部播放器全集播放列表契约——顺序
   2. **播放器重启**（`_terminate_previous` 换源/重开）→ 旧租约先释放再启新租约，不得泄漏旧 id。
   3. **App 退出**（`shutdown_video()`）→ 释放后 `MediaProxy.stop()` 仍能正常关闭（持租约也不阻塞关闭）。
   另外：**必须在构造任何代理 URL 之前获取租约**（`acquire_lease()` 不保证代理已起，不能当作「代理在线且受保护」的断言）。
-  回归测试：`test_release_lease_idempotent`、`test_lease_released_when_proc_exits`、`test_terminate_previous_releases_old_lease`、`test_stop_works_while_leased`。
+  回归测试（本任务 Step 1 已写全，名字以此为准）：
+  - 验收 1「VLC 进程退出」→ `test_watch_proc_releases_lease_on_exit`
+  - 验收 2「播放器重启」→ `test_terminate_previous_releases_old_lease_before_new`
+  - 拉起即取租约 → `test_open_acquires_lease_and_watches_proc`
+  - 验收 3「App 退出」→ 见 Task 6 `shutdown_video` 用例（Task 5 不引入 App 退出路径）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1466,6 +1471,44 @@ def test_watch_proc_releases_lease_on_exit(monkeypatch):
 
     ep._watch_proc(_P(), "LX")
     assert released == ["LX"]
+    assert ep._lease_id == ""
+
+
+def test_terminate_previous_releases_old_lease_before_new(monkeypatch):
+    """验收 2：播放器重启必须先释放**旧**租约，且旧 id 不残留。
+
+    顺序反了（旧租约被新租约覆盖后才释放）就会永久泄漏一个 lease id →
+    空闲看门狗在整个 App 会话内失效。
+    """
+    released = []
+    monkeypatch.setattr(ep, "_release_proxy_lease",
+                        lambda lid: released.append(lid))
+
+    class _P:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    old = _P()
+    monkeypatch.setattr(ep, "_last_proc", old)
+    monkeypatch.setattr(ep, "_lease_id", "OLD")
+    ep._terminate_previous()
+    assert released == ["OLD"]
+    assert ep._lease_id == ""
+    assert old.terminated is True
+
+    # 换新实例：新租约必须在旧租约已释放之后才登记
+    lease = {"n": 0}
+    procs = _install(monkeypatch)
+    monkeypatch.setattr(ep, "_acquire_proxy_lease",
+                        lambda: lease["n"] += 1 or f"NEW{lease['n']}")
+    ep.open_with_player("https://cdn.example.com/hls/b.m3u8")
+    assert released == ["OLD"]        # 拉新实例不释放别人的租约
+    assert ep._lease_id == "NEW1"
+    ep._terminate_previous()
+    assert released == ["OLD", "NEW1"]
     assert ep._lease_id == ""
 
 
