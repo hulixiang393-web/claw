@@ -384,9 +384,10 @@ def test_episode_503_when_resolver_slots_busy(monkeypatch):
     started = threading.Barrier(mp._SERIES_SEM + 1, timeout=10)
 
     def _slow(i):
-        started.wait()          # 占满全部 _SERIES_SEM 个许可后一起放行
-        gate.wait(timeout=10)
-        return "https://cdn.example.com/x.m3u8", "", {}, None
+        if i == 0:            # 只有被占满的那一集参与 barrier/闸门；后置断言请求
+            started.wait()   # 的第 1 集会**再次进入**已放行的 barrier（parties
+            gate.wait(timeout=10)  # 重新计数，永远凑不齐 → 卡满 timeout 后
+        return "https://cdn.example.com/x.m3u8", "", {}, None  # BrokenBarrierError → 502）
 
     key = proxy.register_series(_slow, count=2)
     url = proxy.series_episode_url(key, 0)
