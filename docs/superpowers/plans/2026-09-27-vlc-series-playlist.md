@@ -64,10 +64,12 @@
 
 ```python
 # -*- coding: utf-8 -*-
-"""media_proxy 租约制令牌生命周期：VLC 存活期间看门狗不得回收代理。"""
+"""media_proxy 租约 + 惰性系列端点：VLC 存活期间看门狗不得回收代理。"""
+import threading
 import time
 
 import pytest
+import requests
 
 import framework.media_proxy as mp
 from framework.media_proxy import MediaProxy
@@ -352,6 +354,101 @@ def test_unregister_series_404_after():
     r = requests.get(urls[0], allow_redirects=False, timeout=5)
     assert r.status_code == 404
     assert calls == []
+
+
+def test_series_max_evicts_oldest():
+    """注册表上限 _SERIES_MAX：第 9 支挤掉最旧的一支，最旧的 404、新的照常 302。
+
+    淘汰那个 while 若被改成 if（只挤一支而非循环到达标），本测试会红。
+    """
+    keys, urls = [], []
+    for i in range(mp._SERIES_MAX + 1):
+        k = proxy.register_series(
+            lambda i: ("https://cdn.example.com/x.m3u8", "", {}, None),
+            count=1)
+        keys.append(k)
+        urls.append(proxy.series_episode_url(k, 0))
+    assert len(proxy._series) == mp._SERIES_MAX
+    assert keys[0] not in proxy._series          # 最旧被淘汰
+    assert keys[-1] in proxy._series            # 最新的留下
+    r0 = requests.get(urls[0], allow_redirects=False, timeout=5)
+    assert r0.status_code == 404
+    rn = requests.get(urls[-1], allow_redirects=False, timeout=5)
+    assert rn.status_code == 302
+
+
+def test_episode_503_when_resolver_slots_busy(monkeypatch):
+    """解析槽位占满且等待超时 → 503，且不泄漏信号量许可。"""
+    monkeypatch.setattr(mp, "_SERIES_WAIT", 0.01)
+    gate = threading.Event()
+    started = threading.Barrier(mp._SERIES_SEM + 1, timeout=10)
+
+    def _slow(i):
+        started.wait()          # 占满全部 _SERIES_SEM 个许可后一起放行
+        gate.wait(timeout=10)
+        return "https://cdn.example.com/x.m3u8", "", {}, None
+
+    key = proxy.register_series(_slow, count=1)
+    url = proxy.series_episode_url(key, 0)
+    busy = [threading.Thread(target=requests.get,
+                             args=(url,), kwargs={"allow_redirects": False,
+                                                   "timeout": 10})
+            for _ in range(mp._SERIES_SEM)]
+    for t in busy:
+        t.start()
+    try:
+        started.wait()                                   # 槽位已占满
+        r = requests.get(url, allow_redirects=False, timeout=5)
+        assert r.status_code == 503
+    finally:
+        gate.set()
+        for t in busy:
+            t.join(timeout=10)
+    # 许可未泄漏：占满的请求都完成后，仍能再解析一集
+    r2 = requests.get(url, allow_redirects=False, timeout=5)
+    assert r2.status_code == 302
+
+
+def test_episode_empty_video_url_502_and_not_memoized():
+    """解析成功但 video 为空 → 502，且不写 memo（下次仍重新解析）。"""
+    calls = []
+
+    def _empty(i):
+        calls.append(i)
+        return "", "", {}, None
+
+    key = proxy.register_series(_empty, count=1)
+    url = proxy.series_episode_url(key, 0)
+    r = requests.get(url, allow_redirects=False, timeout=5)
+    assert r.status_code == 502
+    r2 = requests.get(url, allow_redirects=False, timeout=5)
+    assert r2.status_code == 502
+    assert calls == [0, 0]               # 没有被 memo 住
+
+
+def test_stop_clears_series_so_memo_cannot_outlive_token(proxy_ctx):
+    """stop() 必须连 _series 一起清。
+
+    否则：已 memo 的 302 指向的 token 被 stop() 清掉 → 该集此后永久 404
+    且不会重新解析（memo 一直命中一个死 token）。
+    """
+    calls = []
+    proxy = proxy_ctx
+    key = proxy.register_series(
+        lambda i: (calls.append(i) or "https://cdn.example.com/x.m3u8", "", {}, None),
+        count=1)
+    url = proxy.series_episode_url(key, 0)
+    assert requests.get(url, allow_redirects=False, timeout=5).status_code == 302
+    assert len(calls) == 1                       # 已 memo
+
+    proxy.stop()
+    assert not proxy._series
+    assert not proxy._tokens
+
+    url2 = proxy.series_episode_url(key, 0)      # 新端口上的同 key
+    r = requests.get(url2, allow_redirects=False, timeout=5)
+    assert r.status_code == 302                  # 重新解析，而非 302 到死 token
+    assert calls == [1, 1]
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -422,7 +519,7 @@ _SERIES_WAIT = 20.0
                 "memo": {}, "sem": threading.Semaphore(_SERIES_SEM),
                 "force_proxy": bool(force_proxy),
             }
-            while len(self._series) > _SERIES_MAX:   # LRU 兜底：淘汰最旧一支
+            while len(self._series) > _SERIES_MAX:   # FIFO 兜底：淘汰最旧一支
                 self._series.pop(next(iter(self._series)))
         return key
 
@@ -444,7 +541,10 @@ _SERIES_WAIT = 20.0
             handler.send_error(404, "bad series path")
             return
         key, raw_idx = parts[0], parts[1]
-        if not raw_idx.isdigit():        # 拒绝 -1/abc/1e3 等一切非十进制整数
+        # isdecimal 而非 isdigit：isdigit() 对上标（如 "²"）返回 True 而 int()
+        # 抛 ValueError → 落到外层 502，并把客户端输入回显进 HTTP reason
+        # phrase。长度上限 9 位：避免超长数字串触发 3.11+ 的 int 转换位长限制。
+        if not raw_idx.isdecimal() or len(raw_idx) > 9:
             handler.send_error(404, "bad episode index")
             return
         idx = int(raw_idx)
@@ -495,15 +595,25 @@ _SERIES_WAIT = 20.0
         handler.end_headers()
 ```
 
+3f. `stop()` 内 `self._tokens.clear()` 之前插入（**Task 2 审查裁决**：只清 token
+不清注册表，已 memo 的 302 就会指向被清掉的 token，此后该集永久 404 且不会
+重新解析——租约接线要到 Task 5 才存在，本任务落地时看门狗完全可能在会话中途
+回收代理；顺手也把每支的信号量一并释放掉）：
+
+```python
+        self._series.clear()   # memo 一并作废（Task 2 审查）
+        self._tokens.clear()
+```
+
 注：`_series` 的 `memo` 注释同步改为 `{idx: (video, audio, location)}`。
-代理被 `stop()` 强制回收后 memo 里的 token 会失效，但那只发生在 App 退出（`atexit`）时，播放器本就不再请求，无需兜底重建。
+代理被 `stop()` 强制回收后 memo 里的 token 会失效 —— **原判断「只发生在 App 退出（`atexit`）时」是错的**（Task 2 审查裁决）：租约接线在 Task 5，本任务落地时没有任何东西阻止 `_idle_expired()` 在会话中途返回 True。`stop()` 已改为在 `_tokens.clear()` 旁一并 `self._series.clear()`，memo 随之消失，下次请求重新解析。
 
 - [ ] **Step 4: 运行测试确认通过**
 
 ```
 cd D:\code\claw; python -m pytest tests/test_media_proxy_series.py -q -p no:randomly
 ```
-Expected: 全部 passed（3 个租约 + 7 个系列用例）
+Expected: 全部 passed（5 个租约 + 11 个系列用例）
 
 - [ ] **Step 5: 回归代理全组**
 
