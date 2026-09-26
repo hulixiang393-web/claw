@@ -853,7 +853,10 @@ def _install(monkeypatch, proxy=None) -> list:
     monkeypatch.setattr(ep, "_last_proc", None)
     monkeypatch.setattr(ep, "_control_state", None)
     monkeypatch.setattr(ep, "_playlist_items", [])
-    monkeypatch.setattr(ep, "_start_playlist_sync", lambda *a, **k: None)
+    # raising=False：本任务还不实现 _start_playlist_sync（Task 5 才加），
+    # 默认 raising=True 会 AttributeError 让本任务全部测试报错。
+    monkeypatch.setattr(ep, "_start_playlist_sync", lambda *a, **k: None,
+                        raising=False)
     return procs
 
 
