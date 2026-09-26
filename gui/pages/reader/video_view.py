@@ -1445,6 +1445,7 @@ class VideoView(QWidget):
             referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
             headers=hdrs, ad_block=ad_block, force_proxy=self._force_proxy_enabled(),
             episodes=episodes,
+            caching_ms=self._source_network_caching_ms(),
         )
         self._show_status(f"{msg}：{title or video}")
         self.play_btn.setText("▶")
@@ -1763,9 +1764,21 @@ class VideoView(QWidget):
             self._current_play, audio=audio,
             referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
             headers=hdrs, force_proxy=self._force_proxy_enabled(),
+            caching_ms=self._source_network_caching_ms(),
         )
         self._show_status(msg)
         self._external_active = True  # 外播会话在 → App 内快捷键转发 VLC
+
+    def _source_network_caching_ms(self) -> int:
+        """读源配置 media.hls.network_caching_ms（缺省 0 = 用分类默认值）。
+
+        CDN 按连接限速的源需要更大的 VLC 网络缓冲（见 external_player 注释）。
+        """
+        try:
+            hls = ((self._source.raw or {}).get("media") or {}).get("hls") or {}
+            return int(hls.get("network_caching_ms") or 0)
+        except Exception:  # noqa: BLE001 —— 配置缺失/损坏按默认缓冲走
+            return 0
 
     def _media_needs_referer(self) -> bool:
         """媒体直链是否被 Referer 保护：源配了 Referer 且媒体域名 ≠ 源站域名。"""

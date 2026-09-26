@@ -96,7 +96,8 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                      user_agent: str = "", headers: dict | None = None,
                      ad_block: dict | None = None,
                      force_proxy: bool = False,
-                     episodes: list | None = None) -> str:
+                     episodes: list | None = None,
+                     caching_ms: int = 0) -> str:
     """用外部播放器打开媒体地址。
 
     url      媒体直链（单流）
@@ -169,6 +170,13 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                 _caching = max(_caching, 8000)
         except Exception:  # noqa: BLE001
             _caching = 5000
+        # 按源覆盖（sources/<id>.json 的 media.hls.network_caching_ms）：CDN
+        # **按连接限速**的源（实测 ikanpp 单连接 33~190KB/s，而实时播放需
+        # ≥136KB/s）用默认 8s 缓冲必然反复卡死，需给到 20~30s 扛住带宽缺口。
+        # 只按源开（其余源仍是 8s），避免给本来正常的源白加启动延迟。
+        # 取 max() 当下限用：配小了也不会把分类算出的更大值降级。
+        if caching_ms and int(caching_ms) > 0:
+            _caching = max(_caching, int(caching_ms))
         # 播放处理（调研 VLC 流播放调优）：除加大网络缓冲外，加 --no-drop-late-frames
         # 让 VLC 不丢晚到的帧（默认丢帧会表现为画面卡顿跳动）；不强制硬件解码——
         # DXVA2/D3D11VA 的 copy-back 开销在某些机器上反而更卡，交给 VLC 自动判断。

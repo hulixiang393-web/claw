@@ -47,13 +47,18 @@
   },
   "video_cache": {
     "enabled": true,
-    "max_videos": 3,
-    "max_bytes_mb": 2048
+    "max_videos": 5,
+    "max_bytes_mb": 8192
   },
   "sources_runtime": {
     "broken_source_warn_interval_hours": 24,
     "auto_disable_after_failures": 3,
     "selfcheck_strategy": "soft",
     "sources_selected": true
+  },
+  "hls_prefetch": {
+    "enabled": false,
+    "depth": 4,
+    "workers": 3
   }
 }

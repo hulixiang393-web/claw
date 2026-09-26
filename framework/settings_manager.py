@@ -67,8 +67,16 @@ DEFAULTS: dict = {
     },
     "video_cache": {
         "enabled": True,
-        "max_videos": 3,
-        "max_bytes_mb": 2048,
+        "max_videos": 5,
+        "max_bytes_mb": 8192,
+    },
+    "hls_prefetch": {
+        # 有界 HLS 预取：按消费位置前瞻 depth 片、并发 workers 路拉取落盘。
+        # 实测部分 CDN 按连接限速，4 并发总带宽可达单连接的 2.1x。
+        # 默认**关闭**：开启会改变对源站的请求模式，需实测确认不触发风控后再手动开。
+        "enabled": False,
+        "depth": 4,
+        "workers": 3,
     },
     "sources_runtime": {
         "broken_source_warn_interval_hours": 24,

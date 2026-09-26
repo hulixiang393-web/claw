@@ -91,9 +91,9 @@ class MediaCache:
         else:
             self.root = _base_dir() / "data" / "cache" / "video"
         if max_videos is None:
-            max_videos = 3
+            max_videos = 5
         if max_bytes is None:
-            max_bytes = 2 * 1024 ** 3
+            max_bytes = 8 * 1024 ** 3
         self.max_videos = int(max_videos)
         self.max_bytes = int(max_bytes)
         self.enabled = bool(enabled)
@@ -412,7 +412,11 @@ class MediaCache:
 
 
 def _settings_defaults() -> dict:
-    """从 app_config.json 的 video_cache 段读取配额；读取失败用默认值。"""
+    """从 app_config.json 的 video_cache 段读取配额；读取失败用默认值。
+
+    默认 8GB / 5 集：实测长片可达 1.4GB（1060 个 HLS 分片），2GB 配额装不下
+    单集，写到一半就被 LRU 淘汰 → 边写边淘汰抖动 + 重播缓存不中。
+    """
     try:
         from .settings_manager import SettingsManager
 
@@ -420,8 +424,8 @@ def _settings_defaults() -> dict:
         sec = sm.get_section("video_cache") or {}
         return {
             "enabled": bool(sec.get("enabled", True)),
-            "max_videos": int(sec.get("max_videos", 3) or 3),
-            "max_bytes": int(sec.get("max_bytes_mb", 2048) or 2048) * 1024 * 1024,
+            "max_videos": int(sec.get("max_videos", 5) or 5),
+            "max_bytes": int(sec.get("max_bytes_mb", 8192) or 8192) * 1024 * 1024,
         }
     except Exception:  # noqa: BLE001 —— 配置缺失/损坏用默认
-        return {"enabled": True, "max_videos": 3, "max_bytes": 2 * 1024 ** 3}
+        return {"enabled": True, "max_videos": 5, "max_bytes": 8 * 1024 ** 3}

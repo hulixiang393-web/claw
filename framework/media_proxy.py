@@ -45,6 +45,14 @@ from requests.adapters import HTTPAdapter
 _IDLE_TIMEOUT = 600.0
 _WATCH_INTERVAL = 10.0  # 看门狗轮询间隔（秒）；测试可调小以加速验证
 _READ_CHUNK = 64 * 1024
+# 内容嗅探读取字节数：判断响应体是不是 HLS 播放列表（URL 未含 .m3u8 但
+# 内容是的，如短链/参数化 m3u8）。只需覆盖 "#EXTM3U" 魔数（7 字节）。
+# **不要调大**：read(n) 在 http.client 的 BufferedReader 上要凑满 n 字节或
+# EOF 才返回，预读 64KB 会把每个分片的首字节延后一个 64KB 的到达时间
+# （慢 CDN 上就是肉眼可见的起播延迟）。
+_SNIFF_BYTES = 16
+# 媒体响应透传的头
+_MEDIA_HDRS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
 
 # 转发到 CDN 的连接池单例：VLC 经本地代理逐个拉 m3u8 分片时复用 keep-alive
 # 连接，避免每个分片都重新对 CDN 握手（urllib.urlopen 无连接池，几十个分片
@@ -313,6 +321,53 @@ class _FileTee:
         self.cache.inflight_remove(self.key)
 
 
+def _send_stream_headers(handler, resp, override_len: int | None = None) -> tuple:
+    """透传上游媒体响应头并保证 HTTP/1.1 响应有正确定界。
+
+    **不能声明 Connection: close**（handler 已是 HTTP/1.1）：HLS 播放器逐段
+    拉分片、mp4 拖动逐个发 Range，每次新建连接都要重新握手 + 代理新建服务
+    线程，是播放卡顿/拖动迟滞的主要来源。代价是每个响应都必须有定界：
+    上游给了 Content-Length 就原样透传；上游是 chunked 则由我们重新按
+    chunked 分帧（保持流式）；两者都没有（连接关闭定界）才退回
+    close_connection，让客户端读到 EOF 为止。
+
+    override_len：body 已被整读（如 gzip 分支 resp.content 已解压）时传入
+    实际长度——此时上游的 Content-Length 是压缩态长度，与将写出的字节数不
+    符，keep-alive 下会让客户端死等。
+
+    返回 (chunked, declared_len)：declared_len 为 None 表示长度未知。
+    """
+    handler.send_response(resp.status_code)
+    for hk in _MEDIA_HDRS:
+        if hk == "Content-Length" and override_len is not None:
+            continue
+        hv = resp.headers.get(hk)
+        if hv:
+            handler.send_header(hk, hv)
+    if override_len is not None:
+        raw_len = str(override_len)
+        handler.send_header("Content-Length", raw_len)
+    else:
+        raw_len = resp.headers.get("Content-Length")
+    declared = int(raw_len) if (raw_len or "").isdigit() else None
+    chunked = False
+    if declared is None:
+        if (resp.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+            handler.send_header("Transfer-Encoding", "chunked")
+            chunked = True
+        else:
+            handler.close_connection = True
+    handler.end_headers()
+    return chunked, declared
+
+
+def _frame(chunk: bytes, chunked: bool) -> bytes:
+    """chunked 响应分帧；非 chunked 原样透传。"""
+    if not chunked:
+        return chunk
+    return b"%x\r\n" % len(chunk) + chunk + b"\r\n"
+
+
 class _ProxyHandler(BaseHTTPRequestHandler):
     """单请求处理器。
 
@@ -363,6 +418,16 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # 静音访问日志
         pass
 
+    def send_error(self, code, message=None, explain=None):
+        """错误响应：先标记连接关闭。
+
+        流式响应体可能已写出一半，此时再发错误头会与已发字节错位，
+        复用该连接的客户端会拿到乱序数据。出错即关闭连接最安全
+        （代价仅是该次请求，与 keep-alive 无关）。
+        """
+        self.close_connection = True
+        super().send_error(code, message, explain)
+
 
 class MediaProxy:
     """本地流媒体代理（单例）。
@@ -375,7 +440,7 @@ class MediaProxy:
 
     _instance: "MediaProxy | None" = None
 
-    def __init__(self, cache=None):
+    def __init__(self, cache=None, prefetch=None):
         self._tokens: dict[str, tuple] = {}
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
@@ -387,8 +452,177 @@ class MediaProxy:
         # cache_ctx key → (base_url, headers, ad_block, force_proxy)（四元组）
         self._cache_ctx: dict[str, tuple] = {}
         self._mp4_tee: dict[str, _FileTee] = {}  # key → 进行中的 mp4 落盘
+        # HLS 有界预取（默认关，见 _pf_cfg）
+        self._pf_cfg = self._resolve_prefetch_cfg(prefetch)
+        self._seg_order: dict[str, list[str]] = {}    # cache_key → 有序分片 URL
+        self._seg_pos: dict[str, dict[str, int]] = {}  # cache_key → URL → 序号
+        self._pf_scheduled: set[tuple[str, str]] = set()  # 已排队 (key, url) 去重
+        self._pf_futures: set = set()
+        self._pf_pool = None
+        self._pf_lock = threading.Lock()
         self._start_idle_watch()
         atexit.register(self.stop)
+
+    # ------------------------------------------------------------------ #
+    # HLS 有界预取
+    # ------------------------------------------------------------------ #
+    # 实测部分 CDN **按连接限速**（ikanpp 单连接 33~190KB/s，实时播放需
+    # >=136KB/s；4 并发总带宽 280.2KB/s ≈ 单连接顺序 133.2KB/s 的 2.1x）。
+    # 预取按「当前消费到第 N 片」前瞻 depth 片、workers 路并发落盘，VLC 随后
+    # 直接命中 /c/ 本地文件。窗口有界（不扫完整清单）、同片去重、playback
+    # 停止即随 stop() 结束。
+    # 默认**关闭**：开启会改变对源站的请求模式（并发+提前拉），需实测确认
+    # 不触发风控后再手动打开（app_config.json → hls_prefetch.enabled）。
+    @staticmethod
+    def _read_prefetch_settings() -> dict:
+        try:
+            from .media_cache import _base_dir
+            from .settings_manager import SettingsManager
+            sm = SettingsManager(_base_dir() / "app_config.json")
+            return sm.get_section("hls_prefetch") or {}
+        except Exception:  # noqa: BLE001 —— 配置缺失/损坏按默认（关闭）
+            return {}
+
+    def _resolve_prefetch_cfg(self, prefetch) -> dict:
+        sec = dict(prefetch) if prefetch is not None else self._read_prefetch_settings()
+        try:
+            depth = int(sec.get("depth", 4))
+        except (TypeError, ValueError):
+            depth = 4
+        try:
+            workers = int(sec.get("workers", 3))
+        except (TypeError, ValueError):
+            workers = 3
+        return {
+            "enabled": bool(sec.get("enabled", False)),
+            # 夹紧上限：防手滑把 depth 写成 1000 把源站打爆
+            "depth": max(1, min(16, depth)),
+            "workers": max(1, min(8, workers)),
+        }
+
+    def _prefetch_enabled(self) -> bool:
+        return bool(self._pf_cfg.get("enabled"))
+
+    def _set_seg_order(self, cache_key: str, segs: list[str]) -> None:
+        """登记某播放列表的有序分片（每次重写整体替换，避免直播刷新重复累加）。"""
+        with self._pf_lock:
+            self._seg_order[cache_key] = segs
+            self._seg_pos[cache_key] = {u: i for i, u in enumerate(segs)}
+
+    def _ensure_pf_pool(self):
+        with self._pf_lock:
+            if self._pf_pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+                self._pf_pool = ThreadPoolExecutor(
+                    max_workers=self._pf_cfg["workers"],
+                    thread_name_prefix="claw-pf")
+            return self._pf_pool
+
+    def _maybe_prefetch(self, cache_key: str, full_url: str) -> None:
+        """播放器已取第 full_url 片 → 把后续 depth 片排队落盘。"""
+        if not self._prefetch_enabled():
+            return
+        cache = self._cache_obj()
+        if cache is None or not cache.enabled:
+            return
+        with self._lock:
+            ctx = self._cache_ctx.get(cache_key)
+            pos = self._seg_pos.get(cache_key)
+        if ctx is None or not pos:
+            return
+        idx = pos.get(full_url)
+        if idx is None:
+            return
+        order = self._seg_order.get(cache_key) or []
+        window = order[idx + 1: idx + 1 + self._pf_cfg["depth"]]
+        if not window:
+            return
+        headers = dict(ctx[1])
+        headers["Accept-Encoding"] = "identity"  # 落盘要原始分片字节，不能是 gzip 态
+        force_proxy = _tuple_force_proxy(ctx)
+        for u in window:
+            with self._pf_lock:
+                mark = (cache_key, u)
+                if mark in self._pf_scheduled:
+                    continue
+                if cache.hls_segment_final(cache_key, u).is_file():
+                    continue
+                self._pf_scheduled.add(mark)
+            try:
+                fut = self._ensure_pf_pool().submit(
+                    self._prefetch_one, cache_key, u, dict(headers), force_proxy)
+            except RuntimeError:  # 池已关（stop 竞态）
+                return
+            with self._pf_lock:
+                self._pf_futures.add(fut)
+
+    def _prefetch_one(self, cache_key: str, url: str, headers: dict,
+                      force_proxy: bool) -> None:
+        """后台拉一个分片并按 _FileTee 落盘（best-effort，失败静默）。
+
+        path_lock 用完整 URL 作键（与 _serve_cache 同一把）→ 播放器随后请求
+        同一片时会等预取结束并直接命中 final 文件，不会重复回源。
+        """
+        cache = self._cache_obj()
+        if cache is None:
+            return
+        with cache.path_lock(url):
+            final = cache.hls_segment_final(cache_key, url)
+            if final.is_file():
+                return
+            try:
+                resp = _fetch_upstream(url, headers, force_proxy=force_proxy)
+            except Exception:  # noqa: BLE001 —— 预取失败不影响播放
+                return
+            if resp.status_code >= 400:
+                return
+            tee = None
+            try:
+                tee = _FileTee(cache, cache_key,
+                               cache.hls_segment_part(cache_key, url), final,
+                               _content_total(resp), is_mp4=False)
+                if not tee.start():
+                    return
+                while True:
+                    chunk = resp.raw.read(_READ_CHUNK)
+                    if not chunk:
+                        break
+                    tee.write(chunk)
+                tee.finish()
+            except Exception:  # noqa: BLE001
+                if tee is not None:
+                    tee.abort()
+            finally:
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _prefetch_drain(self, timeout: float = 5.0) -> bool:
+        """等已排队的预取任务跑完（测试用；返回是否全部完成）。"""
+        from concurrent.futures import wait as _cf_wait
+        with self._pf_lock:
+            futs = set(self._pf_futures)
+        if not futs:
+            return True
+        _done, pending = _cf_wait(futs, timeout=timeout)
+        with self._pf_lock:
+            self._pf_futures -= pending
+        return not pending
+
+    def _shutdown_prefetch(self) -> None:
+        with self._pf_lock:
+            pool, self._pf_pool = self._pf_pool, None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # noqa: BLE001
+                pass
+        with self._pf_lock:
+            self._pf_futures.clear()
+            self._seg_order.clear()
+            self._seg_pos.clear()
+            self._pf_scheduled.clear()
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -483,6 +717,7 @@ class MediaProxy:
         with self._lock:
             if self._active > 0:
                 return
+        self._shutdown_prefetch()
         srv, self._server = self._server, None
         if srv is not None:
             try:
@@ -616,8 +851,7 @@ class MediaProxy:
         handler.send_response(status)
         handler.send_header("Content-Type", "application/vnd.apple.mpegurl")
         handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Connection", "close")
-        handler.end_headers()
+        handler.end_headers()  # 有 Content-Length 定界 → 可 keep-alive 复用
         handler.wfile.write(body)
 
     # ------------------------------------------------------------------ #
@@ -693,13 +927,17 @@ class MediaProxy:
             if resp.status_code >= 400:
                 handler.send_error(resp.status_code, "upstream error")
                 return
-            # 先读一小块判断是不是 HLS 播放列表（URL 未含 .m3u8 但内容是的，
-            # 如短链接/参数化 m3u8）。上游 gzip 压缩时 raw 是压缩字节无法判断，
-            # 此时整读 content（自动解压）判断；明文则用 raw 流式读小块。
+            # 判断内容是不是 HLS 播放列表（URL 未含 .m3u8 但内容是的，如
+            # 短链/参数化 m3u8）。只嗅探 _SNIFF_BYTES 字节（够覆盖 #EXTM3U）：
+            # 预读多了会把每个分片的首字节延后一整个读取量的到达时间。
+            # 压缩流必须整读解压（无法边读边判），此分支保留整读。
+            # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
+            whole = False
             if (resp.headers.get("Content-Encoding") or "").lower() in ("gzip", "deflate", "br"):
                 first = resp.content
+                whole = True  # 已整读解压：上游 Content-Length 是压缩态长度
             else:
-                first = resp.raw.read(65536)
+                first = resp.raw.read(_SNIFF_BYTES)
             is_m3u8 = first.startswith(b"#EXTM3U") or (
                 resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
 
@@ -713,13 +951,8 @@ class MediaProxy:
                 return
 
             # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
-            handler.send_response(resp.status_code)
-            for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
-                v = resp.headers.get(h)
-                if v:
-                    handler.send_header(h, v)
-            handler.send_header("Connection", "close")
-            handler.end_headers()
+            chunked, declared = _send_stream_headers(
+                handler, resp, override_len=len(first) if whole else None)
 
             # 磁盘缓存 tee：首播流（从头开始）才起写；已知总长且从头接收，
             # 写满 commit。拖动进度的非 0 起始请求走 _abort_tee_on_gap 放弃。
@@ -744,19 +977,28 @@ class MediaProxy:
                                 tee = st
                 except Exception:  # noqa: BLE001 —— 落盘失败不阻断播放
                     tee = None
+            sent = 0
             try:
                 if first:
-                    handler.wfile.write(first)
+                    handler.wfile.write(_frame(first, chunked))
+                    sent += len(first)
                     if tee:
                         tee.write(first)
                 while True:
                     chunk = resp.raw.read(_READ_CHUNK)
                     if not chunk:
                         break
-                    handler.wfile.write(chunk)
+                    handler.wfile.write(_frame(chunk, chunked))
+                    sent += len(chunk)
                     self._touch()  # 流式期间持续刷新看门狗（暂停/拖动不误杀）
                     if tee:
                         tee.write(chunk)
+                if chunked:
+                    handler.wfile.write(b"0\r\n\r\n")
+                elif declared is not None and sent < declared:
+                    # 上游提前断流：声明了长度却没写满 → 该连接已无法定界，
+                    # 必须关闭，否则复用它的下一个请求会读到错位的残留字节
+                    handler.close_connection = True
                 if tee:
                     tee.finish()
                 # 结束即从进行中字典移除：finish/abort 后残留对象会令
@@ -765,6 +1007,7 @@ class MediaProxy:
                     self._drop_mp4_tee(key, tee)
             except (BrokenPipeError, ConnectionResetError):
                 # 播放器提前关闭连接（拖动/停止）属正常；未完成的落盘弃用
+                handler.close_connection = True
                 if tee:
                     tee.abort()
                     self._drop_mp4_tee(key, tee)
@@ -786,8 +1029,7 @@ class MediaProxy:
         if ct:
             handler.send_header("Content-Type", ct)
         handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Connection", "close")
-        handler.end_headers()
+        handler.end_headers()  # 有 Content-Length 定界 → 可 keep-alive 复用
         handler.wfile.write(body)
 
     # ------------------------------------------------------------------ #
@@ -817,6 +1059,10 @@ class MediaProxy:
         base_url, base_headers, ad_block = ctx[0], ctx[1], ctx[2]
         force_proxy = _tuple_force_proxy(ctx)
         target = urljoin(base_url, seg_name)
+        # 分片级预取钩子：取到第 seg_name 片后把后续 depth 片排队落盘。
+        # 放锁外：预取自身会取同名 path_lock，锁内触发会自死锁。
+        if not seg_name.endswith(".m3u8"):
+            self._maybe_prefetch(cache_key, target)
 
         # 定位到本段在缓存里的路径；已知总长才 tee（见 _content_total）。
         lock = cache.path_lock(seg_name)
@@ -855,10 +1101,12 @@ class MediaProxy:
                     handler.send_error(resp.status_code, "upstream error")
                     return
                 # 可能是「URL 不带 .m3u8 的嵌套播放列表」→ 先嗅探首块
+                whole = False
                 if (resp.headers.get("Content-Encoding") or "").lower() in ("gzip", "deflate", "br"):
                     first = resp.content
+                    whole = True  # 已整读解压：上游 Content-Length 是压缩态长度
                 else:
-                    first = resp.raw.read(65536)
+                    first = resp.raw.read(_SNIFF_BYTES)
                 is_m3u8 = first.startswith(b"#EXTM3U") or (
                     resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
                 if is_m3u8:
@@ -871,13 +1119,8 @@ class MediaProxy:
                     # 上游非 m3u8（动态校验失败/错误页）→ 原样回给播放器
                     self._send_body(handler, resp, first + (resp.raw.read() or b""))
                     return
-                handler.send_response(resp.status_code)
-                for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
-                    v = resp.headers.get(h)
-                    if v:
-                        handler.send_header(h, v)
-                handler.send_header("Connection", "close")
-                handler.end_headers()
+                chunked, declared = _send_stream_headers(
+                    handler, resp, override_len=len(first) if whole else None)
 
                 total = _content_total(resp)
                 tee = None
@@ -889,22 +1132,30 @@ class MediaProxy:
                                   final, total, is_mp4=False)
                     if st.start():
                         tee = st
+                sent = 0
                 try:
                     if first:
-                        handler.wfile.write(first)
+                        handler.wfile.write(_frame(first, chunked))
+                        sent += len(first)
                         if tee:
                             tee.write(first)
                     while True:
                         chunk = resp.raw.read(_READ_CHUNK)
                         if not chunk:
                             break
-                        handler.wfile.write(chunk)
+                        handler.wfile.write(_frame(chunk, chunked))
+                        sent += len(chunk)
                         self._touch()
                         if tee:
                             tee.write(chunk)
+                    if chunked:
+                        handler.wfile.write(b"0\r\n\r\n")
+                    elif declared is not None and sent < declared:
+                        handler.close_connection = True  # 提前断流，连接不可复用
                     if tee:
                         tee.finish()
                 except (BrokenPipeError, ConnectionResetError):
+                    handler.close_connection = True
                     if tee:
                         tee.abort()
             finally:
@@ -925,7 +1176,6 @@ class MediaProxy:
                     handler.send_response(416)
                     handler.send_header("Content-Range", f"bytes */{size}")
                     handler.send_header("Content-Length", "0")
-                    handler.send_header("Connection", "close")
                     handler.end_headers()
                     return
                 if parsed is None:
@@ -940,8 +1190,7 @@ class MediaProxy:
                 handler.send_header("Content-Type", ctype)
                 handler.send_header("Content-Length", str(length))
                 handler.send_header("Accept-Ranges", "bytes")
-                handler.send_header("Connection", "close")
-                handler.end_headers()
+                handler.end_headers()  # Content-Length 定界 → 可 keep-alive 复用
                 f.seek(start)
                 remaining = length
                 while remaining > 0:
@@ -995,6 +1244,7 @@ class MediaProxy:
         mark_hls_segment 总在已索引的影片条目上累加字节数。
         """
         out = []
+        segs: list[str] = []  # 有序分片（供预取前瞻定位消费位置）
         for line in text.splitlines():
             if not line:
                 continue
@@ -1009,14 +1259,29 @@ class MediaProxy:
                                               ad_block, force_proxy)
                     out.append(line.replace(f'URI="{m.group(1)}"', f'URI="{new_uri}"'))
                     continue
-                new_uri = self._rewrite_cache_or_token(
-                    m.group(1), base, headers, ad_block, cache_on, cache_key,
-                    force_proxy)
-                out.append(line.replace(f'URI="{m.group(1)}"', f'URI="{new_uri}"'))
+                uri = m.group(1)
+                out.append(line.replace(f'URI="{uri}"',
+                                        f'URI="{self._rewrite_cache_or_token(uri, base, headers, ad_block, cache_on, cache_key, force_proxy)}"'))
+                self._note_segment(segs, uri, base, cache_on, cache_key)
                 continue
+            uri = line
             out.append(self._rewrite_cache_or_token(
-                line, base, headers, ad_block, cache_on, cache_key, force_proxy))
+                uri, base, headers, ad_block, cache_on, cache_key, force_proxy))
+            self._note_segment(segs, uri, base, cache_on, cache_key)
+        if cache_on and cache_key is not None:
+            self._set_seg_order(cache_key, segs)
         return "\n".join(out)
+
+    @staticmethod
+    def _note_segment(segs: list[str], uri: str, base: str,
+                      cache_on: bool, cache_key: str | None) -> None:
+        """收集可预取的分片（排除嵌套清单本身，它们走各自的重写/缓存路径）。"""
+        if not cache_on or cache_key is None:
+            return
+        full = urljoin(base, uri)
+        if full.split("?", 1)[0].lower().endswith(".m3u8"):
+            return
+        segs.append(full)
 
     # ------------------------------------------------------------------ #
     def _rewrite_cache_or_token(self, uri: str, base: str, headers: dict,
