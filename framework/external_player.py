@@ -13,6 +13,7 @@
 2. 系统默认打开方式（webbrowser / os.startfile）
 """
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -25,6 +26,12 @@ except ImportError:  # pragma: no cover —— VLC 控制接口非必需，缺�
     requests = None
 
 from .media_proxy import proxy_url_for
+
+# 系列播放列表的裁剪上限。Windows CreateProcess 命令行硬上限 32767 字符；
+# 集数上千时一次性 enqueue 数千项既撑爆命令行也给 VLC 自身 playlist 增压。
+# 窗口从**当前集往后**取（保证「下一集」永远可用）。
+_SERIES_MAX_MRL = 300
+_SERIES_MAX_CMD = 30000
 
 _VLC_CANDIDATES = [
     r"C:\Program Files\VideoLAN\VLC\vlc.exe",
@@ -99,31 +106,99 @@ def _pick_http_port() -> int:
         return 8090
 
 
+def _is_local_proxy_url(target: str) -> bool:
+    """是否本机 media_proxy 的 URL（/s/<token> 或 /e/<key>/<idx>）。
+
+    惰性系列每集 URL 本就是代理地址，**不能再包一层代理**（否则多一跳转发
+    + 双重广告过滤）。VLC 只访问回环，故按前缀判定即可。
+    """
+    t = (target or "").lower()
+    return t.startswith("http://127.0.0.1:") or t.startswith("http://localhost:")
+
+
+def _sanitize_title(title: str, idx: int = 0) -> str:
+    """MRL #title 片段消毒。
+
+    - 剥掉 #（会截断 MRL）、\\r\\n\\t（破坏 argv 解析）
+    - 折叠连续空白
+    - 空 → 「第{idx+1}集」
+    - **首字符是数字时加「集」前缀**：VLC 的 fragment 若匹配
+      mrl-title=DIGIT*DIGIT 会被解释为**时间偏移**（跳到第 N 秒）而非标题
+    """
+    t = re.sub(r"[#\r\n\t]+", " ", str(title or ""))
+    t = " ".join(t.split()).strip()
+    if not t:
+        t = f"第{idx + 1}集"
+    if t[0].isdigit():
+        t = "集" + t
+    return t
+
+
+def _mrl_with_title(url: str, title: str, idx: int = 0) -> str:
+    """带显示标题的 MRL（URL#[title]）。"""
+    return f"{url}#{_sanitize_title(title, idx)}"
+
+
+def _fit_series(episodes: list, start_idx: int,
+                resolve) -> tuple[list[tuple[int, str]], bool]:
+    """裁剪系列列表，返回 ([(集下标, MRL), ...], 是否截断)。
+
+    resolve(url, audio) -> play_url：非本机代理 URL 才经它包一层代理
+    （惰性 /e/ URL 原样使用）。**先解析再计长**——代理 URL 比原 URL 长，
+    先计长会低估命令行占用。
+    窗口从 start_idx（当前集）往后连续取，受 _SERIES_MAX_MRL 条数与
+    _SERIES_MAX_CMD 总字符数双重限制；空 URL 的集整条跳过。至少保留 1 条
+    （单条超长也不丢，保证「当前集能播」优先于命令行长度）。
+    """
+    items: list[tuple[int, str]] = []
+    used = 0
+    truncated = False
+    for off, entry in enumerate(episodes[start_idx:]):
+        ep_url = entry[0]
+        if not ep_url:
+            continue
+        idx = start_idx + off
+        ep_play = ep_url if _is_local_proxy_url(ep_url) else resolve(
+            ep_url, entry[1] if len(entry) > 1 else "")
+        mrl = _mrl_with_title(ep_play, entry[2] if len(entry) > 2 else "", idx)
+        if items and (len(items) >= _SERIES_MAX_MRL
+                      or used + len(mrl) > _SERIES_MAX_CMD):
+            truncated = True
+            break
+        items.append((idx, mrl))
+        used += len(mrl)
+    return items, truncated
+
+
 def open_with_player(url: str, audio: str = "", referer: str = "",
                      user_agent: str = "", headers: dict | None = None,
                      ad_block: dict | None = None,
                      force_proxy: bool = False,
                      episodes: list | None = None,
-                     caching_ms: int = 0) -> str:
+                     caching_ms: int = 0, classify_url: str = "",
+                     on_playlist_ready=None) -> str:
     """用外部播放器打开媒体地址。
 
-    url      媒体直链（单流）
-    audio    DASH 音频轨地址（非空时以 input-slave 挂入）
+    url      媒体直链（单流）。episodes 非空时它只用于**定位起始项**与分类，
+             实际入列的 MRL 全部来自 episodes。
+    audio    DASH 音频轨地址（非空时以 input-slave 挂入；系列路径忽略）
     referer / user_agent / headers  防盗链透传。referer/user_agent 是兼容旧
-            调用的便捷参数；headers 提供完整头（含 Cookie 等）。任何防盗链
-            头存在时走本地代理（VLC 无法设置 UA，只有代理能根治）。HLS 流
-            一律走本地代理（含广告段过滤），即使无防盗链头也让代理剔除广告段。
+             调用的便捷参数；headers 提供完整头（含 Cookie 等）。任何防盗链
+             头存在时走本地代理（VLC 无法设置 UA，只有代理能根治）。HLS 流
+             一律走本地代理（含广告段过滤），即使无防盗链头也让代理剔除广告段。
     ad_block 源 ad_block 配置，非空时代理转发 m3u8 会剔除广告段。
-    force_proxy 代理转发时强制走系统代理会话（跳过直连探测）：用于直连不稳
-            但系统代理稳定的源（如 hanime mp4 直连 0.3~1MB/s 波动但代理
-            1.8~2.6MB/s）。传 True 时主 MRL/音频轨/episodes 每集的本地代理
-            URL 都带 force_proxy；不传（默认 False）行为与旧版完全一致。
-    episodes 当前集起的完整播放列表 list[tuple[url, audio, title]]，
-            **当前集放首位**（首项一般即 url 这一集；主 MRL 已是当前集，
-            列表从第 2 项起逐集追加）。VLC 收到多 MRL 自动组成播放列表，
-            用户在播放器内用 P/N（上一首/下一首）或播放列表面板切集。
-            每集 URL 后的音频轨以 :input-slave= 紧跟其 MRL。列表内某集
-            URL 为空则跳过该集，不影响其余集。None → 与旧行为完全一致。
+    force_proxy 代理转发时强制走系统代理会话（跳过直连探测）。
+    episodes **全集完整有序播放列表** list[tuple[url, audio, title]]：
+             episodes[i] = 第 i 集（0-based，严格播放顺序），**episodes[0]
+             不会被跳过**。每条 MRL 追加 `#<消毒后的标题>` 供播放列表显示；
+             整表加 `--no-random` 保证顺序；起始项（url 命中项）非首项时加
+             `--no-playlist-autostart` 并在后台握手 `pl_play&id=<id>` 定位。
+             列表项 URL 为空则跳过该集。None → 与旧行为完全一致。
+    classify_url 非空时用它做缓冲分类。惰性系列 URL 是
+             http://127.0.0.1:PORT/e/... 分类不出 HLS，必须传**当前集真实流
+             地址**，否则按连接限速的源（ikanpp 需 30000ms）缓冲退化卡顿。
+    on_playlist_ready 握手线程拿到 {集下标: vlc_id} 映射后的回调（后台线程
+             执行，调用方须自行跨线程）。失败/超时不调用。
 
     附加能力：VLC 分支启动时附带 HTTP 控制接口（--extraintf=http），GUI
     键盘事件可经 player_command() 转成 VLC 控制命令（播放/暂停/进退等）。
@@ -161,7 +236,11 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                 audio_url = src_audio
             return play_url, audio_url
 
-        play_url, audio_url = _resolve(url, audio)
+        if _is_local_proxy_url(url):
+            # 惰性系列：url 已是代理 URL，不能再包一层
+            play_url, audio_url = url, ""
+        else:
+            play_url, audio_url = _resolve(url, audio)
         # 缓冲调优：按媒体类型给 VLC 设 network-caching（HLS 分片流网络抖动
         # 敏感，慢 CDN 每片 1-2s 时默认 300ms 缓冲会频繁卡顿/加载慢）。
         # 复用 media_tuner.classify 的缓冲画像，缺省 HLS 5000ms 抗慢 CDN。
@@ -170,10 +249,11 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
         # 拿 2500ms，走代理的慢 HLS 反而缓冲更小（播放卡顿的根因之一）。
         try:
             from .media_tuner import classify as _classify
-            _profile = _classify(url)
+            # 分类对象：系列路径必须用**真实流地址**（惰性 /e/ URL 判不出类型）
+            _profile = _classify(classify_url or url)
             _caching = max(_profile.buffer_ms, 5000) if _profile.kind == "hls" else _profile.buffer_ms
             # 经本地代理转发（防盗链头）多一跳、更抖，缓冲再加大抗卡顿
-            if play_url != url:
+            if play_url != url or _is_local_proxy_url(url):
                 _caching = max(_caching, 8000)
         except Exception:  # noqa: BLE001
             _caching = 5000
@@ -202,17 +282,26 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             "--extraintf=http", "--http-host=127.0.0.1",
             f"--http-port={port}", f"--http-password={http_password}",
         ]
-        args.append(play_url)
-        if audio_url:
-            args.append(f":input-slave={audio_url}")
+        window: list[tuple[int, str]] = []
+        start_idx = 0
+        truncated = False
         if episodes:
-            for ep_url, ep_audio, _ep_title in episodes[1:]:
-                if not ep_url:
-                    continue  # 该集缺流：跳过，不影响其余集
-                ep_play, ep_audio_play = _resolve(ep_url, ep_audio)
-                args.append(ep_play)
-                if ep_audio_play:
-                    args.append(f":input-slave={ep_audio_play}")
+            # 系列：全集按序入列（episodes[0] 也在列内），不另加主 MRL。
+            # 起始项 = url 命中的集；取不到（url 不在列表内）按 0 处理。
+            start_idx = next(
+                (i for i, e in enumerate(episodes) if e and e[0] == url), 0)
+            args.append("--no-random")
+            if start_idx > 0:
+                # 非首项开播：先禁止 autostart，再由握手 pl_play 定位
+                args.append("--no-playlist-autostart")
+            window, truncated = _fit_series(episodes, start_idx,
+                                           lambda u, a: _resolve(u, a)[0])
+            for _idx, mrl in window:
+                args.append(mrl)
+        else:
+            args.append(play_url)
+            if audio_url:
+                args.append(f":input-slave={audio_url}")
         # 新开播放器前先关掉上一次拉起的实例（避免多 VLC 窗口堆积）——
         # 旧进程可能已自行退出，terminate 幂等包裹，不影响新实例拉起。
         _terminate_previous()
@@ -226,6 +315,13 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             _control_state = {
                 "host": "127.0.0.1", "port": port, "password": http_password,
             }
+            if episodes and window:
+                # 后台握手：轮询 playlist.json 建 {集下标: vlc_id} 映射，
+                # 非首项开播时顺带 pl_play 定位。必须在后台线程（VLC 建列表
+                # 需时，主线程会卡 UI）。
+                _start_playlist_sync(window[0][1], start_idx, on_playlist_ready)
+            if truncated:
+                return f"已用外部播放器打开（列表已截断，共 {len(window)} 集）"
             return "已用外部播放器打开"
         except Exception:  # noqa: BLE001 —— VLC 启动失败降级系统默认
             pass
