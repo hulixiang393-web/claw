@@ -14,6 +14,8 @@ VLC 3.0.23 无效（恒发 VLC 默认 UA，多数 CDN 拒绝）。本模块起�
 - /c/<key>/<segment>     HLS 分片磁盘缓存路由（framework/media_cache.py）：
   命中本地文件直接 serve（支持 Range，磁盘磁盘秒开不再打源站）；未命中
   回落上游代理转发，同时 tee 落盘供下次命中
+- /e/<key>/<idx>         惰性系列（全集播放列表）：VLC 点到哪一集才解析哪一集，
+  解析后 302 到该集的 /s/<token>（重复请求按集 memo，不回源）
 - mp4 大文件流式转发时 tee 落盘：完整写毕后后续 Range 请求直接本地 serve
 - 单例 + 空闲自动回收（无请求 N 秒停掉，下次 open 重新起）。播放是长连接
   流式转发，循环内持续刷新 _last_use，暂停/拖动进度期间不会被看门狗误杀；
@@ -53,6 +55,14 @@ _READ_CHUNK = 64 * 1024
 _SNIFF_BYTES = 16
 # 媒体响应透传的头
 _MEDIA_HDRS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
+
+# 惰性系列（外部播放器全集播放列表）同时注册的最大支数。注册表是有序 dict，
+# 超出时淘汰最旧的一支（兜底：App 反复换源不注销时的注册泄漏）。
+_SERIES_MAX = 8
+# 单集惰性解析的并发上限（避免多集同时点播把源站/反爬打爆）。
+_SERIES_SEM = 4
+# 单集惰性解析排队等待上限（秒）；超时回 503。
+_SERIES_WAIT = 20.0
 
 # 转发到 CDN 的连接池单例：VLC 经本地代理逐个拉 m3u8 分片时复用 keep-alive
 # 连接，避免每个分片都重新对 CDN 握手（urllib.urlopen 无连接池，几十个分片
@@ -374,6 +384,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     - /s/<token> → 按 token 找目标 URL + headers 转发（媒体流 / m3u8）
     - /c/<key>/<segment> → HLS 分片磁盘缓存路由：命中本地 serve，未命中
       回落上游代理转发并 tee 落盘
+    - /e/<key>/<idx> → 惰性系列：按集解析（失败 502 不缓存）→ 302 到 /s/<token>
     """
 
     protocol_version = "HTTP/1.1"
@@ -389,6 +400,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 try:
                     proxy._serve_cache(self, path)
                 except Exception as exc:  # noqa: BLE001 —— 网络波动直接断流
+                    try:
+                        self.send_error(502, f"proxy error: {exc}")
+                    except Exception:
+                        pass
+                return
+            if path.startswith("/e/"):
+                try:
+                    proxy._serve_series(self, path)
+                except Exception as exc:  # noqa: BLE001 —— 解析异常已在内部归类
                     try:
                         self.send_error(502, f"proxy error: {exc}")
                     except Exception:
@@ -453,6 +473,10 @@ class MediaProxy:
         # stop() 会 _tokens.clear()，VLC 恢复播放时全部 404。VLC 退出 /
         # 重开播放器 / App 退出时由 external_player 释放。
         self._leases: set[str] = set()
+        # 惰性系列注册表：key → {resolver, on_play, count, memo, sem}
+        #   memo: {idx: (video, audio, location)} 按集缓存，重复请求（VLC 重试/重播）不回源
+        #   sem:  该系列独占的解析并发信号量
+        self._series: dict[str, dict] = {}
         self._cache = cache  # 可注入测试用缓存实例；None → 懒加载单例
         # cache_ctx key → (base_url, headers, ad_block, force_proxy)（四元组）
         self._cache_ctx: dict[str, tuple] = {}
@@ -727,6 +751,99 @@ class MediaProxy:
                 target_url, _strip_stale_headers(headers or {}), ad_block, force_proxy,
             )
         return f"http://127.0.0.1:{self._server.server_address[1]}/s/{token}"
+
+    # ------------------------------------------------------------------ #
+    # 惰性系列：外部播放器全集播放列表
+    # ------------------------------------------------------------------ #
+    def register_series(self, resolver, on_play=None, count: int = 0,
+                        force_proxy: bool = False) -> str:
+        """注册一支惰性解析系列，返回不透明 key。
+
+        resolver(idx) -> (video, audio, headers, ad_block)；抛异常表示该集取流
+        失败（/e/ 回 502 且不 memo，允许重试）。ad_block 传 None 即不过滤广告段。
+        on_play(idx, video, audio) 在**每次** /e/ 请求时回调（memo 命中也回调），
+        供 App 侧同步「正在播第几集」——在代理线程执行，实现方须自行跨线程。
+        count 为集数上限，越界回 404。force_proxy 透传给 build_url。
+        """
+        self._ensure_server()
+        key = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._series[key] = {
+                "resolver": resolver, "on_play": on_play, "count": int(count),
+                "memo": {}, "sem": threading.Semaphore(_SERIES_SEM),
+                "force_proxy": bool(force_proxy),
+            }
+            while len(self._series) > _SERIES_MAX:   # LRU 兜底：淘汰最旧一支
+                self._series.pop(next(iter(self._series)))
+        return key
+
+    def unregister_series(self, key: str) -> None:
+        """注销系列并丢弃其 memo（幂等）。"""
+        with self._lock:
+            self._series.pop(key, None)
+
+    def series_episode_url(self, key: str, idx: int) -> str:
+        """第 idx 集的惰性 URL（绝对地址，不含 #标题 fragment）。"""
+        self._ensure_server()
+        return (f"http://127.0.0.1:{self._server.server_address[1]}"
+                f"/e/{key}/{int(idx)}")
+
+    def _serve_series(self, handler, path: str) -> None:
+        """/e/<key>/<idx>：按集惰性解析 → 302 到 /s/<token>。"""
+        parts = path[len("/e/"):].split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            handler.send_error(404, "bad series path")
+            return
+        key, raw_idx = parts[0], parts[1]
+        if not raw_idx.isdigit():        # 拒绝 -1/abc/1e3 等一切非十进制整数
+            handler.send_error(404, "bad episode index")
+            return
+        idx = int(raw_idx)
+        with self._lock:
+            ser = self._series.get(key)
+            if ser is None:
+                handler.send_error(404, "series not found")
+                return
+            if not (0 <= idx < int(ser["count"])):
+                handler.send_error(404, "episode out of range")
+                return
+            entry = ser["memo"].get(idx)
+            sem = ser["sem"]
+            resolver, on_play = ser["resolver"], ser["on_play"]
+            force_proxy = ser["force_proxy"]
+        if entry is None:
+            if not sem.acquire(timeout=_SERIES_WAIT):
+                handler.send_error(503, "too many concurrent resolves")
+                return
+            try:
+                video, audio, headers, ad_block = resolver(idx)
+            except Exception:  # noqa: BLE001 —— 该集取流失败：502 且**不**写 memo
+                handler.send_error(502, "episode resolve failed")
+                return
+            finally:
+                sem.release()
+            if not video:
+                handler.send_error(502, "empty stream url")
+                return
+            # memo 存 (video, audio, location)：命中时直接拿 token URL 重定向，
+            # 既不回源也不用再扫 _tokens 反查。
+            entry = (video, audio,
+                     self.build_url(video, headers, ad_block=ad_block,
+                                    force_proxy=force_proxy))
+            with self._lock:
+                cur = self._series.get(key)      # 解析期间可能已被注销
+                if cur is not None:
+                    cur["memo"][idx] = entry
+        if on_play is not None:
+            try:
+                on_play(idx, entry[0], entry[1])
+            except Exception:  # noqa: BLE001 —— 回调异常不阻断播放
+                pass
+        handler.send_response(302)
+        handler.send_header("Location", entry[2])
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
 
     def _ensure_server(self) -> None:
         if self._server is not None:
