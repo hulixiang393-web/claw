@@ -377,17 +377,22 @@ def test_series_max_evicts_oldest():
     assert rn.status_code == 302
 
 
-def test_episode_503_when_resolver_slots_busy(monkeypatch):
+def test_episode_503_when_resolver_slots_busy(proxy_ctx, monkeypatch):
     """解析槽位占满且等待超时 → 503，且不泄漏信号量许可。"""
+    proxy = proxy_ctx
     monkeypatch.setattr(mp, "_SERIES_WAIT", 0.01)
     gate = threading.Event()
     started = threading.Barrier(mp._SERIES_SEM + 1, timeout=10)
 
     def _slow(i):
-        if i == 0:            # 只有被占满的那一集参与 barrier/闸门；后置断言请求
-            started.wait()   # 的第 1 集会**再次进入**已放行的 barrier（parties
-            gate.wait(timeout=10)  # 重新计数，永远凑不齐 → 卡满 timeout 后
-        return "https://cdn.example.com/x.m3u8", "", {}, None  # BrokenBarrierError → 502）
+        # 只有被占满的那一集参与 barrier/闸门。后置断言请求的是第 1 集，若也
+        # 进 barrier，会**再次进入**已放行的 barrier（CPython 的 Barrier 换代后
+        # 可重用，parties 重新计数且永远凑不齐）→ 卡满 timeout 后
+        # BrokenBarrierError → _serve_series 的 except Exception → 502。
+        if i == 0:
+            started.wait()
+            gate.wait(timeout=10)
+        return "https://cdn.example.com/x.m3u8", "", {}, None
 
     key = proxy.register_series(_slow, count=2)
     url = proxy.series_episode_url(key, 0)
