@@ -67,12 +67,28 @@
 """media_proxy 租约制令牌生命周期：VLC 存活期间看门狗不得回收代理。"""
 import time
 
+import pytest
+
 import framework.media_proxy as mp
 from framework.media_proxy import MediaProxy
 
 
 class _OffCache:
     enabled = False
+
+
+@pytest.fixture
+def proxy_ctx():
+    """起真实代理的用例必须在收尾停掉它。
+
+    _ensure_server() 会绑 ThreadingHTTPServer + serve_forever daemon 线程；
+    不停就留到会话末尾（只靠 atexit 兜底），端口和线程会越积越多。
+    与 tests/test_media_cache.py 的 proxy_ctx 同一写法。
+    """
+    proxy = MediaProxy(cache=_OffCache())
+    yield proxy
+    proxy.stop()
+    proxy._leases.clear()
 
 
 def test_lease_ids_unique_and_releasable():
@@ -88,17 +104,42 @@ def test_lease_ids_unique_and_releasable():
     assert b in proxy._leases
 
 
-def test_idle_expired_skipped_while_leased(monkeypatch):
-    """有租约时即使远超空闲超时也不判过期（VLC 暂停超 10 分钟不断流）。"""
-    monkeypatch.setattr(mp, "_IDLE_TIMEOUT", 0.01)
-    proxy = MediaProxy(cache=_OffCache())
+def test_idle_expired_skipped_while_leased(proxy_ctx, monkeypatch):
+    """有租约时即使远超空闲超时也不判过期（VLC 暂停超 10 分钟不断流）。
+
+    用 monkeypatch 把 _IDLE_TIMEOUT 调小并把 _last_use 设在 patched 值之内，
+    这样断言真的证明了「判据在调用时读全局 _IDLE_TIMEOUT」，
+    而不是靠 999 秒这个魔法数在 600s 默认值下也能过。
+    """
+    monkeypatch.setattr(mp, "_IDLE_TIMEOUT", 30.0)
+    proxy = proxy_ctx
     proxy._ensure_server()
-    proxy._last_use = time.time() - 999          # 早已空闲超时
+    proxy._last_use = time.time() - mp._IDLE_TIMEOUT - 1   # 刚好越过阈值
     assert proxy._idle_expired() is True         # 无租约 → 判过期
     lid = proxy.acquire_lease()
     assert proxy._idle_expired() is False        # 有租约 → 不回收
     proxy.release_lease(lid)
     assert proxy._idle_expired() is True         # 释放后恢复回收
+
+
+def test_release_lease_with_unknown_id_is_noop():
+    """释放从未获取过的 id：静默无副作用（discard 语义，不抛异常）。"""
+    proxy = MediaProxy(cache=_OffCache())
+    proxy.release_lease("never-acquired")
+    assert not proxy._leases
+
+
+def test_stop_works_while_leased(proxy_ctx):
+    """**整个设计依赖的属性**：持租约时 stop() 仍必须关闭代理。
+
+    stop() 是唯一清 _tokens 的地方；若它日后变成租约感知，App 退出就会挂住。
+    """
+    proxy = proxy_ctx
+    proxy.acquire_lease()
+    proxy._ensure_server()
+    assert proxy._server is not None
+    proxy.stop()
+    assert proxy._server is None
 
 
 def test_idle_expired_false_without_server():
@@ -1327,6 +1368,13 @@ git commit -m "feat(player): 外部播放器全集播放列表契约——顺序
   - `_acquire_proxy_lease() -> str` / `_release_proxy_lease(lease_id: str) -> None` / `_watch_proc(proc, lease_id) -> None`
   - 模块级 `_lease_id: str`
   - 常量 `_HANDSHAKE_TIMEOUT = 3.0`、`_HANDSHAKE_INTERVAL = 0.1`
+
+**租约成对释放（硬性验收，Task 1 审查裁决）**：`MediaProxy._leases` 无 TTL、无持有者存活检查（Task 1 计划的判据），而 `stop()` 是唯一清 `_tokens` 的地方。漏一次 release → 空闲看门狗在整个 App 会话内永久失效、回环端口一直被绑、`_tokens` 无界增长（影响面含非 VLC 播放）。因此本任务必须满足全部三条，**每条都要有回归测试**：
+  1. **VLC 进程退出**（自然退出或被关）→ `_watch_proc` 观察线程释放。
+  2. **播放器重启**（`_terminate_previous` 换源/重开）→ 旧租约先释放再启新租约，不得泄漏旧 id。
+  3. **App 退出**（`shutdown_video()`）→ 释放后 `MediaProxy.stop()` 仍能正常关闭（持租约也不阻塞关闭）。
+  另外：**必须在构造任何代理 URL 之前获取租约**（`acquire_lease()` 不保证代理已起，不能当作「代理在线且受保护」的断言）。
+  回归测试：`test_release_lease_idempotent`、`test_lease_released_when_proc_exits`、`test_terminate_previous_releases_old_lease`、`test_stop_works_while_leased`。
 
 - [ ] **Step 1: 写失败测试**
 
