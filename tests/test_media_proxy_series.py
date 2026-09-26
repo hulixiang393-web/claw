@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """media_proxy 租约制令牌生命周期 + 惰性系列注册表 /e/<key>/<idx>。"""
+import threading
 import time
 
 import pytest
@@ -164,7 +165,8 @@ def test_bad_index_and_key_404_without_resolving(proxy_ctx):
     proxy, key, urls = _series(proxy_ctx, _resolve, count=3)
     port = proxy._server.server_address[1]
     for path in (f"/e/{key}/3", f"/e/{key}/-1", f"/e/{key}/abc",
-                 f"/e/{key}/1/2", "/e/deadbeef/0", "/e//0", f"/e/{key}"):
+                 f"/e/{key}/1/2", "/e/deadbeef/0", "/e//0", f"/e/{key}",
+                 f"/e/{key}/²"):
         r = requests.get(f"http://127.0.0.1:{port}{path}",
                          allow_redirects=False, timeout=5)
         assert r.status_code == 404, path
@@ -194,3 +196,113 @@ def test_unregister_series_404_after(proxy_ctx):
     r = requests.get(urls[0], allow_redirects=False, timeout=5)
     assert r.status_code == 404
     assert calls == []
+
+
+def test_series_max_evicts_oldest(proxy_ctx):
+    """注册表上限 _SERIES_MAX：第 9 支挤掉最旧的一支，最旧的 404、新的照常 302。
+
+    每次 register 只增一支，故 while 与 if 在容量上等价；本测试真正锁住的是
+    「注册表不超上限」+「淘汰顺序为 FIFO（最旧先出）」两件事。
+    """
+    proxy = proxy_ctx
+    keys, urls = [], []
+    for i in range(mp._SERIES_MAX + 1):
+        k = proxy.register_series(
+            lambda i: ("https://cdn.example.com/x.m3u8", "", {}, None),
+            count=1)
+        keys.append(k)
+        urls.append(proxy.series_episode_url(k, 0))
+    assert len(proxy._series) == mp._SERIES_MAX
+    assert keys[0] not in proxy._series          # 最旧被淘汰
+    assert keys[-1] in proxy._series            # 最新的留下
+    r0 = requests.get(urls[0], allow_redirects=False, timeout=5)
+    assert r0.status_code == 404
+    rn = requests.get(urls[-1], allow_redirects=False, timeout=5)
+    assert rn.status_code == 302
+
+
+def test_episode_503_when_resolver_slots_busy(monkeypatch, proxy_ctx):
+    """解析槽位占满且等待超时 → 503，且不泄漏信号量许可。"""
+    proxy = proxy_ctx
+    monkeypatch.setattr(mp, "_SERIES_WAIT", 0.01)
+    gate = threading.Event()
+    started = threading.Barrier(mp._SERIES_SEM + 1, timeout=10)
+
+    def _slow(i):
+        started.wait()          # 占满全部 _SERIES_SEM 个许可后一起放行
+        gate.wait(timeout=10)
+        return "https://cdn.example.com/x.m3u8", "", {}, None
+
+    key = proxy.register_series(_slow, count=1)
+    url = proxy.series_episode_url(key, 0)
+    busy = [threading.Thread(target=requests.get,
+                             args=(url,), kwargs={"allow_redirects": False,
+                                                   "timeout": 10})
+            for _ in range(mp._SERIES_SEM)]
+    for t in busy:
+        t.start()
+    try:
+        started.wait()                                   # 槽位已占满
+        r = requests.get(url, allow_redirects=False, timeout=5)
+        assert r.status_code == 503
+    finally:
+        gate.set()
+        for t in busy:
+            t.join(timeout=10)
+    # 许可未泄漏：占满的请求都完成后，仍能再解析一集
+    r2 = requests.get(url, allow_redirects=False, timeout=5)
+    assert r2.status_code == 302
+
+
+def test_episode_empty_video_url_502_and_not_memoized(proxy_ctx):
+    """解析成功但 video 为空 → 502，且不写 memo（下次仍重新解析）。"""
+    proxy = proxy_ctx
+    calls = []
+
+    def _empty(i):
+        calls.append(i)
+        return "", "", {}, None
+
+    key = proxy.register_series(_empty, count=1)
+    url = proxy.series_episode_url(key, 0)
+    r = requests.get(url, allow_redirects=False, timeout=5)
+    assert r.status_code == 502
+    r2 = requests.get(url, allow_redirects=False, timeout=5)
+    assert r2.status_code == 502
+    assert calls == [0, 0]               # 没有被 memo 住
+
+
+def test_stop_clears_series_so_memo_cannot_outlive_token(proxy_ctx):
+    """stop() 必须连 _series 一起清。
+
+    否则：已 memo 的 302 指向的 token 被 stop() 清掉 → 该集此后永久 302 到一个
+    死 token（对外表现 404），且不会重新解析（memo 一直命中）。
+    """
+    calls = []
+    proxy = proxy_ctx
+    key = proxy.register_series(
+        lambda i: (calls.append(i) or "https://cdn.example.com/x.m3u8", "", {}, None),
+        count=1)
+    url = proxy.series_episode_url(key, 0)
+    assert requests.get(url, allow_redirects=False, timeout=5).status_code == 302
+    assert len(calls) == 1                       # 已 memo
+
+    proxy.stop()
+    assert not proxy._series
+    assert not proxy._tokens
+
+    # 旧 key 落在 stop() 之后新起的端口上：必须 404，而不是 302 到死 token。
+    # （未清注册表时这里是 302 → Location 指向已被 _tokens.clear() 清掉的 token）
+    url2 = proxy.series_episode_url(key, 0)
+    r = requests.get(url2, allow_redirects=False, timeout=5)
+    assert r.status_code == 404
+    assert calls == [0]          # 没有重新解析：证明没有 memo 在供应死 token
+
+    # App 侧重新注册后该集可正常播放 —— 恢复路径不是死局
+    key2 = proxy.register_series(
+        lambda i: (calls.append(i) or "https://cdn.example.com/x.m3u8", "", {}, None),
+        count=1)
+    r2 = requests.get(proxy.series_episode_url(key2, 0),
+                      allow_redirects=False, timeout=5)
+    assert r2.status_code == 302
+    assert calls == [0, 0]

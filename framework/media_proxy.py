@@ -773,7 +773,7 @@ class MediaProxy:
                 "memo": {}, "sem": threading.Semaphore(_SERIES_SEM),
                 "force_proxy": bool(force_proxy),
             }
-            while len(self._series) > _SERIES_MAX:   # LRU 兜底：淘汰最旧一支
+            while len(self._series) > _SERIES_MAX:   # FIFO 兜底：淘汰最旧一支
                 self._series.pop(next(iter(self._series)))
         return key
 
@@ -795,7 +795,10 @@ class MediaProxy:
             handler.send_error(404, "bad series path")
             return
         key, raw_idx = parts[0], parts[1]
-        if not raw_idx.isdigit():        # 拒绝 -1/abc/1e3 等一切非十进制整数
+        # isdecimal 而非 isdigit：isdigit() 对上标（如 "²"）返回 True 而 int()
+        # 抛 ValueError → 落到外层 502，并把客户端输入回显进 HTTP reason
+        # phrase。长度上限 9 位：避免超长数字串触发 3.11+ 的 int 转换位长限制。
+        if not raw_idx.isdecimal() or len(raw_idx) > 9:
             handler.send_error(404, "bad episode index")
             return
         idx = int(raw_idx)
@@ -854,10 +857,15 @@ class MediaProxy:
         self._thread.start()
 
     def stop(self) -> None:
-        """停止代理并清空 token。
+        """停止代理并清空 token 与惰性系列注册表。
 
         存在进行中的活动请求（含流式转发的长连接）时不停止、不清 token：
         播放中途暂停/拖动进度时 URL 不能失效，否则 VLC 后续请求 404。
+
+        **注册表必须与 token 一起清**：memo 里存的是 build_url 产出的 /s/<token>，
+        token 被清而 memo 留下 → /e/ 一直命中一个死 token（对外 404）且永不
+        重新解析。看门狗在 Task 5 租约接线之前就可能中途回收代理，所以这条
+        清扫不能推迟到 App 退出。
         """
         with self._lock:
             if self._active > 0:
@@ -871,6 +879,7 @@ class MediaProxy:
             except Exception:
                 pass
         with self._lock:
+            self._series.clear()   # memo 一并作废（Task 2 审查）
             self._tokens.clear()
 
     # ------------------------------------------------------------------ #
