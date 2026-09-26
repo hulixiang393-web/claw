@@ -27,7 +27,7 @@
 ## 与已批准规格的偏差（实施前已确认，实施时按本计划执行）
 
 1. **`register_series` 多一个关键字参数 `force_proxy`**（规格 §4.1 签名未含）。原因：`build_url(target, headers, ad_block, force_proxy)` 需要它，而 `video_view._force_proxy_enabled()`（`video_view.py:1458`）已存在；规格 §4.1 的示例调用漏传会导致 hanime1 源丢失 `force_proxy`。这是加参数，不破坏规格语义。
-2. **不终止外部 VLC**。规格 §4.4 要求「视图销毁/换源时先 `_terminate_previous()` 再注销」。这会让「离开视频页 → 正在播的 VLC 被杀掉」，与现有 UX（`stop_playback` 只清 `_external_active`，VLC 继续播）冲突。改为：**只要 VLC 还活着就保留系列注册**（VLC 仍可能请求 `/e/`），仅在 (a) 注册新系列前、(b) `shutdown_video()`（App 退出）、(c) `player_running()` 为假时注销。代理侧 `_SERIES_MAX = 8` 的 LRU 淘汰兜底泄漏。
+2. **不终止外部 VLC**。规格 §4.4 要求「视图销毁/换源时先 `_terminate_previous()` 再注销」。这会让「离开视频页 → 正在播的 VLC 被杀掉」，与现有 UX（`stop_playback` 只清 `_external_active`，VLC 继续播）冲突。改为：**只要 VLC 还活着就保留系列注册**（VLC 仍可能请求 `/e/`），仅在 (a) 注册新系列前、(b) `shutdown_video()`（App 退出）、(c) `player_running()` 为假时注销。代理侧 `_SERIES_MAX = 8` 的 FIFO 淘汰兜底泄漏。
 3. **剧集标题不重复加集号**。规格 §4.4 写 `f"第{i+1}集 {ep.title or ''}"`，而多数源的 `Chapter.title` 本身就是「第1集 章节名」→ 播放列表会显示「第1集 第1集 章节名」。改为：源标题非空就用源标题，为空才用「第NN集」兜底。非数字开头的防御仍在 `_sanitize_title` 里。
 4. **握手映射由 `open_with_player` 的 `on_playlist_ready` 回调回传**，而不是让 `video_view` 自己去轮询 `player_playlist_items()`——后者会在 GUI 主线程上阻塞最多 3s（规格 §4.4 未指定由谁轮询，此处选不卡 UI 的方案）。
 
@@ -388,7 +388,7 @@ def test_episode_503_when_resolver_slots_busy(monkeypatch):
         gate.wait(timeout=10)
         return "https://cdn.example.com/x.m3u8", "", {}, None
 
-    key = proxy.register_series(_slow, count=1)
+    key = proxy.register_series(_slow, count=2)
     url = proxy.series_episode_url(key, 0)
     busy = [threading.Thread(target=requests.get,
                              args=(url,), kwargs={"allow_redirects": False,
@@ -404,8 +404,11 @@ def test_episode_503_when_resolver_slots_busy(monkeypatch):
         gate.set()
         for t in busy:
             t.join(timeout=10)
-    # 许可未泄漏：占满的请求都完成后，仍能再解析一集
-    r2 = requests.get(url, allow_redirects=False, timeout=5)
+    # 许可未泄漏：占满的请求都完成后，**另一集**仍能解析。
+    # 必须换一集（count=2 → 请求 idx 1）：同 key 同 idx 会命中 idx 0 刚写下的
+    # memo，根本走不到 sem.acquire，断言再对也证明不了「许可没泄漏」。
+    r2 = requests.get(proxy.series_episode_url(key, 1),
+                      allow_redirects=False, timeout=5)
     assert r2.status_code == 302
 
 
@@ -431,6 +434,9 @@ def test_stop_clears_series_so_memo_cannot_outlive_token(proxy_ctx):
 
     否则：已 memo 的 302 指向的 token 被 stop() 清掉 → 该集此后永久 404
     且不会重新解析（memo 一直命中一个死 token）。
+    注意 stop() 之后旧 key 必然 404（注册表已清），**不是** 302；要证明
+    「重新注册能恢复」得显式再注册一次。真正能区分修没修的是 stop() 后那个
+    404 —— 没修的话 memo 照样命中，一样返回 302。
     """
     calls = []
     proxy = proxy_ctx
@@ -439,7 +445,7 @@ def test_stop_clears_series_so_memo_cannot_outlive_token(proxy_ctx):
         count=1)
     url = proxy.series_episode_url(key, 0)
     assert requests.get(url, allow_redirects=False, timeout=5).status_code == 302
-    assert len(calls) == 1                       # 已 memo
+    assert len(calls) == 1                       # 已 memo（302 走的是写 memo 的成功路径）
 
     proxy.stop()
     assert not proxy._series
@@ -447,8 +453,17 @@ def test_stop_clears_series_so_memo_cannot_outlive_token(proxy_ctx):
 
     url2 = proxy.series_episode_url(key, 0)      # 新端口上的同 key
     r = requests.get(url2, allow_redirects=False, timeout=5)
-    assert r.status_code == 302                  # 重新解析，而非 302 到死 token
-    assert calls == [1, 1]
+    assert r.status_code == 404                  # 没修的话这里是 302（指向死 token）
+    assert calls == [0]                          # 且不会重新解析
+
+    # 「清注册表」不能留下死路：重新注册同 key 后应能正常解析
+    key2 = proxy.register_series(
+        lambda i: (calls.append(i) or "https://cdn.example.com/x.m3u8", "", {}, None),
+        count=1)
+    r2 = requests.get(proxy.series_episode_url(key2, 0),
+                      allow_redirects=False, timeout=5)
+    assert r2.status_code == 302
+    assert calls == [0, 0]
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -601,7 +616,9 @@ _SERIES_WAIT = 20.0
 回收代理；顺手也把每支的信号量一并释放掉）：
 
 ```python
-        self._series.clear()   # memo 一并作废（Task 2 审查）
+        self._series.clear()   # memo 一并作废（Task 2 审查）。清掉 dict 也顺带丢弃
+                               # 每支的 Semaphore 对象；已在途的持有者仍会在自己
+                               # 的 finally 里 release 自己那个引用。
         self._tokens.clear()
 ```
 
@@ -2235,7 +2252,7 @@ Expected: FAIL —— `AttributeError: 'VideoView' object has no attribute '_bui
 
 ```python
         # 外部播放器还在播就别注销系列（VLC 可能继续请求 /e/，注销即 404）；
-        # 播放器已退出才回收（代理侧 _SERIES_MAX=8 另有 LRU 兜底）。
+        # 播放器已退出才回收（代理侧 _SERIES_MAX=8 另有 FIFO 兜底）。
         if not self._external_vlc_running():
             self._unregister_series()
 ```
