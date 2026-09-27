@@ -1087,22 +1087,163 @@ def test_ad_block_reaches_both_entry_points(_qapp, monkeypatch):
 def test_try_external_goto_passes_item_id_unchanged(_qapp, monkeypatch):
     """_try_external_goto 必须把 item_id **原样**转发（不得再 int() 强转）。
 
-    已知取舍：item_id 是 VLC item id（int），强转无害；但若 libvlc 某天给出
-    非数字 id，这一行就是整条链路上唯一的 TypeError 源。on_playlist_ready 已
-    校验过 id 必须是 int，故这里强转是纯冗余 → 删。
+    这里刻意塞一个**非 int** 的合成值来钉「不洗白」这条契约：`_on_vlc_playlist_ready`
+    的 guard（`isinstance(k, int) and isinstance(v, int)`，否则整份映射拒收并告警，
+    见 `test_playlist_ready_rejects_non_int_ids`）保证真实值一定是 int，所以拿 int
+    断言等于什么都没断言（`int(41) == 41`，把 `int()` 加回去照样全绿）。
+
+    要证明的是「这一行不做任何转换」：只有能改变取值转换才能被这种值区分开。
+    语义上也正该如此——上游 guard 若哪天漏了非 int，`int()` 会把一份坏映射重新
+    掩盖成看着可用的假映射（这正是当初删它的理由）。
     """
     view = _view(_video_detail(3), 0)
     got = []
     monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
     view._play_gen = 7
     view._vlc_ids_gen = 7
-    view._vlc_item_ids = {0: 41}
+    view._vlc_item_ids = {0: 41, 1: "42"}
     view._current_idx = 0
     view._external_active = True
 
     assert view._try_external_goto(0) is True
-    assert got == [41]              # item_id 原样转发
+    assert got == [41]              # 常规 int：原样转发
+
+    got.clear()
+    assert view._try_external_goto(1) is True
+    assert got == ["42"]            # 非 int：仍原样转发（不被 int() 洗白）
 
     got.clear()
     assert view._try_external_goto(2) is False    # 未映射 → 不发命令
     assert got == []
+
+
+# --------------------------------------------------------------------- #
+# 复审 polish 轮：⚙ 起播后的 UI 同步 / 无当前流时的反馈 / load 的同一不变量
+# --------------------------------------------------------------------- #
+def test_open_external_resyncs_ui_state_like_play(_qapp, monkeypatch):
+    """⚙起播后必须像 _play 一样把播放按钮/中央浮层/控制条拉回「未播放」一致态。
+
+    这三行**不是死代码**（`_play` 里它们无条件执行，reviewer 纠正了此前
+    「不可达」的说法）。但从默认状态出发，它们的终态与起点相同（`_player` 全仓
+    只赋 `None` → `play_btn` 文案无人改写；`center_play_btn` 从不被隐藏；
+    `control_bar` 只能被 `_hide_controls` 藏，而那也被 `_player` 门控），
+    所以「起播后断言 UI 长什么样」恒真——那种测法等于没测。
+
+    真正的契约是**幂等同步**：App 侧 UI 一旦与「未播放」分叉，起播路径就该把它
+    拉回来，且两条路径（_play / ⚙）同规格。故先人为摆成分叉态再断言被拉回——
+    删掉 ⚙ 里这三行本用例即红。
+    """
+    view = _ext_view(_video_detail(4), 1)
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    monkeypatch.setattr(ep, "open_with_player", lambda url, **kw: "已用外部播放器打开")
+
+    # 人为摆成与「未播放」应有的样子**相反**的状态
+    view.play_btn.setText("⏸")
+    view.center_play_btn.hide()
+    view.control_bar.hide()
+    assert view.play_btn.text() == "⏸"
+    assert view.center_play_btn.isHidden() and view.control_bar.isHidden()
+
+    view._open_external()
+    assert view.play_btn.text() == "▶"
+    assert not view.center_play_btn.isHidden()
+    assert not view.control_bar.isHidden()
+
+
+def test_notify_last_episode_only_at_last_episode(_qapp):
+    """「已是最后一集」只该在**末集**提示——当前实现的条件是反的。
+
+    `_notify_last_episode`（pre-existing，行 :1616-1618）写的是
+    `if not (0 <= idx < len(episodes) - 1): return`：`len-1` **就是**末集下标，
+    于是 idx 落在末集时括号内为假 → 不提示；而 idx < len-1（明明还有下一集）
+    时为真 → 反而提示。与它自己的 docstring「非末集静默」正好相反。
+
+    本轮把 ⚙ 起播接上这个函数，若不先修：⚙ 会在错的时机多弹一次同样的错提示。
+    故一并修正（`0 <= idx < len-1` 即「还有下一集」→ 静默）。
+
+    每个用例单开一个视图：`_notify_last_episode` 有 3s 去抖，同一视图连弹会被吞。
+    """
+    def _toasts(n, idx):
+        view = _view(_video_detail(n), idx)
+        statuses = []
+        view._show_status = lambda s: statuses.append(s)
+        view._notify_last_episode()
+        return statuses
+
+    assert _toasts(3, 0) == []          # 第 1/3 集：还有下一集 → 静默
+    assert _toasts(3, 1) == []          # 第 2/3 集：还有下一集 → 静默
+    assert _toasts(3, 2) == ["已是最后一集"]   # 末集 → 提示
+    assert _toasts(1, 0) == ["已是最后一集"]   # 单集：没有下一集 → 提示
+
+
+def test_open_external_notifies_last_episode_like_play(_qapp, monkeypatch):
+    """⚙起播也要走 _notify_last_episode（与 _play 同规格）。
+
+    `_play` 每次成功起播都调它；⚙ 起播的是**同一个当前集**，末集/单集时用户该
+    收到同一条提示。中间集时它自己静默，故不在这里断言文案（那是
+    `test_notify_last_episode_only_at_last_episode` 的职责），只钉「被调用」。
+    """
+    view = _ext_view(_video_detail(1), 0)
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    monkeypatch.setattr(ep, "open_with_player", lambda url, **kw: "已用外部播放器打开")
+    called = []
+    monkeypatch.setattr(view, "_notify_last_episode", lambda: called.append(True))
+
+    view._open_external()
+    assert called == [True]
+
+
+def test_open_external_without_current_stream_tells_user(_qapp, monkeypatch):
+    """⚙在没有当前流时不能静默 return：得告诉用户先选集数。
+
+    参照物是 `_toggle_play_pause`——它在同一个「没有当前流」状态下是有反馈的
+    （load/reload_detail 发的「请选择要播放的集数」常驻浮层）。⚙ 若一声不吭，
+    用户点了没反应像功能坏了。
+
+    两种到达路径分别给不同文案（都据「_current_play 为空即当前无流」这一权威信号
+    判断，见 `_invalidate_current_stream`）：选集态说「先选集数」；其余情况
+    （单集未开播 / season 页取流未回）说「当前没有正在播放的集」——后者不能也
+    说「请选集数」，单集作品根本没得选。
+    """
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    launched = []
+    monkeypatch.setattr(ep, "open_with_player", lambda url, **kw: launched.append(url) or "ok")
+
+    view = _ext_view(_video_detail(4), 1)          # 选集态：多集未选
+    view._current_play = ""
+    view._selection_mode = True
+    statuses = []
+    view._show_status = lambda s: statuses.append(s)
+    view._open_external()
+    assert launched == []
+    assert statuses == ["请先选择要播放的集数"]
+
+    view2 = _ext_view(_video_detail(1), 0)         # 单集未开播：没得选集
+    view2._current_play = ""
+    view2._selection_mode = False
+    statuses2 = []
+    view2._show_status = lambda s: statuses2.append(s)
+    view2._open_external()
+    assert launched == []
+    assert statuses2 == ["当前没有正在播放的集"]
+
+
+def test_load_invalidates_current_stream(_qapp, monkeypatch):
+    """load() 的 reset 块也必须作废「当前流」三元组（与 reload_detail 同一条不变量）。
+
+    今天安全**只是因为** `reader_page.py:395` 恰好在 `load()`（:417）之前调了
+    `stop_playback()`（它会清 `_current_play`）。把不变量收进两个 reset 块共用的
+    具名方法，才不会因将来多出一条不经 `stop_playback` 的 `load()` 路径（刷新
+    按钮 / 重复 open）而静默复发——那正是上一轮修掉的那个 bug。
+    """
+    view = _playing_old_source(monkeypatch)        # 正在播 OLD 源
+    assert view._current_play == "https://cdn/OLD.m3u8"
+    monkeypatch.setattr(view, "_maybe_load_recommendations", lambda: None)
+
+    view.load(object(), _video_detail(2))          # 换作品
+    assert view._current_play == ""
+    assert view._current_audio == ""
+    assert view._current_title == ""

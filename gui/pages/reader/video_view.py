@@ -1154,6 +1154,7 @@ class VideoView(QWidget):
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用）。
         self._stop_player()
+        self._invalidate_current_stream()  # 与 reload_detail 同一不变量，防两处分叉
         self._episodes = detail.chapters
         self._stream_cache.clear()
         self._prefetch_idx = -2
@@ -1205,13 +1206,8 @@ class VideoView(QWidget):
         self._has_played = False  # 新源尚未播放，不把选集态误存为续读进度
         self._selection_mode = False  # 重置选集态
         # 「当前流」三元组一并作废：_stop_player() 刚停完，界面上摆的已是新源的集，
-        # 留着 _current_play 的话它指的是**旧源**的流 → ⚙外部播放器（无系列时的
-        # 单集回退）、▶_toggle_play_pause、复制流地址三处都会把旧源的流当新源的
-        # 当前集交出去/复制出去（静默播错，App 里看不出来）。_current_audio 一并清：
-        # 它只与 _current_play 成对读，单清其一会凑出「新源视频 + 旧源音轨」。
-        self._current_play = ""
-        self._current_audio = ""
-        self._current_title = ""
+        # 留着 _current_play 的话它指的是**旧源**的流（见 _invalidate_current_stream）
+        self._invalidate_current_stream()
         self._populate_ep_cards(new_detail.chapters)
         self._switching = False
         self._sync_overlay_state(playing=False)
@@ -1330,6 +1326,24 @@ class VideoView(QWidget):
         self.time_label.setText("00:00 / 00:00")
         self.play_label.hide()
         self.setCursor(Qt.ArrowCursor)
+
+    def _invalidate_current_stream(self) -> None:
+        """作废「当前流」三元组（换作品 `load` / 换源 `reload_detail` 两处共用）。
+
+        这三个字段是「界面此刻放的是什么」的唯一记录，`_stop_player()` 不碰它们
+        （它只负责停播）。换作品/换源后若留着，界面摆的是新的一集，
+        `_current_play` 却还指着**上一个作品/源**的流 → ⚙外部播放器（无系列时
+        的单集回退）、`▶_toggle_play_pause`、复制流地址三处都会把旧流当新一集
+        交出去/复制出去（静默播错，App 里看不出来）。
+
+        收成具名方法是为了让 `load()` 与 `reload_detail()` 两个 reset 块无法再
+        分叉：今天两边都安全，只是因为 `reader_page` 恰好在 `load()` 之前调了
+        `stop_playback()`（它会清 `_current_play`）；将来多出一条不经它的 `load()`
+        路径（刷新按钮 / 重复 open）就会把这个 bug 静默放回来。
+        """
+        self._current_play = ""
+        self._current_audio = ""
+        self._current_title = ""
 
     # ------------------------------------------------------------------ #
     def _show_status(self, text: str) -> None:
@@ -1600,8 +1614,8 @@ class VideoView(QWidget):
     def _notify_last_episode(self) -> None:
         """「已是最后一集」提示：非末集静默；去抖 3s 防连点/播放连开重复弹。"""
         if self._episodes:
-            if not (0 <= self._current_idx < len(self._episodes) - 1):
-                return  # 非末集（还有下一集）不提示
+            if 0 <= self._current_idx < len(self._episodes) - 1:
+                return  # 还有下一集 → 非末集静默
         # 无分集（season 页单集）或处于末集 → 提示
         now = time.monotonic()
         if now - self._last_ep_toast_ts < 3.0:
@@ -1999,6 +2013,11 @@ class VideoView(QWidget):
             # ▶/点集卡（_toggle_play_pause 会按高亮集取流，顺带拿到全集播放列表）。
             # 换源后走到这里也正是靠 _current_play 已作废——否则会把**旧源**的流
             # 当新源的当前集交出去。
+            # 但不能一声不吭：_toggle_play_pause 在同一状态下是有反馈的，⚙ 静默
+            # return 会让用户以为功能坏了。_current_play 为空即「当前无流」是权威
+            # 信号（见 _invalidate_current_stream），据此给对应文案。
+            self._show_status("请先选择要播放的集数" if self._selection_mode
+                              else "当前没有正在播放的集")
             return
         audio = getattr(self, "_current_audio", "")
         hdrs = {}
@@ -2060,7 +2079,15 @@ class VideoView(QWidget):
             caching_ms=self._source_network_caching_ms(),
         )
         self._show_status(msg)
+        # 起播后与 _play 同规格地把 App 侧 UI 拉回「未播放」一致态（幂等同步：
+        # 播放按钮文案、中央浮层、控制条）。两处保持一致，将来若让 control_bar
+        # 真能被自动隐藏、或给 play_btn 换文案（⏸/▶），⚙ 不会静默与 _play 分叉。
+        self.play_btn.setText("▶")
+        self._sync_overlay_state(playing=False)
+        self.control_bar.show()  # 外部播放器接管画面 → 控制条常驻
         self._external_active = True  # 外播会话在 → App 内快捷键转发 VLC
+        if msg:
+            self._notify_last_episode()  # 末集/单集：提示不再有下一集
 
     def _source_network_caching_ms(self) -> int:
         """读源配置 media.hls.network_caching_ms（缺省 0 = 用分类默认值）。
