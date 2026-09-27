@@ -178,7 +178,10 @@ class ShelfCacheRepository:
                 with self._db:
                     self._write_content_index(row, now, book_key)
                 if existing:
-                    Path(existing["path"]).unlink(missing_ok=True)
+                    try:
+                        Path(existing["path"]).unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 row["metadata"] = metadata
                 return row
             except Exception:

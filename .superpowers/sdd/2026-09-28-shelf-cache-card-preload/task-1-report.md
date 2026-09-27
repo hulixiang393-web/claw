@@ -57,3 +57,11 @@ The focused tests were first run before implementation and failed during collect
 ### Fix commit
 
 - Included in the review-fix commit for this change.
+
+## Scoped re-review fix report (2026-09-27)
+
+- Fixed post-commit old-file cleanup handling so an unlink failure is ignored as cleanup-only failure; the committed new index row and new payload remain authoritative.
+- Added `test_old_file_cleanup_failure_keeps_new_payload_and_index`, which injects old-file unlink failure and verifies the new payload is readable and indexed to an existing file.
+- `python -m pytest tests/test_shelf_cache_repository.py -q` → `11 passed`.
+- `python -m compileall -q framework tests` → passed.
+- `git diff --check` → passed.

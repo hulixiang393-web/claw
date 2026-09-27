@@ -54,6 +54,24 @@ def test_atomic_text_and_image_content_are_idempotent(tmp_path: Path):
     assert text["size"] == 5 and image["size"] == 3
 
 
+def test_old_file_cleanup_failure_keeps_new_payload_and_index(tmp_path: Path, monkeypatch):
+    repo = make_repo(tmp_path)
+    repo.upsert_book("book", "s", "u", "novel", {})
+    old = repo.put_content("book", "c1", "text/plain", "old", {})
+    original_unlink = Path.unlink
+
+    def fail_old(path, missing_ok=False):
+        if str(path) == old["path"]:
+            raise OSError("injected old-file cleanup failure")
+        return original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_old)
+    new = repo.put_content("book", "c1", "text/plain", "new", {})
+    assert repo.get_content("book", "c1") == "new"
+    assert Path(new["path"]).exists()
+    assert repo.get_book_snapshot("book")["content"][0]["checksum"] == new["checksum"]
+
+
 def test_missing_file_is_repaired_by_removing_stale_index(tmp_path: Path):
     repo = make_repo(tmp_path)
     repo.upsert_book("book", "s", "u", "novel", {})
