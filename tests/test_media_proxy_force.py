@@ -492,6 +492,24 @@ def test_force_proxy_connection_failure_is_explicit_502(monkeypatch):
         proxy.stop()
 
 
+def test_force_proxy_upstream_http_error_is_explicit_at_local_s_url(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, presp=_FakeResp403())
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    try:
+        local = proxy.build_url("http://up.example/video.mp4",
+                                {"Referer": "https://fake/"}, force_proxy=True)
+        response = requests.get(local, timeout=10)
+        assert response.status_code == 403
+        assert response.status_code != 200
+        assert response.content
+        assert dlog == []
+        assert len(plog) == 1
+    finally:
+        proxy.stop()
+
+
 def test_force_proxy_hls_children_keep_route_and_diagnostics(monkeypatch):
     dlog, plog = [], []
 
