@@ -18,6 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 
 import sys
 
@@ -27,7 +28,8 @@ import pytest  # noqa: E402
 import requests  # noqa: E402
 
 from framework.media_cache import MediaCache  # noqa: E402
-from framework.media_proxy import MediaProxy, _IDLE_TIMEOUT, _WATCH_INTERVAL  # noqa: E402
+import framework.media_proxy as mp  # noqa: E402
+from framework.media_proxy import MediaProxy, _FileTee, _IDLE_TIMEOUT, _WATCH_INTERVAL  # noqa: E402
 
 
 # --------------------------------------------------------------------- #
@@ -38,7 +40,17 @@ class _FakeSource(BaseHTTPRequestHandler):
 
     hits = None  # dict[path] = count
     mp4 = b"X" * 200_000
+    partial = b"P" * 100
     segs = {f"seg{i}": bytes(range(0x30 + i, 0x30 + i + 200)) * 20 for i in range(4)}
+
+    def _send_partial(self):
+        self.send_response(206)
+        self.send_header("Content-Range", "bytes 0-99/200")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(len(self.partial)))
+        self.end_headers()
+        self.wfile.write(self.partial)
 
     def _log_hit(self):
         key = self.path.split("?")[0]
@@ -49,6 +61,9 @@ class _FakeSource(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/mp4/movie.mp4":
             self._send_file(self.mp4, "video/mp4")
+            return
+        if path == "/mp4/partial.mp4":
+            self._send_partial()
             return
         if path == "/hls/index.m3u8":
             body = ("#EXTM3U\n"
@@ -88,6 +103,8 @@ class _FakeSource(BaseHTTPRequestHandler):
             if start >= size:
                 self.send_response(416)
                 self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             body = data[start:end + 1]
@@ -105,6 +122,85 @@ class _FakeSource(BaseHTTPRequestHandler):
 
     def log_message(self, *args):  # noqa: A002
         pass
+
+
+class _BlockingSource(BaseHTTPRequestHandler):
+    hits = 0
+    started = threading.Event()
+    release = threading.Event()
+    fail = False
+    range_fail = False
+    hold_body = False
+    body = b"blocking-media"
+
+    def do_GET(self):  # noqa: N802
+        type(self).hits += 1
+        type(self).started.set()
+        if type(self).range_fail:
+            type(self).release.wait(5)
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */200")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.headers.get("Range"):
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes 0-{len(self.body) - 1}/{len(self.body)}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(len(self.body)))
+            self.end_headers()
+            self.wfile.flush()
+            type(self).release.wait(5)
+            try:
+                self.wfile.write(self.body)
+            except OSError:
+                pass
+            return
+        if type(self).hold_body:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(self.body)))
+            self.end_headers()
+            self.wfile.flush()
+            type(self).release.wait(5)
+        else:
+            type(self).release.wait(5)
+        if type(self).fail:
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(len(self.body)))
+        self.end_headers()
+        try:
+            self.wfile.write(self.body)
+        except OSError:
+            pass
+
+    def log_message(self, *args):  # noqa: A002
+        pass
+
+
+@pytest.fixture
+def blocking_source():
+    _BlockingSource.hits = 0
+    _BlockingSource.started.clear()
+    _BlockingSource.release.clear()
+    _BlockingSource.fail = False
+    _BlockingSource.range_fail = False
+    _BlockingSource.hold_body = False
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _BlockingSource)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv
+    finally:
+        _BlockingSource.release.set()
+        srv.shutdown()
+        srv.server_close()
 
 
 @pytest.fixture
@@ -177,9 +273,288 @@ def test_mp4_cached_then_local_range(source, proxy_ctx):
     assert _FakeSource.hits["/mp4/movie.mp4"] == hits_before  # 命中本地，未回源
 
 
+def test_same_complete_resource_uses_one_upstream_request(blocking_source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    target = _url(blocking_source, "/mp4/block.mp4")
+    local = proxy.build_url(target, {"Referer": "https://fake.example/"}, force_proxy=True)
+    results = []
+
+    def fetch():
+        results.append(requests.get(local, timeout=10))
+
+    first = threading.Thread(target=fetch)
+    second = threading.Thread(target=fetch)
+    first.start()
+    assert _BlockingSource.started.wait(2)
+    second.start()
+    time.sleep(0.1)
+    assert _BlockingSource.hits == 1
+    _BlockingSource.release.set()
+    first.join(10)
+    second.join(10)
+    assert [response.status_code for response in results] == [200, 200]
+    assert [response.content for response in results] == [_BlockingSource.body] * 2
+    assert _BlockingSource.hits == 1
+    assert cache.is_complete(cache.key_of(target))
+
+
+def test_failed_singleflight_is_removed_and_next_request_can_retry(blocking_source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    target = _url(blocking_source, "/mp4/block.mp4")
+    local = proxy.build_url(target, {"Referer": "https://fake.example/"}, force_proxy=True)
+    _BlockingSource.fail = True
+    _BlockingSource.release.set()
+    failed = requests.get(local, timeout=10)
+    assert failed.status_code == 503
+    _BlockingSource.fail = False
+    _BlockingSource.started.clear()
+    _BlockingSource.release.clear()
+    retried = requests.get(local, timeout=10)
+    assert retried.status_code == 200
+    assert retried.content == _BlockingSource.body
+    assert _BlockingSource.hits == 2
+    assert _wait_until(lambda: cache.is_complete(cache.key_of(target)))
+
+
+def test_range_response_never_becomes_complete_cache_entry(source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    target = _url(source, "/mp4/partial.mp4")
+    local = proxy.build_url(target, {"Referer": "https://fake.example/"})
+    response = requests.get(local, timeout=10)
+    assert response.status_code == 206
+    assert response.content == _FakeSource.partial
+    key = cache.key_of(target)
+    assert not cache.is_complete(key)
+    assert not cache.mp4_final(key).exists()
+
+
+def test_upstream_416_preserves_range_semantics_through_s(source, proxy_ctx):
+    proxy, _cache = proxy_ctx
+    target = _url(source, "/mp4/movie.mp4")
+    local = proxy.build_url(target, {"Referer": "https://fake.example/"})
+    response = requests.get(local, headers={"Range": "bytes=999999-"}, timeout=10)
+    assert response.status_code == 416
+    assert response.headers["Content-Range"] == "bytes */200000"
+    assert response.headers["Accept-Ranges"] == "bytes"
+    assert response.content == b""
+
+
+def test_upstream_416_preserves_range_semantics_through_c(source, proxy_ctx):
+    proxy, _cache = proxy_ctx
+    manifest = requests.get(
+        proxy.build_url(_url(source, "/hls/index.m3u8"),
+                        {"Referer": "https://fake.example/"}),
+        timeout=10,
+    )
+    cache_url = re.findall(
+        r"http://127\.0\.0\.1:\d+/c/[0-9a-f]{40}/[^\"\n]+",
+        manifest.text,
+    )[0]
+    response = requests.get(cache_url, headers={"Range": "bytes=999999-"}, timeout=10)
+    assert response.status_code == 416
+    assert response.headers["Content-Range"] == "bytes */4000"
+    assert response.headers["Accept-Ranges"] == "bytes"
+    assert response.content == b""
+
+
+def test_cached_route_success_is_single_flight(blocking_source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    target = _url(blocking_source, "/mp4/block.mp4")
+    cache_key = cache.key_of(target)
+    cache.mark_hls(cache_key, 0)
+    proxy._register_cache_ctx(cache_key, target, {}, None, force_proxy=True)
+    proxy._ensure_server()
+    local = f"http://127.0.0.1:{proxy._server.server_port}/c/{cache_key}/{quote(target, safe='/:@')}"
+    results = []
+
+    def fetch():
+        results.append(requests.get(local, timeout=10))
+
+    first = threading.Thread(target=fetch)
+    second = threading.Thread(target=fetch)
+    first.start()
+    assert _BlockingSource.started.wait(2)
+    second.start()
+    time.sleep(0.1)
+    assert _BlockingSource.hits == 1
+    _BlockingSource.release.set()
+    first.join(10)
+    second.join(10)
+    assert [response.status_code for response in results] == [200, 200]
+    assert [response.content for response in results] == [_BlockingSource.body] * 2
+    assert _BlockingSource.hits == 1
+
+
+def test_cached_route_416_follower_preserves_range_metadata(blocking_source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    target = _url(blocking_source, "/mp4/block.mp4")
+    cache_key = cache.key_of(target)
+    cache.mark_hls(cache_key, 0)
+    proxy._register_cache_ctx(cache_key, target, {}, None, force_proxy=True)
+    proxy._ensure_server()
+    local = f"http://127.0.0.1:{proxy._server.server_port}/c/{cache_key}/{quote(target, safe='/:@')}"
+    _BlockingSource.range_fail = True
+    results = []
+
+    def fetch():
+        results.append(requests.get(local, timeout=10))
+
+    first = threading.Thread(target=fetch)
+    second = threading.Thread(target=fetch)
+    first.start()
+    assert _BlockingSource.started.wait(2)
+    second.start()
+    time.sleep(0.1)
+    assert _BlockingSource.hits == 1
+    _BlockingSource.release.set()
+    first.join(10)
+    second.join(10)
+    assert [response.status_code for response in results] == [416, 416]
+    assert [response.headers["Content-Range"] for response in results] == ["bytes */200"] * 2
+    assert [response.headers["Accept-Ranges"] for response in results] == ["bytes"] * 2
+    assert [response.content for response in results] == [b"", b""]
+
+
+def test_cached_route_range_misses_bypass_single_flight(blocking_source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    target = _url(blocking_source, "/mp4/block.mp4")
+    cache_key = cache.key_of(target)
+    cache.mark_hls(cache_key, 0)
+    proxy._register_cache_ctx(cache_key, target, {}, None, force_proxy=True)
+    proxy._ensure_server()
+    local = f"http://127.0.0.1:{proxy._server.server_port}/c/{cache_key}/{quote(target, safe='/:@')}"
+    results = []
+
+    def fetch():
+        results.append(requests.get(local, headers={"Range": "bytes=0-"}, timeout=10))
+
+    first = threading.Thread(target=fetch)
+    second = threading.Thread(target=fetch)
+    first.start()
+    assert _BlockingSource.started.wait(2)
+    second.start()
+    time.sleep(0.1)
+    assert _BlockingSource.hits == 2
+    _BlockingSource.release.set()
+    first.join(10)
+    second.join(10)
+    assert [response.status_code for response in results] == [206, 206]
+    assert [response.content for response in results] == [_BlockingSource.body] * 2
+    assert cache.fetch_state(cache.key_of(target)) is None
+
+
+def test_cached_route_failure_is_single_flight(blocking_source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    target = _url(blocking_source, "/mp4/block.mp4")
+    cache_key = cache.key_of(target)
+    cache.mark_hls(cache_key, 0)
+    proxy._register_cache_ctx(cache_key, target, {}, None, force_proxy=True)
+    proxy._ensure_server()
+    local = f"http://127.0.0.1:{proxy._server.server_port}/c/{cache_key}/{quote(target, safe='/:@')}"
+    _BlockingSource.fail = True
+    results = []
+
+    def fetch():
+        results.append(requests.get(local, timeout=10))
+
+    first = threading.Thread(target=fetch)
+    second = threading.Thread(target=fetch)
+    first.start()
+    assert _BlockingSource.started.wait(2)
+    second.start()
+    time.sleep(0.1)
+    assert _BlockingSource.hits == 1
+    _BlockingSource.release.set()
+    first.join(10)
+    second.join(10)
+    assert [response.status_code for response in results] == [503, 503]
+    assert _BlockingSource.hits == 1
+    assert cache.fetch_state(cache.key_of(target)) is None
+
+
+def test_stop_preserves_blocked_owner_until_fetch_finishes(blocking_source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    target = _url(blocking_source, "/mp4/block.mp4")
+    local = proxy.build_url(target, {"Referer": "https://fake.example/"}, force_proxy=True)
+    _BlockingSource.hold_body = True
+    result = []
+    errors = []
+
+    def fetch():
+        try:
+            result.append(requests.get(local, timeout=5))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=fetch)
+    worker.start()
+    assert _BlockingSource.started.wait(2)
+    assert _wait_until(lambda: cache.fetch_state(cache.key_of(target)) is not None)
+    proxy.stop()
+    assert worker.is_alive()
+    _BlockingSource.release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert len(result) + len(errors) == 1
+    if errors:
+        assert isinstance(errors[0], requests.RequestException)
+    assert _wait_until(lambda: cache.fetch_state(cache.key_of(target)) is None, timeout=2)
+    assert not list(cache.root.glob("*.part"))
+
+
+def test_file_tee_failure_cleans_part_and_inflight(tmp_path, monkeypatch):
+    cache = MediaCache(root=tmp_path / "vc")
+    key = "a" * 40
+    part = cache.mp4_part(key)
+    final = cache.mp4_final(key)
+    tee = _FileTee(cache, key, part, final, 3, is_mp4=True)
+    assert tee.start()
+    tee.write(b"abc")
+
+    def fail_mark(*_args, **_kwargs):
+        raise RuntimeError("index failure")
+
+    monkeypatch.setattr(cache, "mark_mp4", fail_mark)
+    tee.finish()
+    assert not part.exists()
+    assert not final.exists()
+    assert key not in cache._inflight
+    assert tee.aborted is True
+
+
 # --------------------------------------------------------------------- #
 # HLS：m3u8 走 /s/ 且重写出 /c/；分片逐片落盘，.slf 复用不再回源
 # --------------------------------------------------------------------- #
+def test_hls_cache_hit_emits_one_cache_diagnostic_without_upstream_call(source, proxy_ctx):
+    proxy, cache = proxy_ctx
+    manifest_url = proxy.build_url(
+        _url(source, "/hls/index.m3u8"), {"Referer": "https://fake.example/"}
+    )
+    manifest = requests.get(manifest_url, timeout=10)
+    assert manifest.status_code == 200
+    local = re.findall(
+        r"http://127\.0\.0\.1:\d+/c/[0-9a-f]{40}/[^\"\n]+",
+        manifest.text,
+    )[0]
+    target = _url(source, "/hls/seg0.ts")
+
+    first = requests.get(local, timeout=10)
+    assert first.status_code == 200
+    key = cache.key_of(_url(source, "/hls/index.m3u8"))
+    assert _wait_until(lambda: cache.is_complete(key))
+
+    hits_before = _FakeSource.hits["/hls/seg0.ts"]
+    mp._reset_upstream_route_diagnostics()
+    second = requests.get(local, timeout=10)
+    assert second.status_code == 200
+    assert second.content == _FakeSource.segs["seg0"]
+    assert _FakeSource.hits["/hls/seg0.ts"] == hits_before
+    records = mp._read_upstream_route_diagnostics()
+    assert len(records) == 1
+    assert records[0]["route"] == "cache"
+    assert records[0]["cache_state"] == "hit"
+
+
 def test_hls_segments_cached(source, proxy_ctx):
     proxy, cache = proxy_ctx
     target = _url(source, "/hls/index.m3u8")
@@ -274,6 +649,25 @@ def test_watchdog_stop_skipped_while_active(tmp_path, monkeypatch):
     proxy._end()
     proxy.stop()
     assert proxy._server is None
+
+
+def test_stop_does_not_cancel_cache_fetch_while_active(tmp_path):
+    class _Cache:
+        enabled = True
+        def __init__(self):
+            self.cancelled = 0
+        def cancel_fetches(self):
+            self.cancelled += 1
+
+    cache = _Cache()
+    proxy = MediaProxy(cache=cache)
+    proxy.build_url("http://127.0.0.1:9/nope.mp4", {"Referer": "x"})
+    proxy._begin()
+    proxy.stop()
+    assert cache.cancelled == 0
+    assert proxy._server is not None
+    proxy._end()
+    proxy.stop()
 
 
 def test_streaming_touch_keeps_alive(tmp_path, monkeypatch):

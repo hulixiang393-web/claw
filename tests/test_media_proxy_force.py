@@ -150,6 +150,50 @@ def _install_sessions(monkeypatch, dlog, plog, *, dresp=_FakeResp(),
 # --------------------------------------------------------------------- #
 # _fetch_upstream 单元
 # --------------------------------------------------------------------- #
+def test_stream_diagnostic_records_first_byte_and_throughput(monkeypatch):
+    response = _RespBytes()
+    record = mp._record_upstream_diagnostic(
+        "https://cdn.example.com/seg/001.ts?token=secret",
+        {"Cookie": "private", "Authorization": "secret"},
+        "direct",
+        mp.time.perf_counter() - 0.05,
+        response,
+        cache_state="miss",
+        wait_ms=2.5,
+    )
+    mp._attach_upstream_diagnostic(response, record, mp.time.perf_counter() - 0.05)
+    mp._update_upstream_diagnostic(response, len(response.content), finished=True)
+    assert record["host"] == "cdn.example.com"
+    assert record["protocol"] == "hls"
+    assert record["request_kind"] == "segment"
+    assert record["cache_state"] == "miss"
+    assert record["wait_ms"] == 2.5
+    assert record["first_byte_ms"] is not None
+    assert record["throughput_bps"] > 0
+    assert "token" not in record
+    assert "secret" not in repr(record)
+
+
+def test_media_diagnostic_classifies_protocol_and_media_kind():
+    record = mp._record_upstream_diagnostic(
+        "https://cdn.example.com/movie.mp4?token=secret",
+        {}, "direct", mp.time.perf_counter(),
+    )
+    assert record["protocol"] == "mp4"
+    assert record["request_kind"] == "media"
+
+
+def test_cache_hit_diagnostic_does_not_fetch_upstream():
+    record = mp._record_cache_diagnostic(
+        "https://cdn.example.com/movie.mp4?token=secret",
+        {"Cookie": "private"}, "hit", 4.0,
+    )
+    assert record["route"] == "cache"
+    assert record["cache_state"] == "hit"
+    assert record["wait_ms"] == 4.0
+    assert record["status_code"] == 200
+
+
 def test_force_proxy_skips_direct(monkeypatch):
     dlog, plog = [], []
     _install_sessions(monkeypatch, dlog, plog)
@@ -208,6 +252,31 @@ def test_default_direct_http_error_closes_records_and_uses_proxy(monkeypatch):
     assert len(dlog) == 1
     assert len(plog) == 1
     assert mp._DIRECT_FAIL.get("cdn.example.com") is not None
+
+
+def test_default_direct_http_5xx_uses_proxy(monkeypatch):
+    dlog, plog = [], []
+    direct = _FakeRespHttpError(503)
+    _install_sessions(monkeypatch, dlog, plog, dresp=direct)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert direct.closed is True
+    assert len(dlog) == 1
+    assert len(plog) == 1
+    assert mp._DIRECT_FAIL.get("cdn.example.com") is not None
+
+
+def test_direct_failure_memory_uses_normalized_hostname(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    mp._DIRECT_FAIL["cdn.example.com"] = mp.time.time()
+    resp = mp._fetch_upstream(
+        "https://user:secret@CDN.Example.com:8443/x.mp4", {}
+    )
+    assert resp.status_code == 200
+    assert dlog == []
+    assert len(plog) == 1
+    assert set(mp._DIRECT_FAIL) == {"cdn.example.com"}
 
 
 def test_direct_failure_ttl_skips_direct_and_uses_proxy(monkeypatch):
@@ -274,8 +343,9 @@ def test_route_diagnostics_records_direct_success_without_sensitive_data(monkeyp
     records = mp._read_upstream_route_diagnostics()
     assert len(records) == 1
     assert set(records[0]) == {
-        "host", "request_kind", "route", "status_code", "elapsed_ms",
-        "first_byte_ms", "throughput_bps", "failure_category",
+        "protocol", "host", "request_kind", "route", "status",
+        "status_code", "elapsed_ms", "first_byte_ms", "throughput_bps",
+        "cache_state", "wait_ms", "failure_category",
     }
     assert records[0]["host"] == "cdn.example.com"
     assert records[0]["request_kind"] == "manifest"
@@ -283,7 +353,8 @@ def test_route_diagnostics_records_direct_success_without_sensitive_data(monkeyp
     assert records[0]["status_code"] == 200
     assert records[0]["failure_category"] is None
     assert records[0]["elapsed_ms"] >= 0
-    assert records[0]["first_byte_ms"] >= 0
+    assert records[0]["first_byte_ms"] is None
+    assert records[0]["throughput_bps"] is None
     assert all("secret" not in repr(value) for value in records[0].values())
 
 
@@ -302,7 +373,8 @@ def test_route_diagnostics_records_direct_failure_and_proxy_fallback(monkeypatch
     assert records[1]["status_code"] == 200
     assert records[1]["failure_category"] is None
     assert records[1]["elapsed_ms"] >= 0
-    assert records[1]["first_byte_ms"] >= 0
+    assert records[1]["first_byte_ms"] is None
+    assert records[1]["throughput_bps"] is None
 
 
 def test_route_diagnostics_preserves_proxy_http_failure_after_direct_failure(
@@ -321,13 +393,14 @@ def test_route_diagnostics_preserves_proxy_http_failure_after_direct_failure(
     assert records[-1]["status_code"] == 403
     assert records[-1]["failure_category"] == "proxy_http"
     assert records[-1]["elapsed_ms"] >= 0
-    assert records[-1]["first_byte_ms"] >= 0
+    assert records[-1]["first_byte_ms"] is None
+    assert records[-1]["throughput_bps"] is None
 
 
 def test_route_diagnostics_classifies_request_kinds():
     assert mp._classify_upstream_request_kind("https://x/a.m3u8", {}) == "manifest"
     assert mp._classify_upstream_request_kind("https://x/key.bin", {"Accept": "*/*"}) == "key"
-    assert mp._classify_upstream_request_kind("https://x/movie.mp4", {}) == "mp4"
+    assert mp._classify_upstream_request_kind("https://x/movie.mp4", {}) == "media"
     assert mp._classify_upstream_request_kind("https://x/segment.ts", {}) == "segment"
     assert mp._classify_upstream_request_kind("https://x/video", {"Range": "bytes=0-1"}) == "range"
     assert mp._classify_upstream_request_kind("https://x/video", {"range": "bytes=0-1"}) == "range"
@@ -567,13 +640,17 @@ def test_force_proxy_mp4_range_preserves_header_and_route(monkeypatch):
         assert plog[0][1]["headers"]["Range"] == "bytes=10-12"
         records = mp._read_upstream_route_diagnostics()
         assert records == [{
+            "protocol": "mp4",
             "host": "up.example",
             "request_kind": "range",
             "route": "proxy",
+            "status": 206,
             "status_code": 206,
             "elapsed_ms": records[0]["elapsed_ms"],
             "first_byte_ms": records[0]["first_byte_ms"],
-            "throughput_bps": None,
+            "throughput_bps": records[0]["throughput_bps"],
+            "cache_state": "miss",
+            "wait_ms": None,
             "failure_category": None,
         }]
     finally:

@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import threading
 import time
+from urllib.parse import urlsplit
+
+from framework.media_cache import _strip_signed_params
 
 from PySide6.QtCore import Qt, QTimer, QElapsedTimer, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
@@ -74,8 +77,10 @@ class ComicView(QWidget):
         self._pending_swap = False  # 换话保留旧画面：新话首批图就绪后再清空替换
         self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
         self._pending_position = None  # 打开书续读位置（0~1 滚动比例），话加载后定位
+        self._pending_location = None
         self._scroll_to_top = False  # 换话归零标记：期间禁止按比例恢复把视口拉走
         self._scroll_epoch = 0  # 滚动恢复代际：换话自增，使上一话残留的恢复任务作废
+        self._restore_cancel_token = 0
         self._reading_bg = ""  # 阅读区独立背景色（空=透明跟随主题）
         self._reading_fg = ""  # 夜间黑等深色背景下的前景色（漫画以图为主，预留）
         self._auto_scrolling = False  # 自动滚动开关
@@ -215,6 +220,7 @@ class ComicView(QWidget):
         detail: Detail,
         start_chapter_url: str = "",
         restore_position: float | None = None,
+        restore_location: dict | None = None,
     ) -> None:
         # 换书：代际自增 + 清空旧书状态。旧书的后台取流/预取任务仍可能后到，
         # 但代际过期会被回调丢弃——避免旧书结果覆盖新书（URL 相同的章节
@@ -229,6 +235,7 @@ class ComicView(QWidget):
         self._cancel_evt = threading.Event()
         self._prefetch_tasks = []  # 旧预取任务引用一并清空（任务经令牌自行退出）
         self._images = []
+        self._image_labels = []
         self._prefetched = {}
         self._prefetch_queue = []
         self._prefetch_busy = False
@@ -243,9 +250,12 @@ class ComicView(QWidget):
         # _finish_episode_load 会消费到「上一本书残留的 _pending_position」，
         # 把新书滚动条错滚到旧书位置。清零后再按新书记录设置。
         self._pending_position = None
+        self._pending_location = None
         self._populate_toc()
         if restore_position is not None:
             self._pending_position = restore_position
+        if restore_location is not None:
+            self._pending_location = restore_location
         idx = 0
         if start_chapter_url:
             for i, ch in enumerate(detail.chapters):
@@ -279,6 +289,7 @@ class ComicView(QWidget):
         # ——「上一话滚到最低端」的根因。标记期间跳过比例恢复，代际使旧任务作废。
         self._scroll_to_top = True
         self._scroll_epoch += 1
+        self._restore_cancel_token += 1
         self._current_idx = idx
         # 切换话：重置增量渲染计数（gallery 将清空重建，防旧计数错乱）
         self._rendered_count = 0
@@ -357,11 +368,15 @@ class ComicView(QWidget):
         self._scroll_to_top = False
         # 续读定位：打开书恢复到上次滚动位置（重试链随懒加载高度增长逐步到位）。
         # 仅首次 load 设置 _pending_position，换话时为 None → 保持在顶部。
-        if self._pending_position is not None:
+        if self._pending_position is not None or self._pending_location is not None:
             pos = self._pending_position
+            location = self._pending_location
             self._pending_position = None
-            if pos > 0:
+            self._pending_location = None
+            if location is None:
                 self._restore_position_with_retry(pos)
+            else:
+                self._restore_location_with_retry(location, pos=pos)
         # 当前话加载完成即预渲染后续 PREFETCH_COUNT 话（串行队列，不抢当前话
         # 首屏；读到 70% 的 _on_scroll_prefetch 保留作兜底）。后续话插队首、
         # 优先于向前缓存：连看时下一话最先就绪。
@@ -488,6 +503,7 @@ class ComicView(QWidget):
 
     def _render_images(self) -> None:
         self._clear_images()
+        self._image_labels = []
         self._pending_swap = False  # 命中缓存直接渲染，无换话等待
         self._rendered_count = 0
         self._rendered_header = False
@@ -517,6 +533,7 @@ class ComicView(QWidget):
             lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
+            self._image_labels.append(lbl)
         self._rendered_count = limit
         # 刷新 gallery 尺寸（widgetResizable=False 需手动定宽+按内容定高）
         self._apply_zoom()
@@ -553,6 +570,7 @@ class ComicView(QWidget):
             lbl.loaded.connect(self._relayout_gallery_queued)
             lbl.load()
             self.gallery_layout.addWidget(lbl)
+            self._image_labels.append(lbl)
             self._rendered_count += 1
         self._apply_zoom()
         self._relayout_gallery()
@@ -618,6 +636,7 @@ class ComicView(QWidget):
             return
         self._pending_swap = False
         self._clear_images()
+        self._image_labels = []
         self._rendered_header = False  # 重建新话话头
         self._rendered_count = 0
 
@@ -755,13 +774,146 @@ class ComicView(QWidget):
         ch = self._chapters[self._current_idx]
         return (self._detail, ch.title, ch.url)
 
+    @staticmethod
+    def _image_key_for_url(url):
+        value = str(url or "")
+        if not value:
+            return ""
+        parts = urlsplit(value)
+        if not parts.scheme and not parts.netloc:
+            return value
+        normalized = _strip_signed_params(value)
+        parts = urlsplit(normalized)
+        identity = parts.path or "/"
+        if parts.netloc:
+            identity = f"{parts.netloc.lower()}{identity}"
+        if parts.query:
+            identity = f"{identity}?{parts.query}"
+        return identity
+
+    def _image_labels_for_restore(self):
+        labels = getattr(self, "_image_labels", None)
+        if labels is not None:
+            return list(labels)
+        return [self.gallery_layout.itemAt(i).widget() for i in range(self.gallery_layout.count()) if self.gallery_layout.itemAt(i).widget() is not None and hasattr(self.gallery_layout.itemAt(i).widget(), "url")]
+
+    @staticmethod
+    def _widget_top(widget):
+        geometry = getattr(widget, "geometry", None)
+        if callable(geometry):
+            return int(geometry().top())
+        return int(getattr(widget, "y", 0) or 0)
+
+    @staticmethod
+    def _widget_height(widget):
+        height = getattr(widget, "height", None)
+        value = height() if callable(height) else height
+        return max(1, int(value or 1))
+
+    def _visible_image_anchor(self):
+        top = self.scroll.verticalScrollBar().value()
+        labels = self._image_labels_for_restore()
+        for index, label in enumerate(labels):
+            image_top = self._widget_top(label)
+            if image_top + self._widget_height(label) > top:
+                return label, index, image_top
+        return None
+
+    def _build_location_snapshot(self):
+        vbar = self.scroll.verticalScrollBar()
+        anchor = self._visible_image_anchor()
+        ratio = vbar.value() / vbar.maximum() if vbar.maximum() > 0 else 0.0
+        snapshot = {
+            "version": 1,
+            "chapter_url": self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else "",
+            "scroll_ratio": round(max(0.0, min(1.0, ratio)), 4),
+            "scroll_value": int(vbar.value()),
+            "scroll_maximum": int(vbar.maximum()),
+            "image_index": None,
+            "image_url": "",
+            "image_key": "",
+            "image_fraction": 0.0,
+            "layout_width": int(self.gallery.width()),
+        }
+        if anchor is not None:
+            label, index, image_top = anchor
+            snapshot.update(
+                image_index=index,
+                image_url=str(getattr(label, "url", "") or ""),
+                image_key=str(getattr(label, "_image_key", "") or ""),
+                image_fraction=max(0.0, min(1.0, (vbar.value() - image_top) / self._widget_height(label))),
+            )
+        return snapshot
+
+    def _build_current_location(self):
+        return self._build_location_snapshot()
+
+    @staticmethod
+    def _location_matches_chapter(location, chapter_url: str) -> bool:
+        return bool(isinstance(location, dict) and chapter_url and location.get("chapter_url") == chapter_url)
+
+    def _resolve_image_anchor(self, location):
+        if not isinstance(location, dict):
+            return None
+        labels = self._image_labels_for_restore()
+        url = str(location.get("image_url", "") or "")
+        key = str(location.get("image_key", "") or "")
+        if key:
+            for label in labels:
+                label_key = str(getattr(label, "_image_key", "") or "")
+                if label_key == key:
+                    return label
+        if url:
+            for label in labels:
+                if str(getattr(label, "url", "") or "") == url:
+                    return label
+        index = location.get("image_index")
+        if isinstance(index, int) and 0 <= index < len(labels):
+            return labels[index]
+        return None
+
+    def _restore_location_with_retry(self, location, pos=None, tries=8, book=None, generation=None, epoch=None, cancel_token=None):
+        book = self._detail if book is None else book
+        generation = self._gen if generation is None else generation
+        epoch = self._scroll_epoch if epoch is None else epoch
+        cancel_token = self._restore_cancel_token if cancel_token is None else cancel_token
+        if (
+            self._detail is not book
+            or self._gen != generation
+            or self._scroll_epoch != epoch
+            or self._restore_cancel_token != cancel_token
+        ):
+            return
+        vbar = self.scroll.verticalScrollBar()
+        chapter_url = self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else ""
+        valid_location = location if self._location_matches_chapter(location, chapter_url) else None
+        label = self._resolve_image_anchor(valid_location)
+        target = None
+        if label is not None:
+            target = self._widget_top(label) + round(float(location.get("image_fraction", 0) or 0) * self._widget_height(label))
+        elif isinstance(valid_location, dict) and valid_location.get("scroll_ratio") is not None:
+            target = round(float(valid_location["scroll_ratio"]) * vbar.maximum())
+        elif pos is not None:
+            target = round(float(pos) * vbar.maximum())
+        if target is not None and vbar.maximum() > 0:
+            vbar.setValue(max(0, min(vbar.maximum(), int(target))))
+        if valid_location is not None and label is not None:
+            return
+        if tries > 1:
+            QTimer.singleShot(
+                100,
+                lambda: self._restore_location_with_retry(
+                    location, pos, tries - 1, book, generation, epoch, cancel_token
+                ),
+            )
+
     def _emit_position(self) -> None:
         if self._detail is None or not (0 <= self._current_idx < len(self._chapters)):
             return
         ch = self._chapters[self._current_idx]
         pos, _ = self.position_snapshot()
         try:
-            self.position_changed.emit((self._detail, ch.title, ch.url, pos, None))
+            self.position_changed.emit((self._detail, ch.title, ch.url, pos, None, self._build_current_location()))
         except RuntimeError:
             pass
 
@@ -791,6 +943,8 @@ class ComicView(QWidget):
 
     def _on_scrollbar_user_interaction(self) -> None:
         """用户手动拖动滚动条（sliderPressed）时停止自动滚动，让手动接管。"""
+        self._restore_cancel_token += 1
+        self._scroll_epoch += 1
         self._stop_auto_scroll()
 
     def _auto_scroll_tick(self) -> None:
@@ -930,8 +1084,11 @@ class ComicView(QWidget):
         最低端」与「加载中视口被上下拉动」的根因。代际 epoch 使换话前排定的
         恢复任务作废。
         """
-        ratio = self._scroll_ratio()
+        location = self._build_location_snapshot()
+        ratio = location.get("scroll_ratio", 0.0)
         epoch = self._scroll_epoch
+        generation = self._gen
+        book = self._detail
         base = self._current_base_width()
         target = max(200, int(base * self._zoom))
         self.gallery.setFixedWidth(target)
@@ -941,7 +1098,10 @@ class ComicView(QWidget):
         # 图片重排（已加载图按新宽度 _fit）约一个事件循环内完成，160ms 后恢复
         if not self._scroll_to_top:
             QTimer.singleShot(
-                160, lambda r=ratio, e=epoch: self._restore_scroll_ratio(r, e)
+                160,
+                lambda loc=location, r=ratio, b=book, g=generation, e=epoch: self._restore_location_with_retry(
+                    loc, pos=r, tries=4, book=b, generation=g, epoch=e
+                ),
             )
 
     def _scroll_ratio(self) -> float:
@@ -1046,6 +1206,7 @@ class _ComicImageLabel(QLabel):
     def __init__(self, url, referer="", parent=None, source=None):
         super().__init__(parent)
         self.url = url
+        self._image_key = ComicView._image_key_for_url(url)
         self._referer = referer  # 防盗链 Referer（当前章节页 URL），传 CoverLoader
         self._source = source  # 所属源（供 CoverLoader 持久化键 source_id 用）
         self.setAlignment(Qt.AlignCenter)

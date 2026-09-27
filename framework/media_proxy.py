@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import atexit
 import mimetypes
+from contextlib import nullcontext
 import re
 import threading
 import time
@@ -53,6 +54,13 @@ _READ_CHUNK = 64 * 1024
 # EOF 才返回，预读 64KB 会把每个分片的首字节延后一个 64KB 的到达时间
 # （慢 CDN 上就是肉眼可见的起播延迟）。
 _SNIFF_BYTES = 16
+_CACHE_FETCH_WAIT = 30.0
+_PREFETCH_MAX_DEPTH = 16
+_PREFETCH_MAX_WORKERS = 8
+_PREFETCH_MAX_PENDING = 32
+_PREFETCH_TIMEOUT = 10.0
+_PREFETCH_CANCEL_WAIT = 1.0
+_PREFETCH_FAILURE_LIMIT = 3
 # 媒体响应透传的头
 _MEDIA_HDRS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
 
@@ -88,6 +96,21 @@ _UPSTREAM_DIAGNOSTICS = []
 _UPSTREAM_DIAGNOSTICS_LOCK = threading.Lock()
 
 
+def _classify_media_protocol(target: str, headers: dict) -> str:
+    path = urlparse(target).path.lower()
+    if path.endswith((".m3u8", ".m3u")) or "m3u8" in path:
+        return "hls"
+    if path.endswith(".mpd"):
+        return "dash"
+    if path.endswith((".ts", ".key", ".key.bin", ".m3u")) or "/key" in path:
+        return "hls"
+    if any(key.lower() == "range" and value for key, value in headers.items()):
+        return "mp4"
+    if path.endswith((".mp4", ".m4v", ".mov", ".webm")):
+        return "mp4"
+    return "unknown"
+
+
 def _classify_upstream_request_kind(target: str, headers: dict) -> str:
     path = urlparse(target).path.lower()
     if any(key.lower() == "range" and value for key, value in headers.items()):
@@ -97,10 +120,10 @@ def _classify_upstream_request_kind(target: str, headers: dict) -> str:
     if path.endswith((".key", ".key.bin", ".bin")) or "/key" in path:
         return "key"
     if path.endswith((".mp4", ".m4v", ".mov", ".webm")):
-        return "mp4"
+        return "media"
     if path.endswith((".ts", ".m4s", ".aac", ".mp3", ".webvtt", ".vtt")):
         return "segment"
-    return "segment"
+    return "media"
 
 
 def _diagnostic_failure(category: str, exc: Exception | None = None) -> str:
@@ -122,28 +145,115 @@ def _diagnostic_failure(category: str, exc: Exception | None = None) -> str:
 
 
 def _record_upstream_diagnostic(target: str, headers: dict, route: str,
-                               started: float, response=None,
-                               failure_category: str | None = None) -> None:
+                                started: float, response=None,
+                                failure_category: str | None = None,
+                                cache_state: str | None = None,
+                                wait_ms: float | None = None) -> dict:
     elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
     status_code = getattr(response, "status_code", None)
     if status_code is not None and status_code >= 400 and failure_category is None:
         failure_category = f"{route}_http"
     record = {
-        "host": urlparse(target).hostname,
+        "protocol": _classify_media_protocol(target, headers),
+        "host": (urlparse(target).hostname or "")[:128],
         "request_kind": _classify_upstream_request_kind(target, headers),
         "route": route,
+        "status": status_code,
         "status_code": status_code,
         "elapsed_ms": elapsed_ms,
-        "first_byte_ms": elapsed_ms if response is not None else None,
+        "first_byte_ms": None,
         "throughput_bps": None,
+        "cache_state": cache_state,
+        "wait_ms": wait_ms,
         "failure_category": failure_category,
     }
     with _UPSTREAM_DIAGNOSTICS_LOCK:
         _UPSTREAM_DIAGNOSTICS.append(record)
         del _UPSTREAM_DIAGNOSTICS[:-_UPSTREAM_DIAGNOSTICS_MAX]
+    return record
+
+
+def _record_cache_diagnostic(target: str, headers: dict, cache_state: str,
+                             wait_ms: float | None = None) -> dict:
+    return _record_upstream_diagnostic(
+        target, headers, "cache", time.perf_counter(),
+        response=type("_CacheResponse", (), {"status_code": 200})(),
+        cache_state=cache_state, wait_ms=wait_ms,
+    )
+
+
+def _attach_upstream_diagnostic(response, record: dict, started: float) -> None:
+    if response is None:
+        return
+    try:
+        response._media_proxy_diagnostic = record
+        response._media_proxy_started = started
+        response._media_proxy_first_byte = None
+        response._media_proxy_bytes = 0
+    except Exception:
+        pass
+
+
+def _update_upstream_diagnostic(response, size: int, finished: bool = False,
+                                failure_category: str | None = None) -> None:
+    record = getattr(response, "_media_proxy_diagnostic", None)
+    if not record:
+        return
+    now = time.perf_counter()
+    with _UPSTREAM_DIAGNOSTICS_LOCK:
+        if size > 0:
+            first = getattr(response, "_media_proxy_first_byte", None)
+            if first is None:
+                first = now
+                try:
+                    response._media_proxy_first_byte = first
+                except Exception:
+                    pass
+                record["first_byte_ms"] = max(
+                    0.0, (first - getattr(response, "_media_proxy_started", first)) * 1000.0
+                )
+            total = getattr(response, "_media_proxy_bytes", 0) + size
+            try:
+                response._media_proxy_bytes = total
+            except Exception:
+                pass
+            elapsed = max(0.000001, now - first)
+            record["throughput_bps"] = total * 8.0 / elapsed
+        if failure_category is not None:
+            record["failure_category"] = failure_category
+        if finished:
+            record["elapsed_ms"] = max(
+                record["elapsed_ms"],
+                (now - getattr(response, "_media_proxy_started", now)) * 1000.0,
+            )
+
+
+def _read_upstream_body(response) -> bytes:
+    raw = getattr(response, "raw", None)
+    if raw is None or not hasattr(raw, "read"):
+        body = response.content
+        _update_upstream_diagnostic(response, len(body))
+        return body
+    try:
+        if (response.headers.get("Content-Encoding") or "").lower() in (
+                "gzip", "deflate", "br"):
+            raw.decode_content = True
+        chunks = []
+        while True:
+            chunk = raw.read(_READ_CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            _update_upstream_diagnostic(response, len(chunk))
+        return b"".join(chunks)
+    except (AttributeError, TypeError):
+        body = response.content
+        _update_upstream_diagnostic(response, len(body))
+        return body
 
 
 def _read_upstream_route_diagnostics() -> list[dict]:
+
     with _UPSTREAM_DIAGNOSTICS_LOCK:
         return [dict(record) for record in _UPSTREAM_DIAGNOSTICS]
 
@@ -202,38 +312,72 @@ def _strip_stale_headers(headers: dict) -> dict:
     return out
 
 
-def _proxy_get(target: str, headers: dict):
+def _proxy_get(target: str, headers: dict, timeout=30):
     """经系统代理会话取流。重试一次短退避：代理偶发连接重置/切节点时，
     否则上层把异常当 502 抛给播放器 → VLC demux 失败 → 播放中断。
     两次都失败则抛出最后一次异常。"""
     last_exc = None
+    deadline = None
+    if isinstance(timeout, tuple):
+        deadline = time.monotonic() + max(timeout)
     for _attempt in range(2):
+        request_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.Timeout("proxy fetch timeout")
+            request_timeout = (min(timeout[0], remaining), remaining)
         try:
             return _get_session().get(
-                target, headers=headers, timeout=30, stream=True
+                target, headers=headers, timeout=request_timeout, stream=True
             )
         except requests.RequestException as exc:  # noqa: BLE001
             last_exc = exc
-            time.sleep(0.3)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.3, remaining))
+            else:
+                time.sleep(0.3)
     raise last_exc  # noqa: BLE001 —— 两次都失败，让上层 502/重试
 
 
-def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
+def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False,
+                    cache_state: str | None = "miss",
+                    wait_ms: float | None = None, timeout=None):
     """默认直连优先，失败后按 host 记忆并回退系统代理。"""
+    deadline = (time.monotonic() + max(timeout)
+                if isinstance(timeout, tuple) else None)
+
+    def _request_timeout():
+        if deadline is None:
+            return timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.Timeout("upstream fetch timeout")
+        return (min(timeout[0], remaining), remaining)
+
     if force_proxy or _PROXY_ONLY:
         started = time.perf_counter()
         try:
-            resp = _proxy_get(target, headers)
+            resp = _proxy_get(target, headers,
+                              timeout=_request_timeout() or 30)
         except requests.RequestException as exc:
             _record_upstream_diagnostic(
                 target, headers, "proxy", started,
                 failure_category=_diagnostic_failure("proxy", exc),
+                cache_state=cache_state, wait_ms=wait_ms,
             )
             raise
-        _record_upstream_diagnostic(target, headers, "proxy", started, resp)
+        record = _record_upstream_diagnostic(
+            target, headers, "proxy", started, resp,
+            cache_state=cache_state, wait_ms=wait_ms,
+        )
+        _attach_upstream_diagnostic(resp, record, started)
         return resp
 
-    host = urlparse(target).netloc
+    host = urlparse(target).hostname
     with _DIRECT_FAIL_LOCK:
         blocked = time.time() - _DIRECT_FAIL.get(host, 0.0) < _DIRECT_FAIL_TTL
     if not blocked:
@@ -241,13 +385,21 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
         try:
             resp = _get_direct_session().get(
                 target, headers=headers,
-                timeout=(_DIRECT_CONNECT_TIMEOUT, 60), stream=True,
+                timeout=(_request_timeout() if timeout is not None else
+                         (_DIRECT_CONNECT_TIMEOUT, 60)), stream=True,
             )
             if resp is not None:
                 if resp.status_code < 400:
-                    _record_upstream_diagnostic(target, headers, "direct", started, resp)
+                    record = _record_upstream_diagnostic(
+                        target, headers, "direct", started, resp,
+                        cache_state=cache_state, wait_ms=wait_ms,
+                    )
+                    _attach_upstream_diagnostic(resp, record, started)
                     return resp
-                _record_upstream_diagnostic(target, headers, "direct", started, resp)
+                _record_upstream_diagnostic(
+                    target, headers, "direct", started, resp,
+                    cache_state=cache_state, wait_ms=wait_ms,
+                )
                 try:
                     resp.close()
                 except Exception:  # noqa: BLE001
@@ -256,24 +408,45 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
             _record_upstream_diagnostic(
                 target, headers, "direct", started,
                 failure_category=_diagnostic_failure("direct", exc),
+                cache_state=cache_state, wait_ms=wait_ms,
             )
         with _DIRECT_FAIL_LOCK:
             _DIRECT_FAIL[host] = time.time()
     started = time.perf_counter()
     try:
-        resp = _proxy_get(target, headers)
+        resp = _proxy_get(target, headers,
+                          timeout=_request_timeout() or 30)
     except requests.RequestException as exc:
         _record_upstream_diagnostic(
             target, headers, "proxy", started,
             failure_category=_diagnostic_failure("proxy", exc),
+            cache_state=cache_state, wait_ms=wait_ms,
         )
         raise
-    _record_upstream_diagnostic(
+    record = _record_upstream_diagnostic(
         target, headers, "proxy", started, resp,
         failure_category=("direct_failure_memory"
                           if blocked and resp.status_code < 400 else None),
+        cache_state=cache_state, wait_ms=wait_ms,
     )
+    _attach_upstream_diagnostic(resp, record, started)
     return resp
+
+
+def _set_response_read_timeout(response, timeout: float) -> None:
+    raw = getattr(response, "raw", None)
+    candidates = [raw, getattr(raw, "_sock", None)]
+    fp = getattr(raw, "_fp", None)
+    candidates.extend((getattr(fp, "fp", None),
+                       getattr(getattr(fp, "fp", None), "raw", None)))
+    for candidate in candidates:
+        setter = getattr(candidate, "settimeout", None)
+        if setter is not None:
+            try:
+                setter(max(0.01, timeout))
+                return
+            except (OSError, AttributeError):
+                pass
 
 
 def _parse_range_start(rng: str | None) -> int | None:
@@ -313,6 +486,20 @@ def _parse_range(rng: str | None, size: int) -> tuple[int, int] | None:
         return None
     end = int(b) if b else size - 1
     return (start, min(end, size - 1))
+
+
+def _full_zero_offset_response(resp, client_range: str | None = None) -> bool:
+    if client_range:
+        return False
+    if resp.status_code == 200:
+        return True
+    if resp.status_code != 206:
+        return False
+    content_range = resp.headers.get("Content-Range") or ""
+    match = re.fullmatch(r"bytes\s+(0)-(\d+)/(\d+)", content_range.strip())
+    if match is None:
+        return False
+    return int(match.group(2)) + 1 == int(match.group(3))
 
 
 def _content_total(resp) -> int | None:
@@ -372,7 +559,8 @@ class _FileTee:
             self.fh = open(self.part, "wb")
             self.cache.inflight_add(self.key)
             return True
-        except OSError:
+        except Exception:
+            self.abort()
             return False
 
     def write(self, chunk: bytes) -> None:
@@ -384,41 +572,96 @@ class _FileTee:
         except OSError:
             self.abort()
 
+    def _discard_files(self, remove_final: bool = False) -> None:
+        try:
+            if self.fh is not None and not self.fh.closed:
+                self.fh.close()
+        except Exception:
+            pass
+        try:
+            self.cache.discard_part(self.part)
+        except Exception:
+            try:
+                self.part.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if remove_final:
+            try:
+                self.final.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def finish(self) -> None:
         """上游流正常结束：写满 → commit；否则丢弃 .part。"""
         if self.done or self.aborted:
             return
-        self.done = True
+        committed = False
+        failed = False
         try:
-            if self.fh is not None:
-                self.fh.close()
-        except OSError:
-            pass
-        complete = self.total is None or self.written >= self.total
-        if complete:
-            if self.cache.commit_part(self.part, self.final):
+            try:
+                if self.fh is not None and not self.fh.closed:
+                    self.fh.close()
+            except Exception:
+                pass
+            complete = self.total is None or self.written >= self.total
+            if complete and self.cache.commit_part(self.part, self.final):
+                committed = True
                 if self.is_mp4:
                     self.cache.mark_mp4(self.key, self.total or self.written,
                                         complete=True)
                 else:
                     self.cache.mark_hls_segment(self.key, self.written)
                 self.cache.touch(self.key)
-        else:
-            self.cache.discard_part(self.part)
-        self.cache.inflight_remove(self.key)
+            elif complete:
+                failed = True
+            else:
+                self._discard_files()
+        except Exception:
+            failed = True
+        finally:
+            if failed:
+                self._discard_files(remove_final=committed)
+                self.aborted = True
+            self.done = True
+            try:
+                self.cache.inflight_remove(self.key)
+            except Exception:
+                pass
 
     def abort(self) -> None:
         """放弃本次缓存：关文件、清 .part、退出 inflight。"""
-        if self.done or self.aborted:
+        if self.aborted:
             return
         self.aborted = True
+        self._discard_files()
         try:
-            if self.fh is not None:
-                self.fh.close()
-        except OSError:
+            self.cache.inflight_remove(self.key)
+        except Exception:
             pass
-        self.cache.discard_part(self.part)
-        self.cache.inflight_remove(self.key)
+
+
+def _send_range_error(handler, status: int, headers: dict) -> None:
+    handler.send_response(status)
+    for name in ("Content-Range", "Accept-Ranges"):
+        value = headers.get(name)
+        if value:
+            handler.send_header(name, value)
+    handler.send_header("Content-Length", "0")
+    handler.end_headers()
+
+
+def _send_cached_fetch_error(handler, state) -> None:
+    if state.status == 416:
+        _send_range_error(handler, 416, state.headers)
+    else:
+        handler.send_error(state.status or 502, "upstream error")
+
+
+def _send_upstream_error(handler, resp) -> None:
+    if resp.status_code != 416:
+        handler.send_error(resp.status_code, "upstream error")
+        return
+    _send_range_error(handler, 416, resp.headers)
 
 
 def _send_stream_headers(handler, resp, override_len: int | None = None) -> tuple:
@@ -579,6 +822,11 @@ class MediaProxy:
         self._pf_futures: set = set()
         self._pf_pool = None
         self._pf_lock = threading.Lock()
+        self._pf_cancel = threading.Event()
+        self._pf_cancelled_urls: dict[str, threading.Event] = {}
+        self._pf_responses: dict[str, object] = {}
+        self._pf_failures = 0
+        self._pf_disabled = False
         self._start_idle_watch()
         atexit.register(self.stop)
 
@@ -614,13 +862,9 @@ class MediaProxy:
             workers = 3
         return {
             "enabled": bool(sec.get("enabled", False)),
-            # 夹紧上限：防手滑把 depth 写成 1000 把源站打爆
-            "depth": max(1, min(16, depth)),
-            "workers": max(1, min(8, workers)),
+            "depth": max(1, min(_PREFETCH_MAX_DEPTH, depth)),
+            "workers": max(1, min(_PREFETCH_MAX_WORKERS, workers)),
         }
-
-    def _prefetch_enabled(self) -> bool:
-        return bool(self._pf_cfg.get("enabled"))
 
     def _set_seg_order(self, cache_key: str, segs: list[str]) -> None:
         """登记某播放列表的有序分片（每次重写整体替换，避免直播刷新重复累加）。"""
@@ -637,9 +881,51 @@ class MediaProxy:
                     thread_name_prefix="claw-pf")
             return self._pf_pool
 
+    def _prefetch_enabled(self) -> bool:
+        return bool(self._pf_cfg.get("enabled")) and not self._pf_disabled
+
+    def _prefetch_url_cancelled(self, canonical: str) -> bool:
+        with self._pf_lock:
+            event = self._pf_cancelled_urls.get(canonical)
+        return self._pf_cancel.is_set() or (event is not None and event.is_set())
+
+    def _cancel_prefetch_url(self, url: str) -> None:
+        cache = self._cache_obj()
+        if cache is None:
+            return
+        canonical = cache.key_of(url)
+        with self._pf_lock:
+            event = self._pf_cancelled_urls.get(canonical)
+            if event is not None:
+                event.set()
+            response = self._pf_responses.get(canonical)
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def _note_prefetch_failure(self, status=None, exc=None) -> None:
+        if status in (403, 429):
+            with self._pf_lock:
+                self._pf_disabled = True
+            return
+        connection_failure = isinstance(
+            exc, (requests.ConnectionError, requests.Timeout)
+        )
+        if not connection_failure:
+            return
+        with self._pf_lock:
+            self._pf_failures += 1
+            if self._pf_failures >= _PREFETCH_FAILURE_LIMIT:
+                self._pf_disabled = True
+
+    def _note_prefetch_success(self) -> None:
+        with self._pf_lock:
+            self._pf_failures = 0
+
     def _maybe_prefetch(self, cache_key: str, full_url: str) -> None:
-        """播放器已取第 full_url 片 → 把后续 depth 片排队落盘。"""
-        if not self._prefetch_enabled():
+        if not self._prefetch_enabled() or self._pf_cancel.is_set():
             return
         cache = self._cache_obj()
         if cache is None or not cache.enabled:
@@ -657,64 +943,106 @@ class MediaProxy:
         if not window:
             return
         headers = dict(ctx[1])
-        headers["Accept-Encoding"] = "identity"  # 落盘要原始分片字节，不能是 gzip 态
+        headers["Accept-Encoding"] = "identity"
         force_proxy = _tuple_force_proxy(ctx)
         for u in window:
+            canonical = cache.key_of(u)
             with self._pf_lock:
-                mark = (cache_key, u)
-                if mark in self._pf_scheduled:
+                if len(self._pf_futures) >= _PREFETCH_MAX_PENDING:
+                    break
+                if canonical in self._pf_scheduled:
                     continue
                 if cache.hls_segment_final(cache_key, u).is_file():
                     continue
-                self._pf_scheduled.add(mark)
+                self._pf_scheduled.add(canonical)
+                self._pf_cancelled_urls[canonical] = threading.Event()
             try:
                 fut = self._ensure_pf_pool().submit(
                     self._prefetch_one, cache_key, u, dict(headers), force_proxy)
-            except RuntimeError:  # 池已关（stop 竞态）
+            except RuntimeError:
                 return
             with self._pf_lock:
                 self._pf_futures.add(fut)
+            fut.add_done_callback(self._prefetch_future_done)
+
+    def _prefetch_future_done(self, future) -> None:
+        with self._pf_lock:
+            self._pf_futures.discard(future)
 
     def _prefetch_one(self, cache_key: str, url: str, headers: dict,
                       force_proxy: bool) -> None:
-        """后台拉一个分片并按 _FileTee 落盘（best-effort，失败静默）。
-
-        path_lock 用完整 URL 作键（与 _serve_cache 同一把）→ 播放器随后请求
-        同一片时会等预取结束并直接命中 final 文件，不会重复回源。
-        """
         cache = self._cache_obj()
         if cache is None:
             return
-        with cache.path_lock(url):
-            final = cache.hls_segment_final(cache_key, url)
-            if final.is_file():
+        canonical = cache.key_of(url)
+        resp = None
+        try:
+            if self._prefetch_url_cancelled(canonical):
                 return
+            lock = cache.path_lock(url)
+            with lock:
+                final = cache.hls_segment_final(cache_key, url)
+                if final.is_file():
+                    return
             try:
-                resp = _fetch_upstream(url, headers, force_proxy=force_proxy)
-            except Exception:  # noqa: BLE001 —— 预取失败不影响播放
+                resp = _fetch_upstream(
+                    url, headers, force_proxy=force_proxy,
+                    timeout=(_PREFETCH_TIMEOUT, _PREFETCH_TIMEOUT),
+                )
+            except Exception as exc:
+                self._note_prefetch_failure(exc=exc)
                 return
-            if resp.status_code >= 400:
+            with self._pf_lock:
+                self._pf_responses[canonical] = resp
+            if self._prefetch_url_cancelled(canonical):
                 return
-            tee = None
-            try:
+            with lock:
+                if self._prefetch_url_cancelled(canonical):
+                    return
+                if final.is_file():
+                    return
+                if resp.status_code >= 400:
+                    self._note_prefetch_failure(status=resp.status_code)
+                    return
+                self._note_prefetch_success()
                 tee = _FileTee(cache, cache_key,
                                cache.hls_segment_part(cache_key, url), final,
                                _content_total(resp), is_mp4=False)
                 if not tee.start():
                     return
+            committed = False
+            try:
+                deadline = time.monotonic() + _PREFETCH_TIMEOUT
                 while True:
+                    if self._prefetch_url_cancelled(canonical):
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._note_prefetch_failure(
+                            exc=requests.Timeout("prefetch read timeout"))
+                        return
+                    _set_response_read_timeout(resp, remaining)
                     chunk = resp.raw.read(_READ_CHUNK)
                     if not chunk:
                         break
                     tee.write(chunk)
-                tee.finish()
-            except Exception:  # noqa: BLE001
-                if tee is not None:
-                    tee.abort()
+                with lock:
+                    tee.finish()
+                committed = tee.done and not tee.aborted
+            except Exception as exc:
+                self._note_prefetch_failure(exc=exc)
             finally:
+                if not committed:
+                    tee.abort()
+        finally:
+            with self._pf_lock:
+                self._pf_responses.pop(canonical, None)
+                self._pf_scheduled.discard(canonical)
+                self._pf_cancelled_urls.pop(canonical, None)
+            if resp is not None:
                 try:
                     resp.close()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
 
     def _prefetch_drain(self, timeout: float = 5.0) -> bool:
@@ -730,15 +1058,28 @@ class MediaProxy:
         return not pending
 
     def _shutdown_prefetch(self) -> None:
+        from concurrent.futures import wait as _cf_wait
         with self._pf_lock:
+            self._pf_cancel.set()
             pool, self._pf_pool = self._pf_pool, None
+            futures = set(self._pf_futures)
+            responses = list(self._pf_responses.values())
+        for response in responses:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if futures:
+            _cf_wait(futures, timeout=_PREFETCH_CANCEL_WAIT)
         if pool is not None:
             try:
                 pool.shutdown(wait=False, cancel_futures=True)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         with self._pf_lock:
             self._pf_futures.clear()
+            self._pf_responses.clear()
+            self._pf_cancelled_urls.clear()
             self._seg_order.clear()
             self._seg_pos.clear()
             self._pf_scheduled.clear()
@@ -811,6 +1152,28 @@ class MediaProxy:
     def _cache_enabled(self) -> bool:
         cache = self._ensure_cache()
         return bool(cache is not None and cache.enabled)
+
+    def _wait_for_cached_fetch(self, handler, cache, key: str, target: str,
+                               headers: dict) -> bool:
+        state = cache.fetch_state(key)
+        if state is None:
+            return False
+        started = time.perf_counter()
+        if not cache.wait_fetch(state, _CACHE_FETCH_WAIT):
+            handler.send_error(504, "cache fetch timeout")
+            return True
+        wait_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+        if state.error is not None:
+            handler.send_error(state.status or 502, "upstream error")
+            return True
+        entry = cache.entry(key)
+        final = cache.mp4_final(key)
+        if entry and entry.get("complete") and final.is_file():
+            cache.touch(key)
+            _record_cache_diagnostic(target, headers, "wait", wait_ms)
+            self._serve_local_file(handler, final)
+            return True
+        return False
 
     # 缓存上下文注册：m3u8 被重写时把 key → (base_url, headers, ad_block, force_proxy) 记下，
     # /c/<key>/ 缓存未命中时据此回落上游（分片相对 urljoin 到 base）。
@@ -941,6 +1304,10 @@ class MediaProxy:
     def _ensure_server(self) -> None:
         if self._server is not None:
             return
+        with self._pf_lock:
+            self._pf_cancel.clear()
+            self._pf_disabled = False
+            self._pf_failures = 0
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
         self._server.proxy = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -958,8 +1325,12 @@ class MediaProxy:
         清扫不能推迟到 App 退出。
         """
         with self._lock:
-            if self._active > 0:
-                return
+            active = self._active > 0
+        if active:
+            return
+        cache = self._cache_obj()
+        if cache is not None and hasattr(cache, "cancel_fetches"):
+            cache.cancel_fetches()
         self._shutdown_prefetch()
         srv, self._server = self._server, None
         if srv is not None:
@@ -1113,13 +1484,14 @@ class MediaProxy:
             # HTTPError，这里等价处理（播放器收到 502 会提示换线路/重试，
             # 而不是把错误页当媒体流播放黑屏）。
             if resp.status_code >= 400:
-                handler.send_error(resp.status_code, "upstream error")
+                _send_upstream_error(handler, resp)
                 return
             # m3u8 播放列表必须整读且自动解压：stream=True 时 resp.raw 返回
             # gzip 原始字节（Content-Encoding: gzip 不解压），直接重写会乱码/
             # 截断（542B gzip vs 8871B 明文）。m3u8 是小文本，用 resp.content
             # 完整读取 + 自动解压；媒体流（mp4/ts 大文件）才用 resp.raw 流式。
-            body = resp.content
+            body = _read_upstream_body(resp)
+            _update_upstream_diagnostic(resp, 0, finished=True)
             if not body.lstrip().startswith(b"#EXTM3U") and not (
                 (resp.headers.get("Content-Type") or "")).find("mpegurl") >= 0:
                 # URL 是 m3u8 但内容不是（可能重定向/错误页）→ 透传原始内容
@@ -1147,6 +1519,9 @@ class MediaProxy:
         """
         cache = self._ensure_cache()
         cache_on = bool(cache is not None and cache.enabled)
+        key = None
+        fetch_state = None
+        fetch_owner = False
 
         # 本地缓存命中：直接 serve。命中条件 = 索引标记 complete + 文件存在。
         if cache_on:
@@ -1157,19 +1532,44 @@ class MediaProxy:
                     p = cache.mp4_final(key)
                     if p.is_file():
                         cache.touch(key)
+                        _record_cache_diagnostic(target, req_headers, "hit")
                         self._serve_local_file(handler, p)
                         return
+                if self._wait_for_cached_fetch(handler, cache, key, target, req_headers):
+                    return
+                if not handler.headers.get("Range"):
+                    fetch_owner, fetch_state = cache.start_fetch(key)
+                    if not fetch_owner:
+                        if self._wait_for_cached_fetch(handler, cache, key, target,
+                                                       req_headers):
+                            return
+                        fetch_owner, fetch_state = cache.start_fetch(key)
             except Exception:  # noqa: BLE001 —— 缓存不可用退化为直传
                 cache_on = False
+                fetch_owner = False
+                fetch_state = None
 
         # 连接池复用：requests.Session 保持到 CDN 的 keep-alive 连接，
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
         # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
         # 默认直连优先，失败后回退系统代理。
-        resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
+        fetch_status = None
+        fetch_error = None
+        try:
+            resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
+            if fetch_owner:
+                cache.set_fetch_response(key, fetch_state, resp)
+        except Exception as exc:
+            fetch_error = exc
+            if fetch_owner:
+                cache.finish_fetch(key, fetch_state, 502, exc)
+                fetch_owner = False
+            raise
         try:
             if resp.status_code >= 400:
-                handler.send_error(resp.status_code, "upstream error")
+                fetch_status = resp.status_code
+                fetch_error = RuntimeError("upstream error")
+                _send_upstream_error(handler, resp)
                 return
             # 判断内容是不是 HLS 播放列表（URL 未含 .m3u8 但内容是的，如
             # 短链/参数化 m3u8）。只嗅探 _SNIFF_BYTES 字节（够覆盖 #EXTM3U）：
@@ -1178,10 +1578,13 @@ class MediaProxy:
             # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
             whole = False
             if (resp.headers.get("Content-Encoding") or "").lower() in ("gzip", "deflate", "br"):
-                first = resp.content
+                first = _read_upstream_body(resp)
                 whole = True  # 已整读解压：上游 Content-Length 是压缩态长度
             else:
+                if fetch_state is not None and cache.fetch_cancelled(fetch_state):
+                    raise RuntimeError("media fetch cancelled")
                 first = resp.raw.read(_SNIFF_BYTES)
+                _update_upstream_diagnostic(resp, len(first))
             is_m3u8 = first.startswith(b"#EXTM3U") or (
                 resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
 
@@ -1189,6 +1592,7 @@ class MediaProxy:
                 # 读完整文本，重写内部 URL（分片/KEY/变体）为本地代理。
                 # gzip 压缩时 first 已是完整解压内容（上方分支），rest 为空。
                 rest = resp.raw.read()
+                _update_upstream_diagnostic(resp, len(rest), finished=True)
                 text = (first + rest).decode("utf-8", "replace")
                 self._serve_m3u8_text(handler, text, target, req_headers,
                                       ad_block, force_proxy)
@@ -1211,7 +1615,8 @@ class MediaProxy:
                     if (not (entry and entry.get("complete"))
                             and already is None and from_head):
                         total = _content_total(resp)
-                        if total:
+                        if total and _full_zero_offset_response(
+                                resp, req_headers.get("Range")):
                             st = _FileTee(cache, key, cache.mp4_part(key),
                                           cache.mp4_final(key), total,
                                           is_mp4=True)
@@ -1219,6 +1624,7 @@ class MediaProxy:
                                 with self._lock:
                                     self._mp4_tee[key] = st
                                 tee = st
+
                 except Exception:  # noqa: BLE001 —— 落盘失败不阻断播放
                     tee = None
             sent = 0
@@ -1229,11 +1635,14 @@ class MediaProxy:
                     if tee:
                         tee.write(first)
                 while True:
+                    if fetch_state is not None and cache.fetch_cancelled(fetch_state):
+                        raise RuntimeError("media fetch cancelled")
                     chunk = resp.raw.read(_READ_CHUNK)
                     if not chunk:
                         break
                     handler.wfile.write(_frame(chunk, chunked))
                     sent += len(chunk)
+                    _update_upstream_diagnostic(resp, len(chunk))
                     self._touch()  # 流式期间持续刷新看门狗（暂停/拖动不误杀）
                     if tee:
                         tee.write(chunk)
@@ -1243,6 +1652,7 @@ class MediaProxy:
                     # 上游提前断流：声明了长度却没写满 → 该连接已无法定界，
                     # 必须关闭，否则复用它的下一个请求会读到错位的残留字节
                     handler.close_connection = True
+                _update_upstream_diagnostic(resp, 0, finished=True)
                 if tee:
                     tee.finish()
                 # 结束即从进行中字典移除：finish/abort 后残留对象会令
@@ -1250,12 +1660,24 @@ class MediaProxy:
                 if tee:
                     self._drop_mp4_tee(key, tee)
             except (BrokenPipeError, ConnectionResetError):
-                # 播放器提前关闭连接（拖动/停止）属正常；未完成的落盘弃用
+                fetch_error = RuntimeError("client disconnected")
+                _update_upstream_diagnostic(
+                    resp, 0, finished=True, failure_category="client_disconnect"
+                )
                 handler.close_connection = True
                 if tee:
                     tee.abort()
                     self._drop_mp4_tee(key, tee)
+            except Exception as exc:
+                fetch_error = exc
+                handler.close_connection = True
+                if tee:
+                    tee.abort()
+                    self._drop_mp4_tee(key, tee)
+                raise
         finally:
+            if fetch_owner:
+                cache.finish_fetch(key, fetch_state, fetch_status, fetch_error)
             try:
                 resp.close()
             except Exception:  # noqa: BLE001
@@ -1282,8 +1704,10 @@ class MediaProxy:
 
         命中（本地 final 文件已完整存在）→ 直接 serve 本地文件（支持 Range）；
         未命中 → 回落上游代理转发，同时 tee 落盘（写满 commit，下次命中）。
-        若内容是 m3u8（变体/嵌套播放列表）→ 转 m3u8 重写路径。
-        """
+         若内容是 m3u8（变体/嵌套播放列表）→ 转 m3u8 重写路径。
+         客户端 Range miss 不加入共享 fetch state，保持每个 206 响应独立。
+         """
+
         cache = self._ensure_cache()
         if cache is None or not cache.enabled:
             handler.send_error(403, "cache disabled")
@@ -1306,10 +1730,33 @@ class MediaProxy:
         # 分片级预取钩子：取到第 seg_name 片后把后续 depth 片排队落盘。
         # 放锁外：预取自身会取同名 path_lock，锁内触发会自死锁。
         if not seg_name.endswith(".m3u8"):
+            self._cancel_prefetch_url(target)
             self._maybe_prefetch(cache_key, target)
 
+        fetch_key = cache.key_of(target)
+        fetch_owner = False
+        fetch_state = None
+        shared_fetch = not handler.headers.get("Range")
+        if not seg_name.endswith(".m3u8"):
+            final = cache.hls_segment_final(cache_key, seg_name)
+            entry = cache.entry(cache_key)
+            if entry and entry.get("complete") and final.is_file():
+                cache.touch(cache_key)
+                _record_cache_diagnostic(target, base_headers, "hit")
+                self._serve_local_file(handler, final)
+                return
+        if shared_fetch:
+            fetch_owner, fetch_state = cache.start_fetch(fetch_key)
+        if shared_fetch and not fetch_owner:
+            if not cache.wait_fetch(fetch_state, _CACHE_FETCH_WAIT):
+                handler.send_error(504, "cache fetch timeout")
+                return
+            if fetch_state.error is not None:
+                _send_cached_fetch_error(handler, fetch_state)
+                return
+
         # 定位到本段在缓存里的路径；已知总长才 tee（见 _content_total）。
-        lock = cache.path_lock(seg_name)
+        lock = cache.path_lock(seg_name) if shared_fetch else nullcontext()
         with lock:
             if seg_name.endswith(".m3u8"):
                 # 嵌套/变体播放列表：按自身 URL 的独立 key 缓存放过滤文本；
@@ -1331,6 +1778,7 @@ class MediaProxy:
                 entry = cache.entry(cache_key)
                 if entry and entry.get("complete") and final.is_file():
                     cache.touch(cache_key)
+                    _record_cache_diagnostic(target, base_headers, "hit")
                     self._serve_local_file(handler, final)
                     return
 
@@ -1339,22 +1787,38 @@ class MediaProxy:
             rng = handler.headers.get("Range")
             if rng and not seg_name.endswith(".m3u8"):
                 req_headers["Range"] = rng
-            resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
+            fetch_status = None
+            fetch_error = None
             try:
+                resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
+            except Exception as exc:
+                cache.finish_fetch(fetch_key, fetch_state, 502, exc)
+                fetch_owner = False
+                raise
+            try:
+                if fetch_owner:
+                    cache.set_fetch_response(fetch_key, fetch_state, resp)
                 if resp.status_code >= 400:
-                    handler.send_error(resp.status_code, "upstream error")
+                    fetch_status = resp.status_code
+                    fetch_error = RuntimeError("upstream error")
+                    _send_upstream_error(handler, resp)
                     return
+
                 # 可能是「URL 不带 .m3u8 的嵌套播放列表」→ 先嗅探首块
                 whole = False
                 if (resp.headers.get("Content-Encoding") or "").lower() in ("gzip", "deflate", "br"):
-                    first = resp.content
+                    first = _read_upstream_body(resp)
                     whole = True  # 已整读解压：上游 Content-Length 是压缩态长度
                 else:
+                    if fetch_state is not None and cache.fetch_cancelled(fetch_state):
+                        raise RuntimeError("media fetch cancelled")
                     first = resp.raw.read(_SNIFF_BYTES)
+                    _update_upstream_diagnostic(resp, len(first))
                 is_m3u8 = first.startswith(b"#EXTM3U") or (
                     resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
                 if is_m3u8:
                     rest = resp.raw.read()
+                    _update_upstream_diagnostic(resp, len(rest or b""), finished=True)
                     text = (first + (rest or b"")).decode("utf-8", "replace")
                     self._serve_m3u8_text(handler, text, target, req_headers,
                                           ad_block, force_proxy)
@@ -1370,7 +1834,8 @@ class MediaProxy:
                 tee = None
                 # /c/ 分片：只对「从头起」的请求落盘（拖动产生的非 0 Range
                 # 不满足 _safe_keys 顺序写前提），与 mp4 tee 规则一致
-                if total and (_parse_range_start(handler.headers.get("Range")) in (None, 0)):
+                if total and _full_zero_offset_response(
+                        resp, handler.headers.get("Range")):
                     final = cache.hls_segment_final(cache_key, seg_name)
                     st = _FileTee(cache, cache_key, cache.hls_segment_part(cache_key, seg_name),
                                   final, total, is_mp4=False)
@@ -1384,25 +1849,45 @@ class MediaProxy:
                         if tee:
                             tee.write(first)
                     while True:
+                        if fetch_state is not None and cache.fetch_cancelled(fetch_state):
+                            raise RuntimeError("media fetch cancelled")
                         chunk = resp.raw.read(_READ_CHUNK)
                         if not chunk:
                             break
                         handler.wfile.write(_frame(chunk, chunked))
                         sent += len(chunk)
+                        _update_upstream_diagnostic(resp, len(chunk))
                         self._touch()
                         if tee:
                             tee.write(chunk)
+
                     if chunked:
                         handler.wfile.write(b"0\r\n\r\n")
                     elif declared is not None and sent < declared:
                         handler.close_connection = True  # 提前断流，连接不可复用
+                    _update_upstream_diagnostic(resp, 0, finished=True)
                     if tee:
                         tee.finish()
                 except (BrokenPipeError, ConnectionResetError):
+                    fetch_error = RuntimeError("client disconnected")
+                    _update_upstream_diagnostic(
+                        resp, 0, finished=True, failure_category="client_disconnect"
+                    )
                     handler.close_connection = True
                     if tee:
                         tee.abort()
+                except Exception as exc:
+                    fetch_error = exc
+                    handler.close_connection = True
+                    if tee:
+                        tee.abort()
+                    raise
             finally:
+                if fetch_owner:
+                    cache.finish_fetch(
+                        fetch_key, fetch_state, fetch_status, fetch_error,
+                        headers=(dict(resp.headers) if fetch_status == 416 else None),
+                    )
                 try:
                     resp.close()
                 except Exception:  # noqa: BLE001

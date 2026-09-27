@@ -107,6 +107,7 @@ class ReaderPage(BasePage):
         self._favorite_checker = None  # 可选回调: url -> bool（App 注入判断是否已收藏）
         self._pending_position = None  # 打开书续读位置（0~1 比例），_on_detail 传给视图
         self._pending_page = None  # 打开书续读翻页页索引（小说翻页模式）
+        self._pending_location = None
         self._bg_idx = 0  # 当前护眼背景主题索引（READING_BG_THEMES）
         self._reading_font_size = 0  # 当前阅读字号（背景循环不改变字号）
 
@@ -165,7 +166,6 @@ class ReaderPage(BasePage):
             # 章内位置续读（滚动/翻页/播放进度，节流后落盘）
             self.novel_view.position_changed.connect(self._on_progress_signal)
             self.comic_view.position_changed.connect(self._on_progress_signal)
-            self.video_view.position_changed.connect(self._on_progress_signal)
 
         # ---- 换源：VideoView 切源 → 重载分集 ----
         self.video_view.source_changed.connect(self._on_source_changed)
@@ -275,6 +275,7 @@ class ReaderPage(BasePage):
         url = payload[2] if len(payload) > 2 else ""
         position = payload[3] if len(payload) > 3 else None
         page = payload[4] if len(payload) > 4 else None
+        location = payload[5] if len(payload) > 5 else None
         if detail is None:
             return
         try:
@@ -293,6 +294,7 @@ class ReaderPage(BasePage):
                 title,
                 position=position,
                 page=page,
+                location=location,
             )
         except Exception:
             pass  # 记忆失败不影响阅读
@@ -322,11 +324,12 @@ class ReaderPage(BasePage):
         if self._reading_progress is None or not self._current_book_url:
             return
         view = self.stack.currentWidget()
-        if view in (self.novel_view, self.comic_view, self.video_view):
+        if view in (self.novel_view, self.comic_view):
             ctx = view.current_context()
             if ctx is not None:
                 pos, page = view.position_snapshot()
-                self._on_progress_signal((*ctx, pos, page))
+                location = view._build_current_location()
+                self._on_progress_signal((*ctx, pos, page, location))
 
     def flush_progress(self) -> None:
         """对外：落盘当前阅读进度（App 退出 / 切走阅读 Tab 时调用）。
@@ -350,15 +353,17 @@ class ReaderPage(BasePage):
             self.title_label.setText(f"源不存在：{source_id}")
             return
         # 续读恢复：记忆里有这本书 → 用记忆的章覆盖 start_chapter_url，并取位置
-        resume_pos, resume_page = None, None
+        resume_pos, resume_page, resume_location = None, None, None
         if self._reading_progress is not None and book_url:
             rec = self._reading_progress.resume(book_url)
             if rec and rec.get("chapter_url"):
                 start_chapter_url = rec["chapter_url"]
                 resume_pos = rec.get("position")
                 resume_page = rec.get("page")
+                resume_location = rec.get("location")
         self._pending_position = resume_pos
         self._pending_page = resume_page
+        self._pending_location = resume_location
         self._current_source_id = source_id
         self._current_source = source
         self._current_book_url = book_url
@@ -397,20 +402,23 @@ class ReaderPage(BasePage):
         self.title_label.setText(detail.title or "无标题")
         self.refresh_favorite_state()  # 按当前书 URL 刷新收藏按钮
         # 按类型切视图（续读位置随 load 传入，首次显示后定位到页）
-        pos, page = getattr(self, "_pending_position", None), getattr(self, "_pending_page", None)
+        pos = getattr(self, "_pending_position", None)
+        page = getattr(self, "_pending_page", None)
+        location = getattr(self, "_pending_location", None)
         self._pending_position = None
         self._pending_page = None
+        self._pending_location = None
         if content_type == "novel":
             self.stack.setCurrentWidget(self.novel_view)
             self.novel_view.load(
                 self._manager.get(self._current_source_id), detail, start_chapter_url,
-                restore_position=pos, restore_page=page,
+                restore_position=pos, restore_page=page, restore_location=location,
             )
         elif content_type == "comic":
             self.stack.setCurrentWidget(self.comic_view)
             self.comic_view.load(
                 self._manager.get(self._current_source_id), detail, start_chapter_url,
-                restore_position=pos,
+                restore_position=pos, restore_location=location,
             )
         else:
             self.stack.setCurrentWidget(self.video_view)

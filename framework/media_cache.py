@@ -42,6 +42,20 @@ except ImportError:  # pragma: no cover
 
 _INDEX_NAME = "index.json"
 
+
+class _Inflight:
+    __slots__ = ("event", "done", "cancel", "error", "status", "headers", "response")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.done = threading.Event()
+        self.cancel = threading.Event()
+        self.error = None
+        self.status = None
+        self.headers = {}
+        self.response = None
+
+
 # 带签名时效的 URL 参数：参与缓存 key 时必须剔除，否则换 token 重播 key 整体
 # 失效（缓存越积越多且永远命中不了）。只砍明确的时效/签名参数名，不动其余参数。
 _SIGNED_PARAM_NAMES = frozenset([
@@ -100,6 +114,7 @@ class MediaCache:
         self._lock = threading.Lock()
         self._index: dict[str, dict] = {}
         self._inflight: set[str] = set()       # 正在写入的 key（淘汰时跳过）
+        self._fetches: dict[str, _Inflight] = {}
         self._path_locks: dict[str, threading.Lock] = {}
         self._path_locks_guard = threading.Lock()
         self._last_flush = 0.0
@@ -274,6 +289,79 @@ class MediaCache:
     # ------------------------------------------------------------------ #
     # 并发防护
     # ------------------------------------------------------------------ #
+    def fetch_state(self, key: str):
+        with self._lock:
+            return self._fetches.get(key)
+
+    def start_fetch(self, key: str):
+        with self._lock:
+            state = self._fetches.get(key)
+            if state is not None:
+                return False, state
+            state = _Inflight()
+            self._fetches[key] = state
+            return True, state
+
+    def wait_fetch(self, state, timeout: float) -> bool:
+        return state.event.wait(max(0.0, timeout))
+
+    def set_fetch_response(self, key: str, state, response) -> None:
+        with self._lock:
+            if self._fetches.get(key) is not state:
+                close = True
+            else:
+                state.response = response
+                close = state.cancel.is_set()
+        if close:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def fetch_cancelled(self, state) -> bool:
+        return state.cancel.is_set()
+
+    def finish_fetch(self, key: str, state, status: int | None = None,
+                     error: Exception | None = None, headers: dict | None = None) -> None:
+        with self._lock:
+            if self._fetches.get(key) is not state:
+                return
+            self._fetches.pop(key, None)
+            if state.cancel.is_set():
+                state.status = state.status or 503
+                state.error = state.error or RuntimeError("media fetch cancelled")
+            else:
+                state.status = status
+                state.error = error
+                state.headers = dict(headers or {})
+            state.event.set()
+            state.done.set()
+
+    def cancel_fetches(self, timeout: float = 1.0) -> None:
+        with self._lock:
+            states = list(self._fetches.items())
+            responses = []
+            for _key, state in states:
+                state.cancel.set()
+                state.status = 503
+                state.error = RuntimeError("media fetch cancelled")
+                state.event.set()
+                if state.response is not None:
+                    responses.append(state.response)
+        for response in responses:
+            try:
+                response.close()
+            except Exception:
+                pass
+        deadline = time.monotonic() + max(0.0, timeout)
+        for _key, state in states:
+            state.done.wait(max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            for key, state in states:
+                if self._fetches.get(key) is state:
+                    self._fetches.pop(key, None)
+                    state.done.set()
+
     def inflight_add(self, key: str) -> None:
         with self._lock:
             self._inflight.add(key)

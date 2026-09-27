@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
@@ -56,7 +58,9 @@ class NovelView(QWidget):
         self._prev_prefetch_idx = -2  # 正在向前预取的章节 idx（<0 表示空闲）
         self._prev_prefetch_task = None  # 持引用防 GC
         self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
-        self._pending_restore = None  # 打开书续读位置 (position, page)，首次显示章时定位
+        self._pending_restore = None  # 打开书续读位置 (position, page, location)，首次显示章时定位
+        self._restore_generation = 0
+        self._restore_cancel_token = 0
         self._auto_scrolling = False  # 自动滚动开关
         self._auto_pos = 0.0  # 自动滚动记住的位置（浮点，按速度递增，重排不打断）
         self._auto_timer = QTimer(self)  # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
@@ -233,6 +237,7 @@ class NovelView(QWidget):
         start_chapter_url: str = "",
         restore_position: float | None = None,
         restore_page: int | None = None,
+        restore_location: dict | None = None,
     ) -> None:
         """加载小说：设置目录 + 跳到指定章（或续读），并定位到章内位置。
 
@@ -241,6 +246,8 @@ class NovelView(QWidget):
         """
         self._source = source
         self._detail = detail
+        self._restore_generation += 1
+        self._restore_cancel_token += 1
         self._chapters = detail.chapters
         # 换书：无条件清零续读位置——旧书若章节还在后台加载，本次 load() 的
         # 首章显示会消费到「上一本书残留的 _pending_restore」，把新书滚动条
@@ -249,8 +256,12 @@ class NovelView(QWidget):
         self._prev_prefetch_queue = []  # 换书清空向前缓存队列（旧队列指向旧书章节）
         self._prev_prefetch_idx = -2
         self._populate_toc()
-        if restore_position is not None or restore_page is not None:
-            self._pending_restore = (restore_position, restore_page)
+        if restore_position is not None or restore_page is not None or restore_location:
+            self._pending_restore = (
+                (restore_position, restore_page, restore_location)
+                if restore_location is not None
+                else (restore_position, restore_page)
+            )
 
         # 定位起始章
         idx = 0
@@ -333,24 +344,101 @@ class NovelView(QWidget):
         self._prefetch_prev(self._current_idx)
         # 续读定位：首章显示后恢复到上次的章内位置（页索引/滚动比例）
         if self._pending_restore is not None:
-            pos, page = self._pending_restore
+            pending = self._pending_restore
+            pos, page = pending[:2]
+            location = pending[2] if len(pending) > 2 else None
             self._pending_restore = None
-            # 捕获当前 book detail：QTimer 触发时自校验仍为这本书（防旧书
-            # 恢复回调在用户快速换书后把新书滚动条错滚到旧书位置）
             book = self._detail
+            generation = self._restore_generation
             if page is not None:
                 self._current_page = page
                 self._pager_show_page(page)
-            if pos is not None and pos > 0:
-                vbar = self.scroll.verticalScrollBar()
-                QTimer.singleShot(
-                    0, lambda b=book: self._restore_scroll_if_book(pos, b)
-                )
-            # 强制落盘恢复后的位置（节流会吞掉恢复事件，防下次仍回顶部/第0页）
+            QTimer.singleShot(
+                0, lambda b=book, g=generation, p=pos, loc=location: self._restore_location_if_book(p, loc, b, g)
+            )
             self._last_pos_save_ts = 0.0
             QTimer.singleShot(0, self._emit_position)
         # 更新自动滚动滑块状态（根据模式和滚动范围）
         QTimer.singleShot(0, self._update_auto_scroll_slider_state)
+
+    @staticmethod
+    def _normalize_anchor_text(text: str) -> str:
+        lines = str(text or "").splitlines()
+        if lines and lines[0].strip().startswith("【") and lines[0].strip().endswith("】"):
+            lines = lines[1:]
+        return re.sub(r"\s+", " ", " ".join(line.strip() for line in lines)).strip()
+
+    @staticmethod
+    def _location_matches_chapter(location: dict | None, chapter_url: str) -> bool:
+        return bool(isinstance(location, dict) and chapter_url and location.get("chapter_url") == chapter_url)
+
+    @classmethod
+    def _build_location_snapshot(cls, text: str, ratio: float, value: int, maximum: int, chapter_url: str = "") -> dict:
+        body = cls._normalize_anchor_text(text)
+        offset = max(0, min(len(body), int(round(float(ratio or 0) * len(body)))))
+        start = max(0, offset - 80)
+        anchor = body[start:start + 160]
+        return {
+            "version": 1,
+            "chapter_url": chapter_url,
+            "anchor": anchor,
+            "anchor_hash": hashlib.sha1(anchor.encode("utf-8")).hexdigest(),
+            "offset": offset - start,
+            "content_hash": hashlib.sha1(body.encode("utf-8")).hexdigest(),
+            "scroll_ratio": round(max(0.0, min(1.0, float(ratio or 0))), 4),
+            "scroll_value": int(value),
+            "scroll_maximum": int(maximum),
+            "text_length": len(body),
+        }
+
+    @classmethod
+    def _resolve_location_scroll(cls, text: str, location: dict, maximum: int):
+        body = cls._normalize_anchor_text(text)
+        if not isinstance(location, dict):
+            return None
+        if location.get("content_hash") == hashlib.sha1(body.encode("utf-8")).hexdigest():
+            old_max = int(location.get("scroll_maximum", 0) or 0)
+            old_value = int(location.get("scroll_value", 0) or 0)
+            if old_max > 0:
+                return max(0, min(int(maximum), round(maximum * old_value / old_max)))
+        anchor = cls._normalize_anchor_text(location.get("anchor", ""))
+        if anchor:
+            hits = [m.start() for m in re.finditer(re.escape(anchor), body)]
+            if len(hits) == 1:
+                offset = hits[0] + int(location.get("offset", 0) or 0)
+                return max(0, min(int(maximum), round(maximum * offset / max(1, len(body)))))
+        ratio = location.get("scroll_ratio")
+        if ratio is not None:
+            return max(0, min(int(maximum), round(float(ratio) * maximum)))
+        return None
+
+    def _restore_location_if_book(self, pos, location, book, generation, tries=6, cancel_token=None):
+        cancel_token = self._restore_cancel_token if cancel_token is None else cancel_token
+        if self._detail is not book or self._restore_generation != generation or self._restore_cancel_token != cancel_token:
+            return
+        vbar = self.scroll.verticalScrollBar()
+        chapter_url = self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else ""
+        valid_location = location if self._location_matches_chapter(location, chapter_url) else None
+        target = self._resolve_location_scroll(self.text.text(), valid_location, vbar.maximum()) if valid_location else None
+        if target is None and pos is not None:
+            target = round(float(pos) * vbar.maximum())
+        if target is not None and vbar.maximum() > 0:
+            vbar.setValue(int(target))
+        if valid_location is not None and target is not None:
+            return
+        if tries > 1:
+            QTimer.singleShot(
+                100,
+                lambda: self._restore_location_if_book(
+                    pos, location, book, generation, tries - 1, cancel_token
+                ),
+            )
+
+    def _build_current_location(self):
+        pos, _ = self.position_snapshot()
+        vbar = self.scroll.verticalScrollBar()
+        chapter_url = self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else ""
+        return self._build_location_snapshot(self.text.text(), pos, vbar.value(), vbar.maximum(), chapter_url)
 
     def _restore_scroll(self, pos: float) -> None:
         """按 0~1 比例恢复滚动位置（打开书续读）。"""
@@ -430,7 +518,8 @@ class NovelView(QWidget):
         ch = self._chapters[self._current_idx]
         pos, page = self.position_snapshot()
         try:
-            self.position_changed.emit((self._detail, ch.title, ch.url, pos, page))
+            location = self._build_current_location() if self._mode == "scroll" else None
+            self.position_changed.emit((self._detail, ch.title, ch.url, pos, page, location))
         except RuntimeError:
             pass
 
@@ -458,6 +547,8 @@ class NovelView(QWidget):
 
     def _on_scrollbar_user_interaction(self) -> None:
         """用户手动拖动滚动条（sliderPressed）时停止自动滚动，让手动接管。"""
+        self._restore_cancel_token += 1
+        self._restore_generation += 1
         self._stop_auto_scroll()
 
     def _auto_scroll_tick(self) -> None:

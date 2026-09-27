@@ -17,6 +17,7 @@
 import http.client
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -30,6 +31,10 @@ from framework.media_cache import MediaCache
 from framework.media_proxy import MediaProxy
 
 _VLC = "C:/fake/vlc.exe"
+
+
+class _DisabledCache:
+    enabled = False
 
 
 # --------------------------------------------------------------------------- #
@@ -82,10 +87,10 @@ def test_default_hls_buffer_unchanged(monkeypatch):
 
 
 def test_source_override_raises_buffer(monkeypatch):
-    """ikanpp 传 30000 → VLC 用 30s 缓冲。"""
+    """ikanpp 传 45000 → VLC 用 45s 缓冲。"""
     procs = _install_vlc(monkeypatch)
-    ep.open_with_player("https://cdn.example.com/hls/a.m3u8", caching_ms=30000)
-    assert _caching_of(procs[0].args) == 30000
+    ep.open_with_player("https://cdn.example.com/hls/a.m3u8", caching_ms=45000)
+    assert _caching_of(procs[0].args) == 45000
 
 
 def test_override_is_floor_not_cap(monkeypatch):
@@ -100,7 +105,7 @@ def test_ikanpp_source_declares_30s():
     p = Path(__file__).resolve().parent.parent / "sources" / "ikanpp.json"
     raw = json.loads(p.read_text(encoding="utf-8"))
     hls = (raw.get("media") or {}).get("hls") or {}
-    assert hls.get("network_caching_ms") == 30000
+    assert hls.get("network_caching_ms") == 45000
 
 
 # --------------------------------------------------------------------------- #
@@ -340,3 +345,251 @@ def test_prefetched_segment_served_from_disk(pf_proxy, upstream):
     st, data = _get(segs[1])            # VLC 随后消费 001.ts
     assert st == 200 and len(data) == len(_SEG)
     assert _Upstream.hits.get("/001.ts", 0) == 1     # 命中本地，未再回源
+
+
+def test_prefetch_limits_are_hard_clamped():
+    proxy = MediaProxy(cache=_DisabledCache(), prefetch={
+        "enabled": True, "depth": 100, "workers": 100,
+    })
+    try:
+        assert proxy._pf_cfg["depth"] == 16
+        assert proxy._pf_cfg["workers"] == 8
+    finally:
+        proxy.stop()
+
+
+def test_prefetch_dedupes_signed_variants(pf_proxy):
+    proxy = pf_proxy({"enabled": True, "depth": 4, "workers": 2})
+    cache = proxy._cache
+    key = cache.key_of("http://cdn.test/index.m3u8")
+    with proxy._lock:
+        proxy._cache_ctx[key] = ("http://cdn.test/index.m3u8", {}, None, False)
+        proxy._seg_pos[key] = {
+            "http://cdn.test/000.ts": 0,
+        }
+        proxy._seg_order[key] = [
+            "http://cdn.test/000.ts",
+            "http://cdn.test/001.ts?token=a",
+            "http://cdn.test/001.ts?token=b",
+        ]
+    proxy._maybe_prefetch(key, "http://cdn.test/000.ts")
+    assert len(proxy._pf_scheduled) == 1
+    proxy._prefetch_drain()
+
+
+def test_player_request_cancels_queued_prefetch(pf_proxy):
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    url = "http://cdn.test/001.ts"
+    canonical = proxy._cache.key_of(url)
+    with proxy._pf_lock:
+        proxy._pf_scheduled.add(canonical)
+        proxy._pf_cancelled_urls[canonical] = threading.Event()
+    proxy._cancel_prefetch_url(url)
+    with proxy._pf_lock:
+        assert proxy._pf_cancelled_urls[canonical].is_set()
+
+
+def test_prefetch_circuit_breaker_disables_after_connection_failures(
+        monkeypatch, pf_proxy):
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    monkeypatch.setattr(mp, "_fetch_upstream",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            requests.ConnectionError("down")))
+    for _ in range(3):
+        proxy._prefetch_one("key", "http://cdn.test/001.ts", {}, False)
+    assert proxy._pf_disabled is True
+
+
+class _BlockingRaw:
+    def __init__(self):
+        self.closed = threading.Event()
+
+    def read(self, _size):
+        self.closed.wait(2)
+        if self.closed.is_set():
+            raise OSError("closed")
+        return b""
+
+
+class _FakeResponse:
+    def __init__(self, status=200, raw=None):
+        self.status_code = status
+        self.headers = {"Content-Length": "1"}
+        self.raw = raw or type("Raw", (), {"read": lambda self, size: b""})()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+        if hasattr(self.raw, "closed") and isinstance(self.raw.closed, threading.Event):
+            self.raw.closed.set()
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_prefetch_http_statuses_open_circuit(monkeypatch, pf_proxy, status):
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    response = _FakeResponse(status=status)
+    monkeypatch.setattr(mp, "_fetch_upstream",
+                        lambda *args, **kwargs: response)
+    proxy._prefetch_one("key", "http://cdn.test/status.ts", {}, False)
+    assert proxy._pf_disabled is True
+    assert response.closed is True
+
+
+def test_prefetch_passes_actual_bounded_timeout(monkeypatch, pf_proxy):
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    seen = {}
+
+    def _fetch(*args, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        return _FakeResponse()
+
+    monkeypatch.setattr(mp, "_fetch_upstream", _fetch)
+    proxy._prefetch_one("key", "http://cdn.test/timeout.ts", {}, False)
+    assert seen["timeout"] == (mp._PREFETCH_TIMEOUT, mp._PREFETCH_TIMEOUT)
+
+
+def test_stop_closes_active_prefetch_and_cleans_marker(monkeypatch, pf_proxy):
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    raw = _BlockingRaw()
+    response = _FakeResponse(raw=raw)
+    monkeypatch.setattr(mp, "_fetch_upstream",
+                        lambda *args, **kwargs: response)
+    url = "http://cdn.test/active.ts"
+    canonical = proxy._cache.key_of(url)
+    with proxy._pf_lock:
+        proxy._pf_scheduled.add(canonical)
+        proxy._pf_cancelled_urls[canonical] = threading.Event()
+    future = proxy._ensure_pf_pool().submit(
+        proxy._prefetch_one, "key", url, {}, False)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with proxy._pf_lock:
+            if canonical in proxy._pf_responses:
+                break
+        time.sleep(0.01)
+    proxy.stop()
+    assert future.result(timeout=2) is None
+    assert response.closed is True
+    assert raw.closed.is_set()
+    assert not proxy._cache.hls_segment_part("key", url).exists()
+    assert canonical not in proxy._cache._inflight
+    with proxy._pf_lock:
+        assert canonical not in proxy._pf_scheduled
+
+
+def test_prefetch_timeout_cleans_response_and_marker(monkeypatch, pf_proxy):
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    monkeypatch.setattr(mp, "_PREFETCH_TIMEOUT", 0.1)
+    monkeypatch.setattr(mp, "_get_direct_session", _direct_session)
+    monkeypatch.setattr(mp, "_get_session", _direct_session)
+
+    class _StalledBody(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Content-Length", "1024")
+            self.end_headers()
+            self.wfile.write(b"x")
+            self.wfile.flush()
+            time.sleep(1)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StalledBody)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/stalled.ts"
+        cache_key = "stalled-cache"
+        canonical = proxy._cache.key_of(url)
+        with proxy._pf_lock:
+            proxy._pf_scheduled.add(canonical)
+            proxy._pf_cancelled_urls[canonical] = threading.Event()
+        started = time.monotonic()
+        future = proxy._ensure_pf_pool().submit(
+            proxy._prefetch_one, cache_key, url, {}, False)
+        assert future.result(timeout=1) is None
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.75
+        part = proxy._cache.hls_segment_part(cache_key, url)
+        assert not part.exists()
+        with proxy._pf_lock:
+            assert canonical not in proxy._pf_scheduled
+            assert canonical not in proxy._pf_responses
+        assert canonical not in proxy._cache._inflight
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_active_prefetch_does_not_block_player_http_request(monkeypatch, pf_proxy):
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    cache = proxy._cache
+    cache_key = "player-priority"
+    target = "http://cdn.test/priority.ts"
+    blocked = _BlockingRaw()
+    prefetch_response = _FakeResponse(raw=blocked)
+    class _PlayerRaw:
+        def __init__(self):
+            self.done = False
+
+        def read(self, _size):
+            if self.done:
+                return b""
+            self.done = True
+            return _SEG
+
+    player_response = _FakeResponse(raw=_PlayerRaw())
+    player_response.headers["Content-Length"] = str(len(_SEG))
+    calls = []
+
+    def _fetch(*args, **kwargs):
+        calls.append(kwargs)
+        return prefetch_response if len(calls) == 1 else player_response
+
+    monkeypatch.setattr(mp, "_fetch_upstream", _fetch)
+    proxy._register_cache_ctx(cache_key, target, {}, None)
+    canonical = cache.key_of(target)
+    with proxy._pf_lock:
+        proxy._pf_scheduled.add(canonical)
+        proxy._pf_cancelled_urls[canonical] = threading.Event()
+    future = proxy._ensure_pf_pool().submit(
+        proxy._prefetch_one, cache_key, target, {}, False)
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with proxy._pf_lock:
+            if canonical in proxy._pf_responses:
+                break
+        time.sleep(0.01)
+    port = proxy._server.server_address[1]
+    started = time.monotonic()
+    response = requests.get(
+        f"http://127.0.0.1:{port}/c/{cache_key}/priority.ts", timeout=1)
+    elapsed = time.monotonic() - started
+    assert response.status_code == 200
+    assert response.content == _SEG
+    assert elapsed < 0.5
+    assert blocked.closed.is_set()
+    assert future.result(timeout=1) is None
+
+
+def test_prefetch_path_lock_does_not_deadlock_player(monkeypatch, pf_proxy):
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    response = _FakeResponse()
+    monkeypatch.setattr(mp, "_fetch_upstream",
+                        lambda *args, **kwargs: response)
+    cache = proxy._cache
+    url = "http://cdn.test/lock.ts"
+    canonical = cache.key_of(url)
+    with proxy._pf_lock:
+        proxy._pf_scheduled.add(canonical)
+        proxy._pf_cancelled_urls[canonical] = threading.Event()
+    lock = cache.path_lock(url)
+    lock.acquire()
+    try:
+        future = proxy._ensure_pf_pool().submit(
+            proxy._prefetch_one, "key", url, {}, False)
+        proxy._cancel_prefetch_url(url)
+    finally:
+        lock.release()
+    assert future.result(timeout=2) is None
