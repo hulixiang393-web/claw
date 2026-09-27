@@ -1,19 +1,14 @@
 # -*- coding: utf-8 -*-
 """media_proxy force_proxy：强制走系统代理、跳过直连探测。
 
-背景：hanime1 的 mp4 直连连到 vdownload.hembed.com，速度不稳（0.3~1MB/s
-波动、偶发 ConnectionReset），但走系统代理稳定 1.8~2.6MB/s。旧逻辑「直连
-优先、失败回退系统代理」在直连"半成功"（200 但慢）时不会回退 → 卡顿。
-
-force_proxy=True 的行为：跳过直连探测与 _DIRECT_FAIL 读写，无条件把上游
-请求交给系统代理会话（trust_env=True）。默认 False 行为与旧版完全一致。
+默认行为：直连优先，失败后按 host 记忆并回退系统代理。force_proxy=True
+始终只走系统代理；_PROXY_ONLY=True 保留为可测试的兼容开关。
 
 覆盖：
-- _fetch_upstream 单元：force 走代理、不碰直连、不写失败记忆；默认仍直连
-  优先、直连失败回退并记记忆
+- _fetch_upstream 单元：默认直连优先、失败记忆与代理回退、TTL 跳过直连
+- force_proxy / _PROXY_ONLY：只走代理、不读写直连失败记忆
 - 写入点：build_url / proxy_url_for / _register_cache_ctx 存四元组
-- 端到端（真实本地代理服务器 + 假上游会话）：/s/ 请求 force 时仅用系统
-  代理；重写出的内部分片 token 同样带 force_proxy；老三元组 token 兼容
+- 端到端：默认直连，force 请求走代理；老三元组 token 兼容
 """
 import re
 
@@ -123,41 +118,86 @@ def test_force_proxy_no_fail_memory_even_if_direct_poisoned(monkeypatch):
     assert mp._DIRECT_FAIL == {}
 
 
-def test_default_still_direct_first(monkeypatch):
+def test_default_direct_success_does_not_call_proxy(monkeypatch):
     dlog, plog = [], []
     _install_sessions(monkeypatch, dlog, plog)
     resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
     assert resp.status_code == 200
-    assert len(dlog) == 1          # 直连优先
+    assert len(dlog) == 1
     assert plog == []
     assert mp._DIRECT_FAIL == {}
 
 
-def test_default_fallback_on_direct_connect_failure(monkeypatch):
+@pytest.mark.parametrize("exc", [
+    requests.ConnectionError(),
+    requests.Timeout(),
+    requests.exceptions.SSLError(),
+])
+def test_default_direct_request_exception_records_failure_and_uses_proxy(
+        monkeypatch, exc):
     dlog, plog = [], []
-    _install_sessions(monkeypatch, dlog, plog, dex=requests.ConnectionError())
-    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
-    assert resp.status_code == 200
-    assert len(dlog) == 1          # 直连失败
-    assert len(plog) == 1          # 回退系统代理
-    assert mp._DIRECT_FAIL.get("cdn.example.com") is not None  # 记住失败
-
-
-def test_default_fallback_on_direct_http_4xx(monkeypatch):
-    dlog, plog = [], []
-    _install_sessions(monkeypatch, dlog, plog, dresp=_FakeResp403())
+    _install_sessions(monkeypatch, dlog, plog, dex=exc)
     resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
     assert resp.status_code == 200
     assert len(dlog) == 1
-    assert plog and len(plog) == 1  # 4xx 同样换代理出口
+    assert len(plog) == 1
     assert mp._DIRECT_FAIL.get("cdn.example.com") is not None
+
+
+def test_default_direct_http_error_closes_records_and_uses_proxy(monkeypatch):
+    dlog, plog = [], []
+    direct = _FakeResp403()
+    _install_sessions(monkeypatch, dlog, plog, dresp=direct)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert direct.closed is True
+    assert len(dlog) == 1
+    assert len(plog) == 1
+    assert mp._DIRECT_FAIL.get("cdn.example.com") is not None
+
+
+def test_direct_failure_ttl_skips_direct_and_uses_proxy(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    mp._DIRECT_FAIL["cdn.example.com"] = mp.time.time()
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert dlog == []
+    assert len(plog) == 1
+
+
+def test_proxy_only_compatibility_switch_skips_direct(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    monkeypatch.setattr(mp, "_PROXY_ONLY", True)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert dlog == []
+    assert len(plog) == 1
+    assert mp._DIRECT_FAIL == {}
+
+
+def test_force_proxy_never_falls_back_to_direct(monkeypatch):
+    """显式 force_proxy=True 的源：代理不通就报错，不悄悄走直连换出口。"""
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog,
+                      pex=requests.ConnectionError())
+    with pytest.raises(requests.RequestException):
+        mp._fetch_upstream("https://cdn.example.com/x.mp4", {},
+                           force_proxy=True)
+    assert dlog == []
+    assert len(plog) == 2
+    assert mp._DIRECT_FAIL == {}
 
 
 class _FakeResp403:
     status_code = 403
 
+    def __init__(self):
+        self.closed = False
+
     def close(self):
-        pass
+        self.closed = True
 
 
 # --------------------------------------------------------------------- #
@@ -275,12 +315,12 @@ def test_e2e_default_request_direct_first(force_e2e):
                             {"Referer": "https://fake/"})
     r = requests.get(local, timeout=10)
     assert r.status_code == 200
-    assert len(dlog) == 1             # 默认直连优先
+    assert len(dlog) == 1
     assert plog == []
 
 
 def test_e2e_legacy_3tuple_token_compat(force_e2e):
-    """老三元组 token（硬编码写入模拟旧缓存）→ 兼容解包走默认直连。"""
+    """老三元组 token 兼容解包，force_proxy 默认 False，按默认直连。"""
     proxy, dlog, plog = force_e2e
     token = "a" * 32
     with proxy._lock:

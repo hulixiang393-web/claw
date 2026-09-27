@@ -64,16 +64,16 @@ _SERIES_SEM = 4
 # 单集惰性解析排队等待上限（秒）；超时回 503。
 _SERIES_WAIT = 20.0
 
+# 兼容性开关：True 时所有上游请求强制走系统代理。
+_PROXY_ONLY = False
+
 # 转发到 CDN 的连接池单例：VLC 经本地代理逐个拉 m3u8 分片时复用 keep-alive
 # 连接，避免每个分片都重新对 CDN 握手（urllib.urlopen 无连接池，几十个分片
 # 几十次 TCP/TLS 握手是播放卡顿/加载慢的常见根因）。
 #
 # 两个会话：
-# - 系统代理会话（trust_env=True）：尊重用户 HTTP(S)_PROXY（如 Clash 7890）。
-#   用于直连失败的**回退**（被墙/区域限制 CDN 只能经代理到达）。
-# - 直连会话（trust_env=False）：媒体流**直连 CDN**，绕开本地代理对每个分片
-#   的转发延迟（播放卡顿根因——缓冲加再大也盖不住逐分片的代理往返）。
-#   直连失败按 host 记住 30s，后续分片直接走代理，不再逐片等直连超时。
+# - 直连会话（trust_env=False）：正常请求的首选出口，绕开系统代理转发延迟。
+# - 系统代理会话（trust_env=True）：直连失败、失败记忆命中或强制代理时使用。
 _PROXY_SESSION = None
 _DIRECT_SESSION = None
 _DIRECT_FAIL = {}  # {host: 直连失败时间戳}：失败后 300s 内该 host 直接走代理
@@ -134,21 +134,30 @@ def _strip_stale_headers(headers: dict) -> dict:
     return out
 
 
-def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
-    """直连优先，失败回退系统代理（按 host 记住 300s）。
+def _proxy_get(target: str, headers: dict):
+    """经系统代理会话取流。重试一次短退避：代理偶发连接重置/切节点时，
+    否则上层把异常当 502 抛给播放器 → VLC demux 失败 → 播放中断。
+    两次都失败则抛出最后一次异常。"""
+    last_exc = None
+    for _attempt in range(2):
+        try:
+            return _get_session().get(
+                target, headers=headers, timeout=30, stream=True
+            )
+        except requests.RequestException as exc:  # noqa: BLE001
+            last_exc = exc
+            time.sleep(0.3)
+    raise last_exc  # noqa: BLE001 —— 两次都失败，让上层 502/重试
 
-    force_proxy=True：跳过直连探测与 _DIRECT_FAIL 读写，无条件走系统代理
-    会话（trust_env=True）。调用方明确该源只能经系统代理稳定到达时使用
-    （如 hanime mp4 直连速度不稳但走系统代理稳定、"直连半成功不回退"的源），
-    避免直连半成功导致的播放卡顿。
-    直连 connect 短超时（3s）：被墙/不可达主机快速回退，不卡住播放；回退
-    成功后该 host 300s 内直接走代理，不再逐请求等直连超时。直连 4xx/5xx
-    （区域拒绝）同样回退代理换出口 IP。
+
+def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
+    """默认直连优先，失败后按 host 记忆并回退系统代理。
+
+    force_proxy=True 或 _PROXY_ONLY=True：跳过直连探测与 _DIRECT_FAIL 读写，
+    无条件走系统代理会话。代理失败直接抛出请求异常。
     """
-    if force_proxy:
-        return _get_session().get(
-            target, headers=headers, timeout=30, stream=True
-        )
+    if force_proxy or _PROXY_ONLY:
+        return _proxy_get(target, headers)
     from urllib.parse import urlparse
 
     host = urlparse(target).netloc
@@ -171,19 +180,8 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
             pass
         with _DIRECT_FAIL_LOCK:
             _DIRECT_FAIL[host] = time.time()
-    # 系统代理回退也可能偶发失败（连接被重置/代理切换）——重试一次短退避，
-    # 否则上层把异常当 502 抛给播放器 → VLC demux 失败 → 播放中断。
-    last_exc = None
-    for _attempt in range(2):
-        try:
-            return _get_session().get(
-                target, headers=headers, timeout=30, stream=True
-            )
-        except requests.RequestException as exc:  # noqa: BLE001
-            last_exc = exc
-            time.sleep(0.3)
-    if last_exc is not None:
-        raise last_exc  # noqa: BLE001 —— 两次都失败，让上层 502/重试
+    # 兼容旧直连优先策略：直连也不通时再试系统代理。
+    return _proxy_get(target, headers)
 
 
 def _parse_range_start(rng: str | None) -> int | None:
@@ -740,7 +738,7 @@ class MediaProxy:
         ad_block：可选源 ad_block 配置。存在时代理转发 m3u8 会剔除广告段
         （下载路径已有过滤；播放路径此前无过滤，广告分片会照播）。
         force_proxy：True 时该 token 的所有上游转发一律走系统代理会话
-        （跳过直连探测），用于直连不稳但系统代理稳定的源（如 hanime）。
+        （跳过直连探测）；默认策略为直连优先、失败回退代理。
         """
         if not target_url:
             return ""
@@ -1016,7 +1014,7 @@ class MediaProxy:
         # 连接池复用：requests.Session 保持到 CDN 的 keep-alive 连接，
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
         # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
-        # 直连优先（绕开系统代理的逐分片转发延迟），失败自动回退系统代理。
+        # 默认直连优先，失败后回退系统代理。
         resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
         try:
             # 上游错误（403/404/5xx）不发 body 给播放器：原 urllib 会抛
@@ -1075,7 +1073,7 @@ class MediaProxy:
         # 连接池复用：requests.Session 保持到 CDN 的 keep-alive 连接，
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
         # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
-        # 直连优先（绕开系统代理的逐分片转发延迟），失败自动回退系统代理。
+        # 默认直连优先，失败后回退系统代理。
         resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
         try:
             if resp.status_code >= 400:
@@ -1464,7 +1462,7 @@ def proxy_url_for(url: str, headers: dict | None = None,
 
     headers 为空时直接返回原 URL（无防盗链头则无需代理，避免无谓起进程）。
     force_proxy：True 时该 URL 的所有上游转发一律走系统代理会话（跳过
-    直连探测）——用于直连不稳但系统代理稳定的源。
+    直连探测）；默认策略为直连优先、失败回退代理。
     """
     if not headers:
         return url
