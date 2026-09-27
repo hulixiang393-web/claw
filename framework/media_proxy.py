@@ -36,7 +36,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urljoin, unquote, quote
+from urllib.parse import urljoin, unquote, quote, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -83,6 +83,74 @@ _DIRECT_CONNECT_TIMEOUT = 3.0  # 直连 connect 短超时：被墙主机快速�
 _PROXY_SESSION_LOCK = threading.Lock()
 _DIRECT_SESSION_LOCK = threading.Lock()
 _DIRECT_FAIL_LOCK = threading.Lock()
+_UPSTREAM_DIAGNOSTICS_MAX = 128
+_UPSTREAM_DIAGNOSTICS = []
+_UPSTREAM_DIAGNOSTICS_LOCK = threading.Lock()
+
+
+def _classify_upstream_request_kind(target: str, headers: dict) -> str:
+    path = urlparse(target).path.lower()
+    if headers.get("Range"):
+        return "range"
+    if path.endswith((".m3u8", ".m3u")):
+        return "manifest"
+    if path.endswith((".key", ".key.bin", ".bin")) or "/key" in path:
+        return "key"
+    if path.endswith((".mp4", ".m4v", ".mov", ".webm")):
+        return "mp4"
+    if path.endswith((".ts", ".m4s", ".aac", ".mp3", ".webvtt", ".vtt")):
+        return "segment"
+    return "segment"
+
+
+def _diagnostic_failure(category: str, exc: Exception | None = None) -> str:
+    if category == "direct":
+        if isinstance(exc, requests.exceptions.SSLError):
+            return "direct_tls"
+        if isinstance(exc, requests.Timeout):
+            return "direct_timeout"
+        if isinstance(exc, requests.ConnectionError):
+            return "direct_connection"
+        return "direct_failure"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "proxy_tls"
+    if isinstance(exc, requests.Timeout):
+        return "proxy_timeout"
+    if isinstance(exc, requests.ConnectionError):
+        return "proxy_connection"
+    return "proxy_failure"
+
+
+def _record_upstream_diagnostic(target: str, headers: dict, route: str,
+                               started: float, response=None,
+                               failure_category: str | None = None) -> None:
+    elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None and status_code >= 400 and failure_category is None:
+        failure_category = f"{route}_http"
+    record = {
+        "host": urlparse(target).hostname,
+        "request_kind": _classify_upstream_request_kind(target, headers),
+        "route": route,
+        "status_code": status_code,
+        "elapsed_ms": elapsed_ms,
+        "first_byte_ms": elapsed_ms if response is not None else None,
+        "throughput_bps": None,
+        "failure_category": failure_category,
+    }
+    with _UPSTREAM_DIAGNOSTICS_LOCK:
+        _UPSTREAM_DIAGNOSTICS.append(record)
+        del _UPSTREAM_DIAGNOSTICS[:-_UPSTREAM_DIAGNOSTICS_MAX]
+
+
+def _read_upstream_route_diagnostics() -> list[dict]:
+    with _UPSTREAM_DIAGNOSTICS_LOCK:
+        return [dict(record) for record in _UPSTREAM_DIAGNOSTICS]
+
+
+def _reset_upstream_route_diagnostics() -> None:
+    with _UPSTREAM_DIAGNOSTICS_LOCK:
+        _UPSTREAM_DIAGNOSTICS.clear()
 
 
 def _make_session(trust_env: bool) -> requests.Session:
@@ -151,19 +219,25 @@ def _proxy_get(target: str, headers: dict):
 
 
 def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
-    """默认直连优先，失败后按 host 记忆并回退系统代理。
-
-    force_proxy=True 或 _PROXY_ONLY=True：跳过直连探测与 _DIRECT_FAIL 读写，
-    无条件走系统代理会话。代理失败直接抛出请求异常。
-    """
+    """默认直连优先，失败后按 host 记忆并回退系统代理。"""
     if force_proxy or _PROXY_ONLY:
-        return _proxy_get(target, headers)
-    from urllib.parse import urlparse
+        started = time.perf_counter()
+        try:
+            resp = _proxy_get(target, headers)
+        except requests.RequestException as exc:
+            _record_upstream_diagnostic(
+                target, headers, "proxy", started,
+                failure_category=_diagnostic_failure("proxy", exc),
+            )
+            raise
+        _record_upstream_diagnostic(target, headers, "proxy", started, resp)
+        return resp
 
     host = urlparse(target).netloc
     with _DIRECT_FAIL_LOCK:
         blocked = time.time() - _DIRECT_FAIL.get(host, 0.0) < _DIRECT_FAIL_TTL
     if not blocked:
+        started = time.perf_counter()
         try:
             resp = _get_direct_session().get(
                 target, headers=headers,
@@ -171,17 +245,35 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
             )
             if resp is not None:
                 if resp.status_code < 400:
+                    _record_upstream_diagnostic(target, headers, "direct", started, resp)
                     return resp
+                _record_upstream_diagnostic(target, headers, "direct", started, resp)
                 try:
-                    resp.close()  # 4xx/5xx：释放连接，走代理换出口
+                    resp.close()
                 except Exception:  # noqa: BLE001
                     pass
-        except requests.RequestException:  # noqa: BLE001 —— 直连不通/超时/SSL
-            pass
+        except requests.RequestException as exc:
+            _record_upstream_diagnostic(
+                target, headers, "direct", started,
+                failure_category=_diagnostic_failure("direct", exc),
+            )
         with _DIRECT_FAIL_LOCK:
             _DIRECT_FAIL[host] = time.time()
-    # 兼容旧直连优先策略：直连也不通时再试系统代理。
-    return _proxy_get(target, headers)
+    started = time.perf_counter()
+    try:
+        resp = _proxy_get(target, headers)
+    except requests.RequestException as exc:
+        _record_upstream_diagnostic(
+            target, headers, "proxy", started,
+            failure_category=("direct_failure_memory" if blocked
+                              else _diagnostic_failure("proxy", exc)),
+        )
+        raise
+    _record_upstream_diagnostic(
+        target, headers, "proxy", started, resp,
+        failure_category="direct_failure_memory" if blocked else None,
+    )
+    return resp
 
 
 def _parse_range_start(rng: str | None) -> int | None:

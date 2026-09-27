@@ -11,6 +11,7 @@
 - 端到端：默认直连，force 请求走代理；老三元组 token 兼容
 """
 import re
+import threading
 
 import requests
 
@@ -198,6 +199,93 @@ class _FakeResp403:
 
     def close(self):
         self.closed = True
+
+
+# --------------------------------------------------------------------- #
+# 上游路由诊断
+# --------------------------------------------------------------------- #
+def test_route_diagnostics_records_direct_success_without_sensitive_data(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    mp._reset_upstream_route_diagnostics()
+
+    mp._fetch_upstream(
+        "https://user:secret@cdn.example.com/video/index.m3u8?token=secret",
+        {"Authorization": "Bearer secret"},
+    )
+
+    records = mp._read_upstream_route_diagnostics()
+    assert len(records) == 1
+    assert set(records[0]) == {
+        "host", "request_kind", "route", "status_code", "elapsed_ms",
+        "first_byte_ms", "throughput_bps", "failure_category",
+    }
+    assert records[0]["host"] == "cdn.example.com"
+    assert records[0]["request_kind"] == "manifest"
+    assert records[0]["route"] == "direct"
+    assert records[0]["status_code"] == 200
+    assert records[0]["failure_category"] is None
+    assert all("secret" not in repr(value) for value in records[0].values())
+
+
+def test_route_diagnostics_records_direct_failure_and_proxy_fallback(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, dex=requests.ConnectionError())
+    mp._reset_upstream_route_diagnostics()
+
+    mp._fetch_upstream("https://cdn.example.com/seg/001.ts", {})
+
+    records = mp._read_upstream_route_diagnostics()
+    assert [record["route"] for record in records] == ["direct", "proxy"]
+    assert records[0]["request_kind"] == "segment"
+    assert records[0]["status_code"] is None
+    assert records[0]["failure_category"] == "direct_connection"
+    assert records[1]["status_code"] == 200
+    assert records[1]["failure_category"] is None
+
+
+def test_route_diagnostics_classifies_request_kinds():
+    assert mp._classify_upstream_request_kind("https://x/a.m3u8", {}) == "manifest"
+    assert mp._classify_upstream_request_kind("https://x/key.bin", {"Accept": "*/*"}) == "key"
+    assert mp._classify_upstream_request_kind("https://x/movie.mp4", {}) == "mp4"
+    assert mp._classify_upstream_request_kind("https://x/segment.ts", {}) == "segment"
+    assert mp._classify_upstream_request_kind("https://x/video", {"Range": "bytes=0-1"}) == "range"
+
+
+def test_route_diagnostics_is_bounded_and_thread_safe(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    mp._reset_upstream_route_diagnostics()
+    monkeypatch.setattr(mp, "_UPSTREAM_DIAGNOSTICS_MAX", 2)
+
+    def fetch():
+        mp._fetch_upstream("https://cdn.example.com/a.mp4", {})
+
+    threads = [threading.Thread(target=fetch) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    records = mp._read_upstream_route_diagnostics()
+    assert len(records) == 2
+    mp._reset_upstream_route_diagnostics()
+    assert mp._read_upstream_route_diagnostics() == []
+
+
+def test_route_diagnostics_records_forced_proxy_failure(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, pex=requests.Timeout())
+    mp._reset_upstream_route_diagnostics()
+
+    with pytest.raises(requests.RequestException):
+        mp._fetch_upstream("https://cdn.example.com/key", {}, force_proxy=True)
+
+    records = mp._read_upstream_route_diagnostics()
+    assert len(records) == 1
+    assert records[0]["route"] == "proxy"
+    assert records[0]["request_kind"] == "key"
+    assert records[0]["failure_category"] == "proxy_timeout"
 
 
 # --------------------------------------------------------------------- #
