@@ -81,6 +81,11 @@ def network_defaults_from_settings(settings) -> NetworkDefaults:
     )
 
 
+def _make_reading_progress(path: Path, shelf_cb, repository=None):
+    from framework.reading_progress import ReadingProgress
+    return ReadingProgress(path, shelf_cb=shelf_cb, repository=repository)
+
+
 def _app_base_dir() -> Path:
     """应用根目录：PyInstaller 打包后为 exe 所在目录（sources/data/docs 随 exe 旁），
     开发运行时为项目根（gui/ 的上一级）。"""
@@ -222,8 +227,6 @@ class MainWindow(QMainWindow):
         from framework.shelf_cache_migration import migrate_legacy_data
         from framework.library_store import LibraryStore
         from framework.shelf_service import ShelfService
-        from framework.reading_progress import ReadingProgress
-
         from framework.cache_service import get_shelf_cache, get_search_cache
         shelf_cache = None
         try:
@@ -237,10 +240,10 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             self.shelf_cache_repository = None
-        self.reading_progress = ReadingProgress(
+        self.reading_progress = _make_reading_progress(
             base_dir / "data" / "reading_progress.json",
-            shelf_cb=self._favorite_has,
-            repository=self.shelf_cache_repository,
+            self._favorite_has,
+            self.shelf_cache_repository,
         )
         if self.shelf_cache_repository is not None:
             try:
@@ -258,6 +261,10 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 self.shelf_cache_repository = None
+                self.reading_progress = _make_reading_progress(
+                    base_dir / "data" / "reading_progress.json",
+                    self._favorite_has,
+                )
         self.reading_progress.prune(shelf_cb=self._favorite_has)
 
         # 爬取执行链（网络默认值从 settings 接线：impersonate/user_agents 默认关闭）

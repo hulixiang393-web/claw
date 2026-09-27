@@ -217,15 +217,31 @@ class Content:
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         return utils.abs_url(source.base_url, url)
 
+    def _repository_cache_parts(self, key: str):
+        kind, source_id, url = key.split(":", 2)
+        return kind, url
+
     def _cache_get(self, key: str):
+        if self._repository is not None:
+            kind, url = self._repository_cache_parts(key)
+            value = self._repository.get_content(url, kind)
+            if value is not None:
+                if kind == "pages" and isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except json.JSONDecodeError:
+                        return None
+                return value
         if self._cache is not None:
             return self._cache.get(key)
-        if self._repository is not None:
-            book_key, chapter_key = key.split(":", 2)[1:]
-            return self._repository.get_content(book_key, chapter_key)
         return None
 
     def _cache_set(self, key: str, value, ttl=None) -> None:
+        kind, source_id, url = key.split(":", 2)
+        if self._repository is not None:
+            self._repository.upsert_book(url, source_id, url, "", {})
+            payload = json.dumps(value, ensure_ascii=False) if kind == "pages" else value
+            self._repository.put_content(url, kind, "application/json" if kind == "pages" else "text/plain", payload, {})
         if self._cache is not None:
             self._cache.set(key, value, ttl=ttl)
 
@@ -1272,8 +1288,8 @@ class Content:
             break  # 基路径不同 → 是真正的下一章或重复，停止分页
         text = "\n".join(pages)
         # 末尾：写 body: 键（7 天，shelf 池）
-        if self._cache is not None and text:
-            self._cache.set(
+        if text:
+            self._cache_set(
                 f"body:{source.source_id}:{self._abs_url(source, url)}",
                 text,
                 ttl=7 * 86400,
@@ -1294,7 +1310,7 @@ class Content:
 
         chapters：可迭代对象，元素含 .url 属性。current_idx 为当前章下标。
         """
-        if self._cache is None or not chapters:
+        if self._cache is None and self._repository is None or not chapters:
             return
         end = min(current_idx + ahead, len(chapters))
         for i in range(current_idx, end):
@@ -1304,7 +1320,7 @@ class Content:
                 continue
             abs_url = self._abs_url(source, url)
             key = f"body:{source.source_id}:{abs_url}"
-            if self._cache.get(key) is not None:
+            if self._cache_get(key) is not None:
                 continue  # 已缓存
             try:
                 text = self.fetch_chapter(source, url)
@@ -1312,7 +1328,7 @@ class Content:
                 log.warning("[cache] 预加载失败 %s: %s", url, exc)
                 continue
             if text:
-                self._cache.set(key, text, ttl=7 * 86400)
+                self._cache_set(key, text, ttl=7 * 86400)
 
     def _fetch_chapter_page(
         self, source: SourceConfig, url: str, pag_enabled: bool = True
@@ -1527,18 +1543,17 @@ class Content:
         循环里检查并提前返回（已抓到的部分），旧书取流立即让路给新书，不再
         白跑完一整话（dm5 一话 39 页 ≈74s）。None 表示不取消（下载器等同步调用）。
         """
-        if self._cache is not None:
-            abs_url = self._abs_url(source, chapter_url)
-            cached = self._cache.get(f"pages:{source.source_id}:{abs_url}")
-            if cached is not None:
-                if on_page and cached:
-                    on_page(list(cached))
-                return cached
+        abs_url = self._abs_url(source, chapter_url)
+        cached = self._cache_get(f"pages:{source.source_id}:{abs_url}")
+        if cached is not None:
+            if on_page and cached:
+                on_page(list(cached))
+            return cached
         imgs = self._fetch_comic_pages_impl(
             source, chapter_url, on_page=on_page, cancel_evt=cancel_evt
         )
-        if self._cache is not None and imgs:
-            self._cache.set(
+        if imgs:
+            self._cache_set(
                 f"pages:{source.source_id}:{self._abs_url(source, chapter_url)}",
                 list(imgs),
                 ttl=7 * 86400,

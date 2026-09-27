@@ -11,6 +11,15 @@ from framework.shelf_cache_repository import ShelfCacheRepository
 from framework.shelf_service import ShelfService
 
 
+def test_startup_fallback_rebuilds_progress_without_repository(tmp_path):
+    from gui.app import _make_reading_progress
+
+    repo = object()
+    progress = _make_reading_progress(tmp_path / "progress.json", lambda _: False)
+    assert progress._repository is None
+    assert repo is not progress._repository
+
+
 def make_repo(tmp_path: Path) -> ShelfCacheRepository:
     return ShelfCacheRepository(tmp_path / "shelf.sqlite3", tmp_path / "content")
 
@@ -56,6 +65,26 @@ def test_second_startup_is_idempotent_and_does_not_regress_newer_location(tmp_pa
     assert repo.get_book_snapshot("https://book/1")["location"]["chapter_url"] == "new"
     assert first.imported_locations == 0
     assert second.imported_locations == 0
+
+
+def test_migrates_legacy_chapter_directory(tmp_path: Path):
+    progress_path = tmp_path / "reading_progress.json"
+    progress_path.write_text(json.dumps({"https://book/1": {
+        "source_id": "src", "book_url": "https://book/1", "content_type": "novel",
+        "chapter_url": "https://book/1/c2", "chapter_title": "Chapter 2",
+        "updated_at": "2026-09-28T10:00:00"
+    }}), encoding="utf-8")
+    chapter_dir = tmp_path / "chapters" / "src" / "book-1"
+    chapter_dir.mkdir(parents=True)
+    (chapter_dir / "c1.json").write_text(json.dumps({"chapter_key": "c1", "title": "One", "url": "u1"}), encoding="utf-8")
+    (chapter_dir / "c2.json").write_text(json.dumps({"chapter_key": "c2", "title": "Two", "url": "u2"}), encoding="utf-8")
+    shelf = ShelfService(tmp_path / "downloads", data_dir=tmp_path / "data")
+    repo = make_repo(tmp_path)
+
+    report = migrate_legacy_data(repo, progress_path, shelf, None, legacy_chapters_root=tmp_path / "chapters")
+
+    assert report.imported_chapters == 2
+    assert [c["chapter_key"] for c in repo.get_book_snapshot("https://book/1")["chapters"]] == ["c1", "c2"]
 
 
 def test_failed_migration_keeps_legacy_files_usable(tmp_path: Path):

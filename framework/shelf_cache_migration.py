@@ -4,6 +4,7 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,7 @@ def _newer(candidate: dict, existing: dict | None) -> bool:
     return _timestamp(candidate) > _timestamp(existing)
 
 
-def migrate_legacy_data(repository, reading_progress_path, shelf_service, legacy_cache) -> MigrationReport:
+def migrate_legacy_data(repository, reading_progress_path, shelf_service, legacy_cache, legacy_chapters_root=None) -> MigrationReport:
     progress_path = Path(reading_progress_path)
     raw = {}
     if progress_path.exists():
@@ -63,6 +64,33 @@ def migrate_legacy_data(repository, reading_progress_path, shelf_service, legacy
         if location and _newer(location, existing_location):
             repository.update_location(book_key, location)
             imported_locations += 1
+
+    chapters_root = Path(legacy_chapters_root) if legacy_chapters_root else None
+    if chapters_root and chapters_root.is_dir():
+        for book_key in keys:
+            snapshot = repository.get_book_snapshot(book_key)
+            if snapshot and snapshot.get("chapters"):
+                continue
+            record = progress_records.get(book_key) or {}
+            source_id = record.get("source_id", "")
+            slug = str(book_key).rstrip("/").rsplit("/", 1)[-1]
+            normalized = re.sub(r"[^A-Za-z0-9]+", "-", str(book_key).rstrip("/").split("://")[-1]).strip("-")
+            names = {slug, normalized}
+            candidates = [p for p in chapters_root.rglob("*") if p.is_dir() and p.name in names]
+            if source_id:
+                candidates = [p for p in candidates if p.parent.name == source_id] or candidates
+            chapters = []
+            for directory in candidates:
+                for path in sorted(directory.glob("*.json")):
+                    try:
+                        item = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if isinstance(item, dict) and item.get("chapter_key"):
+                        chapters.append(item)
+            if chapters:
+                repository.replace_chapters(book_key, chapters)
+                imported_chapters += len(chapters)
 
     if legacy_cache is not None:
         for key in legacy_cache.scan("*"):
