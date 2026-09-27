@@ -11,6 +11,25 @@ from framework.shelf_cache_repository import ShelfCacheRepository
 from framework.shelf_service import ShelfService
 
 
+def test_startup_migration_passes_chapter_root_and_imports_sqlite_chapters(tmp_path):
+    from gui.app import _run_startup_migration
+
+    progress_path = tmp_path / "data" / "reading_progress.json"
+    progress_path.parent.mkdir(parents=True)
+    progress_path.write_text(json.dumps({"https://book/1": {
+        "source_id": "src", "book_url": "https://book/1", "content_type": "novel"
+    }}), encoding="utf-8")
+    chapter_dir = tmp_path / "data" / "chapters" / "src" / "book-1"
+    chapter_dir.mkdir(parents=True)
+    (chapter_dir / "c1.json").write_text(json.dumps({"chapter_key": "c1", "title": "One"}), encoding="utf-8")
+    repo = make_repo(tmp_path)
+    shelf = ShelfService(tmp_path / "downloads", data_dir=tmp_path / "data")
+
+    _run_startup_migration(repo, progress_path, shelf, None, tmp_path)
+
+    assert repo.get_book_snapshot("https://book/1")["chapters"] == [{"chapter_key": "c1", "title": "One"}]
+
+
 def test_startup_fallback_rebuilds_progress_without_repository(tmp_path):
     from gui.app import _make_reading_progress
 
@@ -44,8 +63,30 @@ def test_first_startup_migrates_progress_shelf_and_cache(tmp_path: Path):
     assert snapshot["metadata"]["title"] == "Book"
     assert snapshot["location"]["chapter_url"] == "https://book/1/c2"
     assert snapshot["content"]
-    assert report.imported_books == 1
+    assert report.imported_books == 2
     assert progress_path.with_suffix(progress_path.suffix + ".bak").exists()
+
+
+def test_migrated_body_is_served_by_repository_first_content(tmp_path: Path):
+    progress_path = tmp_path / "reading_progress.json"
+    progress_path.write_text(json.dumps({"https://book/1": {
+        "source_id": "src", "book_url": "https://book/1", "content_type": "novel"
+    }}), encoding="utf-8")
+    shelf = ShelfService(tmp_path / "downloads", data_dir=tmp_path / "data")
+    cache = RedisLikeStore(1024 * 1024)
+    cache.set("body:src:https://book/1/c2", "migrated body")
+    repo = make_repo(tmp_path)
+    migrate_legacy_data(repo, progress_path, shelf, cache)
+
+    from framework.content import Content
+    from tests.test_cache_service import _fake_checker, _fake_parser, _fake_source
+
+    class OfflineHttp:
+        defaults = type("D", (), {"timeout": 1, "retries": 0, "interval_ms": 0})()
+        def get_text(self, *args, **kwargs):
+            raise AssertionError("network must not be used")
+    content = Content(OfflineHttp(), _fake_parser(), _fake_checker(), repository=repo)
+    assert content.fetch_chapter(_fake_source(), "https://book/1/c2") == "migrated body"
 
 
 def test_second_startup_is_idempotent_and_does_not_regress_newer_location(tmp_path: Path):
@@ -87,9 +128,12 @@ def test_migrates_legacy_chapter_directory(tmp_path: Path):
     assert [c["chapter_key"] for c in repo.get_book_snapshot("https://book/1")["chapters"]] == ["c1", "c2"]
 
 
-def test_failed_migration_keeps_legacy_files_usable(tmp_path: Path):
+def test_failed_migration_keeps_legacy_progress_readable_and_writable(tmp_path: Path):
     progress_path = tmp_path / "reading_progress.json"
-    progress_path.write_text(json.dumps({"https://book/1": {"chapter_url": "c1"}}), encoding="utf-8")
+    progress_path.write_text(json.dumps({"https://book/1": {
+        "source_id": "src", "book_url": "https://book/1", "content_type": "novel",
+        "chapter_url": "c1", "chapter_title": "One"
+    }}), encoding="utf-8")
     shelf = ShelfService(tmp_path / "downloads", data_dir=tmp_path / "data")
     class BrokenRepository:
         def upsert_book(self, *args, **kwargs):
@@ -99,5 +143,8 @@ def test_failed_migration_keeps_legacy_files_usable(tmp_path: Path):
         migrate_legacy_data(BrokenRepository(), progress_path, shelf, None)
     except RuntimeError:
         pass
-    assert json.loads(progress_path.read_text(encoding="utf-8"))["https://book/1"]["chapter_url"] == "c1"
+    progress = ReadingProgress(progress_path)
+    assert progress.resume("https://book/1")["chapter_url"] == "c1"
+    progress.save("src", "https://book/1", "novel", "c2", "Two")
+    assert ReadingProgress(progress_path).resume("https://book/1")["chapter_url"] == "c2"
     assert not progress_path.with_suffix(progress_path.suffix + ".bak").exists()

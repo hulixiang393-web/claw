@@ -86,6 +86,21 @@ def _make_reading_progress(path: Path, shelf_cb, repository=None):
     return ReadingProgress(path, shelf_cb=shelf_cb, repository=repository)
 
 
+def _legacy_chapters_root(base_dir: Path) -> Path:
+    return base_dir / "data" / "chapters"
+
+
+def _run_startup_migration(repository, progress_path, shelf_service, legacy_cache, base_dir):
+    from framework.shelf_cache_migration import migrate_legacy_data
+    return migrate_legacy_data(
+        repository,
+        progress_path,
+        shelf_service,
+        legacy_cache,
+        legacy_chapters_root=_legacy_chapters_root(base_dir),
+    )
+
+
 def _app_base_dir() -> Path:
     """应用根目录：PyInstaller 打包后为 exe 所在目录（sources/data/docs 随 exe 旁），
     开发运行时为项目根（gui/ 的上一级）。"""
@@ -224,7 +239,6 @@ class MainWindow(QMainWindow):
         self.source_manager.set_cookie_provider(self.cookie_manager.to_cookie_header)
         self.search_history = SearchHistory(base_dir / "data" / "search_history.json")
         from framework.shelf_cache_repository import ShelfCacheRepository
-        from framework.shelf_cache_migration import migrate_legacy_data
         from framework.library_store import LibraryStore
         from framework.shelf_service import ShelfService
         from framework.cache_service import get_shelf_cache, get_search_cache
@@ -253,11 +267,12 @@ class MainWindow(QMainWindow):
                     library_store=legacy_store,
                     data_dir=base_dir / "data",
                 )
-                migrate_legacy_data(
+                _run_startup_migration(
                     self.shelf_cache_repository,
                     base_dir / "data" / "reading_progress.json",
                     legacy_shelf,
                     shelf_cache,
+                    base_dir,
                 )
             except Exception:
                 self.shelf_cache_repository = None

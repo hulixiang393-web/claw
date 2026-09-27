@@ -40,3 +40,13 @@ Migrated legacy reading progress, shelf metadata, and shelf cache data into `She
 - Required regression set including cross-book restore: 42 passed.
 - `python -m compileall -q framework gui tests`: passed.
 - `git diff --check`: passed.
+
+## Final Review Fixes
+- Wired production startup to `data/chapters` through `_run_startup_migration`, with a startup-level SQLite chapter import test.
+- Standardized repository content identity as `(exact cached URL, cache kind)` for migration, chapter fetch, precache, and comic-page paths; migrated content is served without network access.
+- Replaced the weak failure assertion with a JSON read/write continuity test after migration failure.
+
+## Final Review Verification
+- Focused migration/progress/content/regression tests: 44 passed.
+- `python -m compileall -q framework gui tests`: passed.
+- `git diff --check`: passed.

@@ -101,7 +101,7 @@ def migrate_legacy_data(repository, reading_progress_path, shelf_service, legacy
             if len(parts) != 3 or parts[0] not in {"page", "body", "pages", "cover"}:
                 continue
             kind, source_id, url = parts
-            book_key = url.rsplit("/", 1)[0] if kind in {"body", "pages", "cover"} else url
+            book_key = url
             if repository.get_book_snapshot(book_key) is None:
                 repository.upsert_book(book_key, source_id, url, "", {})
                 imported_books += 1
