@@ -46,7 +46,9 @@ _SERIES_MAX_MRL = 300
 _SERIES_MAX_CMD = 30000
 
 # 启动握手：等 VLC 建好播放列表（读 playlist.json）并按 uri 匹配起始项。
-# 超时/解析失败即降级为 autostart 播第 1 集——不致命。
+# 超时/解析失败会记 warning。**别指望它降级成「自动播第 1 集」**：超时只在
+# start_idx>0（带 --no-playlist-autostart）时才可能发生，所以真实后果是
+# 「列表已载入、什么都不播」的黑窗，而不是不致命的错播首集。
 _HANDSHAKE_TIMEOUT = 3.0
 _HANDSHAKE_INTERVAL = 0.1
 
@@ -495,6 +497,11 @@ def player_playlist_items(timeout: float = 2.0,
     返回 [{id, name, uri, current}, ...]；无控制会话 / 网络失败 / 状态码
     >=400 / 响应非 list 一律返回 []。**失败结果不缓存**（下次调用重试）。
     refresh=True 强制重新拉（握手轮询 VLC 尚未建好列表时需要）。
+
+    **id 已归一化成 int**：VLC 的 httprequests.lua 用 `tostring(item.id)`
+    序列化，playlist.json 里 id 一律是字符串；pl_play&id= 与 App 切集都按整数
+    项 id 用，所以在这里一次性转好，消费方不必各自 int()。转不成 int 的 id
+    保留原值（**不丢整项**——项数与顺序是有效信息），由消费方自行守卫。
     """
     global _playlist_items
     if _playlist_items and not refresh:
@@ -514,7 +521,18 @@ def player_playlist_items(timeout: float = 2.0,
         return []
     if not isinstance(items, list):
         return []
-    _playlist_items = [it for it in items if isinstance(it, dict)]
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        # id 归一化：VLC 发的是字符串（httprequests.lua: tostring(item.id)），
+        # 而 pl_play&id= / App 切集都按整数项 id 用。转不成就留着原值。
+        try:
+            it["id"] = int(it["id"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        out.append(it)
+    _playlist_items = out
     return _playlist_items
 
 
@@ -637,29 +655,41 @@ def _handshake_worker(start_idx: int, series: list[tuple[int, str]],
     series 是入列的 [(集下标, MRL), ...]（全集 1..N，或降级后的当前集往后窗口）。
     映射**按 uri 匹配**得出，不做下标推算：VLC 列表顺序未必等于入列顺序，
     且下标推算只在「窗口从当前集起」时成立——全集入列时会整体错位。
-    超时即降级：VLC 按 --no-playlist-autostart 行为播放，App 侧映射留空 →
-    切集回落到重开 VLC。
+    超时即放弃并记 warning：App 侧映射留空 → 切集回落到重开 VLC。
 
     起始集**未必在 series 里**（显式 start_idx 指向的集 URL 为空时会被
-    _fit_series 跳过）→ 匹配不到就不发 pl_play，静默降级 autostart。
+    _fit_series 跳过）→ 匹配不到就不发 pl_play。注意这**不是**「降级去播第 1
+    集」：start_idx>0 时带着 --no-playlist-autostart，放弃的结果是列表载入
+    而什么都不播（黑窗），所以必须留日志。
     """
     deadline = time.monotonic() + _HANDSHAKE_TIMEOUT
     bases = [(idx, mrl.split("#", 1)[0]) for idx, mrl in (series or [])]
+    seen_items = 0
+    seen_matched = 0
     while True:
         items = player_playlist_items(timeout=1.0, refresh=True)
+        seen_items = max(seen_items, len(items))
         if items:
             mapping: dict[int, int] = {}
             start_id = None
+            claimed: set[int] = set()   # 已占用的集下标：同 MRL 重复入列取首个
             for item in items:
                 iid = item.get("id")
+                # player_playlist_items 已把 id 归一化成 int；这里再挡一道是
+                # 守类型契约：转不成 int 的（None/"abc"）绝不能进映射，也不能
+                # 拿去 pl_play——那会让 App 侧以为该集「可切」而不回落重开。
                 if not isinstance(iid, int):
-                    continue        # 假 id 进映射 → App 切集拿着它 pl_play 静默失败
+                    continue
                 for idx, base in bases:
-                    if _item_matches(item, base):
+                    # 首个匹配下标胜出：同一条 MRL 入列两次时，VLC 侧只有一项，
+                    # 后面的下标本来就定位不到，显式占用比「后写覆盖」清楚。
+                    if idx not in claimed and _item_matches(item, base):
+                        claimed.add(idx)
                         mapping[idx] = iid
                         if idx == start_idx:
                             start_id = iid
                         break
+            seen_matched = max(seen_matched, len(mapping))
             if on_playlist_ready is not None and mapping:
                 try:
                     on_playlist_ready(mapping)
@@ -670,5 +700,14 @@ def _handshake_worker(start_idx: int, series: list[tuple[int, str]],
                     player_goto(start_id)   # 失败即降级 autostart，不重试
                 return                      # 首集：原生 autostart 已对
         if time.monotonic() >= deadline:
+            # 超时的唯一用户可见后果是 VLC 列表建好了却**什么都没播**（黑窗）。
+            # 这条路径静默返回 = 现场无从排查，必须留日志。匹配数可能非 0：
+            # 起始集被 _fit_series 跳过时，其余集照样能匹配上。
+            log.warning(
+                "VLC 启动握手超时（%.1fs）：playlist.json 最多读到 %d 项，"
+                "按 uri 匹配上 %d 项；VLC 已是「列表已载入但不播放」状态"
+                "（非首集开播带了 --no-playlist-autostart）。",
+                _HANDSHAKE_TIMEOUT, seen_items, seen_matched,
+            )
             return
         time.sleep(_HANDSHAKE_INTERVAL)

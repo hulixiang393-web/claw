@@ -608,18 +608,58 @@ def test_handshake_first_episode_no_goto(monkeypatch):
     assert ready == {0: 21}
 
 
-def test_handshake_skips_non_int_item_ids(monkeypatch):
-    """id 非 int 的项既不进映射、也不拿去 pl_play（id 必须是整数项 id）。
+def _serve_playlist(monkeypatch, payload):
+    """让真的 player_playlist_items 读到 payload（只 stub HTTP 与控制态）。
 
-    混进去会让 App 侧切集拿着 "12"/None 去发 pl_play&id=，静默失败；更糟的是
-    映射里出现假 id 后，Task 7 认为该集「可切」而不回落重开 VLC。
+    握手的 id 归一化发生在 player_playlist_items 里，所以「字符串 id 能用」
+    这类断言必须走真函数——直接 stub 掉它会把归一化那段代码从测试里摘出去。
+    """
+    class _R:
+        status_code = 200
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr(ep, "_control_state",
+                        {"host": "127.0.0.1", "port": 8090, "password": "pw"})
+    monkeypatch.setattr(ep, "_playlist_items", [])
+    monkeypatch.setattr(ep.requests, "get",
+                        lambda *a, **k: _R())
+
+
+def test_handshake_coerces_string_item_ids(monkeypatch):
+    """真 VLC 的 id 是**字符串**（httprequests.lua: result.id=tostring(item.id)）。
+
+    握手必须把 "12" 当成 12 用。若按「非 int 就跳过」处理，映射恒空、pl_play
+    永不发出——而非首集开播恰恰带着 --no-playlist-autostart，结果是 VLC 窗口
+    黑着什么都不播。
     """
     monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
     monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
-    monkeypatch.setattr(ep, "player_playlist_items",
-                        lambda timeout=2.0, refresh=False: [
-                            {"id": "12", "uri": "http://x/e/k/1"},
-                            {"id": None, "uri": "http://x/e/k/0"}])
+    _serve_playlist(monkeypatch, [
+        {"id": "11", "uri": "http://x/e/k/0"},
+        {"id": "12", "uri": "http://x/e/k/1"}])
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    ready = {}
+    ep._handshake_worker(1, [(0, "http://x/e/k/0"), (1, "http://x/e/k/1")],
+                        lambda m: ready.update(m))
+    assert ready == {0: 11, 1: 12}   # 字符串 id 归一化成 int
+    assert got == [12]                # 传给 pl_play 的也是 int，不是 "12"
+
+
+def test_handshake_skips_unusable_item_ids(monkeypatch):
+    """转不成 int 的 id（None / 非数字串）既不进映射、也不拿去 pl_play。
+
+    这类 id 发给 pl_play&id= 会静默失败；更糟的是映射里留下假 id 后 Task 7 会
+    认为该集「可切」而不回落重开 VLC。注意是**转不成**才跳过，不是「非 int 就
+    跳过」——真 VLC 发的就是字符串。
+    """
+    monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
+    _serve_playlist(monkeypatch, [
+        {"id": "abc", "uri": "http://x/e/k/0"},
+        {"id": None, "uri": "http://x/e/k/1"}])
     got = []
     monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
     ready = {}
@@ -646,6 +686,75 @@ def test_handshake_timeout_does_not_raise(monkeypatch):
     # 真的轮询到超时才收手：一次就放弃的话映射/定位都失去了「等 VLC 就绪」的意义
     assert polls["n"] >= 2
     assert got == []       # 空映射不回调、不发 pl_play
+
+
+def test_handshake_timeout_logs_warning(monkeypatch, caplog):
+    """握手超时要留日志。
+
+    静默超时是唯一「屏幕黑着什么都不播」的故障，没日志就只能靠猜；design doc
+    的握手条款也明确要求超时/获取失败记日志。
+    """
+    monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
+    # 有列表项、但一个都没匹配上——比「列表压根是空的」更值得怀疑
+    _serve_playlist(monkeypatch, [
+        {"id": "7", "uri": "http://x/other/k/9"},
+        {"id": "8", "uri": "http://x/other/k/10"},
+        {"id": "9", "uri": "http://x/other/k/11"}])
+    monkeypatch.setattr(ep, "player_goto", lambda i: True)
+    with caplog.at_level(logging.WARNING, logger="framework.external_player"):
+        ep._handshake_worker(1, [(1, "http://x/e/k/1")], None)
+    warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warns) == 1
+    text = warns[0].getMessage()
+    assert "握手超时" in text    # 说清是握手超时，不是别的告警
+    assert "3 项" in text        # 读到几项：3
+    assert "0 项" in text        # 匹配上几项：0（现场据此分辨是「没列表」还是「对不上」）
+    assert "--no-playlist-autostart" in text   # 点明「黑窗」这个真实后果
+
+
+def test_handshake_timeout_logs_matched_count(monkeypatch, caplog):
+    """超时时「匹配上几项」要报真实数字，不能写死 0。
+
+    超时也可能发生在**匹配到了一部分、只是没匹配到起始集**时（显式 start_idx
+    指向的集被 _fit_series 跳过）。这时报 0 项会把排查引向错误方向。
+    """
+    monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
+    # 下标 0 能匹配上，但 start_idx=5 不在 series 里 → 匹配 1 项、定位不到
+    _serve_playlist(monkeypatch, [
+        {"id": "3", "uri": "http://x/e/k/0"},
+        {"id": "4", "uri": "http://x/other/k/9"}])
+    monkeypatch.setattr(ep, "player_goto", lambda i: True)
+    with caplog.at_level(logging.WARNING, logger="framework.external_player"):
+        ep._handshake_worker(5, [(0, "http://x/e/k/0")], None)
+    warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warns) == 1
+    text = warns[0].getMessage()
+    assert "1 项" in text     # 真实匹配数是 1
+    assert "0 项" not in text  # 不能写死 0
+
+
+def test_handshake_duplicate_mrl_first_index_wins(monkeypatch):
+    """series 里同一条 MRL 入列两次 → 每个 VLC 项认领一个下标，先到先得。
+
+    两条相同的 MRL 会在 VLC 里变成两项。内层循环原本的 break 只保证「单个
+    VLC 项不认领两个下标」，但**后一个 VLC 项仍会覆盖前一个认领的下标**
+    （start_id 也跟着变成最后那个）。加 claimed 守卫后是 5→下标0、6→下标1，
+    两集各自可切；否则下标0 的 id 会被静默改写成 6。
+    """
+    monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
+    _serve_playlist(monkeypatch, [
+        {"id": 5, "uri": "http://x/e/k/1"},
+        {"id": 6, "uri": "http://x/e/k/1"}])
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    ready = {}
+    ep._handshake_worker(0, [(0, "http://x/e/k/1"), (1, "http://x/e/k/1")],
+                        lambda m: ready.update(m))
+    assert ready == {0: 5, 1: 6}   # 两项各认领一个下标，没有 {0: 6} 的覆盖
+    assert got == []               # start_idx=0 是首集：只建映射不发 pl_play
 
 
 def test_start_playlist_sync_runs_in_background(monkeypatch):

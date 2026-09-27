@@ -238,6 +238,29 @@ def test_playlist_items_parsed_and_cached(monkeypatch):
     assert len(calls) == 2
 
 
+def test_playlist_items_normalizes_string_ids(monkeypatch):
+    """VLC 发的是**字符串** id（httprequests.lua: result.id=tostring(item.id)）。
+
+    必须在 player_playlist_items 这一个地方归一化：握手按 id 发 pl_play、App
+    侧按 id 切集，都假定 int。不归一化的话「非 int 就跳过」会把每一项都丢掉，
+    映射恒空。
+    """
+    _state(monkeypatch)
+    monkeypatch.setattr(ep.requests, "get", lambda *a, **k: _Resp(200, [
+        {"id": "1", "name": "第01集", "uri": "http://x/e/k/0"},
+        {"id": "2", "name": "第02集", "uri": "http://x/e/k/1"}]))
+    items = ep.player_playlist_items()
+    assert [it["id"] for it in items] == [1, 2]        # "1" -> 1
+    assert all(isinstance(it["id"], int) for it in items)
+    # 其余字段原样透传
+    assert items[0]["uri"] == "http://x/e/k/0"
+    # 转不成 int 的保留原值（不丢项：项数是有效信息），由消费方自行守卫
+    monkeypatch.setattr(ep.requests, "get", lambda *a, **k: _Resp(200, [
+        {"id": "abc", "uri": "http://x/e/k/0"}]))
+    assert ep.player_playlist_items(refresh=True) == [
+        {"id": "abc", "uri": "http://x/e/k/0"}]
+
+
 def test_playlist_items_failure_returns_empty(monkeypatch):
     _state(monkeypatch)
     monkeypatch.setattr(ep.requests, "get",
