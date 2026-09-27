@@ -244,14 +244,18 @@ def test_force_proxy_never_falls_back_to_direct(monkeypatch):
     assert mp._DIRECT_FAIL == {}
 
 
-class _FakeResp403:
-    status_code = 403
-
-    def __init__(self):
+class _FakeRespHttpError:
+    def __init__(self, status_code):
+        self.status_code = status_code
         self.closed = False
 
     def close(self):
         self.closed = True
+
+
+class _FakeResp403(_FakeRespHttpError):
+    def __init__(self):
+        super().__init__(403)
 
 
 # --------------------------------------------------------------------- #
@@ -492,16 +496,19 @@ def test_force_proxy_connection_failure_is_explicit_502(monkeypatch):
         proxy.stop()
 
 
-def test_force_proxy_upstream_http_error_is_explicit_at_local_s_url(monkeypatch):
+@pytest.mark.parametrize("status_code", [403, 500])
+def test_force_proxy_upstream_http_error_is_explicit_at_local_s_url(
+        monkeypatch, status_code):
     dlog, plog = [], []
-    _install_sessions(monkeypatch, dlog, plog, presp=_FakeResp403())
+    _install_sessions(monkeypatch, dlog, plog,
+                      presp=_FakeRespHttpError(status_code))
     proxy = MediaProxy(cache=_OffCache())
     proxy._ensure_server()
     try:
         local = proxy.build_url("http://up.example/video.mp4",
                                 {"Referer": "https://fake/"}, force_proxy=True)
         response = requests.get(local, timeout=10)
-        assert response.status_code == 403
+        assert response.status_code == status_code
         assert response.status_code != 200
         assert response.content
         assert dlog == []

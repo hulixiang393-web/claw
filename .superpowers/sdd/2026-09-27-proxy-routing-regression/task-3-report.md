@@ -76,3 +76,15 @@ python -m pytest tests/test_media_proxy_force.py tests/test_media_proxy_stream_t
 ```
 
 `git diff --check` passed after the test edit. The protected `sources/fanqie.json.bak-fanqie-categories` file remained untouched.
+
+## Review Fix Follow-up
+
+Extended `test_force_proxy_upstream_http_error_is_explicit_at_local_s_url` into a parameterized test covering upstream HTTP 403 and 500 responses. Both cases assert that the local `/s/<token>` endpoint preserves the upstream status and returns a non-empty error body; production code remains unchanged.
+
+Verification:
+
+```text
+python -m pytest tests/test_media_proxy_force.py -q -k upstream_http_error_is_explicit_at_local_s_url
+..                                                                       [100%]
+2 passed, 27 deselected in 1.49s
+```
