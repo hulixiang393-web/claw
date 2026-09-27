@@ -957,10 +957,13 @@ git commit -m "feat(player): VLC 控制面——pl_play&id / pl_previous / playl
 **Interfaces:**
 - Consumes: 无（本 Task 自成闭环；Task 5 才接租约与握手）
 - Produces:
-  - `open_with_player(url, audio="", referer="", user_agent="", headers=None, ad_block=None, force_proxy=False, episodes=None, caching_ms=0, classify_url="", on_playlist_ready=None) -> str`
+  - `open_with_player(url, audio="", referer="", user_agent="", headers=None, ad_block=None, force_proxy=False, episodes=None, caching_ms=0, classify_url="", start_idx=-1, on_playlist_ready=None) -> str`
+    —— `start_idx` 为调用方已知的当前集下标（0-based），**优先于** url 载荷
+    匹配定位起始集；越界或 url 也命中不到时记 warning 退回首项。
   - `_sanitize_title(title: str, idx: int = 0) -> str`
   - `_mrl_with_title(url: str, title: str, idx: int = 0) -> str`
-  - `_fit_series(episodes: list, start_idx: int, resolve) -> tuple[list[tuple[int, str]], bool]`
+  - `_fit_series(episodes: list, start_idx: int, resolve, begin: int = 0) -> tuple[list[tuple[int, str]], bool]`
+    —— `begin` 是 episodes 切片在整表里的起始集位，使集号兜底标题与返回下标同源。
   - `_is_local_proxy_url(target: str) -> bool`
   - 常量 `_SERIES_MAX_MRL = 300`、`_SERIES_MAX_CMD = 30000`
 
@@ -1420,6 +1423,7 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                      force_proxy: bool = False,
                      episodes: list | None = None,
                      caching_ms: int = 0, classify_url: str = "",
+                     start_idx: int = -1,
                      on_playlist_ready=None) -> str:
     """用外部播放器打开媒体地址。
 
@@ -2315,6 +2319,7 @@ Expected: FAIL —— `AttributeError: 'VideoView' object has no attribute '_bui
             headers=hdrs, ad_block=ad_block, force_proxy=self._force_proxy_enabled(),
             episodes=series,
             classify_url=real_url,
+            start_idx=self._current_idx,
             on_playlist_ready=self._on_vlc_playlist_ready,
             caching_ms=self._source_network_caching_ms(),
         )
@@ -2637,6 +2642,7 @@ Expected: FAIL —— 切集仍走 `_load_episode`（`opened`/`got` 不含 vlc i
             referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
             headers=hdrs, ad_block=ad_block, force_proxy=force_proxy,
             episodes=series, classify_url=self._current_play,
+            start_idx=self._current_idx,
             on_playlist_ready=self._on_vlc_playlist_ready,
             caching_ms=self._source_network_caching_ms(),
         )
