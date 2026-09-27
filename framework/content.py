@@ -114,6 +114,7 @@ class Content:
         decrypter: Optional["Decrypter"] = None,
         health_reporter=None,
         cache=None,
+        repository=None,
     ):
         self._http = http
         self._parser = parser
@@ -126,6 +127,7 @@ class Content:
         #   pages:{source_id}:{abs_url}  漫画页图（7 天，shelf 池）
         #   cover:{source_id}:{abs_url}  封面字节（永久，shelf 池）
         self._cache = cache
+        self._repository = repository
         # yt-dlp 流 URL 缓存（同视频短时复用，避免重复签名等待）
         self._ytdlp_stream_cache: dict = {}
         self._ytdlp = None  # 懒加载单例，复用 yt-dlp 子进程
@@ -214,6 +216,18 @@ class Content:
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         return utils.abs_url(source.base_url, url)
+
+    def _cache_get(self, key: str):
+        if self._cache is not None:
+            return self._cache.get(key)
+        if self._repository is not None:
+            book_key, chapter_key = key.split(":", 2)[1:]
+            return self._repository.get_content(book_key, chapter_key)
+        return None
+
+    def _cache_set(self, key: str, value, ttl=None) -> None:
+        if self._cache is not None:
+            self._cache.set(key, value, ttl=ttl)
 
     @staticmethod
     def _looks_like_direct_media(url: str) -> bool:
@@ -1236,12 +1250,11 @@ class Content:
         seen = set()
         max_pages = int(pag_cfg.get("max_pages") or 20)
         # 开头：cached body 命中直接返回（重启后/预加载后免抓）
-        if self._cache is not None:
-            cached = self._cache.get(
-                f"body:{source.source_id}:{self._abs_url(source, url)}"
-            )
-            if cached is not None:
-                return cached
+        cached = self._cache_get(
+            f"body:{source.source_id}:{self._abs_url(source, url)}"
+        )
+        if cached is not None:
+            return cached
         while cur and len(pages) < max_pages:
             page_text, nxt = self._fetch_chapter_page(source, cur, pag_enabled)
             if page_text:

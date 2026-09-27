@@ -218,15 +218,47 @@ class MainWindow(QMainWindow):
         self.cookie_manager = CookieManager(base_dir / "data")
         self.source_manager.set_cookie_provider(self.cookie_manager.to_cookie_header)
         self.search_history = SearchHistory(base_dir / "data" / "search_history.json")
-        # 阅读进度记忆（当天续读，24h 未入书架则清理）
-        self.reading_progress = None
+        from framework.shelf_cache_repository import ShelfCacheRepository
+        from framework.shelf_cache_migration import migrate_legacy_data
+        from framework.library_store import LibraryStore
+        from framework.shelf_service import ShelfService
         from framework.reading_progress import ReadingProgress
 
+        from framework.cache_service import get_shelf_cache, get_search_cache
+        shelf_cache = None
+        try:
+            shelf_cache = get_shelf_cache(str(base_dir / "data" / "cache"))
+        except Exception:
+            shelf_cache = None
+        self.shelf_cache_repository = None
+        try:
+            self.shelf_cache_repository = ShelfCacheRepository(
+                base_dir / "data" / "shelf.sqlite3", base_dir / "data" / "cache"
+            )
+        except Exception:
+            self.shelf_cache_repository = None
         self.reading_progress = ReadingProgress(
             base_dir / "data" / "reading_progress.json",
-            shelf_cb=self._favorite_has,  # 收藏的书续读永久保留，未收藏 24h 清理
+            shelf_cb=self._favorite_has,
+            repository=self.shelf_cache_repository,
         )
-        self.reading_progress.prune(shelf_cb=self._favorite_has)  # 启动清理（收藏保留）
+        if self.shelf_cache_repository is not None:
+            try:
+                legacy_store = LibraryStore(base_dir / "data" / "library.json")
+                legacy_shelf = ShelfService(
+                    self.settings.get("download", "output_dir", "downloads"),
+                    library_store=legacy_store,
+                    data_dir=base_dir / "data",
+                )
+                migrate_legacy_data(
+                    self.shelf_cache_repository,
+                    base_dir / "data" / "reading_progress.json",
+                    legacy_shelf,
+                    shelf_cache,
+                )
+            except Exception:
+                self.shelf_cache_repository = None
+        self.reading_progress.prune(shelf_cb=self._favorite_has)
 
         # 爬取执行链（网络默认值从 settings 接线：impersonate/user_agents 默认关闭）
         self.http = HttpClient(defaults=network_defaults_from_settings(self.settings))
@@ -242,6 +274,7 @@ class MainWindow(QMainWindow):
         self.content = Content(
             self.http, self.parser, self.checker, self.decrypter,
             health_reporter=self.source_manager,
+            repository=self.shelf_cache_repository,
         )
         self.bulk_fetch = BulkFetch(
             self.discovery,
@@ -265,9 +298,6 @@ class MainWindow(QMainWindow):
         self.event_bus.subscribe(self._on_download_event)
         # Redis 持久化缓存注入：书架池（封面/详情/正文/漫画页）+ 搜索&发现池（搜索/列表）。
         # 数据目录随 data/ 走 settings（与首页索引同目录）。
-        from framework.cache_service import get_shelf_cache, get_search_cache
-
-        shelf_cache = get_shelf_cache(str(base_dir / "data" / "cache"))
         search_cache = get_search_cache(str(base_dir / "data" / "cache"))
         self.discovery.cache = search_cache
         self.content._cache = shelf_cache

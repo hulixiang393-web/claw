@@ -102,6 +102,7 @@ class ShelfService:
         output_dir: str | Path,
         library_store=None,
         reading_progress=None,
+        repository=None,
         data_dir: str | Path | None = None,
         epub_detector: EpubTypeDetector = _default_epub_detector,
         hidden_file_name: str = "hidden_local.json",
@@ -117,6 +118,7 @@ class ShelfService:
         )
         self._store = library_store
         self._progress = reading_progress
+        self._repository = repository
         self._detect = epub_detector
         self._hidden_file = self._data_dir / hidden_file_name
         self._meta_file = self._data_dir / meta_file_name
@@ -354,15 +356,26 @@ class ShelfService:
                      folder: str = "") -> Optional[dict]:
         """收藏一部作品（url 作唯一 key）。无 store 返回 None。"""
         if self._store is None:
-            return None
-        return self._store.add(source_id, url, title, content_type,
-                               cover, author, tags, folder)
+            result = None
+        else:
+            result = self._store.add(source_id, url, title, content_type,
+                                     cover, author, tags, folder)
+        if self._repository is not None and url:
+            self._repository.upsert_book(
+                url, source_id, url, content_type,
+                {"title": title, "cover": cover, "author": author,
+                 "tags": list(tags or []), "folder": folder},
+            )
+        return result
 
     def favorite_has(self, url: str) -> bool:
         return bool(self._store and self._store.has(url))
 
     def favorite_remove(self, url: str) -> bool:
-        return bool(self._store and self._store.remove(url))
+        removed = bool(self._store and self._store.remove(url))
+        if self._repository is not None and url:
+            self._repository.clear_content_cache(url)
+        return removed
 
     def favorite_clear_folder(self, folder: str) -> int:
         """一键清空某收藏夹内的全部收藏（保留收藏夹，不删本地文件）。返回移除条数。"""

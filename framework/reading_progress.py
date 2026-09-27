@@ -32,6 +32,7 @@ class ReadingProgress:
         self,
         path: str | Path = "reading_progress.json",
         shelf_cb: Optional[Callable[[str], bool]] = None,
+        repository=None,
     ):
         """shelf_cb(book_url) -> bool：该书是否已入书架。
 
@@ -40,6 +41,7 @@ class ReadingProgress:
         """
         self.path = Path(path)
         self.shelf_cb = shelf_cb
+        self._repository = repository
         self._data: dict = self._load()
 
     # ------------------------------------------------------------------ #
@@ -113,7 +115,7 @@ class ReadingProgress:
         if position is None and page is None and same_chapter:
             position = old.get("position")
             page = old.get("page")
-        self._data[book_url] = {
+        record = {
             "source_id": source_id,
             "book_url": book_url,
             "content_type": content_type,
@@ -124,12 +126,19 @@ class ReadingProgress:
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "location": stored_location,
         }
+        self._data[book_url] = record
+        if self._repository is not None:
+            self._repository.upsert_book(book_url, source_id, book_url, content_type, {})
+            self._repository.update_location(book_url, record)
         self._save()
         self.prune(shelf_cb=self.shelf_cb)  # 每次写入顺带清理超期项（收藏的书保留）
 
     def resume(self, book_url: str) -> Optional[dict]:
         """取某本书的进度（供续读定位）。无则 None。"""
         rec = self._data.get(book_url)
+        if rec is None and self._repository is not None:
+            snapshot = self._repository.get_book_snapshot(book_url)
+            rec = (snapshot or {}).get("location")
         return copy.deepcopy(rec) if rec else None
 
     def prune(self, shelf_cb: Optional[Callable[[str], bool]] = None) -> int:
