@@ -90,7 +90,7 @@ _UPSTREAM_DIAGNOSTICS_LOCK = threading.Lock()
 
 def _classify_upstream_request_kind(target: str, headers: dict) -> str:
     path = urlparse(target).path.lower()
-    if headers.get("Range"):
+    if any(key.lower() == "range" and value for key, value in headers.items()):
         return "range"
     if path.endswith((".m3u8", ".m3u")):
         return "manifest"
@@ -265,13 +265,13 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False):
     except requests.RequestException as exc:
         _record_upstream_diagnostic(
             target, headers, "proxy", started,
-            failure_category=("direct_failure_memory" if blocked
-                              else _diagnostic_failure("proxy", exc)),
+            failure_category=_diagnostic_failure("proxy", exc),
         )
         raise
     _record_upstream_diagnostic(
         target, headers, "proxy", started, resp,
-        failure_category="direct_failure_memory" if blocked else None,
+        failure_category=("direct_failure_memory"
+                          if blocked and resp.status_code < 400 else None),
     )
     return resp
 

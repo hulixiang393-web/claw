@@ -225,6 +225,8 @@ def test_route_diagnostics_records_direct_success_without_sensitive_data(monkeyp
     assert records[0]["route"] == "direct"
     assert records[0]["status_code"] == 200
     assert records[0]["failure_category"] is None
+    assert records[0]["elapsed_ms"] >= 0
+    assert records[0]["first_byte_ms"] >= 0
     assert all("secret" not in repr(value) for value in records[0].values())
 
 
@@ -242,6 +244,27 @@ def test_route_diagnostics_records_direct_failure_and_proxy_fallback(monkeypatch
     assert records[0]["failure_category"] == "direct_connection"
     assert records[1]["status_code"] == 200
     assert records[1]["failure_category"] is None
+    assert records[1]["elapsed_ms"] >= 0
+    assert records[1]["first_byte_ms"] >= 0
+
+
+def test_route_diagnostics_preserves_proxy_http_failure_after_direct_failure(
+        monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, presp=_FakeResp403())
+    mp._reset_upstream_route_diagnostics()
+    mp._DIRECT_FAIL["cdn.example.com"] = mp.time.time()
+
+    response = mp._fetch_upstream("https://cdn.example.com/seg/001.ts", {})
+
+    assert response.status_code == 403
+    assert dlog == []
+    records = mp._read_upstream_route_diagnostics()
+    assert records[-1]["route"] == "proxy"
+    assert records[-1]["status_code"] == 403
+    assert records[-1]["failure_category"] == "proxy_http"
+    assert records[-1]["elapsed_ms"] >= 0
+    assert records[-1]["first_byte_ms"] >= 0
 
 
 def test_route_diagnostics_classifies_request_kinds():
@@ -250,6 +273,7 @@ def test_route_diagnostics_classifies_request_kinds():
     assert mp._classify_upstream_request_kind("https://x/movie.mp4", {}) == "mp4"
     assert mp._classify_upstream_request_kind("https://x/segment.ts", {}) == "segment"
     assert mp._classify_upstream_request_kind("https://x/video", {"Range": "bytes=0-1"}) == "range"
+    assert mp._classify_upstream_request_kind("https://x/video", {"range": "bytes=0-1"}) == "range"
 
 
 def test_route_diagnostics_is_bounded_and_thread_safe(monkeypatch):
