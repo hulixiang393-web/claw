@@ -331,11 +331,14 @@ def test_unregister_series_idempotent(_qapp, monkeypatch):
     view._series_key = "k9"
     view._series_urls = ["a", "b", "c"]
     view._vlc_item_ids = {0: 1}
+    view._vlc_ids_gen = 7
     view._unregister_series()
     view._unregister_series()
     assert proxy.unregistered == ["k9"]
     assert view._series_key == "" and view._series_urls == []
     assert view._vlc_item_ids == {}
+    # 代数一起作废：映射没了，留着一个「对得上」的代数等于给旧 id 开后门
+    assert view._vlc_ids_gen == -1
 
 
 def test_stop_player_keeps_series_until_vlc_exits(_qapp, monkeypatch):
@@ -693,3 +696,264 @@ def test_empty_chapter_url_is_not_enqueued_in_vlc_playlist(_qapp, monkeypatch):
     items, truncated = ep._fit_series(out, 0, _resolve)
     assert [i for i, _m in items] == [0, 2]   # 死条目不入列，且下标不挪位
     assert truncated is False
+
+
+# --------------------------------------------------------------------- #
+# App 内切集：外播会话用 vlc_id 指挥 VLC（不重开进程、进度不丢）
+# --------------------------------------------------------------------- #
+def test_select_episode_uses_vlc_goto_when_mapped(_qapp, monkeypatch):
+    """有映射 → 发 pl_play，不重开播放器（进度不丢、窗口不闪）。"""
+    view = _view(_video_detail(5), 0)
+    view._external_active = True
+    view._vlc_item_ids = {0: 10, 1: 11, 2: 12}
+    view._vlc_ids_gen = view._play_gen          # C5
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    opened = []
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda *a, **k: opened.append(a) or "已用外部播放器打开")
+    view._load_episode = lambda idx: opened.append(("load", idx))
+
+    view._select_episode(2)
+    assert got == [12]
+    assert opened == []              # 没有重开
+    assert view._current_idx == 2    # 乐观更新
+    # 真实选集菜单：乐观更新后第 3 项打勾（UI 高亮必须跟上，否则菜单指向旧集）
+    assert [a.isChecked() for a in view.ep_menu.actions()] == [
+        False, False, True, False, False]
+
+
+def test_select_episode_rejects_mapping_from_stale_generation(_qapp, monkeypatch):
+    """C5：映射属于旧会话（切源后残留）→ 不得用它指挥 VLC，回落重开。
+
+    _stop_player 在 VLC 仍活着时**故意**保留旧注册与旧映射，故映射可能来自
+    上一支播放列表；拿它发 pl_play 会让 VLC 跳到上一个源的集。
+
+    钉「没有发过 pl_play」用**记录**而不是「一调用就抛」：_try_external_goto
+    兜底的 `except Exception` 会把 AssertionError 一起吞掉再回落重开，那样
+    无论是否误发这条测试都通过（= 没有证据）。
+    """
+    view = _view(_video_detail(5), 0)
+    view._external_active = True
+    view._vlc_item_ids = {0: 10, 1: 11}
+    view._vlc_ids_gen = view._play_gen - 1     # 陈旧：上一个会话
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    loaded = []
+    view._load_episode = lambda idx: loaded.append(idx)
+    view._refresh_ep_menu = lambda: None
+    view._select_episode(1)
+    assert got == []                # 陈旧映射不得用来指挥 VLC
+    assert loaded == [1]            # 回落重开路径
+    assert view._current_idx == 0   # 也不能乐观更新（VLC 根本没被指挥）
+
+
+def test_playlist_ready_slot_records_generation_of_mapping(_qapp):
+    """C5：映射与它的代数必须同时落账，供 _try_external_goto 校验。"""
+    view = _view(_video_detail(3), 0)
+    gen = view._play_gen
+    view._vlc_playlist_ready.emit(gen, {0: 7, 1: 8})
+    _drain()
+    assert view._vlc_item_ids == {0: 7, 1: 8}
+    assert view._vlc_ids_gen == gen
+    # 陈旧代数不落账（既有守卫行为，且不得覆盖已记录的代数）
+    view._vlc_playlist_ready.emit(gen - 1, {0: 99})
+    _drain()
+    assert view._vlc_item_ids == {0: 7, 1: 8}
+    assert view._vlc_ids_gen == gen
+
+
+def test_select_episode_falls_back_when_goto_fails(_qapp, monkeypatch):
+    """pl_play 失败 → 回落现有重开路径。"""
+    view = _view(_video_detail(5), 0)
+    view._external_active = True
+    view._vlc_item_ids = {0: 10, 1: 11}
+    view._vlc_ids_gen = view._play_gen
+    monkeypatch.setattr(ep, "player_goto", lambda i: False)
+    loaded = []
+    view._load_episode = lambda idx: loaded.append(idx)
+    view._refresh_ep_menu = lambda: None
+    view._select_episode(1)
+    assert loaded == [1]
+    assert view._current_idx == 0    # 失败就不许乐观更新
+
+
+def test_select_episode_falls_back_without_mapping(_qapp, monkeypatch):
+    """无映射（握手未完成/失败）→ 回落重开。"""
+    view = _view(_video_detail(5), 0)
+    view._external_active = True
+    view._vlc_item_ids = {}
+    view._vlc_ids_gen = view._play_gen      # 会话对，但握手没交出映射
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    loaded = []
+    view._load_episode = lambda idx: loaded.append(idx)
+    view._refresh_ep_menu = lambda: None
+    view._select_episode(3)
+    assert got == []
+    assert loaded == [3]
+
+
+def test_select_episode_normal_when_not_external(_qapp, monkeypatch):
+    """非外播会话 → 行为完全不变（内嵌/单集路径不受影响）。"""
+    view = _view(_video_detail(5), 0)
+    view._external_active = False
+    view._vlc_item_ids = {0: 10, 1: 11}
+    view._vlc_ids_gen = view._play_gen
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    loaded = []
+    view._load_episode = lambda idx: loaded.append(idx)
+    view._refresh_ep_menu = lambda: None
+    view._select_episode(1)
+    assert got == []
+    assert loaded == [1]
+
+
+def test_next_prev_ep_go_through_vlc(_qapp, monkeypatch):
+    """上一集/下一集在映射可用时指挥 VLC，不重开（经 _select_episode 转发）。"""
+    view = _view(_video_detail(5), 1)
+    view._external_active = True
+    view._vlc_item_ids = {0: 10, 1: 11, 2: 12}
+    view._vlc_ids_gen = view._play_gen
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    view._load_episode = lambda idx: got.append(("load", idx))
+    view._refresh_ep_menu = lambda: None
+    view._on_next_ep()
+    view._on_prev_ep()
+    # 从第 2 集（idx 1）出发：下一集 → idx 2（id 12），上一集 → 回到 idx 1（id 11）
+    assert got == [12, 11]
+
+
+def test_handle_key_prev_uses_pl_previous(_qapp, monkeypatch):
+    """回归：P 键必须发 pl_previous（VLC 没有 pl_prev，此前从未生效）。"""
+    from PySide6.QtCore import Qt, QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    view = _view(_video_detail(3), 0)
+    view._external_active = True
+    view._player = None
+    sent = []
+    monkeypatch.setattr(ep, "player_command",
+                        lambda c, v="", item_id=None: sent.append(c) or True)
+    view._handle_key(QKeyEvent(QEvent.KeyPress, Qt.Key_P, Qt.NoModifier))
+    assert sent == ["pl_previous"]
+    view._handle_key(QKeyEvent(QEvent.KeyPress, Qt.Key_N, Qt.NoModifier))
+    assert sent == ["pl_previous", "pl_next"]
+
+
+# --------------------------------------------------------------------- #
+# 「⚙外部播放器」入口：接系列路径 + 新会话代数 + 握手回调适配
+# --------------------------------------------------------------------- #
+def _ext_view(detail, idx, caching_ms=0):
+    """装好「⚙外部播放器」所需状态的视图（源用字符串：无 raw/request_headers）。"""
+    view = _view(detail, idx)
+    view._source = "SRC"
+    view._content = _FakeContent()
+    view._current_play = "https://cdn/cur.m3u8"
+    view._current_audio = ""
+    view._current_title = f"第{idx + 1}集"
+    view._force_proxy_enabled = lambda: False
+    view._source_network_caching_ms = lambda: caching_ms
+    return view
+
+
+def test_open_external_uses_series_playlist(_qapp, monkeypatch):
+    """「⚙外部播放器」入口也走系列路径（此前完全不传 episodes）。"""
+    view = _ext_view(_video_detail(4), 1, caching_ms=30000)
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    captured = {}
+
+    def _open(url, **kw):
+        captured["url"] = url
+        captured.update(kw)
+        return "已用外部播放器打开"
+
+    monkeypatch.setattr(ep, "open_with_player", _open)
+    view._open_external()
+    assert captured["episodes"] is not None
+    assert len(captured["episodes"]) == 4
+    assert captured["url"] == "http://127.0.0.1:9999/e/k1/1"   # 从第 2 集开播
+    assert captured["classify_url"] == "https://cdn/cur.m3u8"   # C3：用真实流分类
+    assert captured["start_idx"] == 1
+    assert captured["caching_ms"] == 30000
+    assert captured["ad_block"] == {}                          # C4：不得丢
+
+
+def test_open_external_playlist_ready_adapts_generation(_qapp, monkeypatch):
+    """C2：交出去的是**单参**适配 lambda：emit 信号 + **捕获**的代数。
+
+    两个陷阱都在这里：
+    1. 把裸槽 `self._on_vlc_playlist_ready` 交出去——握手线程按单参调用会直接
+       炸；即便签名碰巧对上了，也等于绕开代数守卫（每轮陈旧握手都被应用）。
+    2. 写成 `lambda m: emit(self._play_gen, m)`（emit 时才读）——恒等匹配，
+       守卫静默失效。靠「会话作废后旧回调仍被丢弃」钉死。
+    """
+    view = _ext_view(_video_detail(4), 1)
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    seen = {}
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: seen.update(url=url, **kw) or "ok")
+    view._open_external()
+    ready = seen["on_playlist_ready"]
+    assert ready.__code__.co_argcount == 1        # 握手线程的调用契约：单参映射
+    _emit_from_thread(ready, {0: 11})
+    assert view._vlc_item_ids == {}                # 还没投递：事件在队列里
+    _drain()
+    assert view._vlc_item_ids == {0: 11}           # 投递后在主线程落地
+    assert view._vlc_ids_gen == view._play_gen
+
+    stale = seen["on_playlist_ready"]              # 会话作废（换源/换作品）后
+    view._play_gen += 1
+    stale({0: 99})
+    _drain()
+    assert view._vlc_item_ids == {0: 11}           # 旧回调不得覆盖（代数是捕获的）
+    assert view._vlc_ids_gen != view._play_gen     # 故 _try_external_goto 闸门已关
+
+
+def test_open_external_bumps_generation(_qapp, monkeypatch):
+    """C1：⚙外部播放器是新会话 → 必须自增代数，否则旧系列回调将被误认有效。"""
+    view = _ext_view(_video_detail(4), 1)
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    captured = {}
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: captured.update(url=url, **kw) or "ok")
+
+    before = view._play_gen
+    view._open_external()
+    assert view._play_gen == before + 1
+    # 上一会话在途的回调此刻必须作废（这正是 C1 的场景：VLC 还开着）
+    view._vlc_playlist_ready.emit(before, {0: 99})
+    view._external_now_playing.emit(before, 1, "https://cdn/OLD.m3u8", "")
+    _drain()
+    assert view._vlc_item_ids == {}
+    assert view._current_play == "https://cdn/cur.m3u8"   # 旧流没写进来
+    # 本会话的回调带着**新**代数 → 落地
+    captured["on_playlist_ready"]({0: 11})
+    _drain()
+    assert view._vlc_item_ids == {0: 11}
+    assert view._vlc_ids_gen == before + 1
+
+
+def test_open_external_falls_back_for_empty_url_episode(_qapp, monkeypatch):
+    """C3：当前集无 ep.url（列表里该项为 ""）→ 退回单集真实地址，不得播 /e/。"""
+    from framework.content import Chapter
+
+    detail = _video_detail(0)
+    detail.chapters = [Chapter("第1集", "http://e/0", cover=""),
+                       Chapter("无URL集", "", cover=""),
+                       Chapter("第3集", "http://e/2", cover="")]
+    view = _ext_view(detail, 1)              # 当前集 = 无 URL 的第 2 集
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    captured = {}
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: captured.update(url=url, **kw) or "ok")
+    view._open_external()
+    assert captured["url"] == "https://cdn/cur.m3u8"     # 不是点了就 502 的 /e/
+    assert captured["episodes"] is None                  # 退回单集
+    assert captured["classify_url"] == "https://cdn/cur.m3u8"
