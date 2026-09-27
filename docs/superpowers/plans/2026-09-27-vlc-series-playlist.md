@@ -17,7 +17,7 @@
 - MRL 标题 fragment 必须以非数字开头，否则 VLC 按 `mrl-title` 时间偏移解析（纯数字 → 跳转秒数）。调用方一律用 `第NN集 <章节名>` 形式，`_sanitize_title` 再做一次防御。
 - 惰性 resolver 必须是 `fetch_video_streams(source, ep.url, quality=self._quality, merged=True)` —— 与 `_FetchStreamTask.run()`（`gui/pages/reader/video_view.py:124-126`）完全同一条调用，不新增取流分支。
 - resolver 在 `media_proxy` 的请求处理线程内被调用（`ThreadingHTTPServer`，`framework/media_proxy.py:706`）。`framework/content.py` 无 Qt 依赖，故可直接调用；**任何 Qt 对象只能在信号槽里碰**。
-- 命令行上限：Windows `CreateProcess` 32767 字符。裁剪常量 `_SERIES_MAX_MRL = 300`、`_SERIES_MAX_CMD = 30000`，窗口从**当前集往后**取（保证「下一集」永远可用）。
+- 命令行上限：Windows `CreateProcess` 32767 字符。裁剪常量 `_SERIES_MAX_MRL = 300`、`_SERIES_MAX_CMD = 30000`。**正常路径全集按 1..N 严格入列**（当前集在列内中段，由启动握手定位）；仅当全集超上限时才降级为「当前集往后」的窗口。
 - 相关既有行为不得回归：ikanpp 的 `media.hls.network_caching_ms = 30000`（`sources/ikanpp.json`）必须仍生效 → 系列路径的 `--network-caching` 必须用**当前集真实流地址**分类。
 - 提交信息不带 `Co-Authored-By` / `Signed-off-by`；每个 Task 结束一次提交。
 - PowerShell 无 heredoc：需要多行提交信息时先写临时文件再 `git commit -F <file>`。
@@ -1055,7 +1055,11 @@ def test_episodes_none_single_mrl(monkeypatch):
 
 
 def test_episodes_full_series_in_order_with_titles(monkeypatch):
-    """全集按 0..N-1 顺序入列（含 episodes[0]），每条带 #第NN集 标题。"""
+    """全集按 0..N-1 顺序入列（**含当前集之前的集**），每条带 #第NN集 标题。
+
+    从第 3 集开播时，第 1、2 集**仍须在列**——用户在 VLC 里可以往回选，
+    App 侧切集也依赖整列的 id 映射。定位当前集是启动握手的职责。
+    """
     procs = _install(monkeypatch)
     eps = [(f"https://cdn.example.com/hls/{c}.m3u8", "", f"第{i + 1}集 章节{c}")
            for i, c in enumerate("abc")]
@@ -1070,8 +1074,9 @@ def test_episodes_full_series_in_order_with_titles(monkeypatch):
         "P:https://cdn.example.com/hls/b.m3u8#第2集 章节b",
         "P:https://cdn.example.com/hls/c.m3u8#第3集 章节c",
     ]
-    # 系列路径不挂 input-slave
+    # 系列路径不挂 input-slave，也不另加主 MRL
     assert not any(a.startswith(":input-slave=") for a in args)
+    assert not any(a.startswith("P:") and "#" not in a for a in args)
 
 
 def test_first_episode_no_autostart_flag(monkeypatch):
@@ -1174,14 +1179,47 @@ def test_oversized_series_truncated(monkeypatch):
     assert sum(len(a) for a in args) < 32000
 
 
-def test_fit_series_window_starts_at_current():
+def test_fit_series_full_series_kept_when_it_fits():
+    """装得下 → 全集 0..N-1 入列，当前集之前的集**也在列内**。"""
     eps = [(f"u{i}", "", f"第{i + 1}集") for i in range(10)]
     items, truncated = ep._fit_series(eps, 4, lambda u, a: u)
     assert truncated is False
-    assert items[0][0] == 4 and len(items) == 6
-    many = [(f"u{i}", "", f"第{i + 1}集 标题很长很长很长很长很长很长") for i in range(400)]
-    items2, trunc2 = ep._fit_series(many, 0, lambda u, a: u)
-    assert trunc2 is True and len(items2) < 400 and items2[0][0] == 0
+    assert [i for i, _ in items] == list(range(10))   # 全集，不是 4..9
+    assert items[0][0] == 0 and len(items) == 10
+
+
+def test_fit_series_degrades_to_forward_window_on_overflow():
+    """装不下 → 降级为「当前集往后」的窗口；超长剧集选很靠后的集也能播。"""
+    long_title = "标题很长很长很长很长很长很长很长很长很长很长很长"
+    many = [(f"u{i}", "", f"第{i + 1}集 {long_title}") for i in range(400)]
+    items, trunc = ep._fit_series(many, 0, lambda u, a: u)
+    assert trunc is True
+    assert len(items) < 400 and items[0][0] == 0
+    assert len(items) <= ep._SERIES_MAX_MRL
+    # 当前集在已解析范围之外 → 必须以当前集为首重新取窗口，且不丢当前集
+    items2, trunc2 = ep._fit_series(many, 390, lambda u, a: u)
+    assert trunc2 is True
+    assert items2[0][0] == 390
+    assert all(i >= 390 for i, _ in items2)
+
+
+def test_fit_series_budget_caps_respected():
+    """两个上限都真实生效：条数上限与总字符上限各自能触发截断。"""
+    # 条数上限
+    many = [(f"u{i}", "", f"第{i + 1}集") for i in range(ep._SERIES_MAX_MRL + 50)]
+    items, trunc = ep._fit_series(many, 0, lambda u, a: u)
+    assert trunc is True and len(items) == ep._SERIES_MAX_MRL
+    # 字符上限：条数很少但每条超长
+    fat = [(f"u{i}", "", "标" * 20000) for i in range(10)]
+    items2, trunc2 = ep._fit_series(fat, 0, lambda u, a: u)
+    assert trunc2 is True and len(items2) < 10
+
+
+def test_fit_series_keeps_at_least_one_oversized_item():
+    """单条就超字符上限也必须保留（当前集能播 > 命令行长）。"""
+    fat = [("u0", "", "标" * (ep._SERIES_MAX_CMD + 100))]
+    items, trunc = ep._fit_series(fat, 0, lambda u, a: u)
+    assert len(items) == 1 and trunc is False
 
 
 def test_fit_series_resolves_non_local_urls_only():
@@ -1280,7 +1318,8 @@ import time
 ```python
 # 系列播放列表的裁剪上限。Windows CreateProcess 命令行硬上限 32767 字符；
 # 集数上千时一次性 enqueue 数千项既撑爆命令行也给 VLC 自身 playlist 增压。
-# 窗口从**当前集往后**取（保证「下一集」永远可用）。
+# 正常路径仍按 1..N 全集入列（当前集在列内中段，由启动握手定位）；
+# 仅当全集超这两项上限时，才降级为「当前集往后」的窗口。
 _SERIES_MAX_MRL = 300
 _SERIES_MAX_CMD = 30000
 ```
@@ -1325,30 +1364,50 @@ def _fit_series(episodes: list, start_idx: int,
                 resolve) -> tuple[list[tuple[int, str]], bool]:
     """裁剪系列列表，返回 ([(集下标, MRL), ...], 是否截断)。
 
+    **正常路径：全集按第 1 集 → 最后一集严格顺序入列。** 当前集往往位于
+    列表中段——正因如此才需要启动握手：按 MRL 匹配到当前集的 vlc_id 后
+    `pl_play&id` 定位。若这里只取「当前集往后」的窗口，当前集恒为首项，
+    握手就失去意义，且第 1..start_idx-1 集在 VLC 里再也选不到。
+
+    仅当全集超出 _SERIES_MAX_MRL 条数或 _SERIES_MAX_CMD 总字符数时，才降级为
+    「从当前集往后」的窗口（此时当前集恒为窗口首项，握手依然找得到）。
+
     resolve(url, audio) -> play_url：非本机代理 URL 才经它包一层代理
     （惰性 /e/ URL 原样使用）。**先解析再计长**——代理 URL 比原 URL 长，
-    先计长会低估命令行占用。
-    窗口从 start_idx（当前集）往后连续取，受 _SERIES_MAX_MRL 条数与
-    _SERIES_MAX_CMD 总字符数双重限制；空 URL 的集整条跳过。至少保留 1 条
+    先计长会低估命令行占用。空 URL 的集整条跳过。至少保留 1 条
     （单条超长也不丢，保证「当前集能播」优先于命令行长度）。
     """
+    def _mrl_of(idx: int, entry) -> str:
+        ep_play = entry[0] if _is_local_proxy_url(entry[0]) else resolve(
+            entry[0], entry[1] if len(entry) > 1 else "")
+        return _mrl_with_title(ep_play,
+                               entry[2] if len(entry) > 2 else "", idx)
+
     items: list[tuple[int, str]] = []
     used = 0
     truncated = False
-    for off, entry in enumerate(episodes[start_idx:]):
-        ep_url = entry[0]
-        if not ep_url:
+    for idx, entry in enumerate(episodes):
+        if not entry or not entry[0]:
             continue
-        idx = start_idx + off
-        ep_play = ep_url if _is_local_proxy_url(ep_url) else resolve(
-            ep_url, entry[1] if len(entry) > 1 else "")
-        mrl = _mrl_with_title(ep_play, entry[2] if len(entry) > 2 else "", idx)
+        mrl = _mrl_of(idx, entry)
         if items and (len(items) >= _SERIES_MAX_MRL
                       or used + len(mrl) > _SERIES_MAX_CMD):
             truncated = True
             break
         items.append((idx, mrl))
         used += len(mrl)
+
+    if truncated and start_idx > 0:
+        # 全集装不下 → 降级为「当前集往后」的窗口。items 自身已按两个上限
+        # 截断，故其下标 >= start_idx 的后缀必然仍满足上限，无需重新解析。
+        window = [(i, m) for i, m in items if i >= start_idx]
+        if window:
+            return window, True
+        # 当前集落在已解析范围之外（超长剧集选了很靠后的集）→ 必须重新取
+        # 窗口，否则当前集根本不在列表里、无法播放。
+        sub, _ = _fit_series(episodes[start_idx:], 0, resolve)
+        return [(i + start_idx, m) for i, m in sub], True
+
     return items, truncated
 ```
 
@@ -1453,15 +1512,17 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             if episodes and window:
                 # 后台握手：轮询 playlist.json 建 {集下标: vlc_id} 映射，
                 # 非首项开播时顺带 pl_play 定位。必须在后台线程（VLC 建列表
-                # 需时，主线程会卡 UI）。
-                _start_playlist_sync(window[0][1], start_idx, on_playlist_ready)
+                # 需时，主线程会卡 UI）。整个 window 传下去，映射才覆盖
+                # 列表内每一集（App 侧切集依赖它）。
+                _start_playlist_sync(start_idx, window, on_playlist_ready)
             if truncated:
                 return f"已用外部播放器打开（列表已截断，共 {len(window)} 集）"
             return "已用外部播放器打开"
 ```
 
-注：`window[0]` 恒为起始项（`_fit_series` 的窗口从 `start_idx` 起取），其
-MRL 就是握手要匹配的 `uri`；`episodes` 为空列表时 `window` 为空 → 不握手。
+注：`window` 是入列的 [(集下标, MRL), ...] 全体——正常路径下第 1 集到最后
+一集全在列内，当前集位于中段，由握手按 uri 匹配定位；降级窗口下当前集是
+`window` 首项。`episodes` 为空列表时 `window` 为空 → 不握手。
 
 - [ ] **Step 4: 运行测试确认通过**
 
@@ -1496,8 +1557,8 @@ git commit -m "feat(player): 外部播放器全集播放列表契约——顺序
 - Consumes: Task 3 的 `player_playlist_items(refresh=True)`、`player_goto`；Task 4 的 `_start_playlist_sync` 调用点与 `on_playlist_ready` 参数；Task 1 的 `MediaProxy.acquire_lease` / `release_lease`
 - Produces:
   - `open_with_player(..., on_playlist_ready=None)` 会在后台线程以 `{集下标: vlc_id}` 字典调用一次 `on_playlist_ready`
-  - `_start_playlist_sync(start_mrl: str, start_idx: int, on_playlist_ready) -> None`（起 daemon 线程）
-  - `_handshake_worker(start_mrl: str, start_idx: int, on_playlist_ready) -> None`
+  - `_start_playlist_sync(start_idx: int, series: list[tuple[int, str]], on_playlist_ready) -> None`（起 daemon 线程）
+  - `_handshake_worker(start_idx: int, series: list[tuple[int, str]], on_playlist_ready) -> None`
   - `_item_matches(item: dict, mrl: str) -> bool`
   - `_acquire_proxy_lease() -> str` / `_release_proxy_lease(lease_id: str) -> None` / `_watch_proc(proc, lease_id) -> None`
   - 模块级 `_lease_id: str`
@@ -1543,8 +1604,8 @@ def test_handshake_goto_current_episode(monkeypatch):
     monkeypatch.setattr(ep, "player_playlist_items", _items)
     monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
     ready = {}
-    ep._handshake_worker("http://x/e/k/1#第2集", 1,
-                         lambda m: ready.update(m))
+    series = [(0, "http://x/e/k/0#第1集"), (1, "http://x/e/k/1#第2集")]
+    ep._handshake_worker(1, series, lambda m: ready.update(m))
     assert got == [12]
     assert ready == {0: 11, 1: 12}
 
@@ -1557,7 +1618,8 @@ def test_handshake_first_episode_no_goto(monkeypatch):
     got = []
     monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
     ready = {}
-    ep._handshake_worker("http://x/e/k/0#第1集", 0, lambda m: ready.update(m))
+    ep._handshake_worker(0, [(0, "http://x/e/k/0#第1集")],
+                        lambda m: ready.update(m))
     assert got == []
     assert ready == {0: 21}
 
@@ -1570,7 +1632,7 @@ def test_handshake_timeout_does_not_raise(monkeypatch):
                         lambda timeout=2.0, refresh=False: [])
     got = []
     monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
-    ep._handshake_worker("http://x/e/k/1", 1, lambda m: got.append(m))
+    ep._handshake_worker(1, [(1, "http://x/e/k/1")], lambda m: got.append(m))
     assert got == []
 
 
@@ -1655,7 +1717,7 @@ def test_start_playlist_sync_runs_in_background(monkeypatch):
         seen["args"] = (mrl, start_idx, cb)
 
     monkeypatch.setattr(ep, "_handshake_worker", _fake)
-    ep._start_playlist_sync("m", 2, None)
+    ep._start_playlist_sync(2, [(0, "m0"), (1, "m1"), (2, "m2")], None)
     import time as _t
     for _ in range(50):
         if seen:
@@ -1780,39 +1842,43 @@ def _item_matches(item: dict, mrl: str) -> bool:
     return uri == mrl or uri.startswith(mrl + "#")
 
 
-def _start_playlist_sync(start_mrl: str, start_idx: int,
+def _start_playlist_sync(start_idx: int, series: list[tuple[int, str]],
                          on_playlist_ready=None) -> None:
     """后台起线程做握手（绝不阻塞调用方——GUI 主线程会卡 UI）。"""
     threading.Thread(
         target=_handshake_worker,
-        args=(start_mrl, start_idx, on_playlist_ready),
+        args=(start_idx, series, on_playlist_ready),
         daemon=True,
     ).start()
 
 
-def _handshake_worker(start_mrl: str, start_idx: int,
+def _handshake_worker(start_idx: int, series: list[tuple[int, str]],
                       on_playlist_ready=None) -> None:
     """轮询 playlist.json 直到起始项出现：建映射 +（非首集）pl_play 定位。
 
-    映射按 uri 前缀匹配回 MRL 的「集下标」：窗口内第 k 条即 start_idx + k。
-    起点集 id 用 MRL 反查（列表项顺序与入列顺序一致，但以 uri 匹配为准更稳）。
+    series 是入列的 [(集下标, MRL), ...]（全集 1..N，或降级后的当前集往后窗口）。
+    映射**按 uri 匹配**得出，不做下标推算：VLC 列表顺序未必等于入列顺序，
+    且下标推算只在「窗口从当前集起」时成立——全集入列时会整体错位。
     超时即降级：VLC 按 --no-playlist-autostart 行为播放，App 侧映射留空 →
     切集回落到重开 VLC。
     """
     deadline = time.monotonic() + _HANDSHAKE_TIMEOUT
-    base = start_mrl.split("#", 1)[0]
+    bases = [(idx, mrl.split("#", 1)[0]) for idx, mrl in (series or [])]
     while True:
         items = player_playlist_items(timeout=1.0, refresh=True)
         if items:
             mapping: dict[int, int] = {}
             start_id = None
-            for off, item in enumerate(items):
+            for item in items:
                 iid = item.get("id")
                 if not isinstance(iid, int):
                     continue
-                mapping[start_idx + off] = iid
-                if _item_matches(item, base):
-                    start_id = iid
+                for idx, base in bases:
+                    if _item_matches(item, base):
+                        mapping[idx] = iid
+                        if idx == start_idx:
+                            start_id = iid
+                        break
             if on_playlist_ready is not None and mapping:
                 try:
                     on_playlist_ready(mapping)
@@ -2646,7 +2712,7 @@ Expected: 仅 `?? sources/fanqie.json.bak-fanqie-categories`（未跟踪、未�
 - 契约破坏：`open_with_player(episodes=...)` 现为**全集有序列表**，
   `episodes[0]` 不再跳过，`url` 只用于定位起始项
 - 已知限制：每集不单独算 network-caching（用当前集分类作全列表基线）；
-  系列路径不挂 input-slave（merged 流）；>300 集按当前集往后截断
+  系列路径不挂 input-slave（merged 流）；全集超 300 集/30000 字符才按当前集往后截断
 - 待人工验收：见规格 §8「手动 GUI 验收」7 条
 ```
 
@@ -2663,11 +2729,14 @@ git commit -m "docs(session): 记录外部播放器全集播放列表落地与�
 
 1. 打开 ≥10 集剧集 → `Ctrl+L` → 列表显示 `第01集 …` 到 `第NN集 …` 真实标题，顺序正确
 2. 从第 5 集开播 → 确认从第 5 集开始播（不是第 1 集）
-3. 列表里点第 30 集 → 能播；`N` → 第 31 集；`P` → 回到第 30 集
-4. ikanpp 源：第 2 集及之后仍走 30s 缓冲（无新卡顿）
-5. 暂停 15 分钟后恢复 → 不断流
-6. App 内点「下一集」→ VLC 不重启、不闪窗、进度不丢
-7. 代理日志确认每集只触发一次上游取流（memo 生效）
+3. **从第 5 集开播后，打开 VLC 播放列表（`Ctrl+L`）确认第 1..4 集也在列内**——
+   全集入列是「P 能往回」的前提；若列表里只剩第 5 集往后，说明 `_fit_series`
+   误用了降级窗口
+4. 列表里点第 30 集 → 能播；`N` → 第 31 集；`P` → 回到第 30 集
+5. ikanpp 源：第 2 集及之后仍走 30s 缓冲（无新卡顿）
+6. 暂停 15 分钟后恢复 → 不断流
+7. App 内点「下一集」→ VLC 不重启、不闪窗、进度不丢
+8. 代理日志确认每集只触发一次上游取流（memo 生效）
 
 任一条不通过 → 回到对应 Task 修，不要在验收阶段打补丁。
 
