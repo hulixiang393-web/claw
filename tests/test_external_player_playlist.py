@@ -62,8 +62,21 @@ def _install(monkeypatch, proxy=None) -> list:
     monkeypatch.setattr(ep, "_last_proc", None)
     monkeypatch.setattr(ep, "_control_state", None)
     monkeypatch.setattr(ep, "_playlist_items", [])
-    # raising=False：本任务还不实现 _start_playlist_sync（Task 5 才加），
-    # 默认 raising=True 会 AttributeError 让本任务全部测试报错。
+    # 租约同样要复位：模块级状态会跨用例串味（上个用例漏释放的 lease 会被
+    # 本用例开头的 _terminate_previous 释放掉，断言 released 就对不上了）。
+    monkeypatch.setattr(ep, "_lease_id", "", raising=False)
+    # 默认不碰真的 MediaProxy：不装代理的单测没必要实例化单例（真租约还会在
+    # 单例里留下永久条目，把空闲看门狗焊死，波及同进程的 media_proxy 用例）。
+    # 租约断言的用例各自换自己的记录器。
+    monkeypatch.setattr(ep, "_acquire_proxy_lease", lambda: "L", raising=False)
+    monkeypatch.setattr(ep, "_release_proxy_lease", lambda lid: None,
+                        raising=False)
+    # 默认不真的起看守线程：_FakeProc.wait() 立刻返回 0，真线程会在断言中途
+    # 释放租约并清空 _lease_id（竞态）。看守逻辑由 test_watch_proc_* 单独覆盖。
+    monkeypatch.setattr(ep, "_watch_proc", lambda proc, lid: None,
+                        raising=False)
+    # raising=False：_start_playlist_sync 在 Task 5 之前不存在，默认
+    # raising=True 会 AttributeError 让本任务全部测试报错。
     monkeypatch.setattr(ep, "_start_playlist_sync", lambda *a, **k: None,
                         raising=False)
     return procs
@@ -534,3 +547,320 @@ def test_force_proxy_default_false(monkeypatch):
     ep.open_with_player("https://cdn.example.com/hls/a.m3u8",
                         headers={"Referer": "https://fake.example/"})
     assert seen == [False]
+
+
+# ---------------------------------------------------------------------- #
+# 启动握手：playlist.json → {集下标: vlc_id} + 非首集 pl_play 定位
+# ---------------------------------------------------------------------- #
+def test_item_matches_exact_and_fragment():
+    """mrl 传的是**已剥离标题片段**的 MRL；VLC 报告的 uri 带不带片段都算命中。
+
+    反向（mrl 带片段、uri 不带）不算命中：调用方（_handshake_worker）传进来
+    的永远是剥好的 base，两种都认只会让「恰好同前缀」的别的集被误命中。
+    """
+    assert ep._item_matches({"uri": "http://x/e/k/3#第4集"}, "http://x/e/k/3")
+    assert ep._item_matches({"uri": "http://x/e/k/3"}, "http://x/e/k/3")
+    assert not ep._item_matches({"uri": "http://x/e/k/4"}, "http://x/e/k/3")
+    assert not ep._item_matches({}, "http://x/e/k/3")
+    assert not ep._item_matches({"uri": ""}, "http://x/e/k/3")
+    # 片段前缀必须带 "#" 分界：否则 k/3 会把 k/30 一起命中（错一集）
+    assert not ep._item_matches({"uri": "http://x/e/k/30#第31集"},
+                                "http://x/e/k/3")
+
+
+def test_handshake_goto_current_episode(monkeypatch):
+    """非首集开播：握手轮询到起始项后发 pl_play&id=<该集 id>。
+
+    **映射必须按 uri 匹配得出**（不得按下标推算）：全集 1..N 入列时起始项在
+    列内中段，`mapping[start_idx + off]` 那种写法会把每个 id 整体错位一位。
+    这里给的是「第 2 集在列首项之后一位」这一最小反例。
+    """
+    got = []
+    calls = {"n": 0}
+
+    def _items(timeout=2.0, refresh=False):
+        calls["n"] += 1
+        if calls["n"] < 2:      # 第一次 VLC 还没建好列表
+            return []
+        return [{"id": 11, "uri": "http://x/e/k/0"},
+                {"id": 12, "uri": "http://x/e/k/1"}]
+
+    monkeypatch.setattr(ep, "player_playlist_items", _items)
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    ready = {}
+    series = [(0, "http://x/e/k/0#第1集"), (1, "http://x/e/k/1#第2集")]
+    ep._handshake_worker(1, series, lambda m: ready.update(m))
+    assert got == [12]              # 定位到第 2 集（不是列表首项的 11）
+    assert ready == {0: 11, 1: 12}  # 下标 0/1，不是 1/2
+
+
+def test_handshake_first_episode_no_goto(monkeypatch):
+    """起始项就是第 0 集 → 只建映射，不发 pl_play（VLC 原生 autostart 已对）。"""
+    monkeypatch.setattr(ep, "player_playlist_items",
+                        lambda timeout=2.0, refresh=False: [
+                            {"id": 21, "uri": "http://x/e/k/0"}])
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    ready = {}
+    ep._handshake_worker(0, [(0, "http://x/e/k/0#第1集")],
+                        lambda m: ready.update(m))
+    assert got == []
+    assert ready == {0: 21}
+
+
+def test_handshake_skips_non_int_item_ids(monkeypatch):
+    """id 非 int 的项既不进映射、也不拿去 pl_play（id 必须是整数项 id）。
+
+    混进去会让 App 侧切集拿着 "12"/None 去发 pl_play&id=，静默失败；更糟的是
+    映射里出现假 id 后，Task 7 认为该集「可切」而不回落重开 VLC。
+    """
+    monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
+    monkeypatch.setattr(ep, "player_playlist_items",
+                        lambda timeout=2.0, refresh=False: [
+                            {"id": "12", "uri": "http://x/e/k/1"},
+                            {"id": None, "uri": "http://x/e/k/0"}])
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    ready = {}
+    ep._handshake_worker(1, [(0, "http://x/e/k/0"), (1, "http://x/e/k/1")],
+                        lambda m: ready.update(m))
+    assert ready == {}      # 映射里没有假 id
+    assert got == []        # 也没拿假 id 去 pl_play
+
+
+def test_handshake_timeout_does_not_raise(monkeypatch):
+    """VLC 一直没就绪 → 超时降级（不抛、不阻塞调用方）。"""
+    monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
+    polls = {"n": 0}
+
+    def _items(timeout=2.0, refresh=False):
+        polls["n"] += 1
+        return []
+
+    monkeypatch.setattr(ep, "player_playlist_items", _items)
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    ep._handshake_worker(1, [(1, "http://x/e/k/1")], lambda m: got.append(m))
+    # 真的轮询到超时才收手：一次就放弃的话映射/定位都失去了「等 VLC 就绪」的意义
+    assert polls["n"] >= 2
+    assert got == []       # 空映射不回调、不发 pl_play
+
+
+def test_start_playlist_sync_runs_in_background(monkeypatch):
+    """_start_playlist_sync 不阻塞调用方（握手在线程里跑）。
+
+    参数必须是 (start_idx, **整列** series, 回调)：传「窗口首项的 MRL」会把
+    第 1 集当成起始项，pl_play 定位整体错位。
+    """
+    import threading as _th
+    import time as _t
+    seen = {}
+
+    def _fake(start_idx, series, cb):
+        seen["thread"] = _th.current_thread() is not _th.main_thread()
+        seen["args"] = (start_idx, series, cb)
+
+    monkeypatch.setattr(ep, "_handshake_worker", _fake)
+    series = [(0, "m0"), (1, "m1"), (2, "m2")]
+
+    def _cb(mapping):
+        return None
+
+    ep._start_playlist_sync(2, series, _cb)
+    for _ in range(50):
+        if seen:
+            break
+        _t.sleep(0.02)
+    assert seen.get("thread") is True
+    assert seen.get("args") == (2, series, _cb)
+
+
+# ---------------------------------------------------------------------- #
+# 代理租约：VLC 存活期间禁止空闲看门狗回收；每条退出路径都必须释放
+# ---------------------------------------------------------------------- #
+def test_open_acquires_lease_and_watches_proc(monkeypatch):
+    """拉起成功后：登记代理租约 + 起等待线程；_terminate_previous 释放租约。
+
+    必须把 _watch_proc 换掉再断言：_FakeProc.wait() 立刻返回 0，真线程会在
+    断言中途释放租约并把 _lease_id 清空 → 变成竞态测试。
+    """
+    procs = _install(monkeypatch)
+    lease = {"n": 0, "released": []}
+    watched = []
+
+    def _acq():
+        lease["n"] += 1
+        return f"L{lease['n']}"
+
+    monkeypatch.setattr(ep, "_acquire_proxy_lease", _acq)
+    monkeypatch.setattr(ep, "_release_proxy_lease",
+                        lambda lid: lease["released"].append(lid))
+    monkeypatch.setattr(ep, "_watch_proc",
+                        lambda proc, lid: watched.append((proc, lid)))
+    ep.open_with_player("https://cdn.example.com/hls/a.m3u8")
+    assert lease["n"] == 1
+    assert ep._lease_id == "L1"
+    # 看守线程必须盯着**这次拉起的那个进程**（盯错进程 = 提前释放租约）
+    assert watched == [(procs[0], "L1")]
+    ep._terminate_previous()
+    assert lease["released"] == ["L1"]
+    assert ep._lease_id == ""
+
+
+def test_open_releases_lease_when_popen_fails(monkeypatch):
+    """拉起失败降级浏览器 → 没有进程存活、没人替我们释放，当场释放。
+
+    这是「取租约早于 Popen」带来的第四条退出路径：漏掉它就是一次永久泄漏
+    → 空闲看门狗在整个 App 会话内失效。
+    """
+    _install(monkeypatch)
+    released = []
+    watched = []
+    monkeypatch.setattr(ep, "_acquire_proxy_lease", lambda: "LF")
+    monkeypatch.setattr(ep, "_release_proxy_lease",
+                        lambda lid: released.append(lid))
+    monkeypatch.setattr(ep, "_watch_proc",
+                        lambda proc, lid: watched.append(lid))
+    opened = []
+    monkeypatch.setattr(ep.webbrowser, "open", lambda u: opened.append(u))
+    monkeypatch.setattr(ep.subprocess, "Popen",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError("popen failed")))
+    msg = ep.open_with_player("https://cdn.example.com/hls/a.m3u8")
+    assert msg == "已在浏览器中打开"
+    assert opened == ["https://cdn.example.com/hls/a.m3u8"]
+    assert watched == []          # 没有进程 → 不起看守线程
+    assert released == ["LF"]     # 但租约必须已释放
+    assert ep._lease_id == ""
+
+
+def test_lease_taken_before_any_proxy_url(monkeypatch):
+    """租约必须在**第一个代理 URL 被铸造之前**取。
+
+    顺序反了（先铸 token 再取租约）就有几毫秒窗口：空闲看门狗恰好在窗口内
+    判空闲 → stop() → _tokens.clear() → 整列 MRL 全部 404。
+    """
+    _install(monkeypatch, proxy=lambda u, *a, **k: "P:" + u)
+    log = []
+
+    def _acq():
+        log.append(("lease", True))
+        return "L1"
+
+    monkeypatch.setattr(ep, "_acquire_proxy_lease", _acq)
+    monkeypatch.setattr(ep, "_watch_proc", lambda proc, lid: None)
+
+    def _proxy(u, *a, **k):
+        log.append(("url", u))
+        return "P:" + u
+
+    monkeypatch.setattr(ep, "proxy_url_for", _proxy)
+    ep.open_with_player("https://cdn.example.com/hls/a.m3u8",
+                        episodes=[("https://cdn.example.com/hls/a.m3u8", "", "A")])
+    kinds = [k for k, _v in log]
+    assert "lease" in kinds and "url" in kinds
+    assert kinds.index("lease") < kinds.index("url")
+
+
+def test_watch_proc_releases_lease_on_exit(monkeypatch):
+    """VLC 自行退出（用户关窗口）→ 等待线程立即释放租约。"""
+    released = []
+    monkeypatch.setattr(ep, "_release_proxy_lease",
+                        lambda lid: released.append(lid))
+    monkeypatch.setattr(ep, "_lease_id", "LX")
+
+    class _P:
+        def wait(self, timeout=None):
+            return 0
+
+    ep._watch_proc(_P(), "LX")
+    assert released == ["LX"]
+    assert ep._lease_id == ""
+
+
+def test_watch_proc_releases_even_if_wait_raises(monkeypatch):
+    """句柄失效（wait 抛异常）也必须释放租约，否则永久泄漏。
+
+    释放放在 wait 的 finally 语意外面：wait 一抛就跳过释放 = 看门狗整个
+    App 会话内失效。
+    """
+    released = []
+    monkeypatch.setattr(ep, "_release_proxy_lease",
+                        lambda lid: released.append(lid))
+    monkeypatch.setattr(ep, "_lease_id", "LBAD")
+
+    class _P:
+        def wait(self, timeout=None):
+            raise OSError("handle gone")
+
+    ep._watch_proc(_P(), "LBAD")
+    assert released == ["LBAD"]
+    assert ep._lease_id == ""
+
+
+def test_watch_proc_keeps_newer_lease_intact(monkeypatch):
+    """旧进程退出晚于新实例拉起 → 不得清掉**新**租约。
+
+    _lease_id 只记当前会话那个 id：旧看守醒来把新租约清空，等于换源后立刻
+    失去看门狗保护。
+    """
+    released = []
+    monkeypatch.setattr(ep, "_release_proxy_lease",
+                        lambda lid: released.append(lid))
+    monkeypatch.setattr(ep, "_lease_id", "NEW")
+
+    class _P:
+        def wait(self, timeout=None):
+            return 0
+
+    ep._watch_proc(_P(), "OLD")
+    assert released == ["OLD"]   # 自己的租约照放
+    assert ep._lease_id == "NEW"  # 但不能顺手清掉新会话的
+
+
+def test_terminate_previous_releases_old_lease_before_new(monkeypatch):
+    """验收 2：播放器重启必须先释放**旧**租约，且旧 id 不残留。
+
+    顺序反了（旧租约被新租约覆盖后才释放）就会永久泄漏一个 lease id →
+    空闲看门狗在整个 App 会话内失效。
+    """
+    released = []
+    monkeypatch.setattr(ep, "_release_proxy_lease",
+                        lambda lid: released.append(lid))
+
+    class _P:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    old = _P()
+    monkeypatch.setattr(ep, "_last_proc", old)
+    monkeypatch.setattr(ep, "_lease_id", "OLD")
+    ep._terminate_previous()
+    assert released == ["OLD"]
+    assert ep._lease_id == ""
+    assert old.terminated is True
+
+    # 换新实例：新租约必须在旧租约已释放之后才登记
+    lease = {"n": 0}
+    _install(monkeypatch)
+    # _install 会把 _release_proxy_lease 换成空实现，重新挂回记录器
+    monkeypatch.setattr(ep, "_release_proxy_lease",
+                        lambda lid: released.append(lid))
+
+    def _acq():
+        lease["n"] += 1
+        return f"NEW{lease['n']}"
+
+    monkeypatch.setattr(ep, "_acquire_proxy_lease", _acq)
+    monkeypatch.setattr(ep, "_watch_proc", lambda proc, lid: None)
+    ep.open_with_player("https://cdn.example.com/hls/b.m3u8")
+    assert released == ["OLD"]        # 拉新实例不释放别人的租约
+    assert ep._lease_id == "NEW1"
+    ep._terminate_previous()
+    assert released == ["OLD", "NEW1"]
+    assert ep._lease_id == ""
