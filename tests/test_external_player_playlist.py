@@ -185,8 +185,13 @@ def test_start_idx_out_of_range_warns_and_falls_back(monkeypatch, caplog):
     """start_idx 越界 → 记 warning 并退回 url 命中项，不抛异常。
 
     退回 url 命中（第 2 集）而不是硬夹到首/末集：url 命中是**已验证**过的位置。
+    必须钉住**具体下标**（握手拿到的 1）：只断言 flag 存在的话，夹到 len-1
+    （第 3 集）同样有 flag，测不出「退到了错的那一集」。
     """
     procs = _install(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(ep, "_start_playlist_sync",
+                        lambda *a, **k: seen.update(args=a), raising=False)
     eps = [(f"https://cdn.example.com/hls/{c}.m3u8", "", f"第{i + 1}集")
            for i, c in enumerate("abc")]
     with caplog.at_level(logging.WARNING):
@@ -194,6 +199,7 @@ def test_start_idx_out_of_range_warns_and_falls_back(monkeypatch, caplog):
     args = procs[0].args
     assert "--no-playlist-autostart" in args      # 退回第 2 集 → 仍需握手定位
     assert any("越界" in r.getMessage() for r in caplog.records)
+    assert seen["args"][0] == 1                  # url 命中的第 2 集，不是 len-1
 
 
 def test_unlocatable_start_warns_and_plays_episode1(monkeypatch, caplog):
@@ -368,7 +374,7 @@ def test_oversized_series_truncated(monkeypatch):
 def test_fit_series_full_series_kept_when_it_fits():
     """装得下 → 全集 0..N-1 入列，当前集之前的集**也在列内**。"""
     eps = [(f"u{i}", "", f"第{i + 1}集") for i in range(10)]
-    items, truncated = ep._fit_series(eps, 4, lambda u, a: u)
+    items, truncated = ep._fit_series(eps, 4, lambda u: u)
     assert truncated is False
     assert [i for i, _ in items] == list(range(10))   # 全集，不是 4..9
     assert items[0][0] == 0 and len(items) == 10
@@ -378,12 +384,12 @@ def test_fit_series_degrades_to_forward_window_on_overflow():
     """装不下 → 降级为「当前集往后」的窗口；超长剧集选很靠后的集也能播。"""
     long_title = "标题很长很长很长很长很长很长很长很长很长很长很长"
     many = [(f"u{i}", "", f"第{i + 1}集 {long_title}") for i in range(400)]
-    items, trunc = ep._fit_series(many, 0, lambda u, a: u)
+    items, trunc = ep._fit_series(many, 0, lambda u: u)
     assert trunc is True
     assert len(items) < 400 and items[0][0] == 0
     assert len(items) <= ep._SERIES_MAX_MRL
     # 当前集在已解析范围之外 → 必须以当前集为首重新取窗口，且不丢当前集
-    items2, trunc2 = ep._fit_series(many, 390, lambda u, a: u)
+    items2, trunc2 = ep._fit_series(many, 390, lambda u: u)
     assert trunc2 is True
     assert items2[0][0] == 390
     assert all(i >= 390 for i, _ in items2)
@@ -393,11 +399,11 @@ def test_fit_series_budget_caps_respected():
     """两个上限都真实生效：条数上限与总字符上限各自能触发截断。"""
     # 条数上限
     many = [(f"u{i}", "", f"第{i + 1}集") for i in range(ep._SERIES_MAX_MRL + 50)]
-    items, trunc = ep._fit_series(many, 0, lambda u, a: u)
+    items, trunc = ep._fit_series(many, 0, lambda u: u)
     assert trunc is True and len(items) == ep._SERIES_MAX_MRL
     # 字符上限：条数很少但每条超长
     fat = [(f"u{i}", "", "标" * 20000) for i in range(10)]
-    items2, trunc2 = ep._fit_series(fat, 0, lambda u, a: u)
+    items2, trunc2 = ep._fit_series(fat, 0, lambda u: u)
     assert trunc2 is True and len(items2) < 10
 
 
@@ -405,7 +411,7 @@ def test_fit_series_cmd_budget_binds_before_count_cap():
     """条目少而每条超长时，**字符预算**先于条数上限触发（两者双重限制）。"""
     long_title = "标" * 200
     many = [(f"u{i}", "", f"第{i + 1}集 {long_title}") for i in range(400)]
-    items, truncated = ep._fit_series(many, 0, lambda u, a: u)
+    items, truncated = ep._fit_series(many, 0, lambda u: u)
     assert truncated is True
     assert 0 < len(items) < ep._SERIES_MAX_MRL   # 预算先触发（未被条数上限截断）
     assert sum(len(m) for _i, m in items) <= ep._SERIES_MAX_CMD
@@ -415,19 +421,19 @@ def test_fit_series_cmd_budget_binds_before_count_cap():
 def test_fit_series_keeps_at_least_one_oversized_item():
     """单条就超字符上限也必须保留（当前集能播 > 命令行长）。"""
     fat = [("u0", "", "标" * (ep._SERIES_MAX_CMD + 100))]
-    items, trunc = ep._fit_series(fat, 0, lambda u, a: u)
+    items, trunc = ep._fit_series(fat, 0, lambda u: u)
     assert len(items) == 1 and trunc is False
 
 
 def test_series_entry_missing_fields_falls_back():
     """残缺条目（只有 url / url+audio）→ 不抛异常，标题兜底为「第N集」。"""
     items, truncated = ep._fit_series([("u0",), ("u1", "u1a")], 0,
-                                      lambda u, a: u)
+                                      lambda u: u)
     assert items == [(0, "u0#第1集"), (1, "u1#第2集")]
     assert truncated is False
     # 空元组（调用方给了垃圾数据）整条跳过，不 IndexError；下标按原位保留
     # → 集号兜底跟着真实集位走。
-    assert ep._fit_series([(), ("u0",)], 0, lambda u, a: u)[0] == [
+    assert ep._fit_series([(), ("u0",)], 0, lambda u: u)[0] == [
         (1, "u0#第2集")]
 
 
@@ -438,7 +444,7 @@ def test_fit_series_rederive_keeps_original_numbering():
     用户根本看不出自己在第几集。
     """
     many = [(f"u{i}", "", "") for i in range(400)]   # 标题全空 → 走集号兜底
-    items, trunc = ep._fit_series(many, 395, lambda u, a: u)
+    items, trunc = ep._fit_series(many, 395, lambda u: u)
     assert trunc is True
     assert [i for i, _m in items] == list(range(395, 400))
     assert items[0][1] == "u395#第396集"            # 不是切片里的「第1集」
@@ -450,7 +456,7 @@ def test_fit_series_resolves_non_local_urls_only():
     seen = []
     eps = [("http://127.0.0.1:9/e/k/0", "", "第01集"),
            ("https://cdn.example.com/b.m3u8", "", "第02集")]
-    items, _ = ep._fit_series(eps, 0, lambda u, a: seen.append(u) or "P:" + u)
+    items, _ = ep._fit_series(eps, 0, lambda u: seen.append(u) or "P:" + u)
     assert seen == ["https://cdn.example.com/b.m3u8"]
     assert items[0][1] == "http://127.0.0.1:9/e/k/0#第01集"
     assert items[1][1] == "P:https://cdn.example.com/b.m3u8#第02集"

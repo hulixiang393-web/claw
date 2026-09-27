@@ -161,10 +161,12 @@ def _fit_series(episodes: list, start_idx: int, resolve,
     仅当全集超出 _SERIES_MAX_MRL 条数或 _SERIES_MAX_CMD 总字符数时，才降级为
     「从当前集往后」的窗口（此时当前集恒为窗口首项，握手依然找得到）。
 
-    resolve(url, audio) -> play_url：非本机代理 URL 才经它包一层代理
-    （惰性 /e/ URL 原样使用）。**先解析再计长**——代理 URL 比原 URL 长，
-    先计长会低估命令行占用。空 URL 的集整条跳过。至少保留 1 条
-    （单条超长也不丢，保证「当前集能播」优先于命令行长度）。
+    resolve(url) -> play_url：非本机代理 URL 才经它包一层代理
+    （惰性 /e/ URL 原样使用）。协议里**没有 audio 形参**——系列路径丢弃各集
+    音频轨（单集路径的 audio/input-slave 不受影响），留着它只会让人误以为
+    音频被用上了。**先解析再计长**——代理 URL 比原 URL 长，先计长会低估
+    命令行占用。空 URL 的集整条跳过。至少保留 1 条（单条超长也不丢，
+    保证「当前集能播」优先于命令行长度）。
 
     begin episodes 在整表里的**起始集位**（降级重取窗口时传切片起点，默认 0）。
     返回的集下标 = begin + 切片内位置，使集号兜底标题与握手下标始终同源。
@@ -172,8 +174,7 @@ def _fit_series(episodes: list, start_idx: int, resolve,
     def _mrl_of(idx: int, entry) -> str:
         # idx 是**原始集位**（不是切片位置）：集号兜底标题「第{idx+1}集」与
         # items 传给握手的下标必须同源，否则降级重取窗口会重编号。
-        ep_play = entry[0] if _is_local_proxy_url(entry[0]) else resolve(
-            entry[0], entry[1] if len(entry) > 1 else "")
+        ep_play = entry[0] if _is_local_proxy_url(entry[0]) else resolve(entry[0])
         return _mrl_with_title(ep_play,
                                entry[2] if len(entry) > 2 else "", idx)
 
@@ -353,11 +354,12 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             # 系列：全集按序入列（episodes[0] 也在列内），不另加主 MRL。
             # 起始项三级解析：显式 start_idx → url 命中 → 记 warning 退第 1 集。
             start_pos = _locate_start(episodes, start_idx, url)
-            # 系列每集只解析**流地址**（音频传空）：系列路径丢弃 entry[1]，
-            # merged 流另挂 :input-slave 会黑屏（见设计 §7），多解析一次
-            # 就白铸一个没人用的代理 token。主路径的音频轨仍照常解析。
+            # 系列每集只解析**流地址**：系列路径丢弃 entry[1]（merged 流另挂
+            # :input-slave 会黑屏，见设计 §7），resolve 协议里也就没有 audio
+            # 形参；原先多解析一次就白铸一个没人用的代理 token。
+            # 主路径的音频轨仍照常解析。
             window, truncated = _fit_series(
-                episodes, start_pos, lambda u, _a: _resolve(u, "")[0])
+                episodes, start_pos, lambda u: _resolve(u, "")[0])
             if window:
                 args.append("--no-random")
                 if start_pos > 0:
@@ -402,7 +404,11 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                 try:
                     _start_playlist_sync(start_pos, window, on_playlist_ready)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("外部播放器：启动握手失败（不影响已拉起的 VLC）: %s", exc)
+                    # exc_info=True：这条 except 就是为诊断握手失败而存在的，
+                    # 光有 str(exc) 丢掉堆栈——而「缺 Task 5 符号的 NameError」
+                    # 「签名对不上」这类病因恰恰只在堆栈里。
+                    log.warning("外部播放器：启动握手失败（不影响已拉起的 VLC）: %s",
+                                exc, exc_info=True)
             if truncated:
                 return f"已用外部播放器打开（列表已截断，共 {len(window)} 集）"
             return "已用外部播放器打开"
