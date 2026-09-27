@@ -10,6 +10,7 @@
 - 写入点：build_url / proxy_url_for / _register_cache_ctx 存四元组
 - 端到端：默认直连，force 请求走代理；老三元组 token 兼容
 """
+import io
 import re
 import threading
 
@@ -51,6 +52,58 @@ class _RespM3U8:
         "Content-Length": str(len(_FORCE_M3U8.encode())),
     }
     content = _FORCE_M3U8.encode()
+
+    def close(self):
+        pass
+
+
+_FORCE_HLS = (
+    "#EXTM3U\n"
+    "#EXT-X-KEY:METHOD=AES-128,URI=\"/keys/001.key\"\n"
+    "#EXTINF:10.0,\n/seg/001.ts\n"
+    "#EXT-X-ENDLIST\n"
+)
+
+
+class _RespHls:
+    status_code = 200
+    headers = {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Content-Length": str(len(_FORCE_HLS.encode())),
+    }
+    content = _FORCE_HLS.encode()
+
+    def close(self):
+        pass
+
+
+class _RespBytes:
+    status_code = 200
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": "3",
+    }
+    content = b"abc"
+
+    def __init__(self):
+        self.raw = io.BytesIO(self.content)
+
+    def close(self):
+        pass
+
+
+class _RespRange:
+    status_code = 206
+    headers = {
+        "Content-Type": "video/mp4",
+        "Content-Length": "3",
+        "Content-Range": "bytes 10-12/100",
+        "Accept-Ranges": "bytes",
+    }
+    content = b"abc"
+
+    def __init__(self):
+        self.raw = io.BytesIO(self.content)
 
     def close(self):
         pass
@@ -419,6 +472,87 @@ def test_e2e_force_proxy_request_uses_proxy_only(force_e2e):
     for t in re.findall(r"/s/([0-9a-f]+)", r.text):
         entry = proxy._tokens[t]
         assert len(entry) == 4 and entry[3] is True
+
+
+def test_force_proxy_connection_failure_is_explicit_502(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog,
+                       pex=requests.ConnectionError("proxy down"))
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    try:
+        local = proxy.build_url("http://up.example/video.mp4",
+                                {"Referer": "https://fake/"}, force_proxy=True)
+        response = requests.get(local, timeout=10)
+        assert response.status_code == 502
+        assert response.content
+        assert dlog == []
+        assert len(plog) == 2
+    finally:
+        proxy.stop()
+
+
+def test_force_proxy_hls_children_keep_route_and_diagnostics(monkeypatch):
+    dlog, plog = [], []
+
+    def _proxy_get(target, **kwargs):
+        plog.append(((target,), kwargs))
+        return _RespHls() if target.endswith("index.m3u8") else _RespBytes()
+
+    monkeypatch.setattr(mp, "_get_direct_session",
+                        lambda: _FakeSession(dlog, _RespHls()))
+    monkeypatch.setattr(mp, "_get_session", lambda: type(
+        "_Session", (), {"get": staticmethod(_proxy_get)})())
+    mp._reset_upstream_route_diagnostics()
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    try:
+        local = proxy.build_url("http://up.example/hls/index.m3u8",
+                                {"Referer": "https://fake/"}, force_proxy=True)
+        manifest = requests.get(local, timeout=10)
+        assert manifest.status_code == 200
+        child_urls = re.findall(r"https?://127\.0\.0\.1:\d+/s/[0-9a-f]+",
+                                manifest.text)
+        assert len(child_urls) == 2
+        for child in child_urls:
+            assert requests.get(child, timeout=10).status_code == 200
+        records = mp._read_upstream_route_diagnostics()
+        assert [record["request_kind"] for record in records] == [
+            "manifest", "key", "segment",
+        ]
+        assert all(record["route"] == "proxy" for record in records)
+        assert all(record["status_code"] == 200 for record in records)
+        assert all(entry[3] is True for entry in proxy._tokens.values())
+    finally:
+        proxy.stop()
+
+
+def test_force_proxy_mp4_range_preserves_header_and_route(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, presp=_RespRange())
+    mp._reset_upstream_route_diagnostics()
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    try:
+        local = proxy.build_url("http://up.example/video.mp4",
+                                {"Referer": "https://fake/"}, force_proxy=True)
+        response = requests.get(local, headers={"Range": "bytes=10-12"}, timeout=10)
+        assert response.status_code == 206
+        assert response.content == b"abc"
+        assert plog[0][1]["headers"]["Range"] == "bytes=10-12"
+        records = mp._read_upstream_route_diagnostics()
+        assert records == [{
+            "host": "up.example",
+            "request_kind": "range",
+            "route": "proxy",
+            "status_code": 206,
+            "elapsed_ms": records[0]["elapsed_ms"],
+            "first_byte_ms": records[0]["first_byte_ms"],
+            "throughput_bps": None,
+            "failure_category": None,
+        }]
+    finally:
+        proxy.stop()
 
 
 def test_e2e_default_request_direct_first(force_e2e):
