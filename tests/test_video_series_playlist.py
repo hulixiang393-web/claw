@@ -88,6 +88,25 @@ class _FakeContent:
         return self._video, ""
 
 
+class _RawSource:
+    """带真实 raw 配置的源替身：ad_block / media.hls / Referer 都可配。
+
+    「⚙外部播放器」与「当前流」类断言必须靠它才成立：源替身若只写字符串
+    （view._source = "SRC"），(self._source.raw or {}) 会抛 AttributeError 被
+    except 吞掉 → ad_block 恒为 {}，于是「真读了源配置」和「写死字面量 {}」
+    在断言下无法区分（mutant 杀不掉）。
+    """
+
+    base_url = "http://src.example.com"
+
+    def __init__(self, raw=None, headers=None):
+        self.raw = raw or {}
+        self._headers = headers or {}
+
+    def request_headers(self):
+        return dict(self._headers)
+
+
 class _FakeProc:
     """模拟 external_player 的模块级 _last_proc。"""
 
@@ -846,10 +865,14 @@ def test_handle_key_prev_uses_pl_previous(_qapp, monkeypatch):
 # --------------------------------------------------------------------- #
 # 「⚙外部播放器」入口：接系列路径 + 新会话代数 + 握手回调适配
 # --------------------------------------------------------------------- #
-def _ext_view(detail, idx, caching_ms=0):
-    """装好「⚙外部播放器」所需状态的视图（源用字符串：无 raw/request_headers）。"""
+def _ext_view(detail, idx, caching_ms=0, ad_block=None):
+    """装好「⚙外部播放器」所需状态的视图。
+
+    源用 _RawSource 而非字符串：ad_block 真从源配置读（C4 证据必须能区分
+    「读了配置」和「写死 {}」）。
+    """
     view = _view(detail, idx)
-    view._source = "SRC"
+    view._source = _RawSource({"ad_block": ad_block or {}})
     view._content = _FakeContent()
     view._current_play = "https://cdn/cur.m3u8"
     view._current_audio = ""
@@ -861,7 +884,8 @@ def _ext_view(detail, idx, caching_ms=0):
 
 def test_open_external_uses_series_playlist(_qapp, monkeypatch):
     """「⚙外部播放器」入口也走系列路径（此前完全不传 episodes）。"""
-    view = _ext_view(_video_detail(4), 1, caching_ms=30000)
+    view = _ext_view(_video_detail(4), 1, caching_ms=30000,
+                     ad_block={"urls": ["ad-segment"]})
     _install_proxy(monkeypatch, _FakeProxy())
     monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
     captured = {}
@@ -879,7 +903,7 @@ def test_open_external_uses_series_playlist(_qapp, monkeypatch):
     assert captured["classify_url"] == "https://cdn/cur.m3u8"   # C3：用真实流分类
     assert captured["start_idx"] == 1
     assert captured["caching_ms"] == 30000
-    assert captured["ad_block"] == {}                          # C4：不得丢
+    assert captured["ad_block"] == {"urls": ["ad-segment"]}   # C4：真从源配置传下去
 
 
 def test_open_external_playlist_ready_adapts_generation(_qapp, monkeypatch):
@@ -957,3 +981,128 @@ def test_open_external_falls_back_for_empty_url_episode(_qapp, monkeypatch):
     assert captured["url"] == "https://cdn/cur.m3u8"     # 不是点了就 502 的 /e/
     assert captured["episodes"] is None                  # 退回单集
     assert captured["classify_url"] == "https://cdn/cur.m3u8"
+
+
+# --------------------------------------------------------------------- #
+# Review 轮：换源后「当前流」三元组必须作废（Important）
+# --------------------------------------------------------------------- #
+def _playing_old_source(monkeypatch, n=3):
+    """造一个「VLC 正在播旧源第 1 集」的视图（走真实 _play，不手工赋值）。
+
+    ep._last_proc 置 running=True → player_running() 为真 → reload_detail 里的
+    _stop_player() 不注销旧系列（正是「VLC 还开着」的真实前提）。
+    """
+    view = _view(_video_detail(n), 0)
+    view._source = _RawSource({"ad_block": {}})
+    view._content = _FakeContent(video="https://cdn/OLD.m3u8")
+    view._force_proxy_enabled = lambda: False
+    view._source_network_caching_ms = lambda: 0
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_last_proc", _FakeProc(running=True))
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    monkeypatch.setattr(ep, "open_with_player", lambda url, **kw: "已用外部播放器打开")
+    view._play("https://cdn/OLD.m3u8", "https://cdn/OLD-audio.m4a", "第1集 标题0")
+    return view
+
+
+def test_reload_detail_invalidates_current_stream(_qapp, monkeypatch):
+    """换源后 _current_play/_current_audio/_current_title 必须一并作废。
+
+    reload_detail 开头已 _stop_player()（旧流早就不放了），却只清了
+    _stream_cache / _detail_url_for_play / _has_played / _selection_mode，唯独
+    漏了「当前流」三元组。留着的话，界面上摆的是 B 源的集，「当前流」却还是
+    A 源的 → ⚙外部播放器、▶、复制流地址三处都会把 A 源的流当 B 源的当前集
+    交出去/复制出去（静默播错，App 里完全看不出来）。
+
+    _current_audio 必须同清：它只与 _current_play 成对读（_toggle_play_pause /
+    _open_external 都传），单清其一反而会凑出「新源视频 + 旧源音轨」的组合。
+    """
+    view = _playing_old_source(monkeypatch)
+    assert view._current_play == "https://cdn/OLD.m3u8"       # 前提：正在播旧源
+    assert view._current_audio == "https://cdn/OLD-audio.m4a"
+    assert view._current_title == "第1集 标题0"
+
+    view.reload_detail(_video_detail(2))                      # 换源 → 2 集（选集态）
+    assert view._current_play == ""
+    assert view._current_audio == ""
+    assert view._current_title == ""
+
+
+def test_open_external_after_source_switch_launches_nothing(_qapp, monkeypatch):
+    """换源后 ⚙外部播放器不得把**旧源**的流交给 VLC（陈旧回退不可达）。
+
+    选集态语义（有意为之，非副作用）：⚙ 的契约是「把**当前集**交外部播放器」
+    （帮助文案：手动重新拉起播放器），选集态压根没有当前集 → 无可交之物。
+    选集态下要开播请用 ▶／点集卡（_toggle_play_pause 会按高亮集取流，
+    顺带拿到全集播放列表），比「外播一个猜出来的集」更对。
+    """
+    view = _playing_old_source(monkeypatch)
+    launched = []
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: launched.append(url) or "ok")
+
+    view.reload_detail(_video_detail(2))
+    view._open_external()
+    assert launched == []          # 旧源流没被交出去，也没退化成播放新源
+
+
+def test_toggle_play_after_source_switch_loads_highlighted_episode(_qapp, monkeypatch):
+    """换源后 ▶按当前高亮集取流，不得重播旧源的流（同一个根因的第二个出口）。"""
+    view = _playing_old_source(monkeypatch)
+    played = []
+    monkeypatch.setattr(view, "_load_episode", lambda i: played.append(i))
+
+    view.reload_detail(_video_detail(2))
+    view._current_idx = 1
+    view._toggle_play_pause()
+    assert played == [1]           # 走「按高亮集取流」，不是 _play(旧源流)
+
+
+def test_ad_block_reaches_both_entry_points(_qapp, monkeypatch):
+    """C4 证据补强：源配了非空 ad_block → _play 与 ⚙ 两个入口都必须真传下去。
+
+    原来只有 ⚙ 一处、且源替身没有 raw，ad_block 恒为 {}，「读了源配置」与
+    「写死字面量 {}」无法区分。这里两个入口都断言真值。
+    """
+    detail = _video_detail(4)
+    view = _view(detail, 1)
+    view._source = _RawSource({"ad_block": {"urls": ["ad-segment"]}})
+    view._content = _FakeContent()
+    view._force_proxy_enabled = lambda: False
+    view._source_network_caching_ms = lambda: 0
+    _install_proxy(monkeypatch, _FakeProxy())
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\vlc.exe")
+    captured = {}
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: captured.update(url=url, **kw) or "ok")
+
+    view._play("https://cdn/cur.m3u8", "", "第2集")
+    assert captured["ad_block"] == {"urls": ["ad-segment"]}    # _play 入口
+
+    captured.clear()
+    view._open_external()
+    assert captured["ad_block"] == {"urls": ["ad-segment"]}    # ⚙ 入口
+
+
+def test_try_external_goto_passes_item_id_unchanged(_qapp, monkeypatch):
+    """_try_external_goto 必须把 item_id **原样**转发（不得再 int() 强转）。
+
+    已知取舍：item_id 是 VLC item id（int），强转无害；但若 libvlc 某天给出
+    非数字 id，这一行就是整条链路上唯一的 TypeError 源。on_playlist_ready 已
+    校验过 id 必须是 int，故这里强转是纯冗余 → 删。
+    """
+    view = _view(_video_detail(3), 0)
+    got = []
+    monkeypatch.setattr(ep, "player_goto", lambda i: got.append(i) or True)
+    view._play_gen = 7
+    view._vlc_ids_gen = 7
+    view._vlc_item_ids = {0: 41}
+    view._current_idx = 0
+    view._external_active = True
+
+    assert view._try_external_goto(0) is True
+    assert got == [41]              # item_id 原样转发
+
+    got.clear()
+    assert view._try_external_goto(2) is False    # 未映射 → 不发命令
+    assert got == []

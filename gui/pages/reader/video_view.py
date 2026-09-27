@@ -749,7 +749,7 @@ class VideoView(QWidget):
         try:
             from framework.external_player import player_goto
 
-            if not player_goto(int(item_id)):
+            if not player_goto(item_id):
                 return False
         except Exception:  # noqa: BLE001 —— 无控制会话/网络失败：回落重开
             return False
@@ -1204,6 +1204,14 @@ class VideoView(QWidget):
         self._recommend_keyword = ""  # 换源后按新源重搜推荐
         self._has_played = False  # 新源尚未播放，不把选集态误存为续读进度
         self._selection_mode = False  # 重置选集态
+        # 「当前流」三元组一并作废：_stop_player() 刚停完，界面上摆的已是新源的集，
+        # 留着 _current_play 的话它指的是**旧源**的流 → ⚙外部播放器（无系列时的
+        # 单集回退）、▶_toggle_play_pause、复制流地址三处都会把旧源的流当新源的
+        # 当前集交出去/复制出去（静默播错，App 里看不出来）。_current_audio 一并清：
+        # 它只与 _current_play 成对读，单清其一会凑出「新源视频 + 旧源音轨」。
+        self._current_play = ""
+        self._current_audio = ""
+        self._current_title = ""
         self._populate_ep_cards(new_detail.chapters)
         self._switching = False
         self._sync_overlay_state(playing=False)
@@ -1986,6 +1994,11 @@ class VideoView(QWidget):
         媒体直链；VLC 不可用时回退浏览器打开集页面（页面播放绕开防盗链）。
         """
         if not self._current_play:
+            # 有意为之：本入口的契约是「把**当前集**交外部播放器」（帮助文案：手动
+            # 重新拉起播放器），选集态压根没有当前集 → 无可交之物。选集态要开播请用
+            # ▶/点集卡（_toggle_play_pause 会按高亮集取流，顺带拿到全集播放列表）。
+            # 换源后走到这里也正是靠 _current_play 已作废——否则会把**旧源**的流
+            # 当新源的当前集交出去。
             return
         audio = getattr(self, "_current_audio", "")
         hdrs = {}
@@ -2017,6 +2030,11 @@ class VideoView(QWidget):
         except Exception:  # noqa: BLE001
             pass
         force_proxy = self._force_proxy_enabled()
+        # 已知取舍（本轮记录，留待 Task 8 真机验证）：这里重注册会注销**仍在播**的
+        # 旧系列，上一个 VLC 窗口点集/拖进度条时它的 /e/ 已注销 → 404。VLC 单实例
+        # 会把本次拉起并入**旧窗口**（不新开窗口），故在途 /e/ 仍可解析，窗口里的
+        # 旧分集条目则确实失效。旧窗口把「点集」报给 App 时，App 已用新系列重开
+        # 播放，源相同，落在同一集上无感。
         series = self._build_series_playlist(
             self._current_play, audio, hdrs, ad_block, force_proxy)
         # 开播 MRL 取**返回列表**里当前集那一项（不回头读 self._series_urls ——
