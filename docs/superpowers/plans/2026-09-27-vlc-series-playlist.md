@@ -963,7 +963,8 @@ git commit -m "feat(player): VLC 控制面——pl_play&id / pl_previous / playl
   - `_sanitize_title(title: str, idx: int = 0) -> str`
   - `_mrl_with_title(url: str, title: str, idx: int = 0) -> str`
   - `_fit_series(episodes: list, start_idx: int, resolve, begin: int = 0) -> tuple[list[tuple[int, str]], bool]`
-    —— `begin` 是 episodes 切片在整表里的起始集位，使集号兜底标题与返回下标同源。
+    —— `begin` 是 episodes 切片在整表里的起始集位，使集号兜底标题与返回下标同源；
+    `resolve` 是**单参**可调用 `resolve(url) -> play_url`（系列路径不解析各集音频轨）。
   - `_is_local_proxy_url(target: str) -> bool`
   - 常量 `_SERIES_MAX_MRL = 300`、`_SERIES_MAX_CMD = 30000`
 
@@ -1375,14 +1376,15 @@ def _fit_series(episodes: list, start_idx: int,
     仅当全集超出 _SERIES_MAX_MRL 条数或 _SERIES_MAX_CMD 总字符数时，才降级为
     「从当前集往后」的窗口（此时当前集恒为窗口首项，握手依然找得到）。
 
-    resolve(url, audio) -> play_url：非本机代理 URL 才经它包一层代理
-    （惰性 /e/ URL 原样使用）。**先解析再计长**——代理 URL 比原 URL 长，
-    先计长会低估命令行占用。空 URL 的集整条跳过。至少保留 1 条
-    （单条超长也不丢，保证「当前集能播」优先于命令行长度）。
+    resolve(url) -> play_url：非本机代理 URL 才经它包一层代理
+    （惰性 /e/ URL 原样使用）。协议里**没有 audio 形参**——系列路径丢弃各集
+    音频轨（单集路径的 audio/input-slave 不受影响），留着它只会让人误以为
+    音频被用上了。**先解析再计长**——代理 URL 比原 URL 长，先计长会低估
+    命令行占用。空 URL 的集整条跳过。至少保留 1 条（单条超长也不丢，
+    保证「当前集能播」优先于命令行长度）。
     """
     def _mrl_of(idx: int, entry) -> str:
-        ep_play = entry[0] if _is_local_proxy_url(entry[0]) else resolve(
-            entry[0], entry[1] if len(entry) > 1 else "")
+        ep_play = entry[0] if _is_local_proxy_url(entry[0]) else resolve(entry[0])
         return _mrl_with_title(ep_play,
                                entry[2] if len(entry) > 2 else "", idx)
 
@@ -1494,7 +1496,7 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                 # 非首项开播：先禁止 autostart，再由握手 pl_play 定位
                 args.append("--no-playlist-autostart")
             window, truncated = _fit_series(episodes, start_idx,
-                                           lambda u, a: _resolve(u, a)[0])
+                                           lambda u: _resolve(u, "")[0])
             for _idx, mrl in window:
                 args.append(mrl)
         else:
