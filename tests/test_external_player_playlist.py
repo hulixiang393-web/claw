@@ -608,6 +608,34 @@ def test_handshake_first_episode_no_goto(monkeypatch):
     assert ready == {0: 21}
 
 
+def test_handshake_goto_failure_logs_warning(monkeypatch, caplog):
+    """pl_play 失败要记日志，且成功时不记。
+
+    这是握手里最后一处「静默放弃」。它只在 start_idx>0 时可达——而那恰恰是
+    没带 --no-playlist-autostart 的时候，所以 pl_play 失败**不是**「降级去播
+    第 1 集」，而是列表载入却什么都不播（黑窗）。返回值以前被直接丢弃。
+    """
+    monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
+    series = [(0, "http://x/e/k/0"), (1, "http://x/e/k/1")]
+
+    _serve_playlist(monkeypatch, [{"id": "12", "uri": "http://x/e/k/1"}])
+    monkeypatch.setattr(ep, "player_goto", lambda i: False)
+    with caplog.at_level(logging.WARNING, logger="framework.external_player"):
+        ep._handshake_worker(1, series, None)
+    warns = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warns) == 1
+    assert "pl_play" in warns[0]
+    assert "12" in warns[0]        # 点名是哪个项 id 定位失败
+
+    caplog.clear()                # 成功路径不该有这条噪音日志
+    _serve_playlist(monkeypatch, [{"id": "12", "uri": "http://x/e/k/1"}])
+    monkeypatch.setattr(ep, "player_goto", lambda i: True)
+    with caplog.at_level(logging.WARNING, logger="framework.external_player"):
+        ep._handshake_worker(1, series, None)
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 def _serve_playlist(monkeypatch, payload):
     """让真的 player_playlist_items 读到 payload（只 stub HTTP 与控制态）。
 
@@ -713,6 +741,26 @@ def test_handshake_timeout_logs_warning(monkeypatch, caplog):
     assert "--no-playlist-autostart" in text   # 点明「黑窗」这个真实后果
 
 
+def test_handshake_timeout_first_episode_not_black_window(monkeypatch, caplog):
+    """start_idx==0 的超时不能说「黑窗」——那一集根本没加 autostart 禁令。
+
+    首集开播不加 --no-playlist-autostart，握手失败的真实后果是「映射留空、
+    由 VLC 原生 autostart 播第 1 集」，不是「什么都不播」。
+    """
+    monkeypatch.setattr(ep, "_HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ep, "_HANDSHAKE_INTERVAL", 0.01)
+    _serve_playlist(monkeypatch, [{"id": "3", "uri": "http://x/other/k/9"}])
+    monkeypatch.setattr(ep, "player_goto", lambda i: True)
+    with caplog.at_level(logging.WARNING, logger="framework.external_player"):
+        ep._handshake_worker(0, [(0, "http://x/e/k/0")], None)
+    warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warns) == 1
+    text = warns[0].getMessage()
+    assert "握手超时" in text
+    assert "列表已载入但不播放" not in text   # 首集开播不存在黑窗
+    assert "autostart" in text               # 说明改由原生 autostart 播第 1 集
+
+
 def test_handshake_timeout_logs_matched_count(monkeypatch, caplog):
     """超时时「匹配上几项」要报真实数字，不能写死 0。
 
@@ -731,8 +779,10 @@ def test_handshake_timeout_logs_matched_count(monkeypatch, caplog):
     warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warns) == 1
     text = warns[0].getMessage()
-    assert "1 项" in text     # 真实匹配数是 1
-    assert "0 项" not in text  # 不能写死 0
+    assert "1 项" in text       # 真实匹配数是 1
+    # 锚在「匹配上」上，别用裸 "0 项"：payload 有 20/100 项时 "20 项" 含 "0 项"，
+    # 会假红（与「读到几项」无关）
+    assert "匹配上 0 项" not in text
 
 
 def test_handshake_duplicate_mrl_first_index_wins(monkeypatch):

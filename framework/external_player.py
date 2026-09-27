@@ -46,9 +46,12 @@ _SERIES_MAX_MRL = 300
 _SERIES_MAX_CMD = 30000
 
 # 启动握手：等 VLC 建好播放列表（读 playlist.json）并按 uri 匹配起始项。
-# 超时/解析失败会记 warning。**别指望它降级成「自动播第 1 集」**：超时只在
-# start_idx>0（带 --no-playlist-autostart）时才可能发生，所以真实后果是
-# 「列表已载入、什么都不播」的黑窗，而不是不致命的错播首集。
+# 超时/解析失败会记 warning，且**两种情况的后果不同**（循环本身没有按
+# start_idx 分支，所以两种都可能走到超时）：
+# - start_idx>0（带 --no-playlist-autostart）：没有 autostart 退路，真实后果是
+#   「列表已载入、什么都不播」的黑窗；
+# - start_idx==0：VLC 原生 autostart 照播第 1 集，真实后果只是映射留空。
+# 两种都**不是**「降级成自动播第 1 集」那种不致命的错播。
 _HANDSHAKE_TIMEOUT = 3.0
 _HANDSHAKE_INTERVAL = 0.1
 
@@ -498,10 +501,16 @@ def player_playlist_items(timeout: float = 2.0,
     >=400 / 响应非 list 一律返回 []。**失败结果不缓存**（下次调用重试）。
     refresh=True 强制重新拉（握手轮询 VLC 尚未建好列表时需要）。
 
-    **id 已归一化成 int**：VLC 的 httprequests.lua 用 `tostring(item.id)`
+    **id 尽可能归一化成 int**：VLC 的 httprequests.lua 用 `tostring(item.id)`
     序列化，playlist.json 里 id 一律是字符串；pl_play&id= 与 App 切集都按整数
-    项 id 用，所以在这里一次性转好，消费方不必各自 int()。转不成 int 的 id
-    保留原值（**不丢整项**——项数与顺序是有效信息），由消费方自行守卫。
+    项 id 用，所以在这里一次性转好，消费方不必各自 int()。**转不成 int 的保留
+    原值**（不丢整项——项数与顺序是有效信息），由消费方自行守卫。
+
+    注意归一化是**就地**改 r.json() 解析出的 dict（VLC 没给这批对象别的引用，
+    缓存里也是同一批）。副作用：`assert player_playlist_items() == payload`
+    这类断言对 id 的类型是自我满足的（payload 与返回值共用同一批 dict），
+    id 类型回归要靠 `test_playlist_items_normalizes_string_ids` 那样直接查
+    `[it["id"] for it in items]` 才抓得住。
     """
     global _playlist_items
     if _playlist_items and not refresh:
@@ -697,17 +706,37 @@ def _handshake_worker(start_idx: int, series: list[tuple[int, str]],
                     pass
             if start_id is not None:
                 if start_idx > 0:
-                    player_goto(start_id)   # 失败即降级 autostart，不重试
+                    # 这里可达就意味着带了 --no-playlist-autostart：**没有**
+                    # 「降级去播第 1 集」这种退路，pl_play 失败就是「列表载入
+                    # 却什么都不播」的黑窗。不重试（重发也未必比让用户手动点好），
+                    # 但必须留日志——这是握手里最后一处静默放弃。
+                    if not player_goto(start_id):
+                        log.warning(
+                            "VLC 启动握手：pl_play 定位到起始集失败"
+                            "（id=%s）；列表已载入但未定位播放，"
+                            "App 将回落到重开播放器。", start_id,
+                        )
                 return                      # 首集：原生 autostart 已对
         if time.monotonic() >= deadline:
-            # 超时的唯一用户可见后果是 VLC 列表建好了却**什么都没播**（黑窗）。
-            # 这条路径静默返回 = 现场无从排查，必须留日志。匹配数可能非 0：
-            # 起始集被 _fit_series 跳过时，其余集照样能匹配上。
-            log.warning(
-                "VLC 启动握手超时（%.1fs）：playlist.json 最多读到 %d 项，"
-                "按 uri 匹配上 %d 项；VLC 已是「列表已载入但不播放」状态"
-                "（非首集开播带了 --no-playlist-autostart）。",
-                _HANDSHAKE_TIMEOUT, seen_items, seen_matched,
-            )
+            # 静默返回 = 现场无从排查，必须留日志。匹配数可能非 0：起始集被
+            # _fit_series 跳过时，其余集照样能匹配上。
+            if start_idx > 0:
+                log.warning(
+                    "VLC 启动握手超时（%.1fs）：playlist.json 最多读到 %d 项，"
+                    "按 uri 匹配上 %d 项；非首集开播带了 --no-playlist-"
+                    "autostart，VLC 已是「列表已载入但不播放」状态，"
+                    "App 将回落到重开播放器。",
+                    _HANDSHAKE_TIMEOUT, seen_items, seen_matched,
+                )
+            else:
+                # 首集开播**没有** autostart 禁令，所以不存在黑窗：VLC 会自己
+                # 播第 1 集，真实损失只是映射留空。
+                log.warning(
+                    "VLC 启动握手超时（%.1fs）：playlist.json 最多读到 %d 项，"
+                    "按 uri 匹配上 %d 项；首集开播未加 --no-playlist-"
+                    "autostart，说明 VLC 控制会话未就绪，改由原生 autostart "
+                    "播第 1 集——映射留空，App 切集将回落到重开播放器。",
+                    _HANDSHAKE_TIMEOUT, seen_items, seen_matched,
+                )
             return
         time.sleep(_HANDSHAKE_INTERVAL)
