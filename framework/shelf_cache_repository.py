@@ -5,8 +5,10 @@ import hashlib
 import json
 import os
 import sqlite3
+import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +34,7 @@ class ShelfCacheRepository:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA foreign_keys = ON")
         self._init_schema()
+        self._validate_schema_version()
         self._repair_index()
 
     def close(self) -> None:
@@ -71,12 +74,23 @@ class ShelfCacheRepository:
                 """
             )
 
+    def _validate_schema_version(self) -> None:
+        row = self._db.execute("SELECT version FROM schema_version").fetchone()
+        if not row or row[0] != 1:
+            raise RuntimeError(f"unsupported schema version: {row[0] if row else None}")
+
     def _repair_index(self) -> None:
         with self._lock, self._db:
             rows = self._db.execute("SELECT book_key, chapter_key, path FROM content").fetchall()
+            indexed = set()
             for row in rows:
-                if not Path(row["path"]).exists():
+                path = Path(row["path"])
+                indexed.add(path.resolve())
+                if not path.exists():
                     self._db.execute("DELETE FROM content WHERE book_key=? AND chapter_key=?", (row["book_key"], row["chapter_key"]))
+            for path in self.content_root.rglob("*"):
+                if path.is_file() and (path.suffix == ".tmp" or path.name.startswith(".delete-") or path.resolve() not in indexed):
+                    path.unlink(missing_ok=True)
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -132,34 +146,45 @@ class ShelfCacheRepository:
                 result[key] = self._loads(row[0]) if row else None
             return result
 
-    def _content_path(self, book_key: str, chapter_key: str) -> Path:
-        digest = hashlib.sha256(f"{book_key}\0{chapter_key}".encode()).hexdigest()
-        return self.content_root / digest[:2] / f"{digest}.gz"
+    def _new_payload_paths(self) -> tuple[Path, Path]:
+        operation = uuid.uuid4().hex
+        fd, tmp_name = tempfile.mkstemp(prefix=f".payload-{operation}-", suffix=".tmp", dir=self.content_root)
+        os.close(fd)
+        return Path(tmp_name), self.content_root / f"payload-{operation}.gz"
+
+    def _write_content_index(self, row: dict, now: float, book_key: str) -> None:
+        self._db.execute("INSERT INTO content VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(book_key,chapter_key) DO UPDATE SET content_type=excluded.content_type,path=excluded.path,size=excluded.size,metadata=excluded.metadata,checksum=excluded.checksum,accessed_at=excluded.accessed_at", tuple(row.values()))
+        self._db.execute("UPDATE books SET last_active_at=? WHERE book_key=?", (now, book_key))
+        self._evict_locked()
 
     def put_content(self, book_key: str, chapter_key: str, content_type: str, payload: bytes | str, metadata: dict) -> dict:
         raw = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
         checksum = hashlib.sha256(raw).hexdigest()
-        path = self._content_path(book_key, chapter_key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-        with gzip.open(tmp, "wb") as fh:
-            fh.write(raw)
-            fh.flush()
-        os.replace(tmp, path)
-        now = self.clock()
-        with self._lock, self._db:
+        with self._lock:
             existing = self._db.execute("SELECT * FROM content WHERE book_key=? AND chapter_key=?", (book_key, chapter_key)).fetchone()
-            if existing and existing["checksum"] == checksum and existing["content_type"] == content_type and existing["metadata"] == self._json(metadata):
+            if existing and existing["checksum"] == checksum and existing["content_type"] == content_type and existing["metadata"] == self._json(metadata) and Path(existing["path"]).exists():
                 row = dict(existing)
                 row["metadata"] = metadata
                 return row
-            created_at = existing["created_at"] if existing else now
-            row = {"book_key": book_key, "chapter_key": chapter_key, "content_type": content_type, "path": str(path), "size": len(raw), "metadata": self._json(metadata), "checksum": checksum, "created_at": created_at, "accessed_at": now}
-            self._db.execute("INSERT INTO content VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(book_key,chapter_key) DO UPDATE SET content_type=excluded.content_type,path=excluded.path,size=excluded.size,metadata=excluded.metadata,checksum=excluded.checksum,accessed_at=excluded.accessed_at", tuple(row.values()))
-            self._db.execute("UPDATE books SET last_active_at=? WHERE book_key=?", (now, book_key))
-            self._evict_locked()
-        row["metadata"] = metadata
-        return row
+            tmp, path = self._new_payload_paths()
+            try:
+                with gzip.open(tmp, "wb") as fh:
+                    fh.write(raw)
+                    fh.flush()
+                os.replace(tmp, path)
+                now = self.clock()
+                created_at = existing["created_at"] if existing else now
+                row = {"book_key": book_key, "chapter_key": chapter_key, "content_type": content_type, "path": str(path), "size": len(raw), "metadata": self._json(metadata), "checksum": checksum, "created_at": created_at, "accessed_at": now}
+                with self._db:
+                    self._write_content_index(row, now, book_key)
+                if existing:
+                    Path(existing["path"]).unlink(missing_ok=True)
+                row["metadata"] = metadata
+                return row
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
+                raise
 
     def get_content(self, book_key: str, chapter_key: str) -> bytes | str | None:
         with self._lock:
@@ -212,8 +237,27 @@ class ShelfCacheRepository:
 
     def cleanup_inactive(self, days: int, now: float | None = None) -> int:
         cutoff = (self.clock() if now is None else now) - days * 86400
-        with self._lock, self._db:
+        with self._lock:
             books = [r[0] for r in self._db.execute("SELECT book_key FROM books WHERE last_active_at < ?", (cutoff,))]
-            for book_key in books:
-                self.clear_content_cache(book_key)
-            return sum(1 for book_key in books if book_key)
+            moved: list[tuple[Path, Path]] = []
+            try:
+                for book_key in books:
+                    rows = self._db.execute("SELECT book_key,chapter_key,path FROM content WHERE book_key=?", (book_key,)).fetchall()
+                    for row in rows:
+                        source = Path(row["path"])
+                        trash = source.with_name(f".delete-{uuid.uuid4().hex}.tmp")
+                        if source.exists():
+                            source.replace(trash)
+                            moved.append((trash, source))
+                    for row in rows:
+                        self._db.execute("DELETE FROM content WHERE book_key=? AND chapter_key=?", (row["book_key"], row["chapter_key"]))
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                for trash, source in reversed(moved):
+                    if trash.exists():
+                        trash.replace(source)
+                raise
+            for trash, _ in moved:
+                trash.unlink(missing_ok=True)
+            return len(books)

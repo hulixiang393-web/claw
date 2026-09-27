@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
+
+import pytest
 
 from framework.shelf_cache_repository import ShelfCacheRepository
 
@@ -92,3 +95,82 @@ def test_clear_content_preserves_metadata_and_cleanup(tmp_path: Path):
     assert repo.cleanup_inactive(5) == 1
     assert repo.get_book_snapshot("book")["content"] == []
     assert repo.get_book_snapshot("book")["chapters"]
+
+
+def test_startup_reconciles_orphan_and_temp_files_but_preserves_indexed_content(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    repo.upsert_book("book", "s", "u", "novel", {})
+    repo.put_content("book", "c1", "text/plain", "keep", {})
+    root = tmp_path / "content"
+    (root / "orphan.gz").write_bytes(b"orphan")
+    (root / "interrupted.tmp").write_bytes(b"partial")
+    repo.close()
+    restarted = make_repo(tmp_path)
+    assert restarted.get_content("book", "c1") == "keep"
+    assert not (root / "orphan.gz").exists()
+    assert not (root / "interrupted.tmp").exists()
+
+
+def test_failed_content_index_write_removes_new_payload_artifact(tmp_path: Path, monkeypatch):
+    repo = make_repo(tmp_path)
+    repo.upsert_book("book", "s", "u", "novel", {})
+    def fail_content_insert(row, now, book_key):
+        raise sqlite3.OperationalError("injected failure")
+
+    monkeypatch.setattr(repo, "_write_content_index", fail_content_insert)
+    with pytest.raises(sqlite3.OperationalError):
+        repo.put_content("book", "c1", "text/plain", "failed", {})
+    assert repo.get_book_snapshot("book")["content"] == []
+    assert not list((tmp_path / "content").rglob("*.gz"))
+    assert not list((tmp_path / "content").rglob("*.tmp"))
+
+
+def test_concurrent_content_writes_do_not_collide(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    repo.upsert_book("book", "s", "u", "novel", {})
+    errors = []
+
+    def write(chapter: str):
+        try:
+            repo.put_content("book", chapter, "text/plain", chapter, {})
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(f"c{i}",)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert {repo.get_content("book", f"c{i}") for i in range(8)} == {f"c{i}" for i in range(8)}
+
+
+def test_cleanup_inactive_is_atomic_when_file_delete_fails(tmp_path: Path, monkeypatch):
+    repo = make_repo(tmp_path)
+    for book in ("a", "b"):
+        repo.upsert_book(book, "s", book, "novel", {})
+        repo.put_content(book, "c", "text/plain", book, {})
+    original = Path.replace
+    calls = []
+
+    def fail_second(path, target):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("injected delete failure")
+        return original(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_second)
+    with pytest.raises(OSError):
+        repo.cleanup_inactive(0, now=repo.clock() + 1)
+    assert repo.get_content("a", "c") == "a"
+    assert repo.get_content("b", "c") == "b"
+
+
+def test_unsupported_schema_version_is_rejected(tmp_path: Path):
+    db = tmp_path / "shelf.sqlite3"
+    repo = make_repo(tmp_path)
+    repo.close()
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE schema_version SET version=999")
+    with pytest.raises(RuntimeError, match="schema version"):
+        ShelfCacheRepository(db, tmp_path / "content")
