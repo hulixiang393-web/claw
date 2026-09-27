@@ -5,10 +5,11 @@
 只断言命令参数（args）组装顺序、代理覆盖与进程清理（terminate）行为。
 
 **episodes 契约（有意破坏）**：episodes 是**全集完整有序列表**，
-episodes[i] = 第 i 集（0-based），episodes[0] **不再被跳过**（系列路径不再
-另加主 MRL）；url 只用于定位起始项与分类。命令行窗口从**当前集往后**取
-（保证「下一集」永远可用），受 _SERIES_MAX_MRL 条数与 _SERIES_MAX_CMD
-总字符数双重限制。
+episodes[i] = 第 i 集（0-based），episodes[0] **不再被跳过**；
+url 只用于定位起始项与分类。**正常路径全集按 1..N 严格入列**——当前集在列内
+中段（从第 5 集开播时第 1..4 集也在列里，用户能在 VLC 里往回选），定位靠启动
+握手；只有全集超出 _SERIES_MAX_MRL 条数 / _SERIES_MAX_CMD 总字符数时，才降级为
+「当前集往后」的窗口。
 """
 import framework.external_player as ep
 
@@ -85,29 +86,66 @@ def test_episodes_none_single_mrl(monkeypatch):
     }
 
 
-def test_episodes_window_from_current_in_order_with_titles(monkeypatch):
-    """从第 2 集开播：窗口 = 当前集及往后，顺序不变，每条带 #第NN集 标题。
+def test_episodes_full_series_in_order_with_titles(monkeypatch):
+    """全集按 0..N-1 顺序入列（**含当前集之前的集**），每条带 #第NN集 标题。
 
-    旧契约是「主 MRL 放 url 那一集 + episodes[1:] 追加」，新契约下系列路径
-    **不再另加主 MRL**——当前集只能由窗口里那一条承载，故不得出现重复的裸 URL。
+    从第 3 集开播时，第 1、2 集**仍须在列**——用户在 VLC 里可以往回选，
+    App 侧切集也依赖整列的 id 映射。定位当前集是启动握手的职责。
     """
     procs = _install(monkeypatch)
     eps = [(f"https://cdn.example.com/hls/{c}.m3u8", "", f"第{i + 1}集 章节{c}")
            for i, c in enumerate("abc")]
-    ep.open_with_player(eps[1][0], episodes=eps)
+    ep.open_with_player(eps[2][0], episodes=eps)
     args = procs[0].args
     assert args[4:8] == _CONTROL_ARGS
-    assert args[8] == "--no-random"        # 系列路径固定加，保证顺序
-    # 起始项非首项 → 需 no-playlist-autostart + 握手定位
+    assert args[8] == "--no-random"
+    # 起始项是第 3 集（非首项）→ 需 no-playlist-autostart + 握手定位
     assert args[9] == "--no-playlist-autostart"
     assert args[10:] == [
+        "P:https://cdn.example.com/hls/a.m3u8#第1集 章节a",
         "P:https://cdn.example.com/hls/b.m3u8#第2集 章节b",
         "P:https://cdn.example.com/hls/c.m3u8#第3集 章节c",
     ]
-    # 当前集不再以裸 URL 重复入列（系列路径无主 MRL）
-    assert "P:https://cdn.example.com/hls/b.m3u8" not in args
-    # 系列路径不挂 input-slave（合并流，双 input-slave 会黑屏）
+    # 系列路径不挂 input-slave，也不另加主 MRL
     assert not any(a.startswith(":input-slave=") for a in args)
+    assert not any(a.startswith("P:") and "#" not in a for a in args)
+
+
+def test_handshake_receives_start_idx_and_whole_series(monkeypatch):
+    """握手按 (start_idx, 入列全体 window, 回调) 收参。
+
+    全集入列后当前集在**中段**：传 window[0][1]（旧契约的 window 恒从当前集起）
+    会把第 1 集的 MRL 当成起始项，pl_play 定位到第 1 集——整个握手定位错位。
+    """
+    procs = _install(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(ep, "_start_playlist_sync",
+                        lambda *a, **k: seen.update(args=a), raising=False)
+    eps = [(f"https://cdn.example.com/hls/{c}.m3u8", "", f"第{i + 1}集")
+           for i, c in enumerate("abc")]
+    ready = lambda mapping: None  # noqa: E731 —— 仅占位，握手在 Task 5 实现
+    ep.open_with_player(eps[2][0], episodes=eps, on_playlist_ready=ready)
+    start_idx, series, cb = seen["args"]
+    assert start_idx == 2
+    assert series == [
+        (0, "P:https://cdn.example.com/hls/a.m3u8#第1集"),
+        (1, "P:https://cdn.example.com/hls/b.m3u8#第2集"),
+        (2, "P:https://cdn.example.com/hls/c.m3u8#第3集"),
+    ]
+    assert cb is ready
+    # 传的必须就是真正入列的那些 MRL（args 去掉全局选项/flag 的尾部）
+    assert [m for _i, m in series] == procs[0].args[10:]
+
+
+def test_no_handshake_without_episodes(monkeypatch):
+    """episodes 为 None 或空列表 → 不起握手（没有播放列表要对齐）。"""
+    _install(monkeypatch)
+    seen = []
+    monkeypatch.setattr(ep, "_start_playlist_sync",
+                        lambda *a, **k: seen.append(a), raising=False)
+    ep.open_with_player("https://cdn.example.com/hls/a.m3u8")
+    ep.open_with_player("https://cdn.example.com/hls/b.m3u8", episodes=[])
+    assert seen == []
 
 
 def test_first_episode_no_autostart_flag(monkeypatch):
@@ -226,13 +264,40 @@ def test_oversized_series_truncated(monkeypatch):
     assert sum(len(a) for a in args) < 32000  # 远低于 CreateProcess 的 32767
 
 
-def test_fit_series_window_starts_at_current():
+def test_fit_series_full_series_kept_when_it_fits():
+    """装得下 → 全集 0..N-1 入列，当前集之前的集**也在列内**。"""
     eps = [(f"u{i}", "", f"第{i + 1}集") for i in range(10)]
     items, truncated = ep._fit_series(eps, 4, lambda u, a: u)
     assert truncated is False
-    # 窗口从当前集往后连续取：保证「下一集」永远可用
-    assert [i for i, _m in items] == [4, 5, 6, 7, 8, 9]
-    assert [m for _i, m in items] == [f"u{i}#第{i + 1}集" for i in range(4, 10)]
+    assert [i for i, _ in items] == list(range(10))   # 全集，不是 4..9
+    assert items[0][0] == 0 and len(items) == 10
+
+
+def test_fit_series_degrades_to_forward_window_on_overflow():
+    """装不下 → 降级为「当前集往后」的窗口；超长剧集选很靠后的集也能播。"""
+    long_title = "标题很长很长很长很长很长很长很长很长很长很长很长"
+    many = [(f"u{i}", "", f"第{i + 1}集 {long_title}") for i in range(400)]
+    items, trunc = ep._fit_series(many, 0, lambda u, a: u)
+    assert trunc is True
+    assert len(items) < 400 and items[0][0] == 0
+    assert len(items) <= ep._SERIES_MAX_MRL
+    # 当前集在已解析范围之外 → 必须以当前集为首重新取窗口，且不丢当前集
+    items2, trunc2 = ep._fit_series(many, 390, lambda u, a: u)
+    assert trunc2 is True
+    assert items2[0][0] == 390
+    assert all(i >= 390 for i, _ in items2)
+
+
+def test_fit_series_budget_caps_respected():
+    """两个上限都真实生效：条数上限与总字符上限各自能触发截断。"""
+    # 条数上限
+    many = [(f"u{i}", "", f"第{i + 1}集") for i in range(ep._SERIES_MAX_MRL + 50)]
+    items, trunc = ep._fit_series(many, 0, lambda u, a: u)
+    assert trunc is True and len(items) == ep._SERIES_MAX_MRL
+    # 字符上限：条数很少但每条超长
+    fat = [(f"u{i}", "", "标" * 20000) for i in range(10)]
+    items2, trunc2 = ep._fit_series(fat, 0, lambda u, a: u)
+    assert trunc2 is True and len(items2) < 10
 
 
 def test_fit_series_cmd_budget_binds_before_count_cap():
@@ -246,12 +311,11 @@ def test_fit_series_cmd_budget_binds_before_count_cap():
     assert [i for i, _m in items] == list(range(len(items)))  # 连续无空洞
 
 
-def test_fit_series_keeps_single_overlong_item():
-    """单条就超预算也必须保留：当前集能播 > 命令行长度。"""
-    items, truncated = ep._fit_series([("x" * 40000, "", "第1集")], 0,
-                                      lambda u, a: u)
-    assert len(items) == 1
-    assert truncated is False
+def test_fit_series_keeps_at_least_one_oversized_item():
+    """单条就超字符上限也必须保留（当前集能播 > 命令行长）。"""
+    fat = [("u0", "", "标" * (ep._SERIES_MAX_CMD + 100))]
+    items, trunc = ep._fit_series(fat, 0, lambda u, a: u)
+    assert len(items) == 1 and trunc is False
 
 
 def test_series_entry_missing_fields_falls_back():
@@ -260,6 +324,10 @@ def test_series_entry_missing_fields_falls_back():
                                       lambda u, a: u)
     assert items == [(0, "u0#第1集"), (1, "u1#第2集")]
     assert truncated is False
+    # 空元组（调用方给了垃圾数据）整条跳过，不 IndexError；下标按原位保留
+    # → 集号兜底跟着真实集位走。
+    assert ep._fit_series([(), ("u0",)], 0, lambda u, a: u)[0] == [
+        (1, "u0#第2集")]
 
 
 def test_fit_series_resolves_non_local_urls_only():
@@ -313,8 +381,8 @@ def test_terminate_clears_control_state(monkeypatch):
 def test_force_proxy_forwarded_to_proxy(monkeypatch):
     """force_proxy=True → 每次包代理都带上（主 MRL/音频轨/系列窗口当前集）。
 
-    play_url 仍要算出来定缓冲下限（主媒体 + 主音频轨 2 次），系列窗口里当前集
-    那条再解析一次（连同它自己的音频轨——系列路径丢弃 audio，见设计 §7），
+    play_url 仍要算出来定缓冲下限（主媒体 + 主音频轨 2 次），系列列表里那条
+    再解析一次（连同它自己的音频轨——系列路径丢弃 audio，见设计 §7），
     4 次调用都必须带 force_proxy。
     """
     seen = []

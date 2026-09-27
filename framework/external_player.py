@@ -29,7 +29,8 @@ from .media_proxy import proxy_url_for
 
 # 系列播放列表的裁剪上限。Windows CreateProcess 命令行硬上限 32767 字符；
 # 集数上千时一次性 enqueue 数千项既撑爆命令行也给 VLC 自身 playlist 增压。
-# 窗口从**当前集往后**取（保证「下一集」永远可用）。
+# 正常路径仍按 1..N 全集入列（当前集在列内中段，由启动握手定位）；
+# 仅当全集超这两项上限时，才降级为「当前集往后」的窗口。
 _SERIES_MAX_MRL = 300
 _SERIES_MAX_CMD = 30000
 
@@ -143,30 +144,50 @@ def _fit_series(episodes: list, start_idx: int,
                 resolve) -> tuple[list[tuple[int, str]], bool]:
     """裁剪系列列表，返回 ([(集下标, MRL), ...], 是否截断)。
 
+    **正常路径：全集按第 1 集 → 最后一集严格顺序入列。** 当前集往往位于
+    列表中段——正因如此才需要启动握手：按 MRL 匹配到当前集的 vlc_id 后
+    `pl_play&id` 定位。若这里只取「当前集往后」的窗口，当前集恒为首项，
+    握手就失去意义，且第 1..start_idx-1 集在 VLC 里再也选不到。
+
+    仅当全集超出 _SERIES_MAX_MRL 条数或 _SERIES_MAX_CMD 总字符数时，才降级为
+    「从当前集往后」的窗口（此时当前集恒为窗口首项，握手依然找得到）。
+
     resolve(url, audio) -> play_url：非本机代理 URL 才经它包一层代理
     （惰性 /e/ URL 原样使用）。**先解析再计长**——代理 URL 比原 URL 长，
-    先计长会低估命令行占用。
-    窗口从 start_idx（当前集）往后连续取，受 _SERIES_MAX_MRL 条数与
-    _SERIES_MAX_CMD 总字符数双重限制；空 URL 的集整条跳过。至少保留 1 条
+    先计长会低估命令行占用。空 URL 的集整条跳过。至少保留 1 条
     （单条超长也不丢，保证「当前集能播」优先于命令行长度）。
     """
+    def _mrl_of(idx: int, entry) -> str:
+        ep_play = entry[0] if _is_local_proxy_url(entry[0]) else resolve(
+            entry[0], entry[1] if len(entry) > 1 else "")
+        return _mrl_with_title(ep_play,
+                               entry[2] if len(entry) > 2 else "", idx)
+
     items: list[tuple[int, str]] = []
     used = 0
     truncated = False
-    for off, entry in enumerate(episodes[start_idx:]):
-        ep_url = entry[0]
-        if not ep_url:
+    for idx, entry in enumerate(episodes):
+        if not entry or not entry[0]:
             continue
-        idx = start_idx + off
-        ep_play = ep_url if _is_local_proxy_url(ep_url) else resolve(
-            ep_url, entry[1] if len(entry) > 1 else "")
-        mrl = _mrl_with_title(ep_play, entry[2] if len(entry) > 2 else "", idx)
+        mrl = _mrl_of(idx, entry)
         if items and (len(items) >= _SERIES_MAX_MRL
                       or used + len(mrl) > _SERIES_MAX_CMD):
             truncated = True
             break
         items.append((idx, mrl))
         used += len(mrl)
+
+    if truncated and start_idx > 0:
+        # 全集装不下 → 降级为「当前集往后」的窗口。items 自身已按两个上限
+        # 截断，故其下标 >= start_idx 的后缀必然仍满足上限，无需重新解析。
+        window = [(i, m) for i, m in items if i >= start_idx]
+        if window:
+            return window, True
+        # 当前集落在已解析范围之外（超长剧集选了很靠后的集）→ 必须重新取
+        # 窗口，否则当前集根本不在列表里、无法播放。
+        sub, _ = _fit_series(episodes[start_idx:], 0, resolve)
+        return [(i + start_idx, m) for i, m in sub], True
+
     return items, truncated
 
 
@@ -267,8 +288,8 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
         # 播放处理（调研 VLC 流播放调优）：除加大网络缓冲外，加 --no-drop-late-frames
         # 让 VLC 不丢晚到的帧（默认丢帧会表现为画面卡顿跳动）；不强制硬件解码——
         # DXVA2/D3D11VA 的 copy-back 开销在某些机器上反而更卡，交给 VLC 自动判断。
-        # 组装顺序：全局选项在前 → 当前集 MRL（其后紧跟其音频 input-slave）
-        # → 其余各集 MRL（音频非空则以 :input-slave= 紧跟其后）。
+        # 组装顺序：全局选项在前 → 单集路径追加主 MRL（音频非空则紧跟其后
+        # 的 :input-slave=）→ 系列路径改为全集按 1..N 顺序追加，不另加主 MRL。
         args = [
             vlc, "--no-video-title-show", "--no-drop-late-frames",
             f"--network-caching={_caching}",
@@ -318,8 +339,9 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             if episodes and window:
                 # 后台握手：轮询 playlist.json 建 {集下标: vlc_id} 映射，
                 # 非首项开播时顺带 pl_play 定位。必须在后台线程（VLC 建列表
-                # 需时，主线程会卡 UI）。
-                _start_playlist_sync(window[0][1], start_idx, on_playlist_ready)
+                # 需时，主线程会卡 UI）。整个 window 传下去，映射才覆盖
+                # 列表内每一集（App 侧切集依赖它）。
+                _start_playlist_sync(start_idx, window, on_playlist_ready)
             if truncated:
                 return f"已用外部播放器打开（列表已截断，共 {len(window)} 集）"
             return "已用外部播放器打开"
