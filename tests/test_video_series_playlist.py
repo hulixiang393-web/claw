@@ -226,12 +226,14 @@ def test_on_play_hops_from_proxy_thread_to_gui_thread(_qapp, monkeypatch):
     main_ident = threading.get_ident()
     seen = []
     view._external_now_playing.connect(
-        lambda i, v, a: seen.append((i, v, a, threading.get_ident())))
+        lambda g, i, v, a: seen.append((g, i, v, a, threading.get_ident())))
     view._build_series_playlist("v", "", {}, None, False)
     _emit_from_thread(proxy.registered[0]["on_play"], 1,
                       "https://cdn/1.m3u8", "")
     _drain()
-    assert seen == [(1, "https://cdn/1.m3u8", "", main_ident)]
+    assert seen == [(view._play_gen, 1, "https://cdn/1.m3u8", "", main_ident)]
+    # 钉槽本身（不只是连着的 lambda）：它确实在主线程改了视图状态
+    assert view._current_idx == 1
 
 
 def test_on_external_now_playing_updates_state(_qapp):
@@ -240,7 +242,7 @@ def test_on_external_now_playing_updates_state(_qapp):
     view._content = _FakeContent()
     emitted = []
     view.episode_changed.connect(lambda a: emitted.append(a))
-    view._on_external_now_playing(2, "https://cdn/2.m3u8", "")
+    view._on_external_now_playing(view._play_gen, 2, "https://cdn/2.m3u8", "")
     assert view._current_idx == 2
     assert view._stream_cache[("http://e/2", "best")] == ("https://cdn/2.m3u8", "")
     assert view._current_play == "https://cdn/2.m3u8"
@@ -255,7 +257,7 @@ def test_on_external_now_playing_updates_state(_qapp):
 def test_on_external_now_playing_ignores_bad_idx(_qapp):
     """越界下标 → 原样丢弃（不该崩，也不该把 _current_idx 带歪）。"""
     view = _view(_video_detail(2), 0)
-    view._on_external_now_playing(9, "v", "")
+    view._on_external_now_playing(view._play_gen, 9, "v", "")
     assert view._current_idx == 0
     assert view._stream_cache == {}
 
@@ -269,10 +271,11 @@ def test_playlist_ready_hop_records_item_ids(_qapp):
     main_ident = threading.get_ident()
     seen = []
     view._vlc_playlist_ready.connect(
-        lambda m: seen.append((m, threading.get_ident())))
-    _emit_from_thread(view._vlc_playlist_ready.emit, {0: 5, 1: 6, 2: 7})
+        lambda g, m: seen.append((g, m, threading.get_ident())))
+    _emit_from_thread(view._vlc_playlist_ready.emit, view._play_gen,
+                      {0: 5, 1: 6, 2: 7})
     _drain()
-    assert seen == [({0: 5, 1: 6, 2: 7}, main_ident)]
+    assert seen == [(view._play_gen, {0: 5, 1: 6, 2: 7}, main_ident)]
     assert view._vlc_item_ids == {0: 5, 1: 6, 2: 7}
 
 
@@ -288,7 +291,7 @@ def test_playlist_ready_repeated_delivery_is_idempotent(_qapp):
     view = _view(_video_detail(3), 0)
     for mapping in ({0: 5, 1: 6, 2: 7}, {0: 5, 1: 6, 2: 7},
                     {0: 5, 1: 6}, {0: 11, 1: 12, 2: 13}):
-        view._vlc_playlist_ready.emit(mapping)
+        view._vlc_playlist_ready.emit(view._play_gen, mapping)
         _drain()
         assert view._vlc_item_ids == mapping
 
@@ -296,7 +299,7 @@ def test_playlist_ready_repeated_delivery_is_idempotent(_qapp):
 def test_playlist_ready_accepts_partial_map(_qapp):
     """只匹配上一部分集时按原样收下：不臆造条目、不抛异常。"""
     view = _view(_video_detail(5), 0)
-    view._vlc_playlist_ready.emit({0: 5, 1: 6})
+    view._vlc_playlist_ready.emit(view._play_gen, {0: 5, 1: 6})
     _drain()
     assert view._vlc_item_ids == {0: 5, 1: 6}
 
@@ -309,10 +312,10 @@ def test_playlist_ready_rejects_non_int_ids(_qapp, caplog):
     （切集命令拿着假 id 发给 VLC，症状是「切集永远没反应」）。
     """
     view = _view(_video_detail(3), 0)
-    view._vlc_playlist_ready.emit({0: 5})
+    view._vlc_playlist_ready.emit(view._play_gen, {0: 5})
     _drain()
     with caplog.at_level(logging.WARNING):
-        view._vlc_playlist_ready.emit({1: "6"})
+        view._vlc_playlist_ready.emit(view._play_gen, {1: "6"})
         _drain()
     assert view._vlc_item_ids == {0: 5}          # 坏映射整轮丢弃，好映射保留
     assert any("非 int" in r.getMessage() for r in caplog.records)
@@ -376,6 +379,88 @@ def test_shutdown_video_releases_lease_then_unregisters(_qapp, monkeypatch):
     assert order == ["terminate", "unregister"]           # 顺序不能反
     assert view._series_key == "" and view._series_urls == []
     assert view._external_active is False
+
+
+# --------------------------------------------------------------------- #
+# 代数护栏：换源后陈旧回调不得落地（I1）
+# --------------------------------------------------------------------- #
+def test_stale_on_play_after_source_switch_is_dropped(_qapp, monkeypatch):
+    """换源后旧系列残留的 on_play 必须丢弃：不得改 _current_idx / _stream_cache。
+
+    复现链：VLC 还在播 → reload_detail 保留旧系列 → 用户在新源点集 → 不调用
+    _play（无新代数）→ 旧系列被 VLC 点到时回调 on_play。若不丢弃：
+    _stream_cache[(新源 ep.url, 画质)] = 旧源流地址，而 _load_episode 命中
+    缓存后原样使用（无复验）→ App 拿 A 源的流去播 B 源的集，且持续到清缓存。
+    """
+    view = _view(_video_detail(3), 0)
+    proxy = _FakeProxy()
+    _install_proxy(monkeypatch, proxy)
+    monkeypatch.setattr(ep, "_last_proc", _FakeProc(running=True))
+    monkeypatch.setattr(view, "_maybe_load_recommendations", lambda: None)
+    view._source = "SRC1"
+    view._content = _FakeContent()
+    view._build_series_playlist("v", "", {}, None, False)
+    stale_on_play = proxy.registered[0]["on_play"]
+
+    view.reload_detail(_video_detail(2))
+    assert view._series_key == "k1"        # 前提：VLC 还在播，旧系列仍注册
+
+    stale_on_play(1, "https://cdn/OLD-S1.m3u8", "")
+    _drain()
+    assert view._current_idx == 0
+    assert view._stream_cache == {}
+    assert view._current_play == ""
+
+
+def test_stale_playlist_ready_after_source_switch_is_dropped(_qapp, monkeypatch):
+    """换源后旧握手线程残留的映射必须丢弃：不得写 _vlc_item_ids。"""
+    view = _view(_video_detail(3), 0)
+    proxy = _FakeProxy()
+    _install_proxy(monkeypatch, proxy)
+    monkeypatch.setattr(ep, "_last_proc", _FakeProc(running=True))
+    monkeypatch.setattr(view, "_maybe_load_recommendations", lambda: None)
+    view._source = "SRC1"
+    view._content = _FakeContent()
+    seen = {}
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: seen.update(kw) or "ok")
+    view._play("https://cdn/real0.m3u8", "", "第1集 标题0")
+    stale_cb = seen["on_playlist_ready"]
+
+    view.reload_detail(_video_detail(2))
+    stale_cb({0: 11, 1: 12})
+    _drain()
+    assert view._vlc_item_ids == {}
+
+
+def test_series_resolver_snapshots_source_and_episodes(_qapp, monkeypatch):
+    """已注册系列按**注册时刻**的 source/episodes/quality 解析，不受换源影响。
+
+    不快照的话：resolver 读的是当前 self._source/self._episodes，而它们已被
+    换源整体替换、彼此自洽 → fetch_video_streams 成功返回**新源**的流，
+    旧 VLC 于是播出新源的集（不报错，静默播错）。
+    """
+    from framework.content import Chapter
+
+    view = _view(_video_detail(3), 0)
+    proxy = _FakeProxy()
+    _install_proxy(monkeypatch, proxy)
+    view._source = "SRC1"
+    view._quality = "best"
+    content = _FakeContent()
+    view._content = content
+    view._build_series_playlist("v", "", {}, None, False)
+    resolver = proxy.registered[0]["resolver"]
+
+    # 换源：视图状态整体切到 SRC2
+    view._source = "SRC2"
+    view._quality = "hd"
+    view._episodes = [Chapter("新1", "http://new/1", cover=""),
+                      Chapter("新2", "http://new/2", cover="")]
+
+    assert resolver(1) == ("https://cdn/v.m3u8", "", {}, None)
+    # 仍是 SRC1 的第 2 集 + best 画质，而非 SRC2 的第 2 集 + hd
+    assert content.calls == [("http://e/1", "best", True)]
 
 
 # --------------------------------------------------------------------- #
@@ -445,3 +530,166 @@ def test_play_playlist_ready_callback_hops_threads(_qapp, monkeypatch):
     assert view._vlc_item_ids == {}          # 还没投递：事件在队列里
     _drain()
     assert view._vlc_item_ids == {0: 11}     # 投递后在主线程落地
+
+
+def test_load_new_work_drops_previous_series_callbacks(_qapp, monkeypatch):
+    """换作品（load）也自增代数：上一部剧的惰性系列回调全部作废。
+
+    load 与 reload_detail 是两条独立的换集路径（前者换作品、后者换源），
+    少任何一条都会留下一个「换屏后旧剧仍在回调」的窗口。
+    """
+    view = _view(_video_detail(3), 0)
+    monkeypatch.setattr(view, "_maybe_load_recommendations", lambda: None)
+    stale_gen = view._play_gen
+    view.load(object(), _video_detail(4))
+    assert view._play_gen > stale_gen
+    view._external_now_playing.emit(stale_gen, 1, "v", "")
+    view._vlc_playlist_ready.emit(stale_gen, {0: 77})
+    _drain()
+    assert view._current_idx == 0
+    assert view._vlc_item_ids == {}
+
+
+def test_play_uses_returned_entry_as_start_url(_qapp, monkeypatch):
+    """开播 MRL 取自**返回列表**当前集那一项，不回头读 _series_urls。
+
+    两处下标必须恒等：_series_urls 对无 ep.url 的集仍是可用的代理 URL，而
+    返回列表里那一项是空串。从 _series_urls 取会给 VLC 开一个点了就 502
+    的死 MRL；从返回列表取则为空 → 干净地退回单集播放。
+    """
+    from framework.content import Chapter
+
+    detail = _video_detail(0)
+    detail.chapters = [Chapter("第1集", "http://e/0", cover=""),
+                       Chapter("无URL集", "", cover=""),
+                       Chapter("第3集", "http://e/2", cover="")]
+    view = _view(detail, 1)                  # 当前集 = 无 URL 的第 2 集
+    proxy = _FakeProxy()
+    _install_proxy(monkeypatch, proxy)
+    view._source = object()
+    view._content = _FakeContent()
+    seen = {}
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: seen.update(url=url, **kw) or "ok")
+    view._play("https://cdn/real1.m3u8", "", "第2集 无URL集")
+    assert seen["url"] == "https://cdn/real1.m3u8"   # 不是代理死 URL
+    assert seen["episodes"] is None                   # 退回单集
+    # 系列仍注册着（无害：下次 _play/换集会回收），要防的死条目是它入列的那一项
+    assert proxy.registered[0]["count"] == 3
+
+
+def test_play_bumps_generation_and_drops_previous_session(_qapp, monkeypatch):
+    """新起一次外播 = 新代数：上一会话的回调立刻作废。
+
+    否则用户「重开播放器」时，上一轮的握手线程（最长还活 3s）回调会带着
+    仍然有效的代数回来，把上一支播放列表的 id 写进 _vlc_item_ids，
+    切集命令就发给了错的列表。
+    """
+    view = _view(_video_detail(3), 0)
+    proxy = _FakeProxy()
+    _install_proxy(monkeypatch, proxy)
+    view._source = object()
+    view._content = _FakeContent()
+    stale_gen = view._play_gen
+    seen = {}
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: seen.update(url=url, **kw) or "ok")
+
+    view._play("https://cdn/real0.m3u8", "", "第1集 标题0")
+    assert view._play_gen > stale_gen                     # 代数确实前进了
+
+    view._vlc_playlist_ready.emit(stale_gen, {0: 99})     # 上一会话的握手
+    view._external_now_playing.emit(stale_gen, 1, "v", "")  # 上一会话的 on_play
+    _drain()
+    assert view._vlc_item_ids == {}                        # 两条都被丢弃
+    assert view._current_idx == 0
+
+    seen["on_playlist_ready"]({0: 11})                    # 本会话的仍要落地
+    _drain()
+    assert view._vlc_item_ids == {0: 11}
+
+
+# --------------------------------------------------------------------- #
+# 降级与入列卫生
+# --------------------------------------------------------------------- #
+def test_build_series_playlist_returns_none_when_proxy_unavailable(_qapp,
+                                                                   monkeypatch):
+    """代理起不来（instance 抛异常）→ 退回单集，且不留任何注册痕迹。"""
+    def _boom():
+        raise RuntimeError("代理起不来")
+
+    monkeypatch.setattr(mp.MediaProxy, "instance", staticmethod(_boom))
+    view = _view(_video_detail(3), 0)
+    view._source = "SRC"
+    assert view._build_series_playlist("v", "", {}, None, False) is None
+    assert view._series_key == ""
+    assert view._series_urls == []
+
+
+def test_registered_series_is_released_when_url_building_fails(_qapp, monkeypatch):
+    """建 URL 失败 → 已注册的系列必须注销，不能留成孤儿。
+
+    注册表里的条目通过闭包持有视图的强引用，key 又没记进 _series_key 时
+    本视图永远注销不掉它，只有代理侧 _SERIES_MAX=8 的 FIFO 能挤掉。
+    """
+    class _UrlFailProxy(_FakeProxy):
+        def series_episode_url(self, key, idx):
+            raise RuntimeError("建 URL 失败")
+
+    proxy = _UrlFailProxy()
+    _install_proxy(monkeypatch, proxy)
+    view = _view(_video_detail(3), 0)
+    view._source = "SRC"
+    assert view._build_series_playlist("v", "", {}, None, False) is None
+    assert proxy.registered[0]["key"] in proxy.unregistered
+    assert view._series_key == "" and view._series_urls == []
+
+
+def test_external_vlc_running_logs_when_symbol_unavailable(_qapp, monkeypatch,
+                                                          caplog):
+    """取不到 player_running（含 ImportError）→ 记 warning，不静默。
+
+    静默按「已退出」处理会让 _stop_player 无条件注销系列，等于悄悄恢复
+    「VLC 还在请求 /e/ → 404」这个故障，且现场毫无线索。
+    """
+    view = _view(_video_detail(2), 0)
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) \
+        else __builtins__.__import__
+
+    def _fake_import(name, *a, **kw):
+        if name == "framework.external_player":
+            raise ImportError("cannot import name 'player_running'")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr("builtins.__import__", _fake_import)
+    with caplog.at_level(logging.WARNING):
+        assert view._external_vlc_running() is False
+    assert any("player_running" in r.getMessage() for r in caplog.records)
+
+
+def test_empty_chapter_url_is_not_enqueued_in_vlc_playlist(_qapp, monkeypatch):
+    """无 ep.url 的分集不占 VLC 播放列表位置（也不会留下永久 502 的死条目）。
+
+    惰性路径下入列的是 `/e/` 代理 URL（**永不为空**），所以 external_player
+    里 `if not entry[0]: continue` 那道守卫对我们不生效——空的是上游的
+    ep.url。这里传空 URL 让 _fit_series 跳过该集：它按**入列位置**记 idx，
+    跳过不挪位，故其余分集的集下标仍与 App 侧严格对齐（Task 7 依赖此对齐）。
+    """
+    from framework.content import Chapter
+
+    detail = _video_detail(0)
+    detail.chapters = [Chapter("第1集", "http://e/0", cover=""),
+                       Chapter("无URL集", "", cover=""),
+                       Chapter("第3集", "http://e/2", cover="")]
+    view = _view(detail, 0)
+    _install_proxy(monkeypatch, _FakeProxy())
+    view._source = "SRC"
+    out = view._build_series_playlist("v", "", {}, None, False)
+    assert out[1][0] == ""          # 空 URL 入列 → 由 _fit_series 跳过
+
+    def _resolve(url):
+        raise AssertionError(f"代理 URL 不该再解析：{url}")
+
+    items, truncated = ep._fit_series(out, 0, _resolve)
+    assert [i for i, _m in items] == [0, 2]   # 死条目不入列，且下标不挪位
+    assert truncated is False
