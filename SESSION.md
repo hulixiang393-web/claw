@@ -1,5 +1,47 @@
 # SESSION — claw（D:\code\claw）
 
+## 外部播放器全集播放列表（vlc-series-playlist，2026-09-27，20 commits / 全量 818 passed / 0 failed）
+### 用户选择
+- **全集**进 VLC 播放列表（不是只当前集往后）；`episodes[0]` 不跳过，严格 1..N。
+- 离开视频页**不终止**外部 VLC；播放器仍活时保留系列注册（VLC 可能继续请求 `/e/`）。
+- 直接在 `master` 实施；每个 Task 独立提交 + 独立审查。
+
+### 落地
+- **设计**：`docs/superpowers/specs/2026-09-27-vlc-series-playlist-design.md`；**计划**：`docs/superpowers/plans/2026-09-27-vlc-series-playlist.md`（8 Task）。
+- `framework/media_proxy.py`：无 TTL 的**租约**（`_leases` / `acquire_lease` / `release_lease`）+ **惰性系列**注册表（`_SERIES_MAX=8` FIFO）+ `/e/<key>/<idx>`（按需 `fetch_video_streams` → memo → 302 `/s/<token>`；失败 502 且不缓存）。
+- `framework/external_player.py`：全集入列 + `#标题` + `--no-random` + **非首集开播握手**（`--no-playlist-autostart` + 后台轮询 `playlist.json` + `pl_play&id=`）+ 租约；`player_command/playlist_items/goto/next/previous/running`。
+- `gui/pages/reader/video_view.py`：`_build_series_playlist` + **播放代数守卫** + App 内切集走 `pl_play` 不重开 + `P` 键改 `pl_previous`（VLC 无 `pl_prev`，此前从未生效）。
+
+### 契约破坏（调用方须改）
+- `open_with_player(episodes=...)` 现为**全集有序列表**，`episodes[0]` 不再跳过，`url` 只用于定位起始项；新增显式 `start_idx=-1`。
+- `player_playlist_items()` 返回的 id 已在**该函数单点**归一化为 `int`（真实 VLC 发的是字符串）。
+- `on_playlist_ready` 由**后台线程**回调，Qt 对象只能在主线程动 → 须经信号 emit。
+
+### 三个真实缺陷（复审抓出，勿重犯）
+1. **切源而 VLC 未关 → 旧系列按新源解析，且污染 `_stream_cache` 持久生效。** 根因是新回调无会话守卫：`_source` 与 `_episodes` 此刻自洽，故 `fetch_video_streams` **成功**而非 502，VLC 静默播新源那一集；随后按**新源 URL 为键**写入**旧源流**，`_load_episode` 命中缓存不复验 → App 持续拿 A 源的流播 B 源的集。修法：`_play_gen` 代次守卫 + resolver 在**注册时刻**快照 `source/quality/episodes`。
+   - 代次守卫**只靠约定且失败无声**：`emit` 时读 `self._play_gen` 恒等于当前值 = 守卫静默失效。首参必须传**会话创建时捕获**的代数（信号声明处已留注释）。
+2. **`reload_detail` 漏清「当前流」三元组** → 切源后 `⚙外部播放器` 的单集回退把**旧源的流**交给新开的 VLC。现由 `_invalidate_current_stream()` 在 `load` / `reload_detail` 两个重置块共用。
+3. **`_notify_last_episode` 条件写反**（既有 bug）：非末集弹「已是最后一集」、末集静默，与自身 docstring 相反。教训：**「非 X 则 return」类守卫极易在重构中写反，务必与注释方向核对。**
+
+### brief/测试失效的两个反复模式
+- brief 早于前序 Task 定稿时会带着刚被关掉的 bug（Task 7 的 C1–C5 即如此）→ **每轮 brief 必须对照当前代码复核后再派发**。
+- **「断言不该发生」用 `throw(AssertionError)` 会恒绿**——实现自身的 `except Exception` 会吞掉它（`AssertionError` 是 `Exception` 子类）。一律改记录型断言（`assert got == []`）。同类失效断言本项目已出现 4 次。
+- 另：**测试替身是字符串/无 `raw` 的对象时，断言值恒为默认值**，`assert x == {}` 无法区分「真的透传」与「写死」。
+
+### 已知限制
+- 每集不单独算 network-caching，用**当前集**真实流地址的分类作全列表基线（ikanpp 30s 生效）。
+- 系列路径不挂 `:input-slave=`（merged 流挂 DASH/fMP4 会黑屏）。
+- 全集超 `_SERIES_MAX_MRL=300` 集或 `_SERIES_MAX_CMD=30000` 字符才降级为「当前集往后」窗口。
+- 无 `ep.url` 的章节在列表里占位为空串、由 `_fit_series` 跳过（否则给 VLC 留一个点了必 502 的死条目）。
+- `⚙外部播放器` 会注销仍活着的系列 → 旧 VLC 窗口的条目变死（用户主动要求重开，判为可接受取舍）。
+- 选集态下 `⚙` 无操作（无流可重开），此时无 VLC + Referer 的浏览器兜底不可达，改用 `▶`。
+- 未修（同类隐患，不同机制）：在途 `_FetchStreamTask` 切源后仍可写 `_stream_cache`；模块级 playlist cache 无锁且返回共享 list。
+
+### 待人工验收（单元测试无法证明 VLC 行为）
+见规格 §8 手动 GUI 验收 7 条。最关键两条：**从第 5 集开播后 `Ctrl+L` 确认第 1..4 集也在列内**（全集入列是「P 能往回」的前提）；**App 内点「下一集」VLC 不重启、不闪窗、进度不丢**。
+
+---
+
 ## ⚠️ 上条结论已被推翻（2026-09-27）：ikanpp 卡顿真根因是上游 CDN 按连接限速，不是 media_proxy
 - 证据：用户确认**只有 ikanpp 卡，其他源全正常**。通用缺陷若为主因应普遍生效 → 排除。
 - 实测：ikanpp `gs.gszyi.com:999` 单连接 85~190KB/s（长测掉到 33~68KB/s）< 该片实时需求 136KB/s（1.33MB/片 ÷ 10s，1060 片/1.4GB/176.7min）；**4 并发总带宽 280.2KB/s vs 顺序 133.2KB/s = 2.1x** → 确认按连接限速。
