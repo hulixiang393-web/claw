@@ -11,6 +11,8 @@ url 只用于定位起始项与分类。**正常路径全集按 1..N 严格入�
 握手；只有全集超出 _SERIES_MAX_MRL 条数 / _SERIES_MAX_CMD 总字符数时，才降级为
 「当前集往后」的窗口。
 """
+import logging
+
 import framework.external_player as ep
 
 _VLC = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
@@ -137,6 +139,81 @@ def test_handshake_receives_start_idx_and_whole_series(monkeypatch):
     assert [m for _i, m in series] == procs[0].args[10:]
 
 
+def test_handshake_failure_does_not_fall_back_to_browser(monkeypatch):
+    """握手抛异常**不得**把已成功的拉起降级成浏览器兜底。
+
+    Popen 已成功、VLC 已在播。异常若冒进启动 try 的 except，会额外弹一个浏览器
+    窗口、把返回串换成「已在浏览器中打开」，还把真实报错吃掉——用户看到的现象
+    与真实故障完全对不上号。
+    """
+    procs = _install(monkeypatch)
+    opened = []
+    monkeypatch.setattr(ep.webbrowser, "open", lambda u: opened.append(u))
+    monkeypatch.setattr(
+        ep, "_start_playlist_sync",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        raising=False)
+    eps = [(f"https://cdn.example.com/hls/{c}.m3u8", "", f"第{i + 1}集")
+           for i, c in enumerate("abc")]
+    msg = ep.open_with_player(eps[2][0], episodes=eps)
+    assert opened == []
+    assert msg == "已用外部播放器打开"
+    assert len(procs) == 1          # 播放器确实拉起了，不是走了浏览器
+
+
+def test_explicit_start_idx_beats_url_match(monkeypatch):
+    """显式 start_idx 优先于 url 命中项（省掉载荷性的 URL 字符串比对）。"""
+    procs = _install(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(ep, "_start_playlist_sync",
+                        lambda *a, **k: seen.update(args=a), raising=False)
+    eps = [(f"https://cdn.example.com/hls/{c}.m3u8", "", f"第{i + 1}集")
+           for i, c in enumerate("abc")]
+    # url 指向第 1 集，调用方却明确说从第 3 集开播 → 以 start_idx 为准
+    ep.open_with_player(eps[0][0], episodes=eps, start_idx=2)
+    args = procs[0].args
+    assert "--no-playlist-autostart" in args      # 非首项 → 握手定位
+    assert [a for a in args if a.startswith("P:")] == [
+        "P:https://cdn.example.com/hls/a.m3u8#第1集",
+        "P:https://cdn.example.com/hls/b.m3u8#第2集",
+        "P:https://cdn.example.com/hls/c.m3u8#第3集",
+    ]                                              # 全集仍在列
+    assert seen["args"][0] == 2                   # 握手拿到的也是第 3 集
+
+
+def test_start_idx_out_of_range_warns_and_falls_back(monkeypatch, caplog):
+    """start_idx 越界 → 记 warning 并退回 url 命中项，不抛异常。
+
+    退回 url 命中（第 2 集）而不是硬夹到首/末集：url 命中是**已验证**过的位置。
+    """
+    procs = _install(monkeypatch)
+    eps = [(f"https://cdn.example.com/hls/{c}.m3u8", "", f"第{i + 1}集")
+           for i, c in enumerate("abc")]
+    with caplog.at_level(logging.WARNING):
+        ep.open_with_player(eps[1][0], episodes=eps, start_idx=99)
+    args = procs[0].args
+    assert "--no-playlist-autostart" in args      # 退回第 2 集 → 仍需握手定位
+    assert any("越界" in r.getMessage() for r in caplog.records)
+
+
+def test_unlocatable_start_warns_and_plays_episode1(monkeypatch, caplog):
+    """既无 start_idx、url 也命中不到 → 记 warning，退回第 1 集 autostart。
+
+    静默退回第 1 集正是本任务要消灭的故障（从第 N 集开播却播第 1 集），
+    行为不变但必须留痕。
+    """
+    procs = _install(monkeypatch)
+    eps = [(f"https://cdn.example.com/hls/{c}.m3u8", "", f"第{i + 1}集")
+           for i, c in enumerate("abc")]
+    with caplog.at_level(logging.WARNING):
+        ep.open_with_player("https://cdn.example.com/hls/zzz.m3u8",
+                            episodes=eps)
+    args = procs[0].args
+    assert "--no-playlist-autostart" not in args  # 退回第 1 集 → 原生 autostart
+    assert len([a for a in args if a.startswith("P:")]) == 3   # 全集仍入列
+    assert any("未能定位起始集" in r.getMessage() for r in caplog.records)
+
+
 def test_no_handshake_without_episodes(monkeypatch):
     """episodes 为 None 或空列表 → 不起握手（没有播放列表要对齐）。"""
     _install(monkeypatch)
@@ -178,6 +255,20 @@ def test_episodes_empty_url_skipped(monkeypatch):
     ]
 
 
+def test_series_all_urls_empty_falls_back_to_single(monkeypatch):
+    """episodes 非空但每集都缺流 → 退回单集路径。
+
+    不能拿 0 条 MRL 拉起 VLC：那会开一个空播放器并回报「已用外部播放器打开」。
+    """
+    procs = _install(monkeypatch)
+    eps = [("", "", "第01集"), ("", "", "第02集")]
+    ep.open_with_player("https://cdn.example.com/hls/a.m3u8", episodes=eps)
+    args = procs[0].args
+    assert args[8] == "P:https://cdn.example.com/hls/a.m3u8"
+    assert len(args) == 9
+    assert "--no-random" not in args
+
+
 def test_title_sanitized():
     assert ep._sanitize_title("第01集 标题#带井号", 0) == "第01集 标题 带井号"
     assert ep._sanitize_title("第01集\n换行\t制表", 0) == "第01集 换行 制表"
@@ -185,6 +276,16 @@ def test_title_sanitized():
     assert ep._sanitize_title("  ", 0) == "第1集"
     assert ep._sanitize_title("123 数字开头", 0).startswith("集")
     assert not ep._sanitize_title("9abc", 0)[0].isdigit()
+
+
+def test_mrl_strips_fragment_from_url():
+    """URL 里的字面 # 必须砍掉。
+
+    不砍则 MRL 在第一个 # 处被截断，余下片段被 VLC 当成 title/chapter 解析，
+    实际指向的资源随之丢失（VLC 会去播那个片段）。
+    """
+    assert ep._mrl_with_title("http://x/a#frag", "第1集", 0) == "http://x/a#第1集"
+    assert ep._mrl_with_title("http://x/a#b#c", "第1集", 0) == "http://x/a#第1集"
 
 
 def test_classify_url_used_for_caching(monkeypatch):
@@ -330,6 +431,20 @@ def test_series_entry_missing_fields_falls_back():
         (1, "u0#第2集")]
 
 
+def test_fit_series_rederive_keeps_original_numbering():
+    """降级重取窗口时，集号兜底按**原始集位**编号，不按切片位置。
+
+    切片重取会把「第 396 集」重新编号成「第 1 集」——列表里出现重名集号，
+    用户根本看不出自己在第几集。
+    """
+    many = [(f"u{i}", "", "") for i in range(400)]   # 标题全空 → 走集号兜底
+    items, trunc = ep._fit_series(many, 395, lambda u, a: u)
+    assert trunc is True
+    assert [i for i, _m in items] == list(range(395, 400))
+    assert items[0][1] == "u395#第396集"            # 不是切片里的「第1集」
+    assert items[-1][1] == "u399#第400集"
+
+
 def test_fit_series_resolves_non_local_urls_only():
     """非本机 URL 才经 resolve 包代理；本机 /e/ URL 原样（不二次代理）。"""
     seen = []
@@ -379,11 +494,12 @@ def test_terminate_clears_control_state(monkeypatch):
 
 
 def test_force_proxy_forwarded_to_proxy(monkeypatch):
-    """force_proxy=True → 每次包代理都带上（主 MRL/音频轨/系列窗口当前集）。
+    """force_proxy=True → 每次包代理都带上（主 MRL/音频轨/系列列表那集）。
 
     play_url 仍要算出来定缓冲下限（主媒体 + 主音频轨 2 次），系列列表里那条
-    再解析一次（连同它自己的音频轨——系列路径丢弃 audio，见设计 §7），
-    4 次调用都必须带 force_proxy。
+    再解析一次 —— 但**不再顺带解析它自己的音频轨**：系列路径丢弃 audio
+    （见设计 §7，merged 流另挂 input-slave 会黑屏），多解析一次就白铸一个
+    没人用的代理 token。故共 3 次调用，音频轨 URL 只出现 1 次。
     """
     seen = []
     procs = _install(monkeypatch, proxy=lambda u, *a, **k: (
@@ -400,9 +516,8 @@ def test_force_proxy_forwarded_to_proxy(monkeypatch):
         "https://cdn.example.com/hls/a.m3u8",
         "https://cdn.example.com/hls/a-a.m3u8",
         "https://cdn.example.com/hls/a.m3u8",
-        "https://cdn.example.com/hls/a-a.m3u8",
     ]
-    assert [f for _u, f in seen] == [True] * 4
+    assert [f for _u, f in seen] == [True] * 3
 
 
 def test_force_proxy_default_false(monkeypatch):

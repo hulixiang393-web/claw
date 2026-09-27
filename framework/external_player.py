@@ -12,6 +12,7 @@
 1. VLC 桌面版（常见安装路径 + PATH）
 2. 系统默认打开方式（webbrowser / os.startfile）
 """
+import logging
 import os
 import re
 import secrets
@@ -26,6 +27,8 @@ except ImportError:  # pragma: no cover —— VLC 控制接口非必需，缺�
     requests = None
 
 from .media_proxy import proxy_url_for
+
+log = logging.getLogger(__name__)
 
 # 系列播放列表的裁剪上限。Windows CreateProcess 命令行硬上限 32767 字符；
 # 集数上千时一次性 enqueue 数千项既撑爆命令行也给 VLC 自身 playlist 增压。
@@ -136,12 +139,18 @@ def _sanitize_title(title: str, idx: int = 0) -> str:
 
 
 def _mrl_with_title(url: str, title: str, idx: int = 0) -> str:
-    """带显示标题的 MRL（URL#[title]）。"""
-    return f"{url}#{_sanitize_title(title, idx)}"
+    """带显示标题的 MRL（URL#[title]）。
+
+    URL 里的字面 # 必须先砍掉：MRL 在第一个 # 处被 VLC 截断，余下片段会被当
+    成 title/chapter 解析——**实际请求的资源随之改变**（VLC 拿片段当路径或时间
+    偏移），表现为播错/播不出。标题由 _sanitize_title 追加在末尾。
+    """
+    base = (url or "").split("#", 1)[0]
+    return f"{base}#{_sanitize_title(title, idx)}"
 
 
-def _fit_series(episodes: list, start_idx: int,
-                resolve) -> tuple[list[tuple[int, str]], bool]:
+def _fit_series(episodes: list, start_idx: int, resolve,
+                begin: int = 0) -> tuple[list[tuple[int, str]], bool]:
     """裁剪系列列表，返回 ([(集下标, MRL), ...], 是否截断)。
 
     **正常路径：全集按第 1 集 → 最后一集严格顺序入列。** 当前集往往位于
@@ -156,8 +165,13 @@ def _fit_series(episodes: list, start_idx: int,
     （惰性 /e/ URL 原样使用）。**先解析再计长**——代理 URL 比原 URL 长，
     先计长会低估命令行占用。空 URL 的集整条跳过。至少保留 1 条
     （单条超长也不丢，保证「当前集能播」优先于命令行长度）。
+
+    begin episodes 在整表里的**起始集位**（降级重取窗口时传切片起点，默认 0）。
+    返回的集下标 = begin + 切片内位置，使集号兜底标题与握手下标始终同源。
     """
     def _mrl_of(idx: int, entry) -> str:
+        # idx 是**原始集位**（不是切片位置）：集号兜底标题「第{idx+1}集」与
+        # items 传给握手的下标必须同源，否则降级重取窗口会重编号。
         ep_play = entry[0] if _is_local_proxy_url(entry[0]) else resolve(
             entry[0], entry[1] if len(entry) > 1 else "")
         return _mrl_with_title(ep_play,
@@ -166,7 +180,7 @@ def _fit_series(episodes: list, start_idx: int,
     items: list[tuple[int, str]] = []
     used = 0
     truncated = False
-    for idx, entry in enumerate(episodes):
+    for idx, entry in enumerate(episodes, start=begin):
         if not entry or not entry[0]:
             continue
         mrl = _mrl_of(idx, entry)
@@ -184,11 +198,33 @@ def _fit_series(episodes: list, start_idx: int,
         if window:
             return window, True
         # 当前集落在已解析范围之外（超长剧集选了很靠后的集）→ 必须重新取
-        # 窗口，否则当前集根本不在列表里、无法播放。
-        sub, _ = _fit_series(episodes[start_idx:], 0, resolve)
-        return [(i + start_idx, m) for i, m in sub], True
+        # 窗口，否则当前集根本不在列表里、无法播放。begin=start_idx 让切片内
+        # 的 idx 保持原始集位（集号兜底标题不重新从「第1集」起数），
+        # 故返回的集下标已是绝对值，**不可再叠加 start_idx**。
+        sub, _ = _fit_series(episodes[start_idx:], 0, resolve, begin=start_idx)
+        return sub, True
 
     return items, truncated
+
+
+def _locate_start(episodes: list, start_idx: int, url: str) -> int:
+    """定开播集位（0-based）。
+
+    三级优先：显式 start_idx（调用方已有下标，最可靠）→ url 命中项 → 记
+    warning 退回第 1 集。每级失配都留 warning：从第 N 集开播却播第 1 集是
+    用户可见的错位故障，静默降级过一次就没法排查了。
+    """
+    if 0 <= start_idx < len(episodes):
+        return start_idx
+    if start_idx != -1:
+        log.warning("外部播放器：start_idx=%s 越界（共 %d 集）",
+                    start_idx, len(episodes))
+    hit = next((i for i, e in enumerate(episodes) if e and e[0] == url), -1)
+    if hit >= 0:
+        return hit
+    log.warning("外部播放器：未能定位起始集（start_idx=%s，url 未命中列表），"
+                "按第 1 集开播", start_idx)
+    return 0
 
 
 def open_with_player(url: str, audio: str = "", referer: str = "",
@@ -197,6 +233,7 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                      force_proxy: bool = False,
                      episodes: list | None = None,
                      caching_ms: int = 0, classify_url: str = "",
+                     start_idx: int = -1,
                      on_playlist_ready=None) -> str:
     """用外部播放器打开媒体地址。
 
@@ -212,9 +249,15 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
     episodes **全集完整有序播放列表** list[tuple[url, audio, title]]：
              episodes[i] = 第 i 集（0-based，严格播放顺序），**episodes[0]
              不会被跳过**。每条 MRL 追加 `#<消毒后的标题>` 供播放列表显示；
-             整表加 `--no-random` 保证顺序；起始项（url 命中项）非首项时加
+             整表加 `--no-random` 保证顺序；起始项非首项时加
              `--no-playlist-autostart` 并在后台握手 `pl_play&id=<id>` 定位。
-             列表项 URL 为空则跳过该集。None → 与旧行为完全一致。
+             列表项 URL 为空则跳过该集；全部为空时退回单集路径。None → 与旧
+             行为完全一致。
+    start_idx 调用方已知的当前集下标（0-based）。**优先于** url 字符串匹配：
+             调用方手里就有下标，比在列表里比对 URL 载荷可靠得多，也省掉
+             「URL 被截断/签名变化就匹配不上」的脆弱环节。越界记 warning 并
+             退回 url 命中项；两者都取不到时记 warning 退回第 1 集。
+             单集路径忽略此参数。
     classify_url 非空时用它做缓冲分类。惰性系列 URL 是
              http://127.0.0.1:PORT/e/... 分类不出 HLS，必须传**当前集真实流
              地址**，否则按连接限速的源（ikanpp 需 30000ms）缓冲退化卡顿。
@@ -304,21 +347,30 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             f"--http-port={port}", f"--http-password={http_password}",
         ]
         window: list[tuple[int, str]] = []
-        start_idx = 0
+        start_pos = 0          # 实际开播集位：单集路径无列表可定位，恒为首项
         truncated = False
         if episodes:
             # 系列：全集按序入列（episodes[0] 也在列内），不另加主 MRL。
-            # 起始项 = url 命中的集；取不到（url 不在列表内）按 0 处理。
-            start_idx = next(
-                (i for i, e in enumerate(episodes) if e and e[0] == url), 0)
-            args.append("--no-random")
-            if start_idx > 0:
-                # 非首项开播：先禁止 autostart，再由握手 pl_play 定位
-                args.append("--no-playlist-autostart")
-            window, truncated = _fit_series(episodes, start_idx,
-                                           lambda u, a: _resolve(u, a)[0])
-            for _idx, mrl in window:
-                args.append(mrl)
+            # 起始项三级解析：显式 start_idx → url 命中 → 记 warning 退第 1 集。
+            start_pos = _locate_start(episodes, start_idx, url)
+            # 系列每集只解析**流地址**（音频传空）：系列路径丢弃 entry[1]，
+            # merged 流另挂 :input-slave 会黑屏（见设计 §7），多解析一次
+            # 就白铸一个没人用的代理 token。主路径的音频轨仍照常解析。
+            window, truncated = _fit_series(
+                episodes, start_pos, lambda u, _a: _resolve(u, "")[0])
+            if window:
+                args.append("--no-random")
+                if start_pos > 0:
+                    # 非首项开播：先禁止 autostart，再由握手 pl_play 定位
+                    args.append("--no-playlist-autostart")
+                for _idx, mrl in window:
+                    args.append(mrl)
+            else:
+                # 每集都缺流地址（解析全空）→ 等同于没有系列，退回单集路径。
+                # 绝不能拿 0 条 MRL 拉起 VLC：那会开一个空播放器并回报成功。
+                args.append(play_url)
+                if audio_url:
+                    args.append(f":input-slave={audio_url}")
         else:
             args.append(play_url)
             if audio_url:
@@ -336,17 +388,24 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             _control_state = {
                 "host": "127.0.0.1", "port": port, "password": http_password,
             }
+        except Exception:  # noqa: BLE001 —— VLC 启动失败降级系统默认
+            pass
+        else:
+            # 握手**故意在启动 try 之外**：VLC 已拉起并开播，握手失败只是
+            # 少一次 pl_play 定位，**不得**降级成浏览器兜底（那会多弹一个
+            # 浏览器窗口、返回「已在浏览器中打开」，把故障现象伪装成成功）。
             if episodes and window:
                 # 后台握手：轮询 playlist.json 建 {集下标: vlc_id} 映射，
                 # 非首项开播时顺带 pl_play 定位。必须在后台线程（VLC 建列表
                 # 需时，主线程会卡 UI）。整个 window 传下去，映射才覆盖
                 # 列表内每一集（App 侧切集依赖它）。
-                _start_playlist_sync(start_idx, window, on_playlist_ready)
+                try:
+                    _start_playlist_sync(start_pos, window, on_playlist_ready)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("外部播放器：启动握手失败（不影响已拉起的 VLC）: %s", exc)
             if truncated:
                 return f"已用外部播放器打开（列表已截断，共 {len(window)} 集）"
             return "已用外部播放器打开"
-        except Exception:  # noqa: BLE001 —— VLC 启动失败降级系统默认
-            pass
     webbrowser.open(url)
     return "已在浏览器中打开"
 
