@@ -72,6 +72,10 @@ def main():
     assert page.export_btn.text() == "导出书架"
     print("导出按钮 OK")
 
+    assert getattr(page, "import_btn", None) is not None, "缺少导入书架按钮"
+    assert page.import_btn.text() == "导入书架"
+    print("导入按钮 OK")
+
     print("\n=== 书架离屏测试通过 ===")
 
 
