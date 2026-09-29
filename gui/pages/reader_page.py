@@ -138,6 +138,11 @@ class ReaderPage(BasePage):
         self.fav_btn.setFixedWidth(86)
         self.fav_btn.clicked.connect(self._on_favorite_clicked)
         info.addWidget(self.fav_btn)
+        self.refresh_btn = QPushButton("刷新内容")
+        self.refresh_btn.setFixedWidth(86)
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.clicked.connect(self._on_refresh_clicked)
+        info.addWidget(self.refresh_btn)
         self.open_btn = QPushButton("打开源详情")
         self.open_btn.clicked.connect(self._open_source_page)
         info.addWidget(self.open_btn)
@@ -150,6 +155,7 @@ class ReaderPage(BasePage):
         self.stack = QStackedWidget()
         self.novel_view = NovelView(content, font_scale=self._font_scale)
         self.comic_view = ComicView(content)
+        self.comic_view.set_cache_policy(lambda: self._comic_cache_allowed())
         self.video_view = VideoView(content, search=self._search)
         self.epub_view = EpubView(font_scale=self._font_scale)
         self.stack.addWidget(self.novel_view)
@@ -281,6 +287,12 @@ class ReaderPage(BasePage):
         location = payload[5] if len(payload) > 5 else None
         if detail is None:
             return
+        if not isinstance(detail, str) and self._favorite_checker is not None:
+            try:
+                if not self._favorite_checker(getattr(detail, "url", "")):
+                    return
+            except Exception:
+                return
         try:
             # epub 本地文件：payload[0] 是路径字符串，用路径作 book_url
             if isinstance(detail, str):
@@ -346,6 +358,28 @@ class ReaderPage(BasePage):
             pass
 
     # ------------------------------------------------------------------ #
+    def _on_refresh_clicked(self) -> None:
+        if self._current_content_type not in ("novel", "comic") or not self._current_book_url:
+            return
+        view = self.novel_view if self._current_content_type == "novel" else self.comic_view
+        chapter_url = ""
+        if 0 <= getattr(view, "_current_idx", -1) < len(getattr(view, "_chapters", [])):
+            chapter_url = getattr(view._chapters[view._current_idx], "url", "")
+        try:
+            pos, page = view.position_snapshot()
+            self._pending_position, self._pending_page = pos, page
+        except Exception:
+            pass
+        self.refresh_btn.setEnabled(False)
+        task = _LoadDetailTask(
+            self._content, self._current_source, self._current_book_url,
+            self._current_content_type, chapter_url, self._current_source_id,
+            force_refresh=True,
+        )
+        task.signals.finished.connect(self._on_detail)
+        self._detail_task = task
+        QThreadPool.globalInstance().start(task)
+
     def open(self, source_id: str, book_url: str, content_type: str, start_chapter_url: str = "") -> None:
         """打开一部作品（续读：记忆的章节/位置优先于调用方传入）。"""
         # 切书前落盘当前作品的最新位置（防换书丢失最后几秒进度）
@@ -357,7 +391,13 @@ class ReaderPage(BasePage):
             return
         # 续读恢复：记忆里有这本书 → 用记忆的章覆盖 start_chapter_url，并取位置
         resume_pos, resume_page, resume_location = None, None, None
-        if self._reading_progress is not None and book_url:
+        can_resume_online = True
+        if self._favorite_checker is not None and book_url:
+            try:
+                can_resume_online = bool(self._favorite_checker(book_url))
+            except Exception:
+                can_resume_online = False
+        if self._reading_progress is not None and book_url and can_resume_online:
             rec = self._reading_progress.resume(book_url)
             if rec and rec.get("chapter_url"):
                 start_chapter_url = rec["chapter_url"]
@@ -374,6 +414,7 @@ class ReaderPage(BasePage):
         self._current_content_type = content_type
         self._current_detail = None  # 详情就绪后由 _on_detail 填充（收藏复用完整元数据）
         self.dl_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(content_type in ("novel", "comic"))
         self.title_label.setText(f"加载中...")
         self.source_label.setText(source.source_name)
         self.refresh_favorite_state()  # 打开新作品即刷新收藏按钮
@@ -448,6 +489,8 @@ class ReaderPage(BasePage):
         try:
             if getattr(self._content, "_cache", None) is None:
                 return
+            if not self._comic_cache_allowed():
+                return
             chapters = getattr(detail, "chapters", None)
             if not chapters:
                 return
@@ -475,6 +518,15 @@ class ReaderPage(BasePage):
             log.warning("[cache] 预加载调度失败: %s", exc)
 
     # ------------------------------------------------------------------ #
+    def _comic_cache_allowed(self) -> bool:
+        checker = getattr(self, "_favorite_checker", None)
+        if checker is None:
+            return True
+        try:
+            return bool(checker(getattr(self, "_current_book_url", "") or ""))
+        except Exception:
+            return False
+
     def set_favorite_checker(self, cb) -> None:
         """注入收藏判断回调：cb(url) -> bool。App 层接 LibraryStore.has。"""
         self._favorite_checker = cb
@@ -651,7 +703,7 @@ class _DetailSignals(QObject):
 class _LoadDetailTask(QRunnable):
     """后台加载详情（QRunnable）。"""
 
-    def __init__(self, content, source, url, content_type, start_url, source_id):
+    def __init__(self, content, source, url, content_type, start_url, source_id, force_refresh=False):
         super().__init__()
         self.signals = _DetailSignals()
         self._content = content
@@ -660,11 +712,17 @@ class _LoadDetailTask(QRunnable):
         self._content_type = content_type
         self._start_url = start_url
         self._source_id = source_id
+        self._force_refresh = force_refresh
 
     def run(self) -> None:
         detail, err = None, None
         try:
-            detail = self._content.fetch_detail(self._source, self._url)
+            if self._force_refresh:
+                detail = self._content.refresh_detail(
+                    self._source, self._url, current_chapter_url=self._start_url
+                )
+            else:
+                detail = self._content.fetch_detail(self._source, self._url)
         except Exception as exc:
             err = str(exc)
         try:

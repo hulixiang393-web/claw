@@ -326,6 +326,34 @@ def test_content_precache_chapters():
     }
 
 
+def test_content_precache_nonfavorite_bypasses_body_cache_reads_and_writes():
+    store = make_store()
+    http = _FakeHttp()
+    c = _make_content(store, http)
+    src = _fake_source()
+    chapters = [type("Ch", (), {"url": "https://x.com/b/1.html"})()]
+    key = f"body:{src.source_id}:https://x.com/b/1.html"
+    store.set(key, "stale", ttl=3600)
+
+    c.precache_chapters(src, chapters, 0, ahead=0, use_cache=False)
+
+    assert http.calls == {"https://x.com/b/1.html": 1}
+    assert store.get(key) == "stale"
+
+
+def test_content_precache_favorite_cache_policy_preserves_shelf_job():
+    store = make_store()
+    http = _FakeHttp()
+    c = _make_content(store, http)
+    src = _fake_source()
+    chapters = [type("Ch", (), {"url": "https://x.com/b/1.html"})()]
+
+    c.precache_chapters(src, chapters, 0, ahead=0, use_cache=True)
+
+    assert store.get(f"body:{src.source_id}:https://x.com/b/1.html") is not None
+    assert http.calls == {"https://x.com/b/1.html": 1}
+
+
 def test_cover_bytes_persist_roundtrip():
     store = make_store()
     store.set("cover:s1:https://c/img.jpg", b"\x89PNG-fake-bytes")

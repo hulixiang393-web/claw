@@ -261,6 +261,59 @@ def test_flush_progress_does_not_save_video_playback_position(app, tmp_path):
     app.processEvents()
 
 
+def test_nonfavorite_progress_is_not_saved_or_resumed(app, tmp_path):
+    from gui.pages.reader_page import ReaderPage
+
+    path = tmp_path / "rp.json"
+    rp = ReadingProgress(path)
+    chapters = [Chapter(f"第{i}章", f"https://example.com/book/1/{i}.html") for i in range(1, 4)]
+    rp.save("demo", BOOK, "novel", chapters[2].url, "第三章")
+
+    content = _MockContent(chapters)
+    reader = ReaderPage(_FakeManager(), content, reading_progress=rp)
+    reader.set_favorite_checker(lambda url: False)
+    reader.resize(800, 600)
+    reader.show()
+    reader.open("demo", BOOK, "novel")
+    _wait(app, 100, 15)
+
+    assert reader.novel_view._current_idx == 0
+    reader.novel_view._current_idx = 1
+    reader.flush_progress()
+    assert rp.resume(BOOK)["chapter_url"] == chapters[2].url
+
+    reader.deleteLater()
+    app.processEvents()
+
+
+def test_transition_to_favorite_enables_subsequent_progress_save(app, tmp_path):
+    from gui.pages.reader_page import ReaderPage
+
+    path = tmp_path / "rp.json"
+    rp = ReadingProgress(path)
+    state = {"favorite": False}
+    chapters = [Chapter("第一章", "https://example.com/book/1/1.html")]
+    detail = Detail(
+        source_id="demo",
+        content_type="novel",
+        url=BOOK,
+        title="书",
+        chapters=chapters,
+    )
+    reader = ReaderPage(_FakeManager(), _MockContent(chapters), reading_progress=rp)
+    reader.set_favorite_checker(lambda url: state["favorite"])
+
+    reader._on_progress_signal((detail, "第一章", chapters[0].url, 0.2, None, None))
+    assert rp.resume(BOOK) is None
+
+    state["favorite"] = True
+    reader._on_progress_signal((detail, "第一章", chapters[0].url, 0.8, None, None))
+    assert rp.resume(BOOK)["position"] == 0.8
+
+    reader.deleteLater()
+    app.processEvents()
+
+
 def test_open_resumes_saved_chapter(app, tmp_path):
     from gui.pages.reader_page import ReaderPage
 

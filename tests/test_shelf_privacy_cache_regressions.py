@@ -30,6 +30,14 @@ class _Cache:
         self.values[key] = value
         self.ttls[key] = time.time() + ttl if ttl is not None else None
 
+    def delete(self, key):
+        self.values.pop(key, None)
+        self.ttls.pop(key, None)
+
+    def scan(self, pattern):
+        prefix = pattern.removesuffix("*")
+        return [key for key in self.values if key.startswith(prefix)]
+
 
 def test_shelf_merge_keeps_same_title_from_different_sources_distinct(tmp_path):
     from framework.shelf_service import ShelfItem, ShelfService
@@ -179,7 +187,7 @@ def test_folder_render_deduplicates_after_local_favorite_merge_using_normalized_
     assert rendered[0]["path"].endswith("book.epub")
 
 
-def test_all_view_locked_content_becomes_visible_after_session_unlock(_qapp, tmp_path):
+def test_all_view_locked_content_stays_hidden_after_session_unlock(_qapp, tmp_path):
     from framework.folder_lock import hash_password, new_salt
     from framework.library_store import LibraryStore
     from gui.pages.library_page import LibraryPage
@@ -204,7 +212,63 @@ def test_all_view_locked_content_becomes_visible_after_session_unlock(_qapp, tmp
 
     page._unlocked.add("私密")
     page._render([book])
-    assert [item["rec"]["title"] for _, items in captured for item in items] == ["秘密书"]
+    assert captured == []
+
+
+def test_refresh_detail_forces_network_and_invalidates_chapter_cache():
+    c = Content.__new__(Content)
+    c._cache = _Cache()
+    c._repository = None
+    source = _src()
+    source.raw["api_endpoints"] = {"detail": {"url": "/detail"}}
+    detail_url = "https://s1.example/book/1"
+    detail_key = "detail:s1:" + detail_url
+    body_key = "body:s1:https://s1.example/ch1"
+    unrelated_body_key = "body:s1:https://s1.example/other-book/ch1"
+    c._cache.set(detail_key, '{"title":"旧","url":"https://s1.example/book/1","source_id":"s1","content_type":"novel","chapters":[{"title":"第一章","url":"https://s1.example/ch1"}]}')
+    c._cache.set(body_key, "旧正文")
+    c._cache.set(unrelated_body_key, "另一本书正文")
+    calls = []
+    c._fetch_detail_api = lambda *args: calls.append(args) or Detail(
+        title="新详情", url=detail_url, source_id="s1", content_type="novel",
+        chapters=[{"title":"第一章","url":"https://s1.example/ch1"}],
+    )
+    c._fetch_chapter_page = lambda *args: ("新正文", "")
+
+    got = c.refresh_detail(source, detail_url, current_chapter_url=body_key.split(":", 2)[2])
+
+    assert got.title == "新详情"
+    assert len(calls) == 1
+    assert c._cache.get(unrelated_body_key) == "另一本书正文"
+    assert c.fetch_chapter(source, "https://s1.example/ch1") == "新正文"
+
+
+def test_refresh_detail_evicts_repository_body_cache_and_refetches_current(tmp_path):
+    from framework.shelf_cache_repository import ShelfCacheRepository
+
+    repository = ShelfCacheRepository(tmp_path / "shelf.sqlite3", tmp_path / "content")
+    c = Content.__new__(Content)
+    c._cache = _Cache()
+    c._repository = repository
+    source = _src()
+    detail_url = "https://s1.example/book/1"
+    current = "https://s1.example/ch1"
+    stale = "https://s1.example/old"
+    latest = "https://s1.example/ch2"
+    for chapter, text in ((current, "旧正文"), (stale, "过时正文"), (latest, "保留正文")):
+        c._cache_set(f"body:s1:{chapter}", text, book_key=detail_url)
+    c.fetch_detail = lambda *_args: Detail(
+        title="新详情", url=detail_url, source_id="s1", content_type="novel",
+        chapters=[{"title": "第二章", "url": latest}],
+    )
+    c._fetch_chapter_page = lambda *args: ("新正文", "")
+
+    c.refresh_detail(source, detail_url, current_chapter_url=current)
+
+    assert repository.get_content(detail_url, current) is None
+    assert repository.get_content(detail_url, stale) is None
+    assert repository.get_content(detail_url, latest) == "保留正文"
+    assert c.fetch_chapter(source, current) == "新正文"
 
 
 def test_session_unlock_is_not_persisted_across_fresh_page_instance(_qapp, tmp_path):

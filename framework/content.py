@@ -220,6 +220,12 @@ class Content:
 
     @staticmethod
     def _repository_cache_parts(key: str, book_key: str | None = None) -> tuple[str, str]:
+        parts = key.split(":", 3)
+        if len(parts) == 4 and parts[0] == "pages" and parts[1] == "v3":
+            url = parts[3]
+            if book_key is None:
+                return "pages", url
+            return url, book_key
         kind, _source_id, url = key.split(":", 2)
         if book_key is None:
             return kind, url
@@ -381,6 +387,46 @@ class Content:
             return ""
 
     # ------------------------------------------------------------------ #
+    def refresh_detail(self, source: SourceConfig, url: str, current_chapter_url: str = "") -> Detail:
+        """强制刷新详情和章节正文缓存，保留缓存优先的普通打开路径。"""
+        abs_url = self._abs_url(source, url)
+        detail_key = f"detail:{source.source_id}:{abs_url}"
+        def _delete(key: str) -> None:
+            if self._cache is None:
+                return
+            deleter = getattr(self._cache, "delete", None)
+            if deleter is not None:
+                deleter(key)
+            else:
+                getattr(self._cache, "values", {}).pop(key, None)
+                getattr(self._cache, "ttls", {}).pop(key, None)
+
+        if self._cache is not None:
+            _delete(detail_key)
+            _delete(f"page:{source.source_id}:{abs_url}")
+            if current_chapter_url:
+                _delete(f"body:{source.source_id}:{self._abs_url(source, current_chapter_url)}")
+        getattr(self, "_detail_html_cache", {}).pop((source.source_id, abs_url), None)
+        getattr(self, "_video_html_cache", {}).pop((source.source_id, abs_url), None)
+        detail = self.fetch_detail(source, url)
+        latest = set()
+        for chapter in detail.chapters or []:
+            chapter_url = chapter.get("url", "") if isinstance(chapter, dict) else getattr(chapter, "url", "")
+            if chapter_url:
+                latest.add(self._abs_url(source, chapter_url))
+        current_abs = self._abs_url(source, current_chapter_url) if current_chapter_url else ""
+        keep = sorted(latest - ({current_abs} if current_abs else set()))
+        if self._repository is not None:
+            book_keys = {
+                url,
+                abs_url,
+                f"{source.source_id}:{url}",
+                f"{source.source_id}:{abs_url}",
+            }
+            for book_key in book_keys:
+                self._repository.evict_book_content(book_key, keep)
+        return detail
+
     def fetch_detail(self, source: SourceConfig, url: str) -> Detail:
         """抓取详情页：元数据 + 章节列表。
 
@@ -1302,7 +1348,7 @@ class Content:
         raise ContentMissingError("请求体需 AES 加密但未配置解密器", source_id="")
 
     # ------------------------------------------------------------------ #
-    def fetch_chapter(self, source: SourceConfig, url: str) -> str:
+    def fetch_chapter(self, source: SourceConfig, url: str, use_cache: bool = True) -> str:
         """抓取单章正文。按类型取正文选择器，支持章节分页拼接。
 
         长章节在部分站点会拆成多页（如 xxx.html / xxx_1.html / xxx_2.html）。
@@ -1327,9 +1373,8 @@ class Content:
         seen = set()
         max_pages = int(pag_cfg.get("max_pages") or 20)
         # 开头：cached body 命中直接返回（重启后/预加载后免抓）
-        cached = self._cache_get(
-            f"body:{source.source_id}:{self._abs_url(source, url)}"
-        )
+        cache_key = f"body:{source.source_id}:{self._abs_url(source, url)}"
+        cached = self._cache_get(cache_key) if use_cache else None
         if cached is not None:
             return cached
         while cur and len(pages) < max_pages:
@@ -1349,12 +1394,8 @@ class Content:
             break  # 基路径不同 → 是真正的下一章或重复，停止分页
         text = "\n".join(pages)
         # 末尾：写 body: 键（7 天，shelf 池）
-        if text:
-            self._cache_set(
-                f"body:{source.source_id}:{self._abs_url(source, url)}",
-                text,
-                ttl=7 * 86400,
-            )
+        if text and use_cache:
+            self._cache_set(cache_key, text, ttl=7 * 86400)
         return text
 
     def precache_chapters(
@@ -1364,6 +1405,7 @@ class Content:
         current_idx: int,
         ahead: int = 3,
         enabled: bool = True,
+        use_cache: bool = True,
     ) -> None:
         """后台预加载当前章+后 ahead 章正文到缓存。不满 ahead 按实际。
 
@@ -1372,7 +1414,9 @@ class Content:
         """
         if not enabled:
             return
-        if self._cache is None and self._repository is None or not chapters:
+        if not chapters:
+            return
+        if use_cache and self._cache is None and self._repository is None:
             return
         ahead = max(0, int(ahead))
         end = min(current_idx + ahead + 1, len(chapters))
@@ -1383,14 +1427,19 @@ class Content:
                 continue
             abs_url = self._abs_url(source, url)
             key = f"body:{source.source_id}:{abs_url}"
-            if self._cache_get(key) is not None:
+            if use_cache and self._cache_get(key) is not None:
                 continue  # 已缓存
             try:
-                text = self.fetch_chapter(source, url)
+                try:
+                    text = self.fetch_chapter(source, url, use_cache=use_cache)
+                except TypeError as exc:
+                    if "use_cache" not in str(exc):
+                        raise
+                    text = self.fetch_chapter(source, url)
             except Exception as exc:  # noqa: BLE001
                 log.warning("[cache] 预加载失败 %s: %s", url, exc)
                 continue
-            if text:
+            if text and use_cache:
                 self._cache_set(key, text, ttl=7 * 86400)
 
     def _fetch_chapter_page(
@@ -1592,6 +1641,7 @@ class Content:
         chapter_url: str,
         on_page=None,
         cancel_evt=None,
+        use_cache: bool = True,
     ) -> List[str]:
         """漫画：抓取一话的全部分页图片 URL（带缓存包装）。
 
@@ -1607,17 +1657,26 @@ class Content:
         白跑完一整话（dm5 一话 39 页 ≈74s）。None 表示不取消（下载器等同步调用）。
         """
         abs_url = self._abs_url(source, chapter_url)
-        cached = self._cache_get(f"pages:{source.source_id}:{abs_url}")
+        # v2 skips entries written by the old implementation, which could
+        # persist a two-image HTML fallback for a week.
+        cache_key = f"pages:v3:{source.source_id}:{abs_url}"
+        cached = self._cache_get(cache_key) if use_cache else None
         if cached is not None:
+
             if on_page and cached:
                 on_page(list(cached))
             return cached
+        degraded: list = []
         imgs = self._fetch_comic_pages_impl(
-            source, chapter_url, on_page=on_page, cancel_evt=cancel_evt
+            source, chapter_url, on_page=on_page, cancel_evt=cancel_evt,
+            degraded_out=degraded,
         )
-        if imgs:
+        if cancel_evt and cancel_evt.is_set():
+            degraded.append("cancelled partial comic page fetch")
+        if use_cache and imgs and not degraded:
             self._cache_set(
-                f"pages:{source.source_id}:{self._abs_url(source, chapter_url)}",
+
+                cache_key,
                 list(imgs),
                 ttl=7 * 86400,
             )
@@ -1629,7 +1688,13 @@ class Content:
         chapter_url: str,
         on_page=None,
         cancel_evt=None,
+        degraded_out=None,
     ) -> List[str]:
+        """抓取一话分页图片 URL（无缓存包装）。
+
+        degraded_out：可选 list。Playwright 渲染失败降级到 HTML 提取时置位
+        （该结果不完整，调用方据此不入 pages: 缓存）。
+        """
         content_cfg = self._content_block(source)
         block = content_cfg.get("page") or {}
         abs_url = self._abs_url(source, chapter_url)
@@ -1672,6 +1737,9 @@ class Content:
                     # 边滚边分批回调：连续前缀提前给 GUI 渲染（首图秒出，后续边滚边补）
                     on_batch=(lambda prefix: on_page(list(prefix))) if on_page else None,
                 )
+                minimum = int(rc.get("min_images") or 0)
+                if minimum and len(imgs) < minimum and degraded_out is not None:
+                    degraded_out.append("incomplete rendered comic page list")
                 if on_page and imgs:
                     on_page(list(imgs))
                 return imgs
@@ -1679,13 +1747,21 @@ class Content:
                 # Playwright 渲染失败 → 降级到普通 HTML 提取（站点改版/选择器不匹配时
                 # 不整话失败，尝试 HTML 兜底；若 HTML 也提取不到，下方会抛 ContentMissingError）
                 log.warning("[%s] Playwright 渲染失败，降级 HTML 提取：%s", source.source_id, exc)
+                # canvas/分片加密源的页面是 JS 应用，静态 HTML 里只有首屏那几个占位
+                # 元素（如 comicbox 只能提到 2 个 .cropped）——兜底结果不完整，若当
+                # 整话缓存会让该章 7 天内永远只出这 2 张（其余页面再也渲染不出来）。
+                if degraded_out is not None:
+                    degraded_out.append(exc)
 
         self._bg_check(source, abs_url)
         # 图片列表优先 body，兼容旧 list
         list_cfg = body_cfg or block.get("list") or {}
         urls = self._fetch_comic_page_imgs(
-            source, list_cfg, chapter_url, cancel_evt=cancel_evt, on_page=on_page
+            source, list_cfg, chapter_url, cancel_evt=cancel_evt, on_page=on_page,
+            degraded_out=degraded_out,
         )
+        if cancel_evt and cancel_evt.is_set() and degraded_out is not None:
+            degraded_out.append("cancelled partial comic page fetch")
         # 图片解密源（如 18mh AES-CBC 加密图）：下载并把每张解密成 data URI，
         # 使阅读器/下载器无需改动即可显示/保存解密图。
         if urls and source.raw.get("decryption", {}).get("targets", {}).get("image"):
@@ -1767,7 +1843,7 @@ class Content:
 
     def _fetch_comic_page_imgs(
         self, source: SourceConfig, list_cfg: dict, chapter_url: str,
-        cancel_evt=None, on_page=None,
+        cancel_evt=None, on_page=None, degraded_out=None,
     ) -> List[str]:
         """从单话 HTML 提取全部图片 URL，支持图片列表翻页（含并行翻页加速）。
 
@@ -1951,6 +2027,8 @@ class Content:
                 n = first_page
                 while n <= p_max:
                     if cancel_evt and cancel_evt.is_set():
+                        if degraded_out is not None:
+                            degraded_out.append("cancelled partial comic page fetch")
                         break  # 换书取消：停止后续 wave 抓取，返回已收集部分
                     wave = list(range(n, min(n + window, p_max + 1)))
                     # 每 wave 并发抓取（max_workers=min(window, 页数)）
@@ -1962,6 +2040,32 @@ class Content:
                         for fut in as_completed(futs):
                             results[futs[fut]] = fut.result()
                     # 图片按页码顺序收集，与第 1 页拼接
+                    populated = [p for p in wave if results.get(p, ([], ""))[0]]
+                    # Empty trailing probes are the normal way a predictable
+                    # paginator discovers its end. Only a hole before a later
+                    # populated page proves the result is incomplete.
+                    if populated:
+                        last_populated = populated[-1]
+                        if any(
+                            not results.get(p, ([], ""))[0]
+                            for p in wave if p < last_populated
+                        ) and degraded_out is not None:
+                            degraded_out.append("incomplete parallel comic page wave")
+                        last_populated_nxt = results.get(last_populated, ([], ""))[1]
+                        if (
+                            last_populated < wave[-1]
+                            and last_populated_nxt
+                            and self._abs_url(source, last_populated_nxt)
+                            == pred(last_populated + 1)
+                            and not results.get(last_populated + 1, ([], ""))[0]
+                            and degraded_out is not None
+                        ):
+                            degraded_out.append("missing expected parallel comic page")
+                    elif degraded_out is not None:
+                        # Entering this wave means the previous page explicitly
+                        # linked to its first predicted page. An all-empty wave
+                        # is therefore a fetch failure, not a natural ending.
+                        degraded_out.append("missing expected parallel comic page")
                     for p in wave:
                         _add_imgs(results.get(p, ([], ""))[0])
                     # 边抓边回调（连续前缀）：阅读器首批图就绪即可渲染首屏，
@@ -1994,12 +2098,16 @@ class Content:
         page_url = chapter_url
         for _ in range(max_pages if max_pages else 1000):
             if cancel_evt and cancel_evt.is_set():
+                if degraded_out is not None:
+                    degraded_out.append("cancelled partial comic page fetch")
                 break  # 换书取消：停止后续翻页抓取
             if page_url in seen_url:
                 break
             seen_url.add(page_url)
             page_imgs, nxt = _fetch_page(page_url)
             _add_imgs(page_imgs)
+            if nxt and not page_imgs and degraded_out is not None:
+                degraded_out.append("incomplete sequential comic page")
             # 无下一页配置 → 单页即止
             if not next_sel or not nxt:
                 break

@@ -485,15 +485,21 @@ class LibraryPage(BasePage):
         """主线程渲染扫描结果（本地在前）。"""
         if not self._visible_combo_state():
             return  # 筛选/搜索/排序已变化 → 旧结果丢弃，等新任务
+        selected_folder = self.folder_combo.currentText()
+        def _visible(b: dict) -> bool:
+            folder = b.get("folder", "")
+            info = self._store.folder_info(folder) if self._store is not None and folder else None
+            if selected_folder == "全部" and info and info.get("locked"):
+                return False
+            return self.is_folder_unlocked(folder)
+
         locals_ = [
             b for b in books
-            if b.get("kind") == "local"
-            and self.is_folder_unlocked(b.get("folder", ""))
+            if b.get("kind") == "local" and _visible(b)
         ]
         favorites = [
             b for b in books
-            if b.get("kind") == "favorite"
-            and self.is_folder_unlocked(b.get("folder", ""))
+            if b.get("kind") == "favorite" and _visible(b)
         ]
         locals_, favorites = self._deduplicate_visible_books(locals_, favorites)
         type_map = {"全部": "", "小说": "novel", "漫画": "comic", "视频": "video"}

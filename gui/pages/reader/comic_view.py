@@ -62,6 +62,8 @@ class ComicView(QWidget):
         self._content = content
         self._source = None
         self._detail: Detail | None = None
+        self._cache_policy = None
+        self._cache_override = None
         self._chapters = []
         self._current_idx = -1
         self._gen = 0  # 加载代际：换书自增，旧书异步回调（取流/预取）因代际过期被丢弃
@@ -216,6 +218,21 @@ class ComicView(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
 
     # ------------------------------------------------------------------ #
+    def set_cache_policy(self, checker) -> None:
+        self._cache_policy = checker
+
+    def _use_cache(self) -> bool:
+        override = getattr(self, "_cache_override", None)
+        if override is not None:
+            return bool(override)
+        policy = getattr(self, "_cache_policy", None)
+        if policy is None:
+            return True
+        try:
+            return bool(policy())
+        except Exception:
+            return False
+
     def load(
         self,
         source,
@@ -223,7 +240,9 @@ class ComicView(QWidget):
         start_chapter_url: str = "",
         restore_position: float | None = None,
         restore_location: dict | None = None,
+        use_cache: bool | None = None,
     ) -> None:
+        self._cache_override = use_cache
         # 换书：代际自增 + 清空旧书状态。旧书的后台取流/预取任务仍可能后到，
         # 但代际过期会被回调丢弃——避免旧书结果覆盖新书（URL 相同的章节
         # 或旧预取污染新书缓存）。旧书图片/缓存/预取队列一并清掉，新书从
@@ -342,7 +361,7 @@ class ComicView(QWidget):
 
         task = _LoadComicTask(
             self._content, self._source, ch, gen=self._gen,
-            cancel_evt=self._cancel_evt,
+            cancel_evt=self._cancel_evt, use_cache=self._use_cache(),
         )
         task.signals.finished.connect(self._on_images_loaded)
         task.signals.partial.connect(self._on_images_partial)  # 边抓边显示
@@ -399,11 +418,17 @@ class ComicView(QWidget):
         if err:
             self.progress_label.setText(f"加载失败：{err}")
             return
+        minimum = self._minimum_complete_images()
         if self._current_idx < 0 or ch.url != self._chapters[self._current_idx].url:
-            ch._cached_images = images  # 过期回调：仅写缓存，不渲染当前画面
+            if len(images) >= minimum:
+                ch._cached_images = images  # 过期回调：仅写完整结果
             return
         self._images = images
-        ch._cached_images = images  # 缓存本话，避免重复爬
+        # Do not retain a likely partial render in the session cache. Rendered
+        # comic sources such as comicbox expose only two placeholders when the
+        # browser scrape stalls; keeping that list would bypass the retry.
+        if len(images) >= minimum:
+            ch._cached_images = images
         self.progress_label.setText(f"第{self._current_idx+1}/{len(self._chapters)}话 · {len(images)}张")
         # 新话首批图就绪 → 清空旧画面并渲染新话（换话保留旧画面到此刻）
         self._prepare_new_episode_render()
@@ -485,7 +510,7 @@ class ComicView(QWidget):
             return
         task = _PrefetchRenderTask(
             self._content, self._source, ch, gen=self._gen,
-            cancel_evt=self._cancel_evt,
+            cancel_evt=self._cancel_evt, use_cache=self._use_cache(),
         )
         task.signals.finished.connect(self._on_prefetch_done)
         self._prefetch_tasks = getattr(self, "_prefetch_tasks", [])
@@ -499,11 +524,25 @@ class ComicView(QWidget):
         """
         if gen != self._gen:
             return
-        self._prefetched[chapter_url] = {
-            "images": images or [], "count": len(images or [])
-        }
+        minimum = self._minimum_complete_images()
+        if not err and len(images or []) >= minimum:
+            self._prefetched[chapter_url] = {
+                "images": images, "count": len(images)
+            }
+        else:
+            self._prefetched.pop(chapter_url, None)
         # 串行：完成一个接着预渲染下一个
         self._start_next_prefetch()
+
+    def _minimum_complete_images(self) -> int:
+        """Source-configured minimum used for session/prefetch cache safety."""
+        try:
+            page = self._source.raw.get("endpoints", {}).get("content", {}).get("page", {})
+            body = page.get("body", {})
+            render_config = page.get("render_config") or body.get("render_config") or {}
+            return max(1, int(render_config.get("min_images") or 1))
+        except (AttributeError, TypeError, ValueError):
+            return 1
 
     def _render_images(self) -> None:
         self._clear_images()
@@ -1347,7 +1386,7 @@ class _ComicSignals(QObject):
 class _LoadComicTask(QRunnable):
     """后台加载漫画话图片 URL（on_page 分批回调，边抓边显示）。"""
 
-    def __init__(self, content, source, chapter, gen: int = 0, cancel_evt=None):
+    def __init__(self, content, source, chapter, gen: int = 0, cancel_evt=None, use_cache=True):
         super().__init__()
         self.signals = _ComicSignals()
         self._content = content
@@ -1355,14 +1394,24 @@ class _LoadComicTask(QRunnable):
         self._chapter = chapter
         self._gen = gen
         self._cancel_evt = cancel_evt  # 换书取消令牌：置位后分页抓取尽早退出
+        self._use_cache = use_cache
 
     def run(self) -> None:
         images, err = [], None
         try:
-            images = self._content.fetch_comic_pages(
-                self._source, self._chapter.url,
-                on_page=self._emit_partial, cancel_evt=self._cancel_evt,
-            )
+            try:
+                images = self._content.fetch_comic_pages(
+                    self._source, self._chapter.url,
+                    on_page=self._emit_partial, cancel_evt=self._cancel_evt,
+                    use_cache=self._use_cache,
+                )
+            except TypeError as exc:
+                if "use_cache" not in str(exc):
+                    raise
+                images = self._content.fetch_comic_pages(
+                    self._source, self._chapter.url,
+                    on_page=self._emit_partial, cancel_evt=self._cancel_evt,
+                )
         except Exception as exc:
             err = str(exc)
         try:
@@ -1391,7 +1440,7 @@ class _PrefetchRenderTask(QRunnable):
     _prefetched[url]["images"] → 秒开，不用现场爬 Playwright。
     """
 
-    def __init__(self, content, source, chapter, gen: int = 0, cancel_evt=None):
+    def __init__(self, content, source, chapter, gen: int = 0, cancel_evt=None, use_cache=True):
         super().__init__()
         self.signals = _PrefetchSignals()
         self._content = content
@@ -1399,13 +1448,22 @@ class _PrefetchRenderTask(QRunnable):
         self._chapter = chapter
         self._gen = gen
         self._cancel_evt = cancel_evt  # 换书取消令牌：置位后分页抓取尽早退出
+        self._use_cache = use_cache
 
     def run(self) -> None:
         images, err = [], None
         try:
-            images = self._content.fetch_comic_pages(
-                self._source, self._chapter.url, cancel_evt=self._cancel_evt
-            )
+            try:
+                images = self._content.fetch_comic_pages(
+                    self._source, self._chapter.url, cancel_evt=self._cancel_evt,
+                    use_cache=self._use_cache,
+                )
+            except TypeError as exc:
+                if "use_cache" not in str(exc):
+                    raise
+                images = self._content.fetch_comic_pages(
+                    self._source, self._chapter.url, cancel_evt=self._cancel_evt
+                )
         except Exception as exc:
             err = str(exc)
         try:

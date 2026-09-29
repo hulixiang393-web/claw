@@ -116,6 +116,30 @@ def test_data_uri_label_skips_coverloader(_qapp):
     assert decoded, "data URI 应走后台字节解码分支"
 
 
+def test_real_jpeg_data_uri_becomes_visible_pixmap(_qapp):
+    """Canvas 抓到的真实 JPEG data URI 必须最终成为非空 QPixmap。"""
+    import base64
+    from PySide6.QtGui import QImage
+    from PySide6.QtCore import QBuffer, QIODevice, QEventLoop
+    from gui.pages.reader import comic_view as cv
+
+    image = QImage(8, 8, QImage.Format_RGB32)
+    image.fill(0x336699)
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    image.save(buffer, "JPEG")
+    uri = "data:image/jpeg;base64," + base64.b64encode(bytes(buffer.data())).decode()
+    label = cv._ComicImageLabel(uri)
+    label.show()
+    label.load()
+    app = _qapp
+    for _ in range(80):
+        app.processEvents(QEventLoop.AllEvents, 10)
+    pixmap = label.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+    assert pixmap.width() > 0 and pixmap.height() > 0
+
+
 def test_local_file_label_skips_coverloader(_qapp):
     """本地文件字节同样短路过 CoverLoader（不进 Referer 流程）。"""
     import pathlib
