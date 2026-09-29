@@ -95,8 +95,11 @@ def _extract_chapter_number(title: str) -> tuple | None:
     """
     if not title:
         return None
+    normalized = _re.sub(r"\s+", "", title.strip())
+    if _re.search(r"(?:从)?第?(?:一|1)(?:章|话)?开始阅读|从头开始阅读|^开始阅读", normalized):
+        return (0, 1)
     # 特殊章节词（楔子/序章/番外/卷首/尾声等）不算数字章节
-    if _re.search(r"楔|序章|番外|卷首|前言|后记|尾声|番外篇", title):
+    if _re.search(r"楔|序章|番外|卷首|前言|后记|尾声|番外篇|预告", title):
         return None
 
     # 找出所有「第X卷」与「第X章/话/回/集/节」
@@ -214,15 +217,35 @@ def _parse_num_token(token: str) -> int | None:
     return None
 
 
+def _is_special_chapter_title(title: str) -> bool:
+    return bool(_re.search(r"特别篇|特別篇", title or ""))
+
+
 def _sort_chapters(chapters: List[_SortableChapter]) -> List[_SortableChapter]:
     """按标题序号升序排序章节（稳定）。
 
     - 有数字的章节按序号排序（倒序/先最新后顺序/反爬乱序都能恢复正序）
-    - 无数字章节（楔子/序章/番外/卷名）保持原相对顺序，排在有数字之后
+    - 特别篇/特別篇无论是否有编号，都排在所有其他章节之后，并保持原相对顺序
+    - 预告/序章/楔子与数字章节的先后，遵循原始顺序中的首个相关条目
+    - 其他无数字章节保持原相对顺序，排在数字/前置桶之后
     """
-    numbered = [(n, idx, ch) for idx, ch in enumerate(chapters)
-                if (n := _extract_chapter_number(ch.title)) is not None]
-    unnumbered = [(idx, ch) for idx, ch in enumerate(chapters)
+    regular = [(idx, ch) for idx, ch in enumerate(chapters)
+               if not _is_special_chapter_title(ch.title)]
+    special = [ch for idx, ch in enumerate(chapters)
+               if _is_special_chapter_title(ch.title)]
+    numbered = [
+        (n, idx, ch)
+        for idx, ch in regular
+        if (n := _extract_chapter_number(ch.title)) is not None
+    ]
+    unnumbered = [(idx, ch) for idx, ch in regular
                   if _extract_chapter_number(ch.title) is None]
+    prelude = [item for item in unnumbered if _re.search(r"预告|序章|楔子", item[1].title or "")]
+    tail = [item for item in unnumbered if item not in prelude]
     numbered.sort(key=lambda t: (t[0], t[1]))
-    return [ch for _, _, ch in numbered] + [ch for _, ch in unnumbered]
+
+    if prelude and numbered and min(idx for idx, _ in prelude) < min(idx for _, idx, _ in numbered):
+        ordered = [ch for _, ch in prelude] + [ch for _, _, ch in numbered]
+    else:
+        ordered = [ch for _, _, ch in numbered] + [ch for _, ch in prelude]
+    return ordered + [ch for _, ch in tail] + special

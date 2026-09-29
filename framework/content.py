@@ -1143,7 +1143,7 @@ class Content:
         if items is None:
             items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         chapters: List[Chapter] = []
-        seen_norm = set()
+        seen_norm = {}
         seen_title = set()
 
         def _norm_url(url: str) -> str:
@@ -1169,25 +1169,29 @@ class Content:
             t = _re.sub(r"\s+", " ", t)
             return t
 
+        start_reading_titles = {
+            "从第一章开始阅读", "开始阅读", "从第一话开始阅读", "从头开始阅读"
+        }
         for it in items:
             url = it.get("url", "")
             if not url:
                 continue
-            # URL 归一化去重（不同 URL 可能指向同一章节，如末尾 /、参数顺序）
+            title = it.get("title", "")
+            raw_title = str(title or "").strip()
+            title = clean_title(raw_title) if list_cfg.get("title_clean") else raw_title
             nurl = _norm_url(url)
             if nurl in seen_norm:
+                existing = chapters[seen_norm[nurl]]
+                if existing.title in start_reading_titles and title not in start_reading_titles:
+                    existing.title = title
                 continue
-            seen_norm.add(nurl)
-            title = it.get("title", "")
-            if list_cfg.get("title_clean"):
-                title = clean_title(title)
-            # 标题规范化去重（清理后标题相同跳过）
             title_key = _re.sub(r"\s+", " ", title.strip().lower())
             if title_key and title_key in seen_title:
                 continue
             if title_key:
                 seen_title.add(title_key)
             chapters.append(Chapter(title=title or f"第{len(chapters)+1}章", url=url))
+            seen_norm[nurl] = len(chapters) - 1
 
         # WordPress 帖子分页（div.page-links）：当前页（详情页自身）是
         # <span class="...current">（无 href），列表只提取后续页 <a> 链接 →
