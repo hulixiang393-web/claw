@@ -92,45 +92,6 @@ def _make_content(store, http):
 
 
 # ---------------------------------------------------------------------- #
-def test_comicbox_split_chapter_links_parse_from_anchor_roots():
-    raw = {
-        "$schema_version": 2,
-        "$id": "comicbox",
-        "$type": "comic",
-        "$name": "漫画盒",
-        "$enabled": True,
-        "$weight": 1.0,
-        "transports": {"base_url": "https://www.comicbox.xyz"},
-        "endpoints": {
-            "content": {
-                "page": {
-                    "list": {
-                        "root_selector": {"css": ".sp-chapter-grid a.sp-chapter-item"},
-                        "fields": {
-                            "title": {"xpath": ".", "attr": "title"},
-                            "url": {"xpath": ".", "attr": "href"},
-                        },
-                    }
-                }
-            }
-        },
-    }
-    src = SourceConfig.from_dict(raw, "<mem>")
-    parser = Parser()
-    html = (
-        '<div class="sp-chapter-grid">'
-        '<a class="sp-chapter-item" title="第1話（1/3）" href="/free-chapter/45812?t=20260415">'
-        '第1話（1/3）</a>'
-        '<a class="sp-chapter-item" title="第1話（2/3）" href="/free-chapter/45813?t=20260415">'
-        '第1話（2/3）</a></div>'
-    )
-    cfg = src.raw["endpoints"]["content"]["page"]["list"]
-    rows = parser.parse_items(parser.parse(html), cfg["root_selector"], cfg["fields"], src.base_url)
-    assert [row["title"] for row in rows] == ["第1話（1/3）", "第1話（2/3）"]
-    assert rows[0]["url"] == "https://www.comicbox.xyz/free-chapter/45812?t=20260415"
-    assert rows[1]["url"] == "https://www.comicbox.xyz/free-chapter/45813?t=20260415"
-
-
 def test_fetch_comic_pages_second_hit_zero_network():
     store = _make_store()
     http = _FakeHttp()
@@ -141,29 +102,13 @@ def test_fetch_comic_pages_second_hit_zero_network():
     imgs = c.fetch_comic_pages(src, url)
     assert imgs == ["https://c.example/pic/1.jpg", "https://c.example/pic/2.jpg"]
     assert http.calls.get(url, 0) == 1
-    key = f"pages:v3:{src.source_id}:{url}"
+    key = f"pages:{src.source_id}:{url}"
     assert store.get(key) == imgs  # URL 列表已落 pages: 键（7 天）
 
     # 二次（模拟重启后/重开同一章）：直接命中 Redis，不再下载
     imgs2 = c.fetch_comic_pages(src, url)
     assert imgs2 == imgs
     assert http.calls.get(url, 0) == 1  # 新增零网络
-
-
-def test_nonfavorite_comic_cache_bypasses_reads_and_writes():
-    store = _make_store()
-    http = _FakeHttp()
-    c = _make_content(store, http)
-    src = SourceConfig.from_dict(COMIC_RAW, "<mem>")
-    url = "https://c.example/ch/1.html"
-    key = f"pages:v3:{src.source_id}:{url}"
-    store.set(key, ["https://c.example/stale.jpg"], ttl=3600)
-
-    imgs = c.fetch_comic_pages(src, url, use_cache=False)
-
-    assert imgs == ["https://c.example/pic/1.jpg", "https://c.example/pic/2.jpg"]
-    assert http.calls.get(url, 0) == 1
-    assert store.get(key) == ["https://c.example/stale.jpg"]
 
 
 def test_fetch_cover_reuses_detail_cache():

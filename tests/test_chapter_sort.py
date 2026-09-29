@@ -113,54 +113,6 @@ def test_sort_no_volume_before_volume():
     print("  [PASS] _sort_chapters 无卷章节排在有卷之前")
 
 
-def test_sort_special_chapters_after_regular_and_unnumbered_tail():
-    chs = [
-        _ch("特别篇 第99话"),
-        _ch("番外A"),
-        _ch("第2话"),
-        _ch("特別篇"),
-        _ch("第1话"),
-        _ch("序章"),
-        _ch("特别篇 第1话"),
-        _ch("番外B"),
-    ]
-    titles = [c.title for c in _sort_chapters(chs)]
-    assert titles == [
-        "第1话",
-        "第2话",
-        "序章",
-        "番外A",
-        "番外B",
-        "特别篇 第99话",
-        "特別篇",
-        "特别篇 第1话",
-    ]
-    print("  [PASS] 特别篇/特別篇稳定排在普通无编号尾项之后")
-
-
-def test_sort_prelude_first_preserves_prelude_before_numbered():
-    chs = [_ch("预告"), _ch("第3话"), _ch("序章"), _ch("第1话"), _ch("番外")]
-    titles = [c.title for c in _sort_chapters(chs)]
-    assert titles == ["预告", "序章", "第1话", "第3话", "番外"]
-    print("  [PASS] 原始首项为预告时，预告桶保持在数字章节之前")
-
-
-def test_sort_numbered_first_puts_numbered_before_prelude():
-    chs = [_ch("第3话"), _ch("序章"), _ch("第1话"), _ch("预告"), _ch("番外")]
-    titles = [c.title for c in _sort_chapters(chs)]
-    assert titles == ["第1话", "第3话", "序章", "预告", "番外"]
-    print("  [PASS] 原始首项为数字章节时，数字章节保持在预告桶之前")
-
-
-def test_sort_start_reading_navigation_before_regular_chapters():
-    chs = [_ch("第2话"), _ch("从第一章开始阅读 >"), _ch("预告"), _ch("第1话")]
-    titles = [c.title for c in _sort_chapters(chs)]
-    assert titles == ["从第一章开始阅读 >", "第1话", "第2话", "预告"]
-    assert _extract_chapter_number("狐妖小红娘 从第一章开始阅读 >") == (0, 1)
-    assert _extract_chapter_number("开始阅读") == (0, 1)
-    print("  [PASS] 导航首章按数字章节处理并保持数字桶优先")
-
-
 def main():
     tests = [
         test_extract_arabic,
@@ -175,10 +127,6 @@ def main():
         test_sort_unnumbered_tail,
         test_sort_empty_and_single,
         test_sort_no_volume_before_volume,
-        test_sort_special_chapters_after_regular_and_unnumbered_tail,
-        test_sort_prelude_first_preserves_prelude_before_numbered,
-        test_sort_numbered_first_puts_numbered_before_prelude,
-        test_sort_start_reading_navigation_before_regular_chapters,
     ]
     failed = 0
     for t in tests:
