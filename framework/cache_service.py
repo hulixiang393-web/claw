@@ -44,7 +44,13 @@ def _value_bytes(value: Any) -> int:
 class RedisLikeStore:
     """Redis 风格键值缓存。线程安全，LRU + TTL + 字节配额 + 落盘。"""
 
-    def __init__(self, quota: int, persist_path: Optional[str] = None):
+    def __init__(
+        self,
+        quota: int,
+        persist_path: Optional[str] = None,
+        source_lru_prefix: Optional[str | tuple[str, ...]] = None,
+        source_lru_limit: Optional[int] = None,
+    ):
         # 排序字典：插入序 = LRU 序（队首最旧，队尾最新）。访问 move_to_end。
         self._data: "OrderedDict[str, Any]" = OrderedDict()
         self._ttl: dict[str, float] = {}    # key -> 过期时间戳（0.0 = 永久）
@@ -52,6 +58,8 @@ class RedisLikeStore:
         self._bytes_used = 0
         self._quota = max(1, int(quota))
         self._persist_path = persist_path
+        self._source_lru_prefix = source_lru_prefix
+        self._source_lru_limit = source_lru_limit
         self._lock = threading.RLock()
         self._writes = 0
         self._last_save_ts = 0.0
@@ -114,6 +122,7 @@ class RedisLikeStore:
             self._ttl[key] = (time.time() + ttl) if (ttl is not None and ttl > 0) else 0.0
             self._writes += 1
             self._evict_until_under_quota()
+            self._evict_source_lru_locked()
         return True
 
     def ttl(self, key: str) -> Optional[float]:
@@ -195,6 +204,18 @@ class RedisLikeStore:
             key = next(iter(self._data))
             self._drop_locked(key)
 
+    def _evict_source_lru_locked(self) -> None:
+        if not self._source_lru_prefix or not self._source_lru_limit:
+            return
+        prefixes = (
+            self._source_lru_prefix
+            if isinstance(self._source_lru_prefix, tuple)
+            else (self._source_lru_prefix,)
+        )
+        keys = [key for key in self._data if key.startswith(prefixes)]
+        while len(keys) > self._source_lru_limit:
+            self._drop_locked(keys.pop(0))
+
     # ------------------------------------------------------------------ #
     def save(self) -> None:
         """落盘（pickle-gz 单文件）。失败静默。"""
@@ -275,9 +296,12 @@ def _configure_defaults(data_dir: Optional[str] = None) -> None:
     _search_singleton = RedisLikeStore(
         quota=10 * 1024 * 1024 * 1024, persist_path=os.path.join(base, "redis_search.gz")
     )
-    # 会话级缓存：不落盘 → 退出应用即由进程回收自动清空，无需清理代码
+    # 会话级缓存：发现页快照落盘，最多保留最近 5 个源。
     _session_singleton = RedisLikeStore(
-        quota=2 * 1024 * 1024 * 1024, persist_path=None
+        quota=2 * 1024 * 1024 * 1024,
+        persist_path=os.path.join(base, "redis_session.gz"),
+        source_lru_prefix=("snap:", "disc:"),
+        source_lru_limit=5,
     )
 
 
@@ -317,10 +341,9 @@ def get_search_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]
 
 
 def get_session_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]:
-    """获取会话级缓存池（换源快照用）：不落盘，退出应用即自动清空。
+    """获取会话级缓存池（发现页快照用）。
 
-    纯内存（persist_path=None）→ 缓存从进程启动持续到进程结束，
-    退出时由进程回收自动释放，无需显式清理、不会阻塞关闭流程。
+    快照落盘到 redis_session.gz，重启后可恢复；缓存损坏时静默降级为空。
     初始化失败返回 None → 调用方功能降级禁用。
     """
     global _session_singleton

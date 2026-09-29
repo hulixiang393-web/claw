@@ -54,7 +54,10 @@ class NovelView(QWidget):
         self._auto_loading = False  # 翻页边界跳章锁，防重复触发
         self._auto_prev_loading = False  # 向上翻页边界跳章锁，防重复触发
         self._prefetch_idx = -2  # 正在后台预加载的章节 idx（<0 表示空闲）
-        self._prev_prefetch_queue = []  # 向前缓存队列（串行，最近前 3 章）
+        self._prefetch_ahead = 3
+        self._prefetch_behind = 1
+        self._next_prefetch_queue = []
+        self._prev_prefetch_queue = []  # 向前缓存队列（串行）
         self._prev_prefetch_idx = -2  # 正在向前预取的章节 idx（<0 表示空闲）
         self._prev_prefetch_task = None  # 持引用防 GC
         self._last_pos_save_ts = 0.0  # 上次章内位置存盘时间戳（节流 1.5s 存一次）
@@ -776,56 +779,81 @@ class NovelView(QWidget):
             return True
         return super().eventFilter(obj, event)
 
-    def _prefetch_next(self, idx: int) -> None:
-        """后台预加载下一章（idx+1），翻章时命中缓存秒开。
+    def set_prefetch_config(self, enabled: bool, ahead: int, behind: int) -> None:
+        """设置预加载数量；无效值回退默认值，不改变串行模型。"""
+        if not enabled:
+            self._prefetch_ahead = 0
+            self._prefetch_behind = 0
+            return
+        try:
+            ahead = int(ahead)
+        except (TypeError, ValueError):
+            ahead = 3
+        try:
+            behind = int(behind)
+        except (TypeError, ValueError):
+            behind = 1
+        self._prefetch_ahead = max(0, ahead)
+        self._prefetch_behind = max(0, behind)
 
-        显示某章后触发：下一章未缓存且无进行中预取 → 后台抓取存 _cached_text。
-        串行：同一时间只预取 1 章，避免并发拉多个章节抢占网络/内存。
-        """
-        if self._source is None:
+    @staticmethod
+    def _prefetch_back_queue(total: int, idx: int, behind: int) -> list[int]:
+        if behind <= 0:
+            return []
+        return [
+            k for k in range(idx - 1, max(idx - 1 - behind, -1), -1)
+            if 0 <= k < total
+        ]
+
+    def _prefetch_next(self, idx: int) -> None:
+        """后台串行预加载后续配置数量的章节。"""
+        if self._source is None or not self._chapters:
             return
-        nxt = idx + 1
-        if not (0 <= nxt < len(self._chapters)):
+        self._next_prefetch_queue = []
+        total = len(self._chapters)
+        for k in range(idx + 1, min(idx + 1 + self._prefetch_ahead, total)):
+            ch = self._chapters[k]
+            if getattr(ch, "_cached_text", None):
+                continue
+            if k == self._prefetch_idx:
+                continue
+            self._next_prefetch_queue.append(k)
+        if self._next_prefetch_queue and self._prefetch_idx < 0:
+            self._pump_next_prefetch()
+
+    def _pump_next_prefetch(self) -> None:
+        if not self._next_prefetch_queue:
             return
-        # 资源就绪则无需预取
-        nxt_ch = self._chapters[nxt]
-        if hasattr(nxt_ch, "_cached_text") and nxt_ch._cached_text:
+        k = self._next_prefetch_queue.pop(0)
+        if not (0 <= k < len(self._chapters)):
             return
-        if self._prefetch_idx == nxt:
-            return  # 该章已在预取中
-        if self._prefetch_idx >= 0 and self._prefetch_idx != nxt:
-            return  # 已有其他章在预取（串行）
-        self._prefetch_idx = nxt
-        from PySide6.QtCore import QThreadPool
-        task = _LoadChapterTask(self._content, self._source, nxt_ch)
+        self._prefetch_idx = k
+        task = _LoadChapterTask(self._content, self._source, self._chapters[k])
         task.signals.finished.connect(self._on_prefetch_done)
-        self._prefetch_task = task  # 持引用防 GC
+        self._prefetch_task = task
         QThreadPool.globalInstance().start(task)
 
     def _on_prefetch_done(self, ch, text, err) -> None:
-        """预取完成：若有正文则写缓存，供翻章命中秒开。"""
-        self._prefetch_idx = -2  # 清预取锁，允许下一个
-        if err or not text:
-            return
-        ch._cached_text = text
+        """预取完成：写缓存并继续泵下一个，保持 -2 空闲哨兵。"""
+        self._prefetch_idx = -2
+        if not err and text:
+            ch._cached_text = text
+        if self._next_prefetch_queue:
+            self._pump_next_prefetch()
 
     # ------------------------------------------------------------------ #
     def _prefetch_prev(self, idx: int) -> None:
-        """后台预加载本章之前 3 章（向前缓存），向上翻章命中缓存秒开。
-
-        与 _prefetch_next 独立串行（各自一把锁，最多同时预取 1 前 + 1 后）。
-        窗口随当前章移动：每显示一章按新基点重建队列，只保留未缓存的最近 3 章。
-        """
+        """后台串行预加载当前章之前配置数量的章节。"""
         if self._source is None or not self._chapters:
             return
         self._prev_prefetch_queue = []
-        for k in range(idx - 1, max(idx - 4, -1), -1):
-            if not (0 <= k < len(self._chapters)):
-                continue
+        for k in self._prefetch_back_queue(
+            len(self._chapters), idx, self._prefetch_behind
+        ):
             ch = self._chapters[k]
-            if hasattr(ch, "_cached_text") and ch._cached_text:
+            if getattr(ch, "_cached_text", None):
                 continue
-            if k == self._prev_prefetch_idx:  # 已在预取中，不必重复入队
+            if k == self._prev_prefetch_idx:
                 continue
             self._prev_prefetch_queue.append(k)
         if self._prev_prefetch_queue and self._prev_prefetch_idx < 0:

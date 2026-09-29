@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://www.eporner.com",
     "description": "Eporner - 高清视频站（列表/搜索走 HTML；详情与取流走 yt-dlp 引擎。JSON-LD contentUrl 已是无签名裸地址，直连 403，真实播放地址是带 IP+时效签名的 vid-*.eporner.com 直链，只能由 yt-dlp 提取）",
     "lang": "en",

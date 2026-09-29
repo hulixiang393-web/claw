@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://51cg1.com/",
     "description": "51吃瓜 - 吃瓜/网红黑料/成人视频图文站（Typecho + Mirages 主题）。发现首页分页 /page/{page}/；分类 /category/{slug}/{page}/（路径式分页，官方同样式）；列表项标题带「热搜 HOT」噪声已清洗；正文含多图（data-src 懒加载）+ DPlayer m3u8 视频（从详情页 JS 提取）。搜索 /search/{keyword}/{page}/ 路径式分页。",
     "lang": "zh-CN",

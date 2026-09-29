@@ -57,6 +57,7 @@ class SourceConfig:
     icon: str = ""
     description: str = ""
     tags: list = field(default_factory=list)
+    adult: bool = False  # 18+ 内容标记（$metadata.adult）
     raw: dict = field(default_factory=dict)  # 原始 JSON，供后续完整解析
     source_path: str = ""
     _buvid3: str = field(default="", init=False, repr=False)  # 缓存，复用连接
@@ -97,6 +98,7 @@ class SourceConfig:
             icon=str(meta.get("icon") or ""),
             description=str(meta.get("description") or ""),
             tags=list(meta.get("tags") or []),
+            adult=bool(meta.get("adult", False)),
             raw=data,
             source_path=path,
         )
@@ -155,6 +157,7 @@ class SourceConfig:
             "icon": self.icon,
             "description": self.description,
             "tags": self.tags,
+            "adult": bool(self.adult),
         })
         transports = dict(self.raw.get("transports") or {})
         transports["base_url"] = self.base_url

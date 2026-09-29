@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from framework.search import Search, SearchResult
+from framework.events import EVENT_SOURCE_VISIBILITY_CHANGED
 from framework.source_manager import SourceManager
 
 from gui.components import WorkCard
@@ -227,11 +228,13 @@ class SearchPage(BasePage):
     add_to_shelf_requested = Signal(object)   # list[SearchResult]
     batch_download_requested = Signal(object)  # list[SearchResult]
 
-    def __init__(self, source_manager: SourceManager, search: Search, content=None, parent=None):
+    def __init__(self, source_manager: SourceManager, search: Search, content=None,
+                 parent=None, event_bus=None):
         super().__init__(parent)
         self._manager = source_manager
         self._search = search
         self._content = content  # 可选：详情封面回填（cover_backfill 源）用
+        self._bus = event_bus
         self._results = []
         self._filter_source = ""
         self._saved_unfiltered_shown = None  # 进入来源筛选前的渲染进度（清除筛选后恢复）
@@ -397,6 +400,16 @@ class SearchPage(BasePage):
         bb.addWidget(self.batch_clear_btn)
         layout.addWidget(self.batch_bar)
 
+        if self._bus is not None:
+            self._bus.subscribe(self._on_visibility_changed)
+
+    def _on_visibility_changed(self, event) -> None:
+        if getattr(event, "type", "") == EVENT_SOURCE_VISIBILITY_CHANGED:
+            if not self.keyword_input.text().strip():
+                self._clear_results_for_source_change()
+                self._reset_source_chips()
+            self.refresh()
+
     def fill_keyword(self, keyword: str) -> None:
         """外部预填关键词并搜索。"""
         self.keyword_input.setText(keyword)
@@ -406,6 +419,8 @@ class SearchPage(BasePage):
         keyword = self.keyword_input.text().strip()
         if not keyword:
             return
+        self._search_epoch += 1
+        epoch = self._search_epoch
         self._filter_source = ""
         self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(False)
@@ -423,6 +438,7 @@ class SearchPage(BasePage):
         self._selected = {}
         self.batch_bar.setVisible(False)
         self.select_all_check.setChecked(False)
+        self._clear_status_bar()
 
         # 选择目标源
         selected_type = self.type_combo.currentData()
@@ -447,8 +463,6 @@ class SearchPage(BasePage):
         self._pending_count = len(sources)
         self._search_tasks = []
         self._streamed = set()
-        self._search_epoch += 1
-        epoch = self._search_epoch
         for source in sources:
             task = _SearchTask(self._search, source, keyword, epoch=epoch)
             task.signals.finished.connect(self._on_source_done)
@@ -461,11 +475,7 @@ class SearchPage(BasePage):
     # ------------------------------------------------------------------ #
     def _build_status_bar(self, sources) -> None:
         """清空并重建每源状态 chip 行。"""
-        while self.status_bar_layout.count():
-            item = self.status_bar_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._status_chips = {}
+        self._clear_status_bar()
         for source in sources:
             chip = QLabel(f"🔄 {source.source_name}")
             chip.setStyleSheet(
@@ -476,6 +486,17 @@ class SearchPage(BasePage):
             self.status_bar_layout.addWidget(chip)
             self._status_chips[source.source_id] = chip
         self.status_bar_layout.addStretch(1)
+
+    def _clear_status_bar(self) -> None:
+        """移除上一轮每源搜索状态，避免隐藏源名称残留。"""
+        while self.status_bar_layout.count():
+            item = self.status_bar_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._status_chips = {}
+        self.status_bar.setVisible(False)
 
     def _set_source_status(self, source, state: str, err: str = "") -> None:
         """更新单源状态 chip：🔄进行中 ✅完成 ❌失败。"""
@@ -1246,8 +1267,10 @@ class SearchPage(BasePage):
         self._load_more_results()
 
     def refresh(self) -> None:
-        """重建源选择菜单（源选择变更后，禁用源不再列出）。"""
+        """重建源菜单；已有搜索时清空旧结果并按当前可见源重跑。"""
         self._rebuild_sources_menu()
+        if self.keyword_input.text().strip():
+            self._on_search()
 
     def _rebuild_sources_menu(self) -> None:
         """按当前启用的源重建 src_btn 弹出菜单，保留已勾选状态。
@@ -1365,14 +1388,7 @@ class SearchPage(BasePage):
         self.select_all_check.blockSignals(True)
         self.select_all_check.setChecked(False)
         self.select_all_check.blockSignals(False)
-        while self.status_bar_layout.count():
-            item = self.status_bar_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
-        self._status_chips = {}
-        self.status_bar.setVisible(False)
+        self._clear_status_bar()
         self.status_label.setText("已更换源，请点击搜索")
 
     def _on_all_source_toggled(self, checked: bool) -> None:

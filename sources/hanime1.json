@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://hanime1.me/",
     "description": "Hanime1 - 成人動漫/裏番/線上看（繁体站，HTML 直链 mp4，无登录）",
     "lang": "zh-Hant",

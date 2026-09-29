@@ -315,15 +315,14 @@ def test_content_precache_chapters():
         for i in range(5)
     ]
     c.precache_chapters(src, chapters, 1, ahead=3)
-    # 当前章(1) + 后续章[2,3) → 预加载 1,2,3（后 ahead-1 章）
-    for i in (1, 2, 3):
+    # 当前章(1) + 后续 3 章 → 预加载 1,2,3,4。
+    for i in (1, 2, 3, 4):
         assert store.get(f"body:{src.source_id}:https://x.com/b/{i}.html") is not None
-    # 第4章（index 4）不在范围内
-    assert store.get(f"body:{src.source_id}:https://x.com/b/4.html") is None
     assert set(http.calls) == {
         "https://x.com/b/1.html",
         "https://x.com/b/2.html",
         "https://x.com/b/3.html",
+        "https://x.com/b/4.html",
     }
 
 
@@ -333,15 +332,15 @@ def test_cover_bytes_persist_roundtrip():
     assert store.get("cover:s1:https://c/img.jpg") == b"\x89PNG-fake-bytes"
 
 
-def test_get_session_cache_singleton_not_persisted():
-    """会话缓存：不落盘（退出即清）、2GB 配额、单例。"""
+def test_get_session_cache_singleton_persisted():
+    """会话缓存：落盘、2GB 配额、单例。"""
     from framework.cache_service import get_session_cache, RedisLikeStore
 
     a = get_session_cache()
     b = get_session_cache()
     assert a is b                       # 单例
     assert isinstance(a, RedisLikeStore)
-    assert a._persist_path is None      # 不落盘 → 进程退出自动释放，无需清理
+    assert a._persist_path is not None  # 会话快照重启后可恢复
     assert a._quota == 2 * 1024 * 1024 * 1024
     # 写读往返
     a.set("disc:demo", "v")

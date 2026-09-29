@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # epub 类型检测函数（注入便于测试/替换）：path -> str
 EpubTypeDetector = Callable[[str], str]
@@ -159,43 +160,69 @@ class ShelfService:
             merged = [i for i in merged if kw in _norm_title(i.title)]
         return self._sort_items(merged, sort)
 
+    @staticmethod
+    def _identity(item: ShelfItem):
+        source_id = item.source_id or ""
+        if item.url:
+            parts = urlsplit(item.url.strip())
+            host = parts.hostname or ""
+            if parts.port not in (None, 80, 443):
+                host = f"{host}:{parts.port}"
+            query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+            url = urlunsplit((parts.scheme.lower(), host.lower(), parts.path.rstrip("/") or "/", query, ""))
+            return source_id, url
+        if item.kind == "local":
+            return source_id, "local:" + (item.path or item.key or _norm_title(item.title))
+        return source_id, "title:" + _norm_title(item.title)
+
     def _merge(self, locals_: list, favs: list) -> list:
-        """本地优先合并：同名（归一化）本地+收藏 → 一条本地条目带在线信息。"""
-        local_by_norm: dict = {}
-        for l in locals_:
-            local_by_norm.setdefault(_norm_title(l.title), l)
-        fav_by_norm: dict = {}
-        for f in favs:
-            fav_by_norm.setdefault(_norm_title(f.title), f)
+        """本地优先合并：按稳定身份合并，保留输入顺序中的首条记录。"""
+        local_by_key: dict = {}
+        for local in locals_:
+            local_by_key.setdefault(self._identity(local), local)
+        fav_by_key: dict = {}
+        for favorite in favs:
+            fav_by_key.setdefault(self._identity(favorite), favorite)
 
         out: list = []
         seen: set = set()
-        for l in locals_:
-            key = _norm_title(l.title)
-            f = fav_by_norm.get(key)
-            if f is not None:
-                # 合并在线信息到本地条目（本地优先：读本地）
-                l.online = True
-                l.url = f.url or l.url
-                l.source_id = f.source_id or l.source_id
-                l.folder = f.folder or l.folder
-                l.author = l.author or f.author
-                l.cover = l.cover or f.cover
-                if not l.tags:
-                    l.tags = list(f.tags)
-                l.updated_at = f.updated_at or l.updated_at
-                # 本地无续读时，视频可回退线上收藏的进度（线上看到哪集，本地也定位到那集）。
-                # 小说/漫画本地 epub 不做跨形态回退：线上章节标题与 epub 目录对不上，
-                # 显示"读到第X章"但点开无法定位，反而像记忆坏了。
-                if not l.resume_title and f.resume_title and l.content_type == "video":
-                    l.resume_title = f.resume_title
-            out.append(l)
-            seen.add(key)
-        # 纯收藏（无本地文件）
-        for f in favs:
-            key = _norm_title(f.title)
-            if key not in seen:
-                out.append(f)
+        fallback_favorites: dict = {}
+        for favorite in fav_by_key.values():
+            if favorite.url:
+                continue
+            fallback_favorites.setdefault(_norm_title(favorite.title), []).append(favorite)
+        titled_favorites: dict = {}
+        for favorite in favs:
+            if favorite.url:
+                titled_favorites.setdefault(_norm_title(favorite.title), []).append(favorite)
+
+        for local in local_by_key.values():
+            key = self._identity(local)
+            favorite = fav_by_key.get(key)
+            if favorite is None and not local.url:
+                candidates = titled_favorites.get(_norm_title(local.title), [])
+                if len(candidates) == 1:
+                    favorite = candidates[0]
+                    key = self._identity(favorite)
+            if favorite is not None:
+                local.online = True
+                local.url = favorite.url or local.url
+                local.source_id = favorite.source_id or local.source_id
+                local.folder = favorite.folder or local.folder
+                local.author = local.author or favorite.author
+                local.cover = local.cover or favorite.cover
+                if not local.tags:
+                    local.tags = list(favorite.tags)
+                local.updated_at = favorite.updated_at or local.updated_at
+                if not local.resume_title and favorite.resume_title and local.content_type == "video":
+                    local.resume_title = favorite.resume_title
+            out.append(local)
+            seen.add(self._identity(local))
+            if favorite is not None:
+                seen.add(self._identity(favorite))
+        for favorite in fav_by_key.values():
+            if self._identity(favorite) not in seen:
+                out.append(favorite)
         return out
 
     def _sort_items(self, items: list, sort: str) -> list:
@@ -381,13 +408,39 @@ class ShelfService:
         """一键清空某收藏夹内的全部收藏（保留收藏夹，不删本地文件）。返回移除条数。"""
         if self._store is None:
             return 0
-        return self._store.clear_folder(folder)
+        urls = [rec.get("url") for rec in self._store.folder_items(folder)
+                if rec.get("url")]
+        n = self._store.clear_folder(folder)
+        if self._repository is not None:
+            for url in urls:
+                try:
+                    self._repository.clear_content_cache(url)
+                except Exception:
+                    pass
+        return n
+
+    def clear_all_favorites(self) -> int:
+        """清空全部收藏，并同步清理 SQLite 内容缓存。"""
+        if self._store is None:
+            return 0
+        urls = [rec.get("url") for rec in self._store.list_all() if rec.get("url")]
+        n = self._store.remove_all()
+        if self._repository is not None:
+            for url in urls:
+                try:
+                    self._repository.clear_content_cache(url)
+                except Exception:
+                    pass
+        return n
 
     def favorite_move(self, url: str, folder: str) -> bool:
         return bool(self._store and self._store.set_folder(url, folder))
 
     def create_folder(self, name: str) -> bool:
         return bool(self._store and self._store.create_folder(name))
+
+    def delete_folder(self, name: str) -> bool:
+        return bool(self._store and self._store.delete_folder(name))
 
     def export_backup(self, path: str | Path):
         """导出书架全部数据（收藏 + 收藏夹）到 JSON，返回落盘路径。"""

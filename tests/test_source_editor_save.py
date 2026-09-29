@@ -170,6 +170,21 @@ def test_edit_limits_only_changes_only_limits(app):
     assert saved["$metadata"] == orig["$metadata"]
 
 
+def test_adult_flag_editor_roundtrips_and_preserves_metadata(app):
+    """成人标记可编辑，且保存不丢失其它 metadata。"""
+    raw = _source_dict()
+    raw["$metadata"].update({"adult": False, "custom": {"keep": True}})
+    ed = _editor(raw)
+
+    assert ed._f_adult.isChecked() is False
+    ed._f_adult.setChecked(True)
+    saved = ed._build_dict()
+
+    assert saved["$metadata"]["adult"] is True
+    assert saved["$metadata"]["custom"] == {"keep": True}
+    assert saved["$metadata"]["homepage"] == raw["$metadata"]["homepage"]
+
+
 def test_uncheck_source_switch_removes_it(app):
     """用户显式取消「启用换源」→ 才移除 source_switch。"""
     ed = _editor(_source_dict())

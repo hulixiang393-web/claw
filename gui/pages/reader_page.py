@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from framework.content import Content, Detail
+from framework.settings_manager import reader_prefetch_settings
 from framework.source_manager import SourceManager
 
 from .reader.novel_view import NovelView
@@ -93,10 +94,12 @@ class ReaderPage(BasePage):
         font_scale: float = 1.0,
         parent=None,
         search=None,
+        settings=None,
     ):
         super().__init__(parent)
         self._manager = source_manager
         self._content = content
+        self.settings = settings
         self._search = search  # 可选：视频阅读页相关推荐（同源搜索）
         self._reading_progress = reading_progress
         self._font_scale = float(font_scale or 1.0)
@@ -426,6 +429,12 @@ class ReaderPage(BasePage):
                 self._manager.get(self._current_source_id), detail, start_chapter_url,
                 restore_position=pos,
             )
+        if content_type in ("novel", "comic") and self.settings is not None:
+            cfg = reader_prefetch_settings(self.settings)
+            view = self.novel_view if content_type == "novel" else self.comic_view
+            setter = getattr(view, "set_prefetch_config", None)
+            if setter is not None:
+                setter(cfg["enabled"], cfg["ahead"], cfg["behind"])
         # 后台预加载当前章+后 3 章正文到 Redis 缓存（小说/漫画，视频除外）。
         # 不阻塞渲染：ReaderPage 已离开_LoadDetailTask 后台线程，此处起独立 QRunnable。
         if content_type in ("novel", "comic"):
@@ -452,8 +461,15 @@ class ReaderPage(BasePage):
                     if getattr(ch, "url", "") == start_url:
                         sidx = i
                         break
+            ahead, enabled = 3, True
+            if self.settings is not None:
+                cfg = reader_prefetch_settings(self.settings)
+                ahead, enabled = cfg["ahead"], cfg["enabled"]
             QThreadPool.globalInstance().start(
-                _PrecacheTask(self._content, source, chapters, sidx)
+                _PrecacheTask(
+                    self._content, source, chapters, sidx,
+                    ahead=ahead, enabled=enabled,
+                )
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("[cache] 预加载调度失败: %s", exc)
@@ -660,19 +676,25 @@ class _LoadDetailTask(QRunnable):
 
 
 class _PrecacheTask(QRunnable):
-    """后台预加载当前章+后 3 章正文（QRunnable，异常静默）。"""
+    """后台预加载当前章+后 N 章正文（QRunnable，异常静默）。"""
 
-    def __init__(self, content, source, chapters, idx):
+    def __init__(self, content, source, chapters, idx, ahead=3, enabled=True):
         super().__init__()
         self._content = content
         self._source = source
         self._chapters = chapters or []
         self._idx = idx
+        self._ahead = ahead
+        self._enabled = enabled
 
     def run(self) -> None:
         try:
             self._content.precache_chapters(
-                self._source, self._chapters, self._idx
+                self._source,
+                self._chapters,
+                self._idx,
+                ahead=self._ahead,
+                enabled=self._enabled,
             )
         except Exception:  # noqa: BLE001
             pass

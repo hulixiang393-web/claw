@@ -21,7 +21,7 @@
     "default_page_size": 20,
     "background_image": "D:/code/claw/薇尔莉特.jpg",
     "background_opacity": 0.4,
-    "reading_bg": "#FBF3D2",
+    "reading_bg": "",
     "reading_font_size": 0
   },
   "download": {
@@ -50,15 +50,31 @@
     "max_videos": 5,
     "max_bytes_mb": 8192
   },
+  "hls_prefetch": {
+    "enabled": false,
+    "depth": 4,
+    "workers": 3
+  },
+  "content": {
+    "show_adult_sources": false
+  },
+  "reader": {
+    "prefetch_enabled": true,
+    "prefetch_ahead": 3,
+    "prefetch_behind": 1
+  },
+  "discover": {
+    "preload_pages": 5,
+    "preload_concurrency": 3
+  },
+  "shelf_cache": {
+    "max_book_mb": 256,
+    "max_total_mb": 8192
+  },
   "sources_runtime": {
     "broken_source_warn_interval_hours": 24,
     "auto_disable_after_failures": 3,
     "selfcheck_strategy": "soft",
     "sources_selected": true
-  },
-  "hls_prefetch": {
-    "enabled": false,
-    "depth": 4,
-    "workers": 3
   }
 }

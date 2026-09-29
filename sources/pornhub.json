@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://cn.pornhub.com",
     "description": "PornHub 视频源（HTML 搜索/发现 + yt-dlp 高清流）",
     "lang": "en",

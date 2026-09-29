@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from framework.discovery import Discovery, Work
 from framework.content import Content
 from framework.bulk_fetch import BulkFetch
-from framework.events import EventBus
+from framework.events import EventBus, EVENT_SOURCE_VISIBILITY_CHANGED
 from framework.source_manager import SourceManager
 from framework.theme_manager import ThemeManager
 
@@ -81,6 +81,7 @@ class DiscoverPage(BasePage):
         theme_manager: ThemeManager,
         parent=None,
         session_cache=None,      # 会话级换源缓存（可选注入；None=禁用）
+        settings=None,
     ):
         super().__init__(parent)
         self._manager = source_manager
@@ -90,6 +91,7 @@ class DiscoverPage(BasePage):
         self._bus = event_bus
         self._theme_manager = theme_manager
         self.session_cache = session_cache
+        self.settings = settings
         self._pending_restore = None
         self._scroll_timer = None
         self._restore_rest_scheduled = False
@@ -101,8 +103,15 @@ class DiscoverPage(BasePage):
         self._current_cat_url = None
         self._work_count = 0
         self._source_epoch = 0  # 源切换序号，防止旧请求回调竞态
-        self._preload_ahead = 2  # 预加载缓冲深度：第 1 页后最多再预加载 2 页，防一次拉太多
+        self._preload_ahead = 5
+        self._preload_concurrency = 3
+        if self.settings is not None:
+            from framework.settings_manager import discover_preload_settings
+
+            cfg = discover_preload_settings(self.settings)
+            self.apply_preload_settings(cfg["pages"], cfg["concurrency"])
         self._active_pages: set = set()  # 正在抓取的页码（防重复请求）
+        self._preload_pending: list[int] = []
         self._loaded_pages: set = set()  # 已完成且有数据的页码
         self._page_tasks: list = []  # 多页并发任务引用（防 GC）
         self._cover_tasks: list = []  # 封面恢复任务持有（防 GC，逐页覆盖引用会丢早任务）
@@ -209,7 +218,13 @@ class DiscoverPage(BasePage):
         self.status_label.setStyleSheet("color: palette(dark); padding: 8px;")
         layout.addWidget(self.status_label)
 
+        if self._bus is not None:
+            self._bus.subscribe(self._on_visibility_changed)
         self._reload_sources()
+
+    def _on_visibility_changed(self, event) -> None:
+        if getattr(event, "type", "") == EVENT_SOURCE_VISIBILITY_CHANGED:
+            self.refresh()
 
     # ------------------------------------------------------------------ #
     def _setup_cat_scroll_drag(self) -> None:
@@ -555,6 +570,17 @@ class DiscoverPage(BasePage):
         self._reset_works()
 
     # ------------------------------------------------------------------ #
+    def apply_preload_settings(self, pages: int, concurrency: int) -> None:
+        """设置预加载深度与在途上限。已派发的任务不受影响。"""
+        self._preload_ahead = max(0, int(pages))
+        self._preload_concurrency = max(1, int(concurrency))
+
+    def _pump_preload(self) -> None:
+        while self._preload_pending:
+            if len(self._active_pages) >= self._preload_concurrency:
+                return
+            self._load_next_page(page=self._preload_pending.pop(0))
+
     def _reset_works(self) -> None:
         """清空网格，首屏并发加载第 1 页 + 预加载缓冲页（快速填满视口）。
 
@@ -568,6 +594,7 @@ class DiscoverPage(BasePage):
         self._has_more = True
         self._work_count = 0
         self._active_pages = set()
+        self._preload_pending = []
         self._loaded_pages = set()
         self._page_tasks = []
         self._cover_tasks = []  # 换源/切分类时清空旧封面恢复任务
@@ -583,8 +610,8 @@ class DiscoverPage(BasePage):
             self._render_restored(self._pending_restore)
             self._pending_restore = None
             return
-        for p in range(1, 1 + self._preload_ahead + 1):
-            self._load_next_page(page=p)
+        self._preload_pending = list(range(1, 1 + self._preload_ahead + 1))
+        self._pump_preload()
 
     def _render_restored(self, snap: dict) -> None:
         """用快照渲染作品网格（0 网络请求），并恢复滚动位置。
@@ -811,6 +838,7 @@ class DiscoverPage(BasePage):
         if epoch != self._source_epoch:
             return
         self._active_pages.discard(page)
+        self._pump_preload()
         if err:
             # 单页失败不标记 _has_more=False（其他页可能成功，继续加载）
             log.warning("[discover] 第 %d 页失败：%s", page, err)

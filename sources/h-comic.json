@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://h-comic.com",
     "icon": "https://h-comic.com/favicon.ico",
     "description": "H-Comic - 免費中文成人漫畫（nhentai 鏡像）。SvelteKit SPA：列表/詳情 DOM 由 JS 渲染，資料在 /__data.json 的 devalue 扁平結構；作品詳情/閱讀路由 /comics/{id}/{chunk}，正文圖走圖床 https://h-comic.link/api/{comic_source}/{media_id}/pages/{n}。發現頁列表經 endpoints.discovery.render=playwright 渲染後按 works_list_item 選擇器解析。",

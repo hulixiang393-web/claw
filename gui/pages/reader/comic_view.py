@@ -35,8 +35,8 @@ from PySide6.QtWidgets import (
 from framework.content import Content, Detail
 
 # 预加载后续话数：当前话加载完成即预渲染后续 PREFETCH_COUNT 话（串行队列，不抢当前话首屏）
-PREFETCH_COUNT = 3  # 预渲染后续话数：连看时下一话已就绪、再下一话开始预渲染，切话更顺
-PREFETCH_BACK = 3  # 向前缓存话数：向上翻话命中缓存秒开（以当前话为基点前 3 话）
+PREFETCH_COUNT = 3  # 默认向后预加载话数
+PREFETCH_BACK = 1  # 默认向前缓存话数
 # 循环滚动：首屏渲染页数 / 滚动增量渲染每批页数
 INITIAL_RENDER_COUNT = 10
 LAZY_BATCH = 12
@@ -71,6 +71,8 @@ class ComicView(QWidget):
         self._zoom = 1.0
         self._prefetched = {}  # {url: {"images":[...], "count":N}} 预渲染的后续话
         self._prefetch_queue = []  # 串行预渲染队列（同一时间只渲染 1 话）
+        self._prefetch_count = PREFETCH_COUNT
+        self._prefetch_back = PREFETCH_BACK
         self._prefetch_busy = False  # 是否正在预渲染
         self._rendered_count = 0  # 已渲染图片数（边抓边显示增量用）
         self._rendered_header = False  # 话头 QLabel 是否已创建
@@ -298,9 +300,9 @@ class ComicView(QWidget):
         # 留着只占内存（长漫画每话几十张图 URL 列表持续累积）。保留当前话
         # 与向后 PREFETCH_COUNT 话（预取仍会用到），其余丢弃。
         keep = {self._chapters[idx].url}
-        for j in range(idx + 1, min(idx + 1 + PREFETCH_COUNT, len(self._chapters))):
+        for j in range(idx + 1, min(idx + 1 + self._prefetch_count, len(self._chapters))):
             keep.add(self._chapters[j].url)
-        for j in range(max(idx - PREFETCH_BACK, 0), idx):  # 保留前缓存窗口（向前预取会再命中）
+        for j in range(max(idx - self._prefetch_back, 0), idx):  # 保留前缓存窗口（向前预取会再命中）
             keep.add(self._chapters[j].url)
         self._prefetched = {k: v for k, v in self._prefetched.items() if k in keep}
         ch = self._chapters[idx]
@@ -380,10 +382,12 @@ class ComicView(QWidget):
         # 当前话加载完成即预渲染后续 PREFETCH_COUNT 话（串行队列，不抢当前话
         # 首屏；读到 70% 的 _on_scroll_prefetch 保留作兜底）。后续话插队首、
         # 优先于向前缓存：连看时下一话最先就绪。
-        self._prefetch_future(self._current_idx, PREFETCH_COUNT)
+        self._prefetch_future(self._current_idx, self._prefetch_count)
+
+
         # 向前缓存：后台预渲染前 PREFETCH_BACK 话，向上翻话命中缓存秒开
         #（与后续话共用串行队列，排在后续话之后不抢资源）。
-        self._prefetch_prev(self._current_idx)
+        self._prefetch_prev(self._current_idx, self._prefetch_back)
         # 更新自动滚动滑块状态（根据模式和滚动范围）
         QTimer.singleShot(0, self._update_auto_scroll_slider_state)
 
@@ -563,6 +567,8 @@ class ComicView(QWidget):
             self._rendered_header = True
         target = len(images) if force_full else min(self._rendered_count + LAZY_BATCH, len(images))
         referer = self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else ""
+        if not hasattr(self, "_image_labels"):
+            self._image_labels = []
         while self._rendered_count < target:
             url = images[self._rendered_count]
             # 同 _render_images：透传当前章节页 URL 作正文图 Referer
@@ -698,14 +704,28 @@ class ComicView(QWidget):
         if vbar.maximum() == 0:
             return
         if value >= vbar.maximum() * 0.7:
-            self._prefetch_future(self._current_idx, PREFETCH_COUNT)
+            self._prefetch_future(self._current_idx, self._prefetch_count)
 
-    def _prefetch_prev(self, idx: int, n: int = PREFETCH_BACK) -> None:
+
+    def set_prefetch_config(self, enabled: bool, ahead: int, behind: int) -> None:
+        try:
+            ahead_value = max(0, int(ahead))
+        except (TypeError, ValueError):
+            ahead_value = PREFETCH_COUNT
+        try:
+            behind_value = max(0, int(behind))
+        except (TypeError, ValueError):
+            behind_value = PREFETCH_BACK
+        self._prefetch_count = ahead_value if enabled else 0
+        self._prefetch_back = behind_value if enabled else 0
+
+    def _prefetch_prev(self, idx: int, n: int | None = None) -> None:
         """预加载前面 n 话（向前缓存）：向上翻话命中缓存秒开。
 
         与后续话共用同一串行队列（_prefetch_queue + _prefetch_busy），最多
         同时预渲染 1 话；在当前话渲染完成（_finish_episode_load）后入队执行。
         """
+        n = self._prefetch_back if n is None else n
         if self._source is None or not self._chapters:
             return
         for k in range(idx - 1, max(idx - 1 - n, -1), -1):

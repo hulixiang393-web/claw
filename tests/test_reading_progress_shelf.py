@@ -284,5 +284,25 @@ def test_open_resumes_saved_chapter(app, tmp_path):
     app.processEvents()
 
 
+def test_shelf_open_resumes_canonical_progress_when_cached_detail_url_differs(app, tmp_path):
+    from gui.pages.reader_page import ReaderPage
+
+    path = tmp_path / "rp.json"
+    rp = ReadingProgress(path)
+    chapters = [Chapter(f"第{i}章", f"https://example.com/book/1/{i}.html") for i in range(1, 5)]
+    rp.save("demo", "https://EXAMPLE.com/book/1/", "novel", chapters[2].url, "第三章")
+
+    content = _MockContent(chapters)
+    reader = ReaderPage(_FakeManager(), content, reading_progress=rp)
+    reader.resize(800, 600)
+    reader.show()
+    reader.open("demo", BOOK, "novel")
+    _wait(app, 100, 15)
+
+    assert reader.novel_view._current_idx == 2
+    reader.deleteLater()
+    app.processEvents()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

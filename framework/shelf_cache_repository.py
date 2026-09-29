@@ -20,7 +20,7 @@ class ShelfCacheRepository:
         content_root: str | Path,
         clock: Callable[[], float] | None = None,
         max_book_bytes: int = 256 * 1024 * 1024,
-        max_total_bytes: int = 1024 * 1024 * 1024,
+        max_total_bytes: int = 8 * 1024 * 1024 * 1024,
     ) -> None:
         self.path = Path(path)
         self.content_root = Path(content_root)
@@ -66,13 +66,19 @@ class ShelfCacheRepository:
                     FOREIGN KEY(book_key) REFERENCES books(book_key) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS content (
-                    book_key TEXT NOT NULL, chapter_key TEXT NOT NULL, content_type TEXT NOT NULL,
-                    path TEXT NOT NULL, size INTEGER NOT NULL, metadata TEXT NOT NULL,
-                    checksum TEXT NOT NULL, created_at REAL NOT NULL, accessed_at REAL NOT NULL,
-                    PRIMARY KEY(book_key, chapter_key), FOREIGN KEY(book_key) REFERENCES books(book_key) ON DELETE CASCADE
-                );
-                """
-            )
+                     book_key TEXT NOT NULL, chapter_key TEXT NOT NULL, content_type TEXT NOT NULL,
+                     path TEXT NOT NULL, size INTEGER NOT NULL, metadata TEXT NOT NULL,
+                     checksum TEXT NOT NULL, created_at REAL NOT NULL, accessed_at REAL NOT NULL,
+                     PRIMARY KEY(book_key, chapter_key), FOREIGN KEY(book_key) REFERENCES books(book_key) ON DELETE CASCADE
+                 );
+                 """
+             )
+            cols = {row[1] for row in self._db.execute("PRAGMA table_info(books)").fetchall()}
+            if "pinned" not in cols:
+                self._db.execute(
+                    "ALTER TABLE books ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                )
+
 
     def _validate_schema_version(self) -> None:
         row = self._db.execute("SELECT version FROM schema_version").fetchone()
@@ -213,8 +219,17 @@ class ShelfCacheRepository:
             self._delete_oldest_locked(None)
 
     def _delete_oldest_locked(self, book_key: str | None) -> None:
-        query = "SELECT book_key,chapter_key,path FROM content" + (" WHERE book_key=?" if book_key else "") + " ORDER BY accessed_at,created_at LIMIT 1"
-        row = self._db.execute(query, (book_key,) if book_key else ()).fetchone()
+        if book_key is None:
+            query = (
+                "SELECT c.book_key,c.chapter_key,c.path FROM content c "
+                "LEFT JOIN books b ON b.book_key=c.book_key "
+                "ORDER BY COALESCE(b.pinned, 0), c.accessed_at, c.created_at LIMIT 1"
+            )
+            params = ()
+        else:
+            query = "SELECT book_key,chapter_key,path FROM content WHERE book_key=? ORDER BY accessed_at,created_at LIMIT 1"
+            params = (book_key,)
+        row = self._db.execute(query, params).fetchone()
         if not row:
             return
         Path(row["path"]).unlink(missing_ok=True)
@@ -235,8 +250,54 @@ class ShelfCacheRepository:
                 Path(row["path"]).unlink(missing_ok=True)
             if book_key:
                 self._db.execute("DELETE FROM content WHERE book_key=?", (book_key,))
+                self._db.execute("UPDATE books SET pinned=0 WHERE book_key=?", (book_key,))
             else:
                 self._db.execute("DELETE FROM content")
+                self._db.execute("UPDATE books SET pinned=0")
+
+    def set_book_pinned(self, book_key: str, pinned: bool) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE books SET pinned=? WHERE book_key=?",
+                (1 if pinned else 0, book_key),
+            )
+
+    def is_book_pinned(self, book_key: str) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT pinned FROM books WHERE book_key=?", (book_key,)
+            ).fetchone()
+            return bool(row["pinned"]) if row else False
+
+    def pinned_book_keys(self) -> list[str]:
+        with self._lock:
+            return [
+                row[0]
+                for row in self._db.execute(
+                    "SELECT book_key FROM books WHERE pinned=1 ORDER BY book_key"
+                ).fetchall()
+            ]
+
+    def cached_chapter_keys(self, book_key: str) -> list[str]:
+        with self._lock:
+            return [
+                row[0]
+                for row in self._db.execute(
+                    "SELECT chapter_key FROM content WHERE book_key=? ORDER BY chapter_key",
+                    (book_key,),
+                ).fetchall()
+            ]
+
+    def content_size(self, book_key: str | None = None) -> int:
+        with self._lock:
+            if book_key is None:
+                row = self._db.execute("SELECT COALESCE(SUM(size),0) FROM content").fetchone()
+            else:
+                row = self._db.execute(
+                    "SELECT COALESCE(SUM(size),0) FROM content WHERE book_key=?",
+                    (book_key,),
+                ).fetchone()
+            return int(row[0])
 
     def cleanup_inactive(self, days: int, now: float | None = None) -> int:
         cutoff = (self.clock() if now is None else now) - days * 86400

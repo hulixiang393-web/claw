@@ -38,6 +38,7 @@ from framework.source_manager import (
     HEALTH_BROKEN,
 )
 from framework.config import SourceConfig, ConfigError
+from framework.events import EVENT_SOURCE_VISIBILITY_CHANGED
 from framework.selfcheck import StructureChecker
 
 from gui.components import EmptyState
@@ -296,12 +297,13 @@ class SourcePage(BasePage):
     edit_requested = Signal(str)
 
     def __init__(self, source_manager: SourceManager, checker: StructureChecker,
-                 sources_dir, cookie_manager=None, parent=None):
+                 sources_dir, cookie_manager=None, parent=None, event_bus=None):
         super().__init__(parent)
         self._manager = source_manager
         self._checker = checker
         self._sources_dir = Path(sources_dir)
         self._cookie_manager = cookie_manager
+        self._bus = event_bus
         self._rows: list = []
         self._diag_count = {"total": 0, "done": 0}
 
@@ -336,7 +338,13 @@ class SourcePage(BasePage):
         self.empty_state.add_source_clicked.connect(self._on_add_source)
         layout.addWidget(self.empty_state, stretch=1)
 
+        if self._bus is not None:
+            self._bus.subscribe(self._on_visibility_changed)
         self.refresh()
+
+    def _on_visibility_changed(self, event) -> None:
+        if getattr(event, "type", "") == EVENT_SOURCE_VISIBILITY_CHANGED:
+            self.refresh()
 
     # ------------------------------------------------------------------ #
     def _build_toolbar(self) -> None:

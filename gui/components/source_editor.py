@@ -628,6 +628,8 @@ class SourceEditor(QDialog):
                                  "源管理页图标，留空用默认")
         self._f_lang = sec._line("语言", "$metadata.lang", "例：zh-CN")
         self._f_region = sec._line("地区", "$metadata.region", "例：cn、global")
+        self._f_adult = sec._check("18+ 内容源", "$metadata.adult",
+                                   "在发现、搜索和源管理中按内容设置过滤")
         self._f_weight = sec._double("权重", "$weight", 0.0, 10.0,
                                      hint="搜索排序权重，默认 1.0")
         self.tabs.addTab(self._wrap_scroll(sec), "基本信息")
@@ -1705,6 +1707,7 @@ class SourceEditor(QDialog):
         self._f_icon.setText(_deep_get(raw, "$metadata.icon", ""))
         self._f_lang.setText(_deep_get(raw, "$metadata.lang", ""))
         self._f_region.setText(_deep_get(raw, "$metadata.region", ""))
+        self._f_adult.setChecked(bool(_deep_get(raw, "$metadata.adult", False)))
         self._f_weight.setValue(float(_deep_get(raw, "$weight", 1.0)))
 
         # 网络
@@ -1845,6 +1848,9 @@ class SourceEditor(QDialog):
         _deep_set(raw, "$name", self._f_name.text())
         _deep_set(raw, "$metadata.homepage", self._f_home.text())
         _deep_set(raw, "$metadata.description", self._f_desc.text())
+        metadata = raw.setdefault("$metadata", {})
+        if self._f_adult.isChecked() or "adult" in metadata:
+            metadata["adult"] = self._f_adult.isChecked()
         tags = [t.strip() for t in self._f_tags.text().split(",") if t.strip()]
         metadata = raw.setdefault("$metadata", {})
         if tags or "tags" in metadata:

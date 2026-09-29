@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://91porna.com/",
     "description": "91Porn动漫 - /comic 分类：成人动画/里番视频（服务端直出HTML，懒加载 data-src 封面）。注意：①播放层 m3u8 由混淆 JS+时间戳签名生成，静态抓取无法闭环，播放可能失败；②详情页浏览器内有随机跳转联盟站，claw 静态抓取不受影响。",
     "lang": "zh-CN",

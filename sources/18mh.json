@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://18mh.net/",
     "description": "禁漫天堂 - 成人漫画源",
     "lang": "zh-CN",

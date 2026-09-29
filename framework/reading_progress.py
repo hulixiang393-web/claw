@@ -22,6 +22,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # 记忆有效期（秒）：超时未加入书架则清理
 MEMORY_TTL_SECONDS = 24 * 3600
@@ -133,9 +134,24 @@ class ReadingProgress:
         self._save()
         self.prune(shelf_cb=self.shelf_cb)  # 每次写入顺带清理超期项（收藏的书保留）
 
+    @staticmethod
+    def _normalized_url(url: str) -> str:
+        parts = urlsplit((url or "").strip())
+        host = parts.hostname or ""
+        if parts.port not in (None, 80, 443):
+            host = f"{host}:{parts.port}"
+        query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+        return urlunsplit((parts.scheme.lower(), host.lower(), parts.path.rstrip("/") or "/", query, ""))
+
     def resume(self, book_url: str) -> Optional[dict]:
         """取某本书的进度（供续读定位）。无则 None。"""
         rec = self._data.get(book_url)
+        if rec is None:
+            normalized = self._normalized_url(book_url)
+            for key, candidate in self._data.items():
+                if self._normalized_url(key) == normalized:
+                    rec = candidate
+                    break
         if rec is None and self._repository is not None:
             snapshot = self._repository.get_book_snapshot(book_url)
             rec = (snapshot or {}).get("location")

@@ -23,7 +23,7 @@ import json
 import logging
 import re as _re
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
 log = logging.getLogger(__name__)
@@ -123,6 +123,7 @@ class Content:
         self._health_reporter = health_reporter  # 可选：update_health(source_id, state, error)
         # 可选 RedisLikeStore 实例（None=禁用）。键约定：
         #   page:{source_id}:{abs_url}   详情/目录页（永久，shelf 池）
+        #   detail:{source_id}:{abs_url} 详情元数据（30 天，shelf 池）
         #   body:{source_id}:{abs_url}   章节正文（7 天，shelf 池）
         #   pages:{source_id}:{abs_url}  漫画页图（7 天，shelf 池）
         #   cover:{source_id}:{abs_url}  封面字节（永久，shelf 池）
@@ -217,16 +218,19 @@ class Content:
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         return utils.abs_url(source.base_url, url)
 
-    def _repository_cache_parts(self, key: str):
-        kind, source_id, url = key.split(":", 2)
-        return kind, url
+    @staticmethod
+    def _repository_cache_parts(key: str, book_key: str | None = None) -> tuple[str, str]:
+        kind, _source_id, url = key.split(":", 2)
+        if book_key is None:
+            return kind, url
+        return url, book_key
 
-    def _cache_get(self, key: str):
+    def _cache_get(self, key: str, book_key: str | None = None):
         if self._repository is not None:
-            kind, url = self._repository_cache_parts(key)
-            value = self._repository.get_content(url, kind)
+            chapter_key, cache_book_key = self._repository_cache_parts(key, book_key)
+            value = self._repository.get_content(cache_book_key, chapter_key)
             if value is not None:
-                if kind == "pages" and isinstance(value, str):
+                if chapter_key == "pages" and isinstance(value, str):
                     try:
                         return json.loads(value)
                     except json.JSONDecodeError:
@@ -236,14 +240,58 @@ class Content:
             return self._cache.get(key)
         return None
 
-    def _cache_set(self, key: str, value, ttl=None) -> None:
-        kind, source_id, url = key.split(":", 2)
+    def _cache_set(
+        self, key: str, value, ttl=None, book_key: str | None = None
+    ) -> None:
+        kind, source_id, _url = key.split(":", 2)
+        chapter_key, cache_book_key = self._repository_cache_parts(key, book_key)
         if self._repository is not None:
-            self._repository.upsert_book(url, source_id, url, "", {})
+            self._repository.upsert_book(cache_book_key, source_id, cache_book_key, "", {})
             payload = json.dumps(value, ensure_ascii=False) if kind == "pages" else value
-            self._repository.put_content(url, kind, "application/json" if kind == "pages" else "text/plain", payload, {})
+            self._repository.put_content(
+                cache_book_key,
+                chapter_key,
+                "application/json" if kind == "pages" else "text/plain",
+                payload,
+                {},
+            )
         if self._cache is not None:
             self._cache.set(key, value, ttl=ttl)
+
+    _DETAIL_TTL = 30 * 86400
+
+    def _cache_get_detail(self, key: str):
+        if self._cache is None:
+            return None
+        raw = self._cache.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, Detail):
+            return raw
+        try:
+            data = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            if not isinstance(data, dict):
+                return None
+            chapters = [
+                chapter if isinstance(chapter, Chapter) else Chapter(**chapter)
+                for chapter in data.pop("chapters", [])
+            ]
+            data["chapters"] = chapters
+            return Detail(**data)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _cache_set_detail(self, key: str, detail: Detail) -> None:
+        if self._cache is None:
+            return
+        try:
+            self._cache.set(
+                key,
+                json.dumps(asdict(detail), ensure_ascii=False),
+                ttl=self._DETAIL_TTL,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("[cache] 详情缓存写入失败", exc_info=True)
 
     @staticmethod
     def _looks_like_direct_media(url: str) -> bool:
@@ -339,12 +387,20 @@ class Content:
         优先 api_endpoints.detail（JSON API，可选 sign 签名）；
         否则走 endpoints.detail HTML 解析。
         """
+        cache_key = f"detail:{source.source_id}:{self._abs_url(source, url)}"
+        cached = self._cache_get_detail(cache_key)
+        if cached is not None:
+            return cached
+
         api = source.raw.get("api_endpoints") or {}
         detail_api = api.get("detail") or {}
         if detail_api:
             if detail_api.get("engine") == "ytdlp":
-                return self._fetch_detail_ytdlp(source, url, detail_api)
-            return self._fetch_detail_api(source, url, detail_api)
+                detail = self._fetch_detail_ytdlp(source, url, detail_api)
+            else:
+                detail = self._fetch_detail_api(source, url, detail_api)
+            self._cache_set_detail(cache_key, detail)
+            return detail
 
         # 详情 URL 规范化：endpoints.detail.url_suffix 配置为 URL 尾缀补全
         # （如 MacCMS 变体列表 href 不带 .html 但详情页必须 .html，否则返回
@@ -357,6 +413,10 @@ class Content:
                 url = path + suffix + ("?" + query if query else "")
 
         abs_url = self._abs_url(source, url)
+        cache_key = f"detail:{source.source_id}:{abs_url}"
+        cached = self._cache_get_detail(cache_key)
+        if cached is not None:
+            return cached
         self._bg_check(source, abs_url)
         html = self._get_detail_html(source, url, abs_url)
         if source.content_type == "video":
@@ -473,6 +533,7 @@ class Content:
         # 播放源列表（换源站）：解析 source_switch 配置的可用源
         detail.source_list = self._parse_source_list(source, html)
 
+        self._cache_set_detail(cache_key, detail)
         return detail
 
     def _maybe_expand_video_series(self, source, detail, chapters) -> list:
@@ -1302,17 +1363,19 @@ class Content:
         chapters,
         current_idx: int,
         ahead: int = 3,
+        enabled: bool = True,
     ) -> None:
         """后台预加载当前章+后 ahead 章正文到缓存。不满 ahead 按实际。
 
-        进入阅读器时调用（novel/comic 都可用）。串行、逐章 fetch_chapter
-        （fetch_chapter 内部已写 body: 缓存）。异常静默。
-
+        enabled=False 时完全 no-op（设置页关闭预加载）。
         chapters：可迭代对象，元素含 .url 属性。current_idx 为当前章下标。
         """
+        if not enabled:
+            return
         if self._cache is None and self._repository is None or not chapters:
             return
-        end = min(current_idx + ahead, len(chapters))
+        ahead = max(0, int(ahead))
+        end = min(current_idx + ahead + 1, len(chapters))
         for i in range(current_idx, end):
             ch = chapters[i]
             url = getattr(ch, "url", "")

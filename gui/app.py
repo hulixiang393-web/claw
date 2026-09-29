@@ -81,6 +81,15 @@ def network_defaults_from_settings(settings) -> NetworkDefaults:
     )
 
 
+def _sync_source_visibility(settings, source_manager, event_bus=None) -> None:
+    """把内容可见性设置同步到 SourceManager。"""
+    if event_bus is not None:
+        source_manager.set_event_bus(event_bus)
+    source_manager.set_adult_visible(
+        bool(settings.get("content", "show_adult_sources", True))
+    )
+
+
 def _make_reading_progress(path: Path, shelf_cb, repository=None):
     from framework.reading_progress import ReadingProgress
     return ReadingProgress(path, shelf_cb=shelf_cb, repository=repository)
@@ -249,8 +258,13 @@ class MainWindow(QMainWindow):
             shelf_cache = None
         self.shelf_cache_repository = None
         try:
+            from framework.settings_manager import shelf_cache_settings
+            cfg = shelf_cache_settings(self.settings)
             self.shelf_cache_repository = ShelfCacheRepository(
-                base_dir / "data" / "shelf.sqlite3", base_dir / "data" / "cache"
+                base_dir / "data" / "shelf.sqlite3",
+                base_dir / "data" / "cache",
+                max_book_bytes=cfg["max_book_mb"] * 1024 * 1024,
+                max_total_bytes=cfg["max_total_mb"] * 1024 * 1024,
             )
         except Exception:
             self.shelf_cache_repository = None
@@ -338,6 +352,7 @@ class MainWindow(QMainWindow):
         # （爱丽丝等直连源封面经系统代理会失败/变慢 → 封面空白）
         for _src in self.source_manager.all():
             CoverLoader.instance().register_source(_src)
+        _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
 
         # Tab 索引映射
         self._tab_index = {key: i for i, (_, key) in enumerate(TABS)}
@@ -414,6 +429,7 @@ class MainWindow(QMainWindow):
             reading_progress=self.reading_progress,
             font_scale=float(self.settings.get("ui", "font_scale", 1.0)),
             search=self.search,
+            settings=self.settings,
         )
         # 阅读器「收藏」→ 写书架收藏库（与发现详情抽屉同一入口 _on_favorite）
         self.reader.favorite_requested.connect(self._on_favorite)
@@ -488,6 +504,7 @@ class MainWindow(QMainWindow):
             event_bus=self.event_bus,
             theme_manager=self.theme_manager,
             session_cache=get_session_cache(),
+            settings=self.settings,
         )
         page.read_requested.connect(self._open_reader)
         page.download_requested.connect(self._open_download_dialog)
@@ -675,6 +692,7 @@ class MainWindow(QMainWindow):
             source_manager=self.source_manager,
             search=self.search,
             content=self.content,
+            event_bus=self.event_bus,
         )
         page.open_requested.connect(self._open_from_search)
         page.add_to_shelf_requested.connect(self._on_batch_add_shelf)
@@ -727,6 +745,10 @@ class MainWindow(QMainWindow):
             reading_progress=self.reading_progress,
             shelf_export_dir=shelf_export_dir,
             cover_backfiller=self._backfill_favorite_covers,
+            shelf_cache_repository=self.shelf_cache_repository,
+            source_manager=getattr(self, "source_manager", None),
+            content=getattr(self, "content", None),
+            settings=self.settings,
         )
         # 点本地 epub → 内置阅读器打开（续读）
         self.library_page.open_epub_requested.connect(self._open_epub)
@@ -978,6 +1000,7 @@ class MainWindow(QMainWindow):
             checker=self.checker,
             sources_dir=base_dir / "sources",
             cookie_manager=self.cookie_manager,
+            event_bus=self.event_bus,
         )
         # 编辑某源 → 打开编辑器对话框
         self.source_page.edit_requested.connect(self._open_source_editor)
@@ -1387,10 +1410,48 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
 }}
 """
 
+    def _schedule_source_visibility_sync(self) -> None:
+        """把设置应用后的源可见性刷新合并到下一轮事件循环。"""
+        if getattr(self, "_source_visibility_sync_scheduled", False):
+            return
+        self._source_visibility_sync_scheduled = True
+
+        from PySide6.QtCore import QTimer
+
+        def _sync():
+            self._source_visibility_sync_scheduled = False
+            _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
+
+        QTimer.singleShot(0, _sync)
+
+    def _schedule_cover_cache_refresh(self) -> None:
+        """把封面缓存配置刷新合并到下一轮事件循环，采用最新设置。"""
+        if getattr(self, "_cover_cache_refresh_scheduled", False):
+            return
+        self._cover_cache_refresh_scheduled = True
+
+        from PySide6.QtCore import QTimer
+
+        def _refresh():
+            self._cover_cache_refresh_scheduled = False
+            from gui.components.cover_loader import CoverLoader
+            from framework.cache_service import get_shelf_cache
+
+            CoverLoader.instance().configure(
+                self.settings.get("ui", "cover_cache_size_mb", 256),
+                shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
+            )
+
+        QTimer.singleShot(0, _refresh)
+
     def _on_settings_applied(self) -> None:
         """设置页点「应用」→ 重跑主题 QSS（含背景图）+ 字体缩放 + 网络默认值 + 封面缓存。"""
+        self._schedule_source_visibility_sync()
+        self._schedule_cover_cache_refresh()
         # 重跑主题（含背景图合成 QSS + 字体缩放）
+
         self._apply_theme_qss(self.theme_manager.current_key())
+
         # 字体缩放 → 阅读器
         font_scale = float(self.settings.get("ui", "font_scale", 1.0))
         if hasattr(self, "reader") and self.reader is not None:
@@ -1400,15 +1461,7 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
                 int(self.settings.get("ui", "reading_font_size", 0) or 0),
             )
         # 网络默认值 → 已读的 http.defaults 跟不上（构造时快照），但超时等走 per-source
-        # 封面缓存预算（保留已注入的书架持久化缓存，避免覆盖为 None）
-        from gui.components.cover_loader import CoverLoader
-
-        from framework.cache_service import get_shelf_cache
-
-        CoverLoader.instance().configure(
-            self.settings.get("ui", "cover_cache_size_mb", 256),
-            shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
-        )
+        # 封面缓存预算在下一轮事件循环刷新，避免阻塞应用按钮点击。
 
     # ------------------------------------------------------------------ #
     def _install_shortcuts(self) -> None:
