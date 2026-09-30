@@ -568,11 +568,12 @@ class MainWindow(QMainWindow):
             page.refresh()
 
     # ------------------------------------------------------------------ #
-    def _on_batch_add_shelf(self, items) -> None:
+    def _on_batch_add_shelf(self, items, folder="") -> None:
         """搜索页勾选批量 → 加入书架（写收藏库）。"""
         store = self._ensure_library_store()
         if store is None or not items:
             return
+        folder = folder if folder and folder != "全部" else ""
         added = 0
         for r in items:
             url = getattr(r, "url", "") or ""
@@ -585,6 +586,7 @@ class MainWindow(QMainWindow):
                 content_type=getattr(r, "content_type", "") or "",
                 cover=getattr(r, "cover", ""),
                 author=getattr(r, "author", ""),
+                folder=folder,
             )
             added += 1
         # 刷新书架（若已构建）
@@ -687,12 +689,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, "download_page"):
             self.tabs.setCurrentWidget(self.download_page)
 
+    def _available_shelf_folders(self) -> list[str]:
+        store = self._ensure_library_store()
+        if store is None:
+            return []
+        return store.list_folders()
+
     def _build_search(self) -> SearchPage:
         page = SearchPage(
             source_manager=self.source_manager,
             search=self.search,
             content=self.content,
             event_bus=self.event_bus,
+            shelf_folder_provider=self._available_shelf_folders,
         )
         page.open_requested.connect(self._open_from_search)
         page.add_to_shelf_requested.connect(self._on_batch_add_shelf)
@@ -1444,24 +1453,40 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
 
         QTimer.singleShot(0, _refresh)
 
-    def _on_settings_applied(self) -> None:
-        """设置页点「应用」→ 重跑主题 QSS（含背景图）+ 字体缩放 + 网络默认值 + 封面缓存。"""
-        self._schedule_source_visibility_sync()
-        self._schedule_cover_cache_refresh()
-        # 重跑主题（含背景图合成 QSS + 字体缩放）
+    def _schedule_settings_refresh(self) -> None:
+        """合并设置应用后的 GUI 刷新，并在主线程下一轮读取最新设置。"""
+        if getattr(self, "_settings_refresh_scheduled", False):
+            return
+        self._settings_refresh_scheduled = True
 
-        self._apply_theme_qss(self.theme_manager.current_key())
+        from PySide6.QtCore import QTimer
 
-        # 字体缩放 → 阅读器
-        font_scale = float(self.settings.get("ui", "font_scale", 1.0))
-        if hasattr(self, "reader") and self.reader is not None:
-            self.reader.apply_font_scale(font_scale)
-            self.reader.apply_reading_style(
-                self.settings.get("ui", "reading_bg", "") or "",
-                int(self.settings.get("ui", "reading_font_size", 0) or 0),
+        def _refresh():
+            self._settings_refresh_scheduled = False
+            _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
+
+            from gui.components.cover_loader import CoverLoader
+            from framework.cache_service import get_shelf_cache
+
+            CoverLoader.instance().configure(
+                self.settings.get("ui", "cover_cache_size_mb", 256),
+                shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
             )
-        # 网络默认值 → 已读的 http.defaults 跟不上（构造时快照），但超时等走 per-source
-        # 封面缓存预算在下一轮事件循环刷新，避免阻塞应用按钮点击。
+            self._apply_theme_qss(self.theme_manager.current_key())
+
+            font_scale = float(self.settings.get("ui", "font_scale", 1.0))
+            if hasattr(self, "reader") and self.reader is not None:
+                self.reader.apply_font_scale(font_scale)
+                self.reader.apply_reading_style(
+                    self.settings.get("ui", "reading_bg", "") or "",
+                    int(self.settings.get("ui", "reading_font_size", 0) or 0),
+                )
+
+        QTimer.singleShot(0, _refresh)
+
+    def _on_settings_applied(self) -> None:
+        """设置页点「应用」→ 合并并延后主题、可见性、缓存和字体刷新。"""
+        self._schedule_settings_refresh()
 
     # ------------------------------------------------------------------ #
     def _install_shortcuts(self) -> None:

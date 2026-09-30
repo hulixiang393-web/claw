@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QInputDialog,
     QLineEdit,
     QMenu,
     QPushButton,
@@ -225,16 +226,17 @@ class SearchPage(BasePage):
     search_clicked = Signal(str)  # 搜索触发（首页接）
     open_requested = Signal(str, str, str)  # (source_id, url, content_type) 打开作品
     # 批量操作（ui-search.md #8）：加入书架 / 加入下载
-    add_to_shelf_requested = Signal(object)   # list[SearchResult]
+    add_to_shelf_requested = Signal(object, str)  # list[SearchResult], folder
     batch_download_requested = Signal(object)  # list[SearchResult]
 
     def __init__(self, source_manager: SourceManager, search: Search, content=None,
-                 parent=None, event_bus=None):
+                 parent=None, event_bus=None, shelf_folder_provider=None):
         super().__init__(parent)
         self._manager = source_manager
         self._search = search
         self._content = content  # 可选：详情封面回填（cover_backfill 源）用
         self._bus = event_bus
+        self._shelf_folder_provider = shelf_folder_provider or (lambda: [])
         self._results = []
         self._filter_source = ""
         self._saved_unfiltered_shown = None  # 进入来源筛选前的渲染进度（清除筛选后恢复）
@@ -276,6 +278,7 @@ class SearchPage(BasePage):
         self.type_combo.addItem("全部类型", "")
         for t in ("novel", "comic", "video"):
             self.type_combo.addItem(t, t)
+        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         self._all_selected: bool = True
         self._selected_sources: set = set()
         self.src_btn = QPushButton("源：全部")
@@ -415,6 +418,20 @@ class SearchPage(BasePage):
         self.keyword_input.setText(keyword)
         self._on_search()
 
+    def _sources_for_current_type(self):
+        selected_type = self.type_combo.currentData() or ""
+        sources = self._manager.enabled_sources()
+        if selected_type:
+            sources = [s for s in sources if s.content_type == selected_type]
+        return sources
+
+    def _on_type_changed(self, _index: int) -> None:
+        visible_ids = {s.source_id for s in self._sources_for_current_type()}
+        self._selected_sources &= visible_ids
+        if self._all_selected and not visible_ids:
+            self._all_selected = False
+        self._rebuild_sources_menu()
+
     def _on_search(self) -> None:
         keyword = self.keyword_input.text().strip()
         if not keyword:
@@ -441,17 +458,14 @@ class SearchPage(BasePage):
         self._clear_status_bar()
 
         # 选择目标源
-        selected_type = self.type_combo.currentData()
+        available = self._sources_for_current_type()
         if self._all_selected:
-            sources = self._manager.enabled_sources()
+            sources = available
         elif self._selected_sources:
-            sources = [s for s in self._manager.enabled_sources()
-                       if s.source_id in self._selected_sources]
+            sources = [s for s in available if s.source_id in self._selected_sources]
         else:
             self.status_label.setText("未选择任何源")
             return
-        if selected_type:
-            sources = [s for s in sources if s.content_type == selected_type]
 
         if not sources:
             self.status_label.setText("没有可搜索的源")
@@ -1105,12 +1119,32 @@ class SearchPage(BasePage):
             card.blockSignals(False)
         self._refresh_batch_bar()
 
+    def _writable_folder_names(self) -> list[str]:
+        return [name for name in self._shelf_folder_provider() if name and name != "全部"]
+
+    def _choose_shelf_folder(self):
+        folders = ["未分类"] + self._writable_folder_names()
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "选择收藏夹",
+            "加入到：",
+            folders,
+            0,
+            False,
+        )
+        if not accepted:
+            return None
+        return "" if choice == "未分类" else choice
+
     def _on_batch_add_shelf(self) -> None:
         """批量加入书架。"""
         items = list(self._selected.values())
         if not items:
             return
-        self.add_to_shelf_requested.emit(items)
+        folder = self._choose_shelf_folder()
+        if folder is None:
+            return
+        self.add_to_shelf_requested.emit(items, folder)
         self._clear_selection()
 
     def _on_batch_download(self) -> None:
@@ -1285,7 +1319,7 @@ class SearchPage(BasePage):
         self._src_menu.clear()
         self._src_rows = {}
 
-        enabled = self._manager.enabled_sources()
+        enabled = self._sources_for_current_type()
         enabled_ids = {s.source_id for s in enabled}
         self._selected_sources &= enabled_ids
 
@@ -1414,10 +1448,10 @@ class SearchPage(BasePage):
         所有源勾满 → 恢复全选态；全部取消 → 按钮显示「源：无」。
         仅更新选择状态与按钮文字，并清空旧结果；必须点「搜索」才发起搜索。
         """
-        enabled = self._manager.enabled_sources()
+        enabled = self._sources_for_current_type()
         enabled_ids = {s.source_id for s in enabled}
         if self._all_selected:
-            # 从「全部」进入部分选择：先铺满全部源，再按本次点击增删
+            # 从「全部」进入部分选择：先铺满当前类型源，再按本次点击增删
             self._selected_sources = set(enabled_ids)
         if checked:
             self._selected_sources.add(source.source_id)

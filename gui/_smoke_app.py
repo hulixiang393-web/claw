@@ -31,6 +31,15 @@ def main():
     assert len(qss) > 100, "QSS 未应用"
     print("主题 QSS 已应用，长度 =", len(qss))
 
+    applied = []
+    win._apply_theme_qss = lambda theme: applied.append(theme)
+    win._on_settings_applied()
+    win._on_settings_applied()
+    assert applied == [], applied
+    app.processEvents()
+    assert len(applied) == 1, applied
+    print("设置应用合并刷新 OK")
+
     win.show()
     app.processEvents()
     print("\n=== App 启动验证通过 ===")
