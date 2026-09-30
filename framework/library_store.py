@@ -265,14 +265,19 @@ class LibraryStore:
                 self._save()
         return len(urls)
 
-    def remove_all(self) -> int:
-        """清空全部收藏（保留收藏夹）。返回移除条数。"""
+    def remove_all(self, exclude_folders: set[str] | None = None) -> int:
+        """清空收藏，可排除指定收藏夹（保留收藏夹）。返回移除条数。"""
+        excluded = set(exclude_folders or ())
         with self._lock:
-            n = len(self._data)
-            self._data.clear()
-            if n:
+            urls = [
+                url for url, rec in self._data.items()
+                if (rec.get("folder") or "") not in excluded
+            ]
+            for url in urls:
+                del self._data[url]
+            if urls:
                 self._save()
-        return n
+        return len(urls)
 
     def remove(self, url: str) -> bool:
         """移除收藏（只删元数据，不删本地文件）。"""

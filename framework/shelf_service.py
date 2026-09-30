@@ -419,12 +419,16 @@ class ShelfService:
                     pass
         return n
 
-    def clear_all_favorites(self) -> int:
-        """清空全部收藏，并同步清理 SQLite 内容缓存。"""
+    def clear_all_favorites(self, exclude_folders: set[str] | None = None) -> int:
+        """清空收藏，可排除指定收藏夹，并同步清理 SQLite 内容缓存。"""
         if self._store is None:
             return 0
-        urls = [rec.get("url") for rec in self._store.list_all() if rec.get("url")]
-        n = self._store.remove_all()
+        excluded = set(exclude_folders or ())
+        urls = [
+            rec.get("url") for rec in self._store.list_all()
+            if rec.get("url") and (rec.get("folder") or "") not in excluded
+        ]
+        n = self._store.remove_all(exclude_folders=excluded)
         if self._repository is not None:
             for url in urls:
                 try:

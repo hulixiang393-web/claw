@@ -1266,13 +1266,13 @@ class LibraryPage(BasePage):
                 return
             removed = self._shelf.favorite_clear_folder(cur)
         else:
-            locked_folders = [
+            locked_folders = {
                 name for name in self._store.list_folders()
-                if self._store.folder_items(name) and not self.is_folder_unlocked(name)
-            ] if self._store is not None else []
-            if not self._ensure_folder_unlocked(*locked_folders):
-                return
-            removed = self._shelf.clear_all_favorites()
+                if self._store.folder_items(name)
+                and self._store.folder_info(name)
+                and self._store.folder_info(name).get("locked")
+            } if self._store is not None else set()
+            removed = self._shelf.clear_all_favorites(exclude_folders=locked_folders)
         QMessageBox.information(self, "清空收藏", f"已移除 {removed} 本收藏。")
         self._rebuild()
 
