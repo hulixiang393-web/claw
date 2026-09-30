@@ -314,6 +314,7 @@ class Search:
                         keyword_replace=keyword_replace,
                     )
                     text = self._http_get(source, abs_url, http=http)
+                text = self._maybe_verify_search(source, abs_url, text, http=http)
             except Exception as exc:  # noqa: BLE001
                 # 404 是分页探测末页的正常信号（超过站点总页数），静默不报；
                 # 其余失败才警告（网络/反爬）。
@@ -1031,6 +1032,37 @@ class Search:
         return self._discovery.decrypt_covers(source, carriers)
 
     # ------------------------------------------------------------------ #
+    def _maybe_verify_search(
+        self, source: SourceConfig, url: str, text: str, http: Optional[HttpClient] = None
+    ) -> str:
+        cfg = ((source.raw.get("endpoints") or {}).get("search") or {}).get("pre_verify") or {}
+        detect = str(cfg.get("detect_regex") or "")
+        if not cfg or not detect or not _re.search(detect, text, _re.IGNORECASE | _re.DOTALL):
+            return text
+        from .signers import get_signer
+        from urllib.parse import urlencode
+
+        signer_cfg = cfg.get("sign") or {}
+        params = get_signer(str(signer_cfg.get("strategy") or ""), http=http or self._http).sign({})
+        body = dict(cfg.get("body") or {})
+        body[str(signer_cfg.get("param") or "i")] = params.get("i")
+        verify_url = urljoin(source.base_url, str(cfg.get("url") or ""))
+        query = cfg.get("query") or {}
+        if query:
+            verify_url += ("&" if "?" in verify_url else "?") + urlencode(query)
+        verify_text = self._http_post_form(source, verify_url, body, http=http)
+        try:
+            result = json.loads(verify_text)
+        except json.JSONDecodeError as exc:
+            raise SourceError(f"搜索验证返回非 JSON：{verify_url}") from exc
+        success = cfg.get("success") or {}
+        value = result
+        for part in str(success.get("json_path") or "").split(".") if success.get("json_path") else ():
+            value = value.get(part) if isinstance(value, dict) else None
+        if value != success.get("equals", 1):
+            raise SourceError(f"搜索验证失败：{verify_text[:200]}")
+        return self._http_get(source, url, http=http)
+
     def _http_get(
         self, source: SourceConfig, url: str, http: Optional[HttpClient] = None
     ) -> str:
