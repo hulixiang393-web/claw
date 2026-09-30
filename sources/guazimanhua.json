@@ -1,0 +1,140 @@
+{
+  "$schema_version": 2,
+  "$id": "guazimanhua",
+  "$type": "comic",
+  "$name": "瓜子漫画",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.guazimanhua.com",
+    "description": "瓜子漫画 - 国漫、日韩漫画在线阅读与持续更新",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "漫画",
+      "国漫",
+      "日韩",
+      "连载",
+      "完结"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.guazimanhua.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.guazimanhua.com/"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/category.php",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          {"title": "全部", "url": "/category.php"},
+          {"title": "耽美", "url": "/category.php?cid=41"},
+          {"title": "恋爱", "url": "/category.php?cid=9"},
+          {"title": "校园", "url": "/category.php?cid=29"},
+          {"title": "霸总", "url": "/category.php?cid=5"},
+          {"title": "都市", "url": "/category.php?cid=42"},
+          {"title": "穿越", "url": "/category.php?cid=8"},
+          {"title": "古风", "url": "/category.php?cid=23"},
+          {"title": "玄幻", "url": "/category.php?cid=25"},
+          {"title": "奇幻", "url": "/category.php?cid=31"},
+          {"title": "科幻", "url": "/category.php?cid=22"},
+          {"title": "灵异", "url": "/category.php?cid=21"},
+          {"title": "动作", "url": "/category.php?cid=54"},
+          {"title": "悬疑", "url": "/category.php?cid=11"},
+          {"title": "冒险", "url": "/category.php?cid=30"},
+          {"title": "搞笑", "url": "/category.php?cid=15"},
+          {"title": "热血", "url": "/category.php?cid=13"},
+          {"title": "恐怖", "url": "/category.php?cid=14"},
+          {"title": "系统", "url": "/category.php?cid=148"},
+          {"title": "逆袭", "url": "/category.php?cid=97"},
+          {"title": "脑洞", "url": "/category.php?cid=55"},
+          {"title": "复仇", "url": "/category.php?cid=61"},
+          {"title": "真人", "url": "/category.php?cid=17"},
+          {"title": "其它", "url": "/category.php?cid=27"},
+          {"title": "完结", "url": "/category.php?is_end=1"},
+          {"title": "连载", "url": "/category.php?is_end=2"},
+          {"title": "国漫", "url": "/category.php?city=338"},
+          {"title": "日韩", "url": "/category.php?city=78"}
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {"css": "article.card"},
+        "fields": {
+          "title": {"css": "h3 a"},
+          "url": {"css": "a.cover-wrap", "attr": "href"},
+          "cover": {"css": "a.cover-wrap img.cover", "attr": "src"},
+          "status": {"css": "a.cover-wrap span.genre"},
+          "author": {"css": "div.meta"}
+        }
+      }
+    },
+    "search": {
+      "base_url": "/category.php",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "item": {
+        "root_selector": {"css": "article.card"},
+        "fields": {
+          "title": {"css": "h3 a"},
+          "url": {"css": "a.cover-wrap", "attr": "href"},
+          "cover": {"css": "a.cover-wrap img.cover", "attr": "src"},
+          "status": {"css": "a.cover-wrap span.genre"},
+          "author": {"css": "div.meta"}
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {"css": "h1"},
+        "cover": {"css": "img[alt$='漫画封面']", "attr": "src"},
+        "author": {"css": "a[href^='/author.php']"},
+        "summary": {"css": "main p"},
+        "status": {"css": ".sp-book-meta-item span, .comic-info span"},
+        "tags": {"css": "a[href^='/category.php?tag=']"}
+      }
+    },
+    "content": {
+      "page": {
+        "list": {
+          "root_selector": {"css": "a[href^='/chapter.php?id=']"},
+          "chapter_order": "desc",
+            "fields": {
+              "title": {"xpath": "."},
+              "url": {"xpath": ".", "attr": "href"}
+            }
+        },
+        "body": {
+          "root_selector": {"css": "main img[src*='img.guazicdn.com']"},
+          "fields": {
+            "url": {"xpath": ".", "attr": "src"}
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {"max_pages": 3, "max_results": 60},
+    "detail": {"max_pages": 1},
+    "page": {"max_pages": 500, "max_items": 3000}
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {"css": "article.card"}
+    }
+  }
+}

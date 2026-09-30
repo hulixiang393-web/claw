@@ -15,10 +15,14 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # 记忆有效期（秒）：超时未加入书架则清理
 MEMORY_TTL_SECONDS = 24 * 3600
@@ -29,6 +33,7 @@ class ReadingProgress:
         self,
         path: str | Path = "reading_progress.json",
         shelf_cb: Optional[Callable[[str], bool]] = None,
+        repository=None,
     ):
         """shelf_cb(book_url) -> bool：该书是否已入书架。
 
@@ -37,6 +42,7 @@ class ReadingProgress:
         """
         self.path = Path(path)
         self.shelf_cb = shelf_cb
+        self._repository = repository
         self._data: dict = self._load()
 
     # ------------------------------------------------------------------ #
@@ -52,13 +58,25 @@ class ReadingProgress:
         return {}
 
     def _save(self) -> None:
+        temp_path = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
             )
-        except OSError:
+            temp_path = Path(temp_name)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self._data, handle, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.path)
+            temp_path = None
+        except (OSError, TypeError, ValueError):
             pass
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------ #
     def save(
@@ -70,6 +88,7 @@ class ReadingProgress:
         chapter_title: str,
         position: float | None = None,
         page: int | None = None,
+        location: dict | None = None,
     ) -> None:
         """记录/更新一部作品的阅读进度（换章/滚动/翻页/播放时调用）。
 
@@ -79,15 +98,25 @@ class ReadingProgress:
         """
         if not book_url:
             return
+        if location is not None and not isinstance(location, dict):
+            raise TypeError("location must be a dict or None")
+        stored_location = copy.deepcopy(location) if location is not None else None
+        if stored_location is not None:
+            try:
+                json.dumps(stored_location, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                raise TypeError("location must contain only JSON-serializable values") from exc
+        old = self._data.get(book_url, {})
+        same_chapter = old.get("chapter_url") == chapter_url
+        if location is None and same_chapter:
+            stored_location = copy.deepcopy(old.get("location"))
         # 同章且本次无位置信息（章级信号先于滚动/播放落盘）：保留旧位置，
         # 避免"打开续读的书 → 加载该章 → 章信号把存储位置刷成 None"丢失恢复点。
         # 换到新章（chapter_url 不同）才重置为无位置（新章从顶部开始）。
-        if position is None and page is None:
-            old = self._data.get(book_url, {})
-            if old.get("chapter_url") == chapter_url:
-                position = old.get("position")
-                page = old.get("page")
-        self._data[book_url] = {
+        if position is None and page is None and same_chapter:
+            position = old.get("position")
+            page = old.get("page")
+        record = {
             "source_id": source_id,
             "book_url": book_url,
             "content_type": content_type,
@@ -96,14 +125,37 @@ class ReadingProgress:
             "position": position,
             "page": page,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "location": stored_location,
         }
+        self._data[book_url] = record
+        if self._repository is not None:
+            self._repository.upsert_book(book_url, source_id, book_url, content_type, {})
+            self._repository.update_location(book_url, record)
         self._save()
         self.prune(shelf_cb=self.shelf_cb)  # 每次写入顺带清理超期项（收藏的书保留）
+
+    @staticmethod
+    def _normalized_url(url: str) -> str:
+        parts = urlsplit((url or "").strip())
+        host = parts.hostname or ""
+        if parts.port not in (None, 80, 443):
+            host = f"{host}:{parts.port}"
+        query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+        return urlunsplit((parts.scheme.lower(), host.lower(), parts.path.rstrip("/") or "/", query, ""))
 
     def resume(self, book_url: str) -> Optional[dict]:
         """取某本书的进度（供续读定位）。无则 None。"""
         rec = self._data.get(book_url)
-        return dict(rec) if rec else None
+        if rec is None:
+            normalized = self._normalized_url(book_url)
+            for key, candidate in self._data.items():
+                if self._normalized_url(key) == normalized:
+                    rec = candidate
+                    break
+        if rec is None and self._repository is not None:
+            snapshot = self._repository.get_book_snapshot(book_url)
+            rec = (snapshot or {}).get("location")
+        return copy.deepcopy(rec) if rec else None
 
     def prune(self, shelf_cb: Optional[Callable[[str], bool]] = None) -> int:
         """清理过期记忆：超 TTL_SECONDS 且（书架回调未命中）→ 删除。

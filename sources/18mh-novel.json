@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://18mh.net",
     "description": "禁漫天堂 - 小说源（SPA 渲染正文）",
     "lang": "zh-CN",

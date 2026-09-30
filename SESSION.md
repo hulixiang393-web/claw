@@ -1,5 +1,177 @@
 # SESSION — claw（D:\code\claw）
 
+## 外部播放器全集播放列表（vlc-series-playlist，2026-09-27，20 commits / 全量 818 passed / 0 failed）
+### 用户选择
+- **全集**进 VLC 播放列表（不是只当前集往后）；`episodes[0]` 不跳过，严格 1..N。
+- 离开视频页**不终止**外部 VLC；播放器仍活时保留系列注册（VLC 可能继续请求 `/e/`）。
+- 直接在 `master` 实施；每个 Task 独立提交 + 独立审查。
+
+### 落地
+- **设计**：`docs/superpowers/specs/2026-09-27-vlc-series-playlist-design.md`；**计划**：`docs/superpowers/plans/2026-09-27-vlc-series-playlist.md`（8 Task）。
+- `framework/media_proxy.py`：无 TTL 的**租约**（`_leases` / `acquire_lease` / `release_lease`）+ **惰性系列**注册表（`_SERIES_MAX=8` FIFO）+ `/e/<key>/<idx>`（按需 `fetch_video_streams` → memo → 302 `/s/<token>`；失败 502 且不缓存）。
+- `framework/external_player.py`：全集入列 + `#标题` + `--no-random` + **非首集开播握手**（`--no-playlist-autostart` + 后台轮询 `playlist.json` + `pl_play&id=`）+ 租约；`player_command/playlist_items/goto/next/previous/running`。
+- `gui/pages/reader/video_view.py`：`_build_series_playlist` + **播放代数守卫** + App 内切集走 `pl_play` 不重开 + `P` 键改 `pl_previous`（VLC 无 `pl_prev`，此前从未生效）。
+
+### 契约破坏（调用方须改）
+- `open_with_player(episodes=...)` 现为**全集有序列表**，`episodes[0]` 不再跳过，`url` 只用于定位起始项；新增显式 `start_idx=-1`。
+- `player_playlist_items()` 返回的 id 已在**该函数单点**归一化为 `int`（真实 VLC 发的是字符串）。
+- `on_playlist_ready` 由**后台线程**回调，Qt 对象只能在主线程动 → 须经信号 emit。
+
+### 三个真实缺陷（复审抓出，勿重犯）
+1. **切源而 VLC 未关 → 旧系列按新源解析，且污染 `_stream_cache` 持久生效。** 根因是新回调无会话守卫：`_source` 与 `_episodes` 此刻自洽，故 `fetch_video_streams` **成功**而非 502，VLC 静默播新源那一集；随后按**新源 URL 为键**写入**旧源流**，`_load_episode` 命中缓存不复验 → App 持续拿 A 源的流播 B 源的集。修法：`_play_gen` 代次守卫 + resolver 在**注册时刻**快照 `source/quality/episodes`。
+   - 代次守卫**只靠约定且失败无声**：`emit` 时读 `self._play_gen` 恒等于当前值 = 守卫静默失效。首参必须传**会话创建时捕获**的代数（信号声明处已留注释）。
+2. **`reload_detail` 漏清「当前流」三元组** → 切源后 `⚙外部播放器` 的单集回退把**旧源的流**交给新开的 VLC。现由 `_invalidate_current_stream()` 在 `load` / `reload_detail` 两个重置块共用。
+3. **`_notify_last_episode` 条件写反**（既有 bug）：非末集弹「已是最后一集」、末集静默，与自身 docstring 相反。教训：**「非 X 则 return」类守卫极易在重构中写反，务必与注释方向核对。**
+
+### brief/测试失效的两个反复模式
+- brief 早于前序 Task 定稿时会带着刚被关掉的 bug（Task 7 的 C1–C5 即如此）→ **每轮 brief 必须对照当前代码复核后再派发**。
+- **「断言不该发生」用 `throw(AssertionError)` 会恒绿**——实现自身的 `except Exception` 会吞掉它（`AssertionError` 是 `Exception` 子类）。一律改记录型断言（`assert got == []`）。同类失效断言本项目已出现 4 次。
+- 另：**测试替身是字符串/无 `raw` 的对象时，断言值恒为默认值**，`assert x == {}` 无法区分「真的透传」与「写死」。
+
+### 已知限制
+- 每集不单独算 network-caching，用**当前集**真实流地址的分类作全列表基线（ikanpp 30s 生效）。
+- 系列路径不挂 `:input-slave=`（merged 流挂 DASH/fMP4 会黑屏）。
+- 全集超 `_SERIES_MAX_MRL=300` 集或 `_SERIES_MAX_CMD=30000` 字符才降级为「当前集往后」窗口。
+- 无 `ep.url` 的章节在列表里占位为空串、由 `_fit_series` 跳过（否则给 VLC 留一个点了必 502 的死条目）。
+- `⚙外部播放器` 会注销仍活着的系列 → 旧 VLC 窗口的条目变死（用户主动要求重开，判为可接受取舍）。
+- 选集态下 `⚙` 无操作（无流可重开），此时无 VLC + Referer 的浏览器兜底不可达，改用 `▶`。
+- 未修（同类隐患，不同机制）：在途 `_FetchStreamTask` 切源后仍可写 `_stream_cache`；模块级 playlist cache 无锁且返回共享 list。
+
+### 待人工验收（单元测试无法证明 VLC 行为）
+见规格 §8 手动 GUI 验收 7 条。最关键两条：**从第 5 集开播后 `Ctrl+L` 确认第 1..4 集也在列内**（全集入列是「P 能往回」的前提）；**App 内点「下一集」VLC 不重启、不闪窗、进度不丢**。
+
+---
+
+## ⚠️ 上条结论已被推翻（2026-09-27）：ikanpp 卡顿真根因是上游 CDN 按连接限速，不是 media_proxy
+- 证据：用户确认**只有 ikanpp 卡，其他源全正常**。通用缺陷若为主因应普遍生效 → 排除。
+- 实测：ikanpp `gs.gszyi.com:999` 单连接 85~190KB/s（长测掉到 33~68KB/s）< 该片实时需求 136KB/s（1.33MB/片 ÷ 10s，1060 片/1.4GB/176.7min）；**4 并发总带宽 280.2KB/s vs 顺序 133.2KB/s = 2.1x** → 确认按连接限速。
+- 下面 09-26 那节的「根因」应读作**已修的通用性能缺陷（保留有价值，但不是解药）**。定案与实施见下一节。
+
+## HLS 吞吐瓶颈定案 + 三项实施（2026-09-27，未 commit，全量 697 passed / 0 failed）
+### 用户选择
+「两个都做，但预取默认关」= 提高缓冲 + 扩容磁盘缓存预算 + 实现有界预取但**默认关闭**。
+### 改动
+1. **按源 VLC 缓冲**（不动全局，避免给正常源加启动延迟）
+   - `framework/external_player.py`：`open_with_player(..., caching_ms: int = 0)`，作**下限** `max(_caching, caching_ms)`（配小不降级分类值）。
+   - `gui/pages/reader/video_view.py`：新增 `_source_network_caching_ms()` 读 `media.hls.network_caching_ms`；两处 `open_with_player` 调用点均传入（`_play` / 1763 行那处）。`gui/app.py:828` 的通用「外部播放器打开」无 source 上下文，保持默认。
+   - `sources/ikanpp.json`：`media.hls.network_caching_ms = 30000`（原 `workers: 4` 保留，下载链路用）。
+   - 全局默认仍 8000ms（其他源零影响）。
+2. **磁盘缓存预算** 2048MB/3集 → **8192MB/5集**：`app_config.json`（实际生效值）+ `framework/settings_manager.py` 默认块 + `framework/media_cache.py`（`__init__` 与 `_settings_defaults`）。装得下 1.4GB 单集，消除边写边 LRU 淘汰抖动。D 盘实测余 193GB，无容量风险。
+3. **有界 HLS 预取**（`framework/media_proxy.py`，**默认关**）
+   - 新增 `hls_prefetch` 配置段（`app_config.json` + `settings_manager` 默认）：`{enabled: false, depth: 4, workers: 3}`。
+   - `MediaProxy.__init__(cache=None, prefetch=None)`；`_resolve_prefetch_cfg` 夹紧 depth≤16 / workers≤8；`_prefetch_enabled()`。
+   - `_rewrite_m3u8` 登记有序分片 `_seg_order` + `_seg_pos`（整体替换，直播刷新不累加）；`_note_segment` 排除嵌套 m3u8。
+   - `_serve_cache` 分片请求钩子 → `_maybe_prefetch` → `ThreadPoolExecutor` + `_FileTee` 落盘；同片 `_pf_scheduled` 去重；`path_lock(完整URL)` 与播放器请求**同一把**（预取过的片零回源）；`stop()` → `_shutdown_prefetch()`。
+   - `_prefetch_drain(timeout)` 供测试同步。
+### 踩坑（重要）
+- **钩子必须放 `path_lock` 锁外**：`/c/` 路由整段持锁，而预取自身要取同名 `path_lock` → 锁内触发会**自死锁**。
+- **`MediaTuner` 自适应缓冲是死代码**：`on_buffering`/`next_buffer_ms` 从未被调用 → 缓冲永远不涨。故本次走显式按源配置而非自适应。（`media_tuner.py` 未改，留待后续接线或删除。）
+- **`proxy_url_for(url, {})` 空 headers 直接返回原 URL**（不代理）；且它走 `MediaProxy.instance()` **单例**，与测试注入的实例不是同一个 → 测试须用 `proxy.build_url()`，否则断言的是另一个对象的状态。
+- **`_Upstream.hits` 计数需每用例重置**（类属性共享）。
+### 测试
+- 新增 `tests/test_hls_throughput_tuning.py` **14 例**（先 RED 后 GREEN）：缓冲默认值不变/按源覆盖/覆盖当下限、ikanpp 配置落 30s、缓存预算 8192MB/5集（两处）、预取默认关→零额外上游请求、lookahead=4、depth 可配、清单尾部不越界、同片去重、**端到端**（真实 `/c/` 分片请求触发预取、预取片再请求**零回源**、预取走直连会话）。
+- 代理 13 例 + 缓存/调优/播放器相关 7 文件 **63 passed**；`-k "proxy or media or player or cache or external or download"` **176 passed**（新文件多数用例文件名不含这些关键词，需单独跑）。
+- 全量 `--ignore=tests/test_comic_scroll_anchor.py --ignore=tests/test_comic_view_referer.py -p no:randomly`：**697 passed, 0 failed**（固定顺序后此前顺序依赖的 `test_card_layout_qss::test_workcard_no_author` 也通过）。
+### 知识沉淀
+- 新增 `topics/web/hls-cdn-单连接限速与预取.md`（三步判据 + 措施风险排序 + 反模式，跨项目可复用）；`projects/claw.md` 与 `coding/web/note-HTTP代理keep-alive与流式定界.md` 已加**过度归因修正声明**；INDEX/coding-INDEX/learning-log/CONVERSATION_LOG 同步。
+### 待办（@followup）
+- **未 commit**：`media_proxy.py` + `external_player.py` + `video_view.py` + `media_cache.py` + `settings_manager.py` + `app_config.json` + `ikanpp.json` + 两个测试文件，与工作区大量并行改动混在一起，提交方案待用户确认。
+- **待用户在 GUI 实测 ikanpp**：30s 缓冲是否足以扛住带宽缺口；若仍卡，再手动开 `hls_prefetch.enabled`（先确认不触发风控）。
+- `media_tuner.py` 的死代码自适应链路：接线（需真实缓冲事件源）或删除，二选一。
+- `app.py` 仍在为未使用的 `VlcPlayer` 预热 libVLC（启动期资源浪费），可另开任务清理。
+
+## 视频播放卡顿定位 + media_proxy keep-alive/首字节优化（2026-09-26，未 commit，定向 63 passed / 全量 682 passed）
+> **注意：本节根因判断已被 09-27 的实测推翻，见文件开头。下列两条为真实存在并已修复的通用缺陷。**
+### 关键纠偏（先做这一步，否则全白工）
+- 真实播放链路：`gui/pages/reader/video_view.py:1417` `_play()` → `external_player.open_with_player()`（HLS 强制本地代理）→ `framework/media_proxy.py` `/s/<token>` → 外部 VLC。
+- **`framework/vlc_player.py` 的 `VlcPlayer` 从未被实例化**（`app.py:386/391` 仅 warmup/shutdown libVLC）→ 最初「调 VlcPlayer 参数」方向作废，其测试文件已删。
+- `external_player.py:164-179` 已有 HLS≥5000ms / 代理≥8000ms / `--no-drop-late-frames`，无需再调。
+### 通用缺陷（已修；**非** ikanpp 病根因）
+1. 虽 `protocol_version="HTTP/1.1"`，但清单/分片/缓存/本地文件响应**逐个发 `Connection: close`** → 播放器逐段拉流/拖动逐个 Range 每次重握手 + 代理新建服务线程。
+2. 为嗅探 HLS 而 `resp.raw.read(65536)` 预读 → `BufferedReader.read(n)` **凑满 n 或 EOF 才返回** → 每个分片首字节延后一整个 64KB 到达时间（慢 CDN 即肉眼可见起播延迟）。
+### 改动（framework/media_proxy.py，+105/-30）
+- 新增 `_SNIFF_BYTES=16`、`_MEDIA_HDRS`、模块级 `_send_stream_headers(handler, resp, override_len=None)` 与 `_frame(chunk, chunked)`。
+- **去掉 6 处 `Connection: close`**，同时保证每响应定界：有 Content-Length 原样透传 / 上游 chunked 由代理重新分帧（urllib3 已解码）/ 都无才 `close_connection=True`。
+- 提前断流（声明长度没写满）→ `close_connection=True`；客户端断连（BrokenPipe/Reset）→ 同。
+- 覆写 `_ProxyHandler.send_error` 先置 `close_connection=True`（半截流后再发错误头会与已发字节错位）。
+- **gzip 分支长度错位（keep-alive 引入的新隐患）**：`resp.content` 是解压后字节、上游 Content-Length 是压缩态（8192 vs 44）→ `override_len=len(first)` 覆盖（`_forward_media` 与 `_serve_cache` 两处）。
+- 上游请求数/并发/重试/限速**零改动** → 对源站请求速率不变，反爬约束不受影响（已 diff 核对：新增行无任何 `_fetch_upstream`/session/并发改动）。
+### 测试
+- 新增 `tests/test_media_proxy_stream_tuning.py` **13 例**（假上游 ThreadingHTTPServer + 真实 MediaProxy，缓存关闭、不触外网；`_CountingConn` 记 TCP 连接数）：清单/分片复用单连接、chunked 终止与复用、截断→`IncompleteRead`、慢速分片首字节 <2s、gzip 长度、本地文件 200/206 keep-alive、416。
+- RED→GREEN 全程留痕；gzip 用例经临时回退验证确实 RED（`assert '44' == '8192'`）。
+- 修过 3 个**我自己写错的测试**：①清单重写后分片是 `/s/<token>` 不再以 `.ts` 结尾，不能按后缀过滤；②慢速用例用 `r.read(8192)` 会凑满 8192 与上游 8KB 后挂住死锁 → 改 `read1(1024)`；③截断用例原期望「同连接继续可用」，但正确行为是代理关连接 → 改断言 `IncompleteRead`（它本身就是「已关连接」的证据）。
+- 定向 7 文件 **63 passed**；`-k "proxy or media or player or cache or external or download"` **175 passed**。
+- 全量 `--ignore=test_comic_scroll_anchor.py --ignore=test_comic_view_referer.py`：**682 passed, 1 failed**（`test_card_layout_qss.py::test_workcard_no_author` Qt `SystemError`）。**git stash 基线对照：基线同样失败且多一个 `test_workcard_no_update`** → 预存 Qt flaky，与本次无关。
+### 踩坑（工具/方法）
+- **PowerShell 管道会把已结束的 pytest 挂住**：`| Out-File | Select-String` 出现「900s 超时无输出」而 pytest 实际 90s 已跑完。改用 `Start-Process -RedirectStandardOutput` 后台跑 + 轮询文件；`while (-not $p.HasExited)` 会因属性缓存自旋，必须用 `Get-Process -Id` 轮询。
+- 一次误判：`test_app_background.py` 在大选中偶发失败 → 连续 3 次重跑全绿，确认是共享文件 5s 轮询抖动而非回归。
+### 知识沉淀
+- 新增 `coding/web/note-HTTP代理keep-alive与流式定界.md`（跨项目可复用）+ coding/INDEX；`projects/claw.md` 追加本次案例；learning-log + CONVERSATION_LOG。
+### 待办（@followup）
+- **未 commit**：`framework/media_proxy.py` + `tests/test_media_proxy_stream_tuning.py` 与工作区大量并行改动混在一起，提交方案待用户确认。
+- 待用户在 GUI 实测播放是否真的不再卡（代理层理论成立，真实 CDN 效果需人眼确认）。
+- `app.py` 仍在为未使用的 `VlcPlayer` 预热 libVLC（启动期资源浪费），可另开任务清理。
+
+## ikanpp 搜索全量改造：entity-search(1条) → search-parallel SSE(25源/300+条)（2026-09-25，未 commit，663 全绿）
+### 根因（用户报告搜索只有 1 条）
+- ikanpp 站内真实搜索是 `POST /api/search-parallel`（并行聚合 25 个 MacCMS 采集源的搜索结果），返回 **text/event-stream**（SSE）；原实现用 `/api/entity-search`（TMDB 单实体，恒 1 条）。
+- SSE 响应是**非标准拆块流**：超大 JSON 事件被服务器按 200~800B 切成多物理行，仅首行带 `data:` 前缀，续行是裸 UTF-8 片段（多字节中文可能截断跨行）→ 逐行/join('\n') 解析会丢数据，必须「空行切事件块 → 仅首行带前缀则块内 join('')」。
+- 无论什么 Accept 头，该接口恒返回 text/event-stream，无法切 JSON → 框架必须支持 SSE。
+### 改动摘要
+- **`framework/http.py`**：新增 `post_text(url, json_body, ...)`（POST JSON 返回原文文本，复用 _run_with_proxy_switch/反爬/重试逻辑）。
+- **`framework/search.py`**：
+  - `_search_api` 支持 `cfg["sse"]=true` + `cfg["sse_field"]`：POST 拿 `post_text` 原文 → `_parse_sse_items` 合并所有事件的 sse_field 数组 → 走原有 item_fields → SearchResult。
+  - `_parse_sse_items`（静态方法）重写为事件块级解析（兼容标准流与拆块流，见上）。
+  - **顺带修**原 POST 非 SSE 分支 bug：POST 后无条件调 `get_json(abs_url)` 而 `abs_url` 在 POST 分支未定义 → 现在 POST 分支直接以 resp 作为 items。
+- **`sources/ikanpp.json`**：
+  - search 改 `POST /api/search-parallel` + `sse:true` + `sse_field:"videos"` + body 内嵌 **25 源数组**（巨量/光速/暴风/无尽/最大/极速/新浪/电影天堂/魔都/360/1080JSON/海豚/量子/非凡/虎牙/如意/金鹰/优酷/速博/iKun/乐子/红牛/鲸鱼/魔都影视/魔都动漫，含 baseUrl/searchPath/detailPath/priority，从浏览器真实请求捕获）。
+  - item_fields：title=vod_name、url=`/title/{vod_id}?title={vod_name}&source={source}`、cover=vod_pic、author=vod_area、update=vod_remarks。
+  - detail body `"source"` 由 `{}` 改 `"{source}"`（**重要**：搜索结果 detail 必须带源，空 {} 只能 heal 到部分 id；source 字符串/完整对象均可）。
+- **`tests/test_ikanpp.py`**：FakeHttp 加 `post_text`（模拟拆块流 SSE，800B 物理行含跨多字节截断）；`_BROWSE/_DETAIL` 不变；细节：items 加 `source` 字段、url 断言带 `&source=`、detail body source 断言字符串。新增 `test_search_parallel_sse_aggregates_sources`（2 事件 4 条 → 同 URL 去重 3 条）与 `test_search_parallel_posts_query_and_sources`（body query/page/sources=25）。
+### 验证
+- ikanpp 单测 8 passed；全量 pytest `--ignore=tests/test_comic_scroll_anchor.py` **663 passed, 1 warning**（50.9s）。
+- 真实验证（避免限频：请求间隔 ≥15s）：搜索「战狼」→ **358 条、358 唯一 URL**（~7s）；top 结果 detail → title「战狼之父亲归…」+ 分集 m3u8 直链 `https://v4.zuidazym3u8.com/.../index.m3u8` 全链路通。
+- **限频经验**：ikanpp 短连发会被 500 反爬（调试时初判 detail 全挂，实为限频）；单请求实测 200。调试被误导 ~5 轮，宜先间隔再重测。
+### 知识沉淀
+- projects/claw.md 已更新 ikanpp 案例；topics/web/claw-source-authoring.md 新增「SSE 搜索接口（拆块流）写法」小节。
+### 待办（@followup）
+- **未 commit**：本会话改动（http.py post_text + search.py SSE + ikanpp.json + test_ikanpp.py）与先行 ikanpp 制源改动及大量并行改动（media_proxy/media_cache/adblock/settings_manager/source_editor/kanav/pornhub 等）混在同一工作区，提交方案待用户确认。
+
+## ikanpp 源制源完成（2026-09-25，未 commit，验证全绿）
+### 改动摘要
+- **框架改动 (a) `_fetch_detail_api`（content.py）**：bvid 只从 URL path 末段取（urlsplit 剥 query、BV 优先）；URL query 全并入占位符 `_ph` → POST body/params、GET url/params 的 `{title}` 等可注入（仅此一源用，向后兼容）。
+- **框架改动 (b) `fetch_video_episode`（content.py）**：新增 `_looks_like_direct_media`，无 `api_endpoints.episode` 时对 `.m3u8/.mpd/.mp4/.flv/.webm/.mkv/.mov/.ts/.m4a` 直链原样返回，不走 HTML/API 解析。
+- **`sources/ikanpp.json`（新）**：6 分类 browse API 发现、entity-search 搜索（URL `/title/{id}?title={title}`）、POST /api/detail（body `{"id","source":{},"title"}` + 裸键 field_extractors + chapters `{items:"episodes",url_template:"{url}"}` 直出 CDN m3u8）、media hls、selfcheck off。
+- **`tests/test_ikanpp.py`（新）7 例**：配置形态/发现 URL 模板/搜索/详情 title 注入/直链 passthrough/_looks_like_direct_media。
+### 验证
+- 在线 probe（Temp 目录跑，规避 http.py 遮蔽）：发现 36/页 → fetch_detail 正确命中（title 注入）→ m3u8 passthrough → 搜索「生化危机」8 集全通。
+- 全量 pytest `--ignore=tests/test_comic_scroll_anchor.py` **662 passed**（该文件 Qt access violation 为既有间歇）。
+### 知识沉淀
+- projects/claw.md + topics/web/claw-source-authoring.md（ikanpp 案例 + 裸键/query 注入/直链 passthrough 写法）+ INDEX + learning-log + CONVERSATION_LOG。
+### 待办（@followup）
+- **未 commit**：本次改动（content.py 两处 + ikanpp.json + test）与 prior 并行改动（media_proxy/adblock/settings_manager/source_editor/kanav/json/test_kanav/hanime1/pornhub related、media_cache.py、多个新 test）混在一工作区，提交需与用户核对归属。
+
+## 视频磁盘缓存 + 代理看门狗（2026-09-20，未 commit）
+### 改动摘要
+- **Part 2 磁盘缓存**：新增 `framework/media_cache.py`（`MediaCache`：mp4 `<key>.mp4`、
+  HLS `<key>/` 目录 + `playlist.m3u8`，index.json LRU 默认 3 部 / 2GB，`.part` 原子写+
+  `_startup_reclaim`；`key = sha1(strip_signed_params(url))`）；`media_proxy` 集成
+  `/c/<key>/<quote(完整上游URL)>` 路由、缓存命中本地 Range serve、miss 回源 tee 落盘
+  （仅"从头 Range"建 tee），`_rewrite_m3u8`：KEY/SESSION-KEY→`/s/`，其余→`/c/`。
+- **Part 1 看门狗**：`_IDLE_TIMEOUT=600.0` + `_WATCH_INTERVAL=10.0`（模块常量，测试可
+  monkeypatch）；`self._active` 在 do_GET try/finally 里 `_begin/_end`，`stop()` 活动期
+  失效；流式循环 `_touch()` 续命。
+- `settings_manager` 加 `video_cache` 默认块（enabled=True / max_videos=3 / max_bytes_mb=2048），
+  docstring 更新为六块。
+### 测试结果
+- 新增 `tests/test_media_cache.py` 7 例（本地 ThreadingHTTPServer 假 CDN + 注入实例缓存，
+  不碰 MediaProxy.instance()）：mp4 缓存+本地 Range 不回源、HLS 分片落盘复用、签名参数
+  key 稳定、LRU 保留三部、看门狗空闲回收/活动保护/_touch 续命、无 .part 残留。
+- 定向 3 文件 **12 passed**（4.5s）。未 commit（用户未确认）。
+### 待办（@followup）
+- `#EXT-X-PRELOAD-HINT` 走 /c/（原计划 /s/）待定；嵌套变体 m3u8 经 /c/ 端到端未专门测；
+  commit 待确认。
+
 ## m3u8 广告过滤加强（2026-09-17，7 任务计划已收口）
 ### 改动摘要（六步 commit，全部已推送 master）
 1. **default_on**（`241717d`）：`AdblockEngine.configure(source, default_on=False)` +

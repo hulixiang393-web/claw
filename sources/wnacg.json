@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://www.wnacg.com/",
     "description": "绅士漫画 - 汉化本子/成人漫画源（MeiuPic CMS）",
     "lang": "zh-CN",

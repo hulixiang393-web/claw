@@ -128,31 +128,33 @@
       }
     },
     "content": {
-      "page": {
-        "list": {
-          "root_selector": {
-            "css": ".sp-chapter-grid .sp-chapter-item"
-          },
-          "fields": {
-            "title": {
-              "css": "a.sp-chapter-item",
-              "attr": "title"
+        "page": {
+          "list": {
+            "root_selector": {
+              "css": ".sp-chapter-grid a.sp-chapter-item"
             },
-            "url": {
-              "css": "a.sp-chapter-item",
-              "attr": "href"
+            "fields": {
+              "title": {
+                "xpath": ".",
+                "attr": "title"
+              },
+              "url": {
+                "xpath": ".",
+                "attr": "href"
+              }
             }
-          }
-        },
+          },
         "body": {
           "render": "playwright",
           "render_config": {
             "wait_for": "canvas",
             "wait_until": "domcontentloaded",
-            "extra_delay_ms": 800,
-            "scroll_to_bottom": true,
-            "extract_mode": "canvas",
-            "page_container_selector": "div.cropped"
+                "extra_delay_ms": 1800,
+                "scroll_to_bottom": true,
+                "extract_mode": "canvas",
+                "page_container_selector": "div.cropped",
+                "scroll_stale_rounds": 12,
+                "min_images": 3
           },
           "root_selector": {
             "css": ".comicpage .cropped"

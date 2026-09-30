@@ -245,6 +245,15 @@ def test_fetch_detail_title_tolerates_no_author():
     assert d.title == "某动画"
 
 
+def test_fetch_detail_title_no_prefix_plan_page():
+    # Fanbox 支援计划页格式：h1 无「标题：」前缀，尾部是 #标签/日期/价格
+    c = _content({_DETAIL_URL: _play_snippet(
+        title="某插画/系列Kei [支援計画 ]2026年8月30日 22:00 - 1,000日元#動画 #GIF #支援計画"
+    )})
+    d = c.fetch_detail(_source(), _DETAIL_URL)
+    assert d.title == "某插画/系列Kei"
+
+
 def test_fetch_video_episode_decrypts_maccms():
     c = _content({_DETAIL_URL: _play_snippet()})
     # _fetch_play_url_once：走 source_switch(play_regex) 分支 + decryption 解密，

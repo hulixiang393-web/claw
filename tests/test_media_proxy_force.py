@@ -1,0 +1,686 @@
+# -*- coding: utf-8 -*-
+"""media_proxy force_proxy：强制走系统代理、跳过直连探测。
+
+默认行为：直连优先，失败后按 host 记忆并回退系统代理。force_proxy=True
+始终只走系统代理；_PROXY_ONLY=True 保留为可测试的兼容开关。
+
+覆盖：
+- _fetch_upstream 单元：默认直连优先、失败记忆与代理回退、TTL 跳过直连
+- force_proxy / _PROXY_ONLY：只走代理、不读写直连失败记忆
+- 写入点：build_url / proxy_url_for / _register_cache_ctx 存四元组
+- 端到端：默认直连，force 请求走代理；老三元组 token 兼容
+"""
+import io
+import re
+import threading
+
+import requests
+
+import pytest
+
+import framework.media_proxy as mp
+from framework.media_proxy import MediaProxy
+
+_FORCE_M3U8 = (
+    "#EXTM3U\n"
+    "#EXT-X-VERSION:3\n"
+    "#EXT-X-TARGETDURATION:10\n"
+    "#EXTINF:10.0,\n/seg/001.ts\n"
+    "#EXTINF:10.0,\n/seg/002.ts\n"
+    "#EXT-X-ENDLIST\n"
+)
+
+
+class _FakeResp:
+    """最简上游响应：200 常量，close 幂等。"""
+
+    status_code = 200
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _RespM3U8:
+    """m3u8 播放列表响应（_forward_m3u8 走 resp.content + resp.headers.get）。"""
+
+    status_code = 200
+    headers = {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Content-Length": str(len(_FORCE_M3U8.encode())),
+    }
+    content = _FORCE_M3U8.encode()
+
+    def close(self):
+        pass
+
+
+_FORCE_HLS = (
+    "#EXTM3U\n"
+    "#EXT-X-KEY:METHOD=AES-128,URI=\"/keys/001.key\"\n"
+    "#EXTINF:10.0,\n/seg/001.ts\n"
+    "#EXT-X-ENDLIST\n"
+)
+
+
+class _RespHls:
+    status_code = 200
+    headers = {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Content-Length": str(len(_FORCE_HLS.encode())),
+    }
+    content = _FORCE_HLS.encode()
+
+    def close(self):
+        pass
+
+
+class _RespBytes:
+    status_code = 200
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": "3",
+    }
+    content = b"abc"
+
+    def __init__(self):
+        self.raw = io.BytesIO(self.content)
+
+    def close(self):
+        pass
+
+
+class _RespRange:
+    status_code = 206
+    headers = {
+        "Content-Type": "video/mp4",
+        "Content-Length": "3",
+        "Content-Range": "bytes 10-12/100",
+        "Accept-Ranges": "bytes",
+    }
+    content = b"abc"
+
+    def __init__(self):
+        self.raw = io.BytesIO(self.content)
+
+    def close(self):
+        pass
+
+
+class _FakeSession:
+    """记录 get 调用的假会话：可选抛异常 / 固定响应。"""
+
+    def __init__(self, log, resp=_FakeResp(), exc=None):
+        self.log = log
+        self.resp = resp
+        self.exc = exc
+
+    def get(self, *a, **k):
+        self.log.append((a, k))
+        if self.exc is not None:
+            raise self.exc
+        return self.resp
+
+
+class _OffCache:
+    """注入的关闭缓存：让代理跳过落盘/命中路径，聚焦转发行为。"""
+
+    enabled = False
+
+
+@pytest.fixture(autouse=True)
+def _clean_direct_fail():
+    with mp._DIRECT_FAIL_LOCK:
+        mp._DIRECT_FAIL.clear()
+    yield
+    with mp._DIRECT_FAIL_LOCK:
+        mp._DIRECT_FAIL.clear()
+
+
+def _install_sessions(monkeypatch, dlog, plog, *, dresp=_FakeResp(),
+                      presp=_FakeResp(), dex=None, pex=None):
+    monkeypatch.setattr(mp, "_get_direct_session",
+                        lambda: _FakeSession(dlog, dresp, dex))
+    monkeypatch.setattr(mp, "_get_session",
+                        lambda: _FakeSession(plog, presp, pex))
+
+
+# --------------------------------------------------------------------- #
+# _fetch_upstream 单元
+# --------------------------------------------------------------------- #
+def test_stream_diagnostic_records_first_byte_and_throughput(monkeypatch):
+    response = _RespBytes()
+    record = mp._record_upstream_diagnostic(
+        "https://cdn.example.com/seg/001.ts?token=secret",
+        {"Cookie": "private", "Authorization": "secret"},
+        "direct",
+        mp.time.perf_counter() - 0.05,
+        response,
+        cache_state="miss",
+        wait_ms=2.5,
+    )
+    mp._attach_upstream_diagnostic(response, record, mp.time.perf_counter() - 0.05)
+    mp._update_upstream_diagnostic(response, len(response.content), finished=True)
+    assert record["host"] == "cdn.example.com"
+    assert record["protocol"] == "hls"
+    assert record["request_kind"] == "segment"
+    assert record["cache_state"] == "miss"
+    assert record["wait_ms"] == 2.5
+    assert record["first_byte_ms"] is not None
+    assert record["throughput_bps"] > 0
+    assert "token" not in record
+    assert "secret" not in repr(record)
+
+
+def test_media_diagnostic_classifies_protocol_and_media_kind():
+    record = mp._record_upstream_diagnostic(
+        "https://cdn.example.com/movie.mp4?token=secret",
+        {}, "direct", mp.time.perf_counter(),
+    )
+    assert record["protocol"] == "mp4"
+    assert record["request_kind"] == "media"
+
+
+def test_cache_hit_diagnostic_does_not_fetch_upstream():
+    record = mp._record_cache_diagnostic(
+        "https://cdn.example.com/movie.mp4?token=secret",
+        {"Cookie": "private"}, "hit", 4.0,
+    )
+    assert record["route"] == "cache"
+    assert record["cache_state"] == "hit"
+    assert record["wait_ms"] == 4.0
+    assert record["status_code"] == 200
+
+
+def test_force_proxy_skips_direct(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4",
+                              {"Referer": "r"}, force_proxy=True)
+    assert resp.status_code == 200
+    assert dlog == []              # 不做直连探测
+    assert len(plog) == 1          # 直接系统代理会话
+    assert mp._DIRECT_FAIL == {}   # 不写失败记忆
+
+
+def test_force_proxy_no_fail_memory_even_if_direct_poisoned(monkeypatch):
+    """即使直连会话一碰就炸，force 也只走代理、不读不写 _DIRECT_FAIL。"""
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, dex=requests.ConnectionError())
+    mp._fetch_upstream("https://cdn.example.com/x.mp4", {},
+                       force_proxy=True)
+    assert dlog == []
+    assert len(plog) == 1
+    assert mp._DIRECT_FAIL == {}
+
+
+def test_default_direct_success_does_not_call_proxy(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert len(dlog) == 1
+    assert plog == []
+    assert mp._DIRECT_FAIL == {}
+
+
+@pytest.mark.parametrize("exc", [
+    requests.ConnectionError(),
+    requests.Timeout(),
+    requests.exceptions.SSLError(),
+])
+def test_default_direct_request_exception_records_failure_and_uses_proxy(
+        monkeypatch, exc):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, dex=exc)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert len(dlog) == 1
+    assert len(plog) == 1
+    assert mp._DIRECT_FAIL.get("cdn.example.com") is not None
+
+
+def test_default_direct_http_error_closes_records_and_uses_proxy(monkeypatch):
+    dlog, plog = [], []
+    direct = _FakeResp403()
+    _install_sessions(monkeypatch, dlog, plog, dresp=direct)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert direct.closed is True
+    assert len(dlog) == 1
+    assert len(plog) == 1
+    assert mp._DIRECT_FAIL.get("cdn.example.com") is not None
+
+
+def test_default_direct_http_5xx_uses_proxy(monkeypatch):
+    dlog, plog = [], []
+    direct = _FakeRespHttpError(503)
+    _install_sessions(monkeypatch, dlog, plog, dresp=direct)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert direct.closed is True
+    assert len(dlog) == 1
+    assert len(plog) == 1
+    assert mp._DIRECT_FAIL.get("cdn.example.com") is not None
+
+
+def test_direct_failure_memory_uses_normalized_hostname(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    mp._DIRECT_FAIL["cdn.example.com"] = mp.time.time()
+    resp = mp._fetch_upstream(
+        "https://user:secret@CDN.Example.com:8443/x.mp4", {}
+    )
+    assert resp.status_code == 200
+    assert dlog == []
+    assert len(plog) == 1
+    assert set(mp._DIRECT_FAIL) == {"cdn.example.com"}
+
+
+def test_direct_failure_ttl_skips_direct_and_uses_proxy(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    mp._DIRECT_FAIL["cdn.example.com"] = mp.time.time()
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert dlog == []
+    assert len(plog) == 1
+
+
+def test_proxy_only_compatibility_switch_skips_direct(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    monkeypatch.setattr(mp, "_PROXY_ONLY", True)
+    resp = mp._fetch_upstream("https://cdn.example.com/x.mp4", {})
+    assert resp.status_code == 200
+    assert dlog == []
+    assert len(plog) == 1
+    assert mp._DIRECT_FAIL == {}
+
+
+def test_force_proxy_never_falls_back_to_direct(monkeypatch):
+    """显式 force_proxy=True 的源：代理不通就报错，不悄悄走直连换出口。"""
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog,
+                      pex=requests.ConnectionError())
+    with pytest.raises(requests.RequestException):
+        mp._fetch_upstream("https://cdn.example.com/x.mp4", {},
+                           force_proxy=True)
+    assert dlog == []
+    assert len(plog) == 2
+    assert mp._DIRECT_FAIL == {}
+
+
+class _FakeRespHttpError:
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeResp403(_FakeRespHttpError):
+    def __init__(self):
+        super().__init__(403)
+
+
+# --------------------------------------------------------------------- #
+# 上游路由诊断
+# --------------------------------------------------------------------- #
+def test_route_diagnostics_records_direct_success_without_sensitive_data(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    mp._reset_upstream_route_diagnostics()
+
+    mp._fetch_upstream(
+        "https://user:secret@cdn.example.com/video/index.m3u8?token=secret",
+        {"Authorization": "Bearer secret"},
+    )
+
+    records = mp._read_upstream_route_diagnostics()
+    assert len(records) == 1
+    assert set(records[0]) == {
+        "protocol", "host", "request_kind", "route", "status",
+        "status_code", "elapsed_ms", "first_byte_ms", "throughput_bps",
+        "cache_state", "wait_ms", "failure_category",
+    }
+    assert records[0]["host"] == "cdn.example.com"
+    assert records[0]["request_kind"] == "manifest"
+    assert records[0]["route"] == "direct"
+    assert records[0]["status_code"] == 200
+    assert records[0]["failure_category"] is None
+    assert records[0]["elapsed_ms"] >= 0
+    assert records[0]["first_byte_ms"] is None
+    assert records[0]["throughput_bps"] is None
+    assert all("secret" not in repr(value) for value in records[0].values())
+
+
+def test_route_diagnostics_records_direct_failure_and_proxy_fallback(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, dex=requests.ConnectionError())
+    mp._reset_upstream_route_diagnostics()
+
+    mp._fetch_upstream("https://cdn.example.com/seg/001.ts", {})
+
+    records = mp._read_upstream_route_diagnostics()
+    assert [record["route"] for record in records] == ["direct", "proxy"]
+    assert records[0]["request_kind"] == "segment"
+    assert records[0]["status_code"] is None
+    assert records[0]["failure_category"] == "direct_connection"
+    assert records[1]["status_code"] == 200
+    assert records[1]["failure_category"] is None
+    assert records[1]["elapsed_ms"] >= 0
+    assert records[1]["first_byte_ms"] is None
+    assert records[1]["throughput_bps"] is None
+
+
+def test_route_diagnostics_preserves_proxy_http_failure_after_direct_failure(
+        monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, presp=_FakeResp403())
+    mp._reset_upstream_route_diagnostics()
+    mp._DIRECT_FAIL["cdn.example.com"] = mp.time.time()
+
+    response = mp._fetch_upstream("https://cdn.example.com/seg/001.ts", {})
+
+    assert response.status_code == 403
+    assert dlog == []
+    records = mp._read_upstream_route_diagnostics()
+    assert records[-1]["route"] == "proxy"
+    assert records[-1]["status_code"] == 403
+    assert records[-1]["failure_category"] == "proxy_http"
+    assert records[-1]["elapsed_ms"] >= 0
+    assert records[-1]["first_byte_ms"] is None
+    assert records[-1]["throughput_bps"] is None
+
+
+def test_route_diagnostics_classifies_request_kinds():
+    assert mp._classify_upstream_request_kind("https://x/a.m3u8", {}) == "manifest"
+    assert mp._classify_upstream_request_kind("https://x/key.bin", {"Accept": "*/*"}) == "key"
+    assert mp._classify_upstream_request_kind("https://x/movie.mp4", {}) == "media"
+    assert mp._classify_upstream_request_kind("https://x/segment.ts", {}) == "segment"
+    assert mp._classify_upstream_request_kind("https://x/video", {"Range": "bytes=0-1"}) == "range"
+    assert mp._classify_upstream_request_kind("https://x/video", {"range": "bytes=0-1"}) == "range"
+
+
+def test_route_diagnostics_is_bounded_and_thread_safe(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog)
+    mp._reset_upstream_route_diagnostics()
+    monkeypatch.setattr(mp, "_UPSTREAM_DIAGNOSTICS_MAX", 2)
+
+    def fetch():
+        mp._fetch_upstream("https://cdn.example.com/a.mp4", {})
+
+    threads = [threading.Thread(target=fetch) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    records = mp._read_upstream_route_diagnostics()
+    assert len(records) == 2
+    mp._reset_upstream_route_diagnostics()
+    assert mp._read_upstream_route_diagnostics() == []
+
+
+def test_route_diagnostics_records_forced_proxy_failure(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, pex=requests.Timeout())
+    mp._reset_upstream_route_diagnostics()
+
+    with pytest.raises(requests.RequestException):
+        mp._fetch_upstream("https://cdn.example.com/key", {}, force_proxy=True)
+
+    records = mp._read_upstream_route_diagnostics()
+    assert len(records) == 1
+    assert records[0]["route"] == "proxy"
+    assert records[0]["request_kind"] == "key"
+    assert records[0]["failure_category"] == "proxy_timeout"
+
+
+# --------------------------------------------------------------------- #
+# 写入点：token / cache_ctx 四元组
+# --------------------------------------------------------------------- #
+def test_build_url_registers_force_proxy():
+    proxy = MediaProxy(cache=_OffCache())
+    try:
+        local = proxy.build_url("https://cdn.example.com/x.mp4",
+                                {"Referer": "r"}, force_proxy=True)
+        token = local.rsplit("/", 1)[-1]
+        entry = proxy._tokens[token]
+        assert entry[0] == "https://cdn.example.com/x.mp4"
+        assert entry[1] == {"Referer": "r"}
+        assert entry[2] is None
+        assert entry[3] is True      # 四元组最后一位带上 force_proxy
+    finally:
+        proxy.stop()
+
+
+def test_build_url_default_force_proxy_false():
+    proxy = MediaProxy(cache=_OffCache())
+    try:
+        local = proxy.build_url("https://cdn.example.com/x.mp4", {"Referer": "r"})
+        token = local.rsplit("/", 1)[-1]
+        assert proxy._tokens[token][3] is False  # 默认 False，向后兼容
+    finally:
+        proxy.stop()
+
+
+def test_proxy_url_for_forwards_force_proxy(monkeypatch):
+    calls = []
+
+    class _FakeProxy:
+        def build_url(self, url, headers=None, ad_block=None, force_proxy=False):
+            calls.append((url, headers, ad_block, force_proxy))
+            return "http://127.0.0.1:0/s/x"
+
+    monkeypatch.setattr(mp.MediaProxy, "instance", classmethod(lambda cls: _FakeProxy()))
+    out = mp.proxy_url_for("https://cdn.example.com/x.mp4", {"Referer": "r"},
+                           ad_block={"enabled": True}, force_proxy=True)
+    assert calls == [(
+        "https://cdn.example.com/x.mp4", {"Referer": "r"},
+        {"enabled": True}, True,
+    )]
+    assert out == "http://127.0.0.1:0/s/x"
+
+
+def test_proxy_url_for_no_headers_no_proxy(monkeypatch):
+    called = []
+
+    class _FakeProxy:
+        def build_url(self, *a, **k):
+            called.append(a)
+            return "x"
+
+    monkeypatch.setattr(mp.MediaProxy, "instance", classmethod(lambda cls: _FakeProxy()))
+    out = mp.proxy_url_for("https://cdn.example.com/x.mp4", None, force_proxy=True)
+    assert out == "https://cdn.example.com/x.mp4"  # 无头 → 原 URL，不建代理
+    assert called == []
+
+
+def test_register_cache_ctx_stores_force_proxy():
+    proxy = MediaProxy(cache=_OffCache())
+    try:
+        key = "k" * 40
+        proxy._register_cache_ctx(key, "http://up.example/hls/i.m3u8",
+                                  {"Referer": "r"}, {"enabled": False},
+                                  force_proxy=True)
+        with proxy._lock:
+            ctx = proxy._cache_ctx[key]
+        assert ctx[:3] == ("http://up.example/hls/i.m3u8",
+                           {"Referer": "r"}, {"enabled": False})
+        assert ctx[3] is True  # /c/<key> 回落上游沿用 force_proxy
+    finally:
+        proxy.stop()
+
+
+# --------------------------------------------------------------------- #
+# 端到端：真实本地代理服务器 + 假上游会话
+# --------------------------------------------------------------------- #
+@pytest.fixture
+def force_e2e(monkeypatch):
+    """MediaProxy + 假上游会话（记录直连/代理各被调用次数）。"""
+    dlog, plog = [], []
+    monkeypatch.setattr(mp, "_get_direct_session",
+                        lambda: _FakeSession(dlog, _RespM3U8()))
+    monkeypatch.setattr(mp, "_get_session",
+                        lambda: _FakeSession(plog, _RespM3U8()))
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    yield proxy, dlog, plog
+    proxy.stop()
+
+
+def test_e2e_force_proxy_request_uses_proxy_only(force_e2e):
+    proxy, dlog, plog = force_e2e
+    local = proxy.build_url("http://up.example/hls/i.m3u8",
+                            {"Referer": "https://fake/"}, force_proxy=True)
+    r = requests.get(local, timeout=10)
+    assert r.status_code == 200
+    assert "#EXTM3U" in r.text
+    assert dlog == []                 # 未做任何直连探测
+    assert len(plog) == 1             # 上游取回走系统代理
+    assert mp._DIRECT_FAIL == {}      # 不写失败记忆
+    # 重写后的内部分片 URL 也是 /s/<token>，token 同样带 force_proxy
+    for t in re.findall(r"/s/([0-9a-f]+)", r.text):
+        entry = proxy._tokens[t]
+        assert len(entry) == 4 and entry[3] is True
+
+
+def test_force_proxy_connection_failure_is_explicit_502(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog,
+                       pex=requests.ConnectionError("proxy down"))
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    try:
+        local = proxy.build_url("http://up.example/video.mp4",
+                                {"Referer": "https://fake/"}, force_proxy=True)
+        response = requests.get(local, timeout=10)
+        assert response.status_code == 502
+        assert response.content
+        assert dlog == []
+        assert len(plog) == 2
+    finally:
+        proxy.stop()
+
+
+@pytest.mark.parametrize("status_code", [403, 500])
+def test_force_proxy_upstream_http_error_is_explicit_at_local_s_url(
+        monkeypatch, status_code):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog,
+                      presp=_FakeRespHttpError(status_code))
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    try:
+        local = proxy.build_url("http://up.example/video.mp4",
+                                {"Referer": "https://fake/"}, force_proxy=True)
+        response = requests.get(local, timeout=10)
+        assert response.status_code == status_code
+        assert response.status_code != 200
+        assert response.content
+        assert dlog == []
+        assert len(plog) == 1
+    finally:
+        proxy.stop()
+
+
+def test_force_proxy_hls_children_keep_route_and_diagnostics(monkeypatch):
+    dlog, plog = [], []
+
+    def _proxy_get(target, **kwargs):
+        plog.append(((target,), kwargs))
+        return _RespHls() if target.endswith("index.m3u8") else _RespBytes()
+
+    monkeypatch.setattr(mp, "_get_direct_session",
+                        lambda: _FakeSession(dlog, _RespHls()))
+    monkeypatch.setattr(mp, "_get_session", lambda: type(
+        "_Session", (), {"get": staticmethod(_proxy_get)})())
+    mp._reset_upstream_route_diagnostics()
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    try:
+        local = proxy.build_url("http://up.example/hls/index.m3u8",
+                                {"Referer": "https://fake/"}, force_proxy=True)
+        manifest = requests.get(local, timeout=10)
+        assert manifest.status_code == 200
+        child_urls = re.findall(r"https?://127\.0\.0\.1:\d+/s/[0-9a-f]+",
+                                manifest.text)
+        assert len(child_urls) == 2
+        for child in child_urls:
+            assert requests.get(child, timeout=10).status_code == 200
+        records = mp._read_upstream_route_diagnostics()
+        assert [record["request_kind"] for record in records] == [
+            "manifest", "key", "segment",
+        ]
+        assert all(record["route"] == "proxy" for record in records)
+        assert all(record["status_code"] == 200 for record in records)
+        assert all(entry[3] is True for entry in proxy._tokens.values())
+    finally:
+        proxy.stop()
+
+
+def test_force_proxy_mp4_range_preserves_header_and_route(monkeypatch):
+    dlog, plog = [], []
+    _install_sessions(monkeypatch, dlog, plog, presp=_RespRange())
+    mp._reset_upstream_route_diagnostics()
+    proxy = MediaProxy(cache=_OffCache())
+    proxy._ensure_server()
+    try:
+        local = proxy.build_url("http://up.example/video.mp4",
+                                {"Referer": "https://fake/"}, force_proxy=True)
+        response = requests.get(local, headers={"Range": "bytes=10-12"}, timeout=10)
+        assert response.status_code == 206
+        assert response.content == b"abc"
+        assert plog[0][1]["headers"]["Range"] == "bytes=10-12"
+        records = mp._read_upstream_route_diagnostics()
+        assert records == [{
+            "protocol": "mp4",
+            "host": "up.example",
+            "request_kind": "range",
+            "route": "proxy",
+            "status": 206,
+            "status_code": 206,
+            "elapsed_ms": records[0]["elapsed_ms"],
+            "first_byte_ms": records[0]["first_byte_ms"],
+            "throughput_bps": records[0]["throughput_bps"],
+            "cache_state": "miss",
+            "wait_ms": None,
+            "failure_category": None,
+        }]
+    finally:
+        proxy.stop()
+
+
+def test_e2e_default_request_direct_first(force_e2e):
+    proxy, dlog, plog = force_e2e
+    local = proxy.build_url("http://up.example/hls/i.m3u8",
+                            {"Referer": "https://fake/"})
+    r = requests.get(local, timeout=10)
+    assert r.status_code == 200
+    assert len(dlog) == 1
+    assert plog == []
+
+
+def test_e2e_legacy_3tuple_token_compat(force_e2e):
+    """老三元组 token 兼容解包，force_proxy 默认 False，按默认直连。"""
+    proxy, dlog, plog = force_e2e
+    token = "a" * 32
+    with proxy._lock:
+        proxy._tokens[token] = ("http://up.example/hls/i.m3u8",
+                                {"Referer": "f"}, None)
+    port = proxy._server.server_port
+    r = requests.get(f"http://127.0.0.1:{port}/s/{token}", timeout=10)
+    assert r.status_code == 200
+    assert len(dlog) == 1   # 三元组 → _tuple_force_proxy 为 False → 直连优先
+    assert plog == []
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v"]))

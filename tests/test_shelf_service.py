@@ -206,6 +206,28 @@ def test_favorite_crud_proxy(base: Path):
     assert not svc.favorite_has("http://x/1")
 
 
+def test_clear_all_favorites_excludes_locked_folders(base: Path):
+    store = LibraryStore(base / "lib.json")
+    store.add("src", "http://x/open", "公开", folder="公开")
+    store.add("src", "http://x/locked", "加密", folder="加密")
+    store.set_folder_lock("加密", True, pw="hash", salt="salt")
+    svc = ShelfService(output_dir=base / "dl", data_dir=base / "data", library_store=store)
+
+    assert svc.clear_all_favorites(exclude_folders={"加密"}) == 1
+    assert not store.has("http://x/open")
+    assert store.has("http://x/locked")
+
+
+def test_delete_folder_moves_favorites_to_uncategorized(base: Path):
+    store = LibraryStore(base / "lib.json")
+    store.add("src", "http://x/1", "书", folder="待读")
+    svc = ShelfService(output_dir=base / "dl", data_dir=base / "data", library_store=store)
+
+    assert svc.delete_folder("待读")
+    assert store.folder_items("待读") == []
+    assert store.folder_items("")[0]["url"] == "http://x/1"
+
+
 def test_resume_title_merged(base: Path):
     class FakeProgress:
         def resume(self, key):

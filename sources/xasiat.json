@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://www.xasiat.com/",
     "description": "Xasiat - 亚洲成人直播录制视频站（Stripchat/OnlyFans等平台）。发现列表走 /latest-updates/{page}/ 等真实视频列表（官方 4000+ 页）；搜索走 /search/{keyword}/ 路径式（无分页，关键词空格→\"-\"、原连字符→\"--\"，无结果返回 404 视为空）。播放页内嵌独立播放器（embed 页含 JS 配置含视频直链 mp4，HTTP 链式提取，无需 Playwright）。",
     "lang": "en",

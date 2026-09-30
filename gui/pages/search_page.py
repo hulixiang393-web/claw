@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QInputDialog,
     QLineEdit,
     QMenu,
     QPushButton,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from framework.search import Search, SearchResult
+from framework.events import EVENT_SOURCE_VISIBILITY_CHANGED
 from framework.source_manager import SourceManager
 
 from gui.components import WorkCard
@@ -71,6 +73,24 @@ CHALLENGE_MARKERS = (
 # 一屏铺满全屏）；源少时菜单随内容自适应，不含滚动条。仅限高，不改变
 # _NonClosingMenu「点行不收起、点外部/Escape 收起」行为。
 SRC_MENU_SCROLL_LIMIT = 400
+
+# 来源筛选 chips 样式（QPushButton checkable，选中 = 正在只看该源）
+SOURCE_CHIP_SS = (
+    "QPushButton { background: palette(midlight); border: none;"
+    " border-radius: 10px; padding: 3px 10px; font-size: 11px;"
+    " color: palette(text); }"
+    "QPushButton:hover { background: palette(light); }"
+    "QPushButton:checked { background: palette(highlight);"
+    " color: palette(highlightedText); font-weight: bold; }"
+)
+SOURCE_ALL_CHIP_SS = (
+    "QPushButton { background: palette(base); border: 1px solid palette(mid);"
+    " border-radius: 10px; padding: 3px 10px; font-size: 11px;"
+    " color: palette(text); }"
+    "QPushButton:checked { background: palette(highlight);"
+    " color: palette(highlightedText); font-weight: bold;"
+    " border: 1px solid palette(highlight); }"
+)
 
 
 class _SearchSignals(QObject):
@@ -206,17 +226,23 @@ class SearchPage(BasePage):
     search_clicked = Signal(str)  # 搜索触发（首页接）
     open_requested = Signal(str, str, str)  # (source_id, url, content_type) 打开作品
     # 批量操作（ui-search.md #8）：加入书架 / 加入下载
-    add_to_shelf_requested = Signal(object)   # list[SearchResult]
+    add_to_shelf_requested = Signal(object, str)  # list[SearchResult], folder
     batch_download_requested = Signal(object)  # list[SearchResult]
 
-    def __init__(self, source_manager: SourceManager, search: Search, content=None, parent=None):
+    def __init__(self, source_manager: SourceManager, search: Search, content=None,
+                 parent=None, event_bus=None, shelf_folder_provider=None):
         super().__init__(parent)
         self._manager = source_manager
         self._search = search
         self._content = content  # 可选：详情封面回填（cover_backfill 源）用
+        self._bus = event_bus
+        self._shelf_folder_provider = shelf_folder_provider or (lambda: [])
         self._results = []
         self._filter_source = ""
         self._saved_unfiltered_shown = None  # 进入来源筛选前的渲染进度（清除筛选后恢复）
+        self._source_chip_btns: dict = {}  # source_id → source chip QPushButton（结果来源筛选行）
+        self._source_chip_row = None  # 来源筛选 chips 行 widget（构建后赋值）
+        self._chip_ready = False  # 来源筛选行已构建（防御早于 _build 的调用）
         self._status_chips: dict = {}  # source_id → (QLabel, QLabel状态) 或组合控件
         self._pending_count = 0  # 未完成搜索的源数
         self._work_count = 0  # 当前网格卡片计数（追加/重建共用）
@@ -252,6 +278,7 @@ class SearchPage(BasePage):
         self.type_combo.addItem("全部类型", "")
         for t in ("novel", "comic", "video"):
             self.type_combo.addItem(t, t)
+        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         self._all_selected: bool = True
         self._selected_sources: set = set()
         self.src_btn = QPushButton("源：全部")
@@ -307,6 +334,24 @@ class SearchPage(BasePage):
         self.filter_bar_widget.setVisible(False)
         layout.addWidget(self.filter_bar_widget)
 
+        # ---- 来源筛选 chips 行（结果完成后聚合可筛选来源）----
+        self._source_chip_row = QWidget()
+        self._source_chip_row.setVisible(False)
+        self._source_chip_hbox = QHBoxLayout(self._source_chip_row)
+        self._source_chip_hbox.setContentsMargins(0, 0, 0, 0)
+        self._source_chip_hbox.setSpacing(6)
+        self._all_chip_btn = QPushButton("全部")
+        self._all_chip_btn.setCheckable(True)
+        self._all_chip_btn.setChecked(True)
+        self._all_chip_btn.setStyleSheet(SOURCE_ALL_CHIP_SS)
+        self._all_chip_btn.setCursor(Qt.PointingHandCursor)
+        self._all_chip_btn.setToolTip("显示所有来源的结果")
+        self._all_chip_btn.clicked.connect(self._clear_filter)
+        self._source_chip_hbox.addWidget(self._all_chip_btn)
+        self._source_chip_hbox.addStretch(1)
+        self._chip_ready = True
+        layout.addWidget(self._source_chip_row)
+
         # ---- 搜索状态 ----
         self.status_label = QLabel("")
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -317,6 +362,9 @@ class SearchPage(BasePage):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 竖直滚动条常显：scrollbar 出现/消失 → 视口宽度变化 → 列数跳变（固定 4 列
+        # 只在整除边界免疫，±15px 会触发列宽重排）→ 卡片抖动。常显宽度恒定。
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         layout.addWidget(self.scroll, stretch=1)
 
         self.grid_container = QWidget()
@@ -355,18 +403,45 @@ class SearchPage(BasePage):
         bb.addWidget(self.batch_clear_btn)
         layout.addWidget(self.batch_bar)
 
+        if self._bus is not None:
+            self._bus.subscribe(self._on_visibility_changed)
+
+    def _on_visibility_changed(self, event) -> None:
+        if getattr(event, "type", "") == EVENT_SOURCE_VISIBILITY_CHANGED:
+            if not self.keyword_input.text().strip():
+                self._clear_results_for_source_change()
+                self._reset_source_chips()
+            self.refresh()
+
     def fill_keyword(self, keyword: str) -> None:
         """外部预填关键词并搜索。"""
         self.keyword_input.setText(keyword)
         self._on_search()
 
+    def _sources_for_current_type(self):
+        selected_type = self.type_combo.currentData() or ""
+        sources = self._manager.enabled_sources()
+        if selected_type:
+            sources = [s for s in sources if s.content_type == selected_type]
+        return sources
+
+    def _on_type_changed(self, _index: int) -> None:
+        visible_ids = {s.source_id for s in self._sources_for_current_type()}
+        self._selected_sources &= visible_ids
+        if self._all_selected and not visible_ids:
+            self._all_selected = False
+        self._rebuild_sources_menu()
+
     def _on_search(self) -> None:
         keyword = self.keyword_input.text().strip()
         if not keyword:
             return
+        self._search_epoch += 1
+        epoch = self._search_epoch
         self._filter_source = ""
         self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(False)
+        self._reset_source_chips()
         self.status_label.setText("搜索中...")
         self._clear_grid()
         self._results = []
@@ -380,19 +455,17 @@ class SearchPage(BasePage):
         self._selected = {}
         self.batch_bar.setVisible(False)
         self.select_all_check.setChecked(False)
+        self._clear_status_bar()
 
         # 选择目标源
-        selected_type = self.type_combo.currentData()
+        available = self._sources_for_current_type()
         if self._all_selected:
-            sources = self._manager.enabled_sources()
+            sources = available
         elif self._selected_sources:
-            sources = [s for s in self._manager.enabled_sources()
-                       if s.source_id in self._selected_sources]
+            sources = [s for s in available if s.source_id in self._selected_sources]
         else:
             self.status_label.setText("未选择任何源")
             return
-        if selected_type:
-            sources = [s for s in sources if s.content_type == selected_type]
 
         if not sources:
             self.status_label.setText("没有可搜索的源")
@@ -404,8 +477,6 @@ class SearchPage(BasePage):
         self._pending_count = len(sources)
         self._search_tasks = []
         self._streamed = set()
-        self._search_epoch += 1
-        epoch = self._search_epoch
         for source in sources:
             task = _SearchTask(self._search, source, keyword, epoch=epoch)
             task.signals.finished.connect(self._on_source_done)
@@ -418,11 +489,7 @@ class SearchPage(BasePage):
     # ------------------------------------------------------------------ #
     def _build_status_bar(self, sources) -> None:
         """清空并重建每源状态 chip 行。"""
-        while self.status_bar_layout.count():
-            item = self.status_bar_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._status_chips = {}
+        self._clear_status_bar()
         for source in sources:
             chip = QLabel(f"🔄 {source.source_name}")
             chip.setStyleSheet(
@@ -433,6 +500,17 @@ class SearchPage(BasePage):
             self.status_bar_layout.addWidget(chip)
             self._status_chips[source.source_id] = chip
         self.status_bar_layout.addStretch(1)
+
+    def _clear_status_bar(self) -> None:
+        """移除上一轮每源搜索状态，避免隐藏源名称残留。"""
+        while self.status_bar_layout.count():
+            item = self.status_bar_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._status_chips = {}
+        self.status_bar.setVisible(False)
 
     def _set_source_status(self, source, state: str, err: str = "") -> None:
         """更新单源状态 chip：🔄进行中 ✅完成 ❌失败。"""
@@ -742,6 +820,7 @@ class SearchPage(BasePage):
 
     def _update_batch_status(self) -> None:
         """更新状态文本：已显示 X / 共 Y 条。"""
+        self._refresh_source_chips()  # 结果变化统一刷新来源筛选 chips（增量，防闪烁）
         total = len(self._filtered_display())
         if self._filter_source:
             self.status_label.setText(f"共 {total} 条结果（仅看此源）")
@@ -1040,12 +1119,32 @@ class SearchPage(BasePage):
             card.blockSignals(False)
         self._refresh_batch_bar()
 
+    def _writable_folder_names(self) -> list[str]:
+        return [name for name in self._shelf_folder_provider() if name and name != "全部"]
+
+    def _choose_shelf_folder(self):
+        folders = ["未分类"] + self._writable_folder_names()
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "选择收藏夹",
+            "加入到：",
+            folders,
+            0,
+            False,
+        )
+        if not accepted:
+            return None
+        return "" if choice == "未分类" else choice
+
     def _on_batch_add_shelf(self) -> None:
         """批量加入书架。"""
         items = list(self._selected.values())
         if not items:
             return
-        self.add_to_shelf_requested.emit(items)
+        folder = self._choose_shelf_folder()
+        if folder is None:
+            return
+        self.add_to_shelf_requested.emit(items, folder)
         self._clear_selection()
 
     def _on_batch_download(self) -> None:
@@ -1069,8 +1168,84 @@ class SearchPage(BasePage):
         self._more_pending = False  # 换词/重建网格：中止旧滚动分批链
         self._last_columns = 0  # 重建后需重新应用一次列拉伸
 
+    # ------------------------------------------------------------------ #
+    # 来源筛选 chips 行（顶部显式入口；卡片来源角标点击入口在其下）
+    # ------------------------------------------------------------------ #
+    def _reset_source_chips(self) -> None:
+        """清空来源筛选 chips 行并隐藏（新搜索/清空时）。"""
+        if not self._chip_ready:
+            return
+        for btn in self._source_chip_btns.values():
+            self._source_chip_hbox.removeWidget(btn)
+            btn.deleteLater()
+        self._source_chip_btns = {}
+        self._source_chip_row.setVisible(False)
+
+    def _available_sources(self) -> dict:
+        """当前结果（合并后为 _results_display，否则 _results）聚合来源。
+
+        返回 {source_id: (source_name, 条数)}，顺序按首次出现保持稳定。
+        """
+        agg = {}
+        for r in self._current_display():
+            sid = getattr(r, "source_id", "") or ""
+            if not sid:
+                continue
+            name = getattr(r, "source_name", "") or sid
+            if sid in agg:
+                agg[sid] = (name, agg[sid][1] + 1)
+            else:
+                agg[sid] = (name, 1)
+        return agg
+
+    def _refresh_source_chips(self) -> None:
+        """按当前结果聚合来源，增量刷新筛选 chips（已有按钮只改计数，不重建防闪）。
+
+        每个来源按钮 → _set_filter（复用结果筛选渲染路径）；「全部」→ _clear_filter。
+        无结果时整行隐藏。chips 由 _current_display 聚合——合并/筛选不影响其来源集
+        合（始终基于全量），保证切源后 chips 行来源列表稳定。
+        """
+        if not self._chip_ready:
+            return
+        agg = self._available_sources()
+        # 删除已消失来源的按钮
+        for sid in [s for s in self._source_chip_btns if s not in agg]:
+            btn = self._source_chip_btns.pop(sid)
+            self._source_chip_hbox.removeWidget(btn)
+            btn.deleteLater()
+        # 更新计数 / 插入新来源；「全部」按钮后插入（stretch 在最右）
+        idx = self._source_chip_hbox.indexOf(self._all_chip_btn) + 1
+        for sid, (name, count) in agg.items():
+            btn = self._source_chip_btns.get(sid)
+            if btn is None:
+                btn = QPushButton(f"{name} ({count})")
+                btn.setCheckable(True)
+                btn.setStyleSheet(SOURCE_CHIP_SS)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setToolTip(f"仅看 {name} 的结果")
+                btn.clicked.connect(lambda _, s=sid: self._set_filter(s))
+                self._source_chip_hbox.insertWidget(idx, btn)
+                idx += 1
+                self._source_chip_btns[sid] = btn
+            else:
+                btn.setText(f"{name} ({count})")
+        self._source_chip_row.setVisible(bool(agg))
+        self._sync_chip_checked()
+
+    def _sync_chip_checked(self) -> None:
+        """同步 chips 选中态：全部 / 当前筛选源（blockSignals 防 setChecked 触发点击）。"""
+        if not self._chip_ready:
+            return
+        self._all_chip_btn.blockSignals(True)
+        self._all_chip_btn.setChecked(not self._filter_source)
+        self._all_chip_btn.blockSignals(False)
+        for sid, btn in self._source_chip_btns.items():
+            btn.blockSignals(True)
+            btn.setChecked(sid == self._filter_source)
+            btn.blockSignals(False)
+
     def _set_filter(self, source_id: str) -> None:
-        """来源角标筛选。"""
+        """来源筛选（chips 按钮 / 卡片来源角标共用）。"""
         if source_id != self._filter_source:
             if not self._filter_source:
                 # 首次进入筛选：保存未筛选时的渲染进度，清除筛选后恢复用
@@ -1086,6 +1261,7 @@ class SearchPage(BasePage):
                 self._shown_count = self._saved_unfiltered_shown
                 self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(bool(self._filter_source))
+        self._sync_chip_checked()
         self._show_results()
 
     def _clear_filter(self) -> None:
@@ -1095,6 +1271,7 @@ class SearchPage(BasePage):
         if self._saved_unfiltered_shown is not None:
             self._shown_count = self._saved_unfiltered_shown
             self._saved_unfiltered_shown = None
+        self._sync_chip_checked()
         self._show_results()
 
     def _on_scroll(self, value: int) -> None:
@@ -1124,8 +1301,10 @@ class SearchPage(BasePage):
         self._load_more_results()
 
     def refresh(self) -> None:
-        """重建源选择菜单（源选择变更后，禁用源不再列出）。"""
+        """重建源菜单；已有搜索时清空旧结果并按当前可见源重跑。"""
         self._rebuild_sources_menu()
+        if self.keyword_input.text().strip():
+            self._on_search()
 
     def _rebuild_sources_menu(self) -> None:
         """按当前启用的源重建 src_btn 弹出菜单，保留已勾选状态。
@@ -1140,7 +1319,7 @@ class SearchPage(BasePage):
         self._src_menu.clear()
         self._src_rows = {}
 
-        enabled = self._manager.enabled_sources()
+        enabled = self._sources_for_current_type()
         enabled_ids = {s.source_id for s in enabled}
         self._selected_sources &= enabled_ids
 
@@ -1243,14 +1422,7 @@ class SearchPage(BasePage):
         self.select_all_check.blockSignals(True)
         self.select_all_check.setChecked(False)
         self.select_all_check.blockSignals(False)
-        while self.status_bar_layout.count():
-            item = self.status_bar_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
-        self._status_chips = {}
-        self.status_bar.setVisible(False)
+        self._clear_status_bar()
         self.status_label.setText("已更换源，请点击搜索")
 
     def _on_all_source_toggled(self, checked: bool) -> None:
@@ -1276,10 +1448,10 @@ class SearchPage(BasePage):
         所有源勾满 → 恢复全选态；全部取消 → 按钮显示「源：无」。
         仅更新选择状态与按钮文字，并清空旧结果；必须点「搜索」才发起搜索。
         """
-        enabled = self._manager.enabled_sources()
+        enabled = self._sources_for_current_type()
         enabled_ids = {s.source_id for s in enabled}
         if self._all_selected:
-            # 从「全部」进入部分选择：先铺满全部源，再按本次点击增删
+            # 从「全部」进入部分选择：先铺满当前类型源，再按本次点击增删
             self._selected_sources = set(enabled_ids)
         if checked:
             self._selected_sources.add(source.source_id)

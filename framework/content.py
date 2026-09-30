@@ -23,7 +23,7 @@ import json
 import logging
 import re as _re
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
 log = logging.getLogger(__name__)
@@ -98,6 +98,11 @@ class Detail:
     # 图文集（video 详情页内嵌截图序列等，如 xasiat 的 fancybox screenshots）；
     # 由 detail.fields.gallery 多值选择器提取，详情抽屉以缩略图形式展示
     gallery: List[str] = field(default_factory=list)
+    # 站内相关推荐：详情页内嵌的相关影片（如 hanime1 #related-tabcontent 卡片、
+    # pornhub relatedVideos JS 变量）。由 detail.related 配置驱动，未配置该块
+    # 时保持空列表 → 列表页 UI 回退同源关键词搜索（其他源零影响）。
+    # 每项 dict 只含 title/url/cover 三个字符串键，均允许空串（无封面纯文字卡片）。
+    related: List[dict] = field(default_factory=list)
 
 
 class Content:
@@ -109,6 +114,7 @@ class Content:
         decrypter: Optional["Decrypter"] = None,
         health_reporter=None,
         cache=None,
+        repository=None,
     ):
         self._http = http
         self._parser = parser
@@ -117,10 +123,12 @@ class Content:
         self._health_reporter = health_reporter  # 可选：update_health(source_id, state, error)
         # 可选 RedisLikeStore 实例（None=禁用）。键约定：
         #   page:{source_id}:{abs_url}   详情/目录页（永久，shelf 池）
+        #   detail:{source_id}:{abs_url} 详情元数据（30 天，shelf 池）
         #   body:{source_id}:{abs_url}   章节正文（7 天，shelf 池）
         #   pages:{source_id}:{abs_url}  漫画页图（7 天，shelf 池）
         #   cover:{source_id}:{abs_url}  封面字节（永久，shelf 池）
         self._cache = cache
+        self._repository = repository
         # yt-dlp 流 URL 缓存（同视频短时复用，避免重复签名等待）
         self._ytdlp_stream_cache: dict = {}
         self._ytdlp = None  # 懒加载单例，复用 yt-dlp 子进程
@@ -210,6 +218,103 @@ class Content:
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         return utils.abs_url(source.base_url, url)
 
+    @staticmethod
+    def _repository_cache_parts(key: str, book_key: str | None = None) -> tuple[str, str]:
+        parts = key.split(":", 3)
+        if len(parts) == 4 and parts[0] == "pages" and parts[1] == "v3":
+            url = parts[3]
+            if book_key is None:
+                return "pages", url
+            return url, book_key
+        kind, _source_id, url = key.split(":", 2)
+        if book_key is None:
+            return kind, url
+        return url, book_key
+
+    def _cache_get(self, key: str, book_key: str | None = None):
+        if self._repository is not None:
+            chapter_key, cache_book_key = self._repository_cache_parts(key, book_key)
+            value = self._repository.get_content(cache_book_key, chapter_key)
+            if value is not None:
+                if chapter_key == "pages" and isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except json.JSONDecodeError:
+                        return None
+                return value
+        if self._cache is not None:
+            return self._cache.get(key)
+        return None
+
+    def _cache_set(
+        self, key: str, value, ttl=None, book_key: str | None = None
+    ) -> None:
+        kind, source_id, _url = key.split(":", 2)
+        chapter_key, cache_book_key = self._repository_cache_parts(key, book_key)
+        if self._repository is not None:
+            self._repository.upsert_book(cache_book_key, source_id, cache_book_key, "", {})
+            payload = json.dumps(value, ensure_ascii=False) if kind == "pages" else value
+            self._repository.put_content(
+                cache_book_key,
+                chapter_key,
+                "application/json" if kind == "pages" else "text/plain",
+                payload,
+                {},
+            )
+        if self._cache is not None:
+            self._cache.set(key, value, ttl=ttl)
+
+    _DETAIL_TTL = 30 * 86400
+
+    def _cache_get_detail(self, key: str):
+        if self._cache is None:
+            return None
+        raw = self._cache.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, Detail):
+            return raw
+        try:
+            data = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            if not isinstance(data, dict):
+                return None
+            chapters = [
+                chapter if isinstance(chapter, Chapter) else Chapter(**chapter)
+                for chapter in data.pop("chapters", [])
+            ]
+            data["chapters"] = chapters
+            return Detail(**data)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _cache_set_detail(self, key: str, detail: Detail) -> None:
+        if self._cache is None:
+            return
+        try:
+            self._cache.set(
+                key,
+                json.dumps(asdict(detail), ensure_ascii=False),
+                ttl=self._DETAIL_TTL,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("[cache] 详情缓存写入失败", exc_info=True)
+
+    @staticmethod
+    def _looks_like_direct_media(url: str) -> bool:
+        """URL 是否已是可直接播放的媒体文件/流（m3u8/mpd/mp4/flv/webm 等）。
+
+        用在 fetch_video_episode 的直链 passthrough：这类地址交给 HTML 解析
+        或 episode API 都没有意义（fetch 会拿到二进制/list 文本而非播放页）。
+        """
+        if not url:
+            return False
+        from urllib.parse import urlsplit as _urlsplit
+
+        path = _urlsplit(url).path.lower()
+        return path.endswith(
+            (".m3u8", ".mpd", ".mp4", ".m4v", ".flv", ".webm", ".mkv", ".mov", ".ts", ".m4a")
+        )
+
     def _get(self, source: SourceConfig, url: str, http=None) -> str:
         """抓取页面 HTML。http 可传独立 HttpClient（并行翻页时避免共享
         self._http 的 requests.Session 跨线程竞态）；缺省用共享实例。"""
@@ -282,18 +387,66 @@ class Content:
             return ""
 
     # ------------------------------------------------------------------ #
+    def refresh_detail(self, source: SourceConfig, url: str, current_chapter_url: str = "") -> Detail:
+        """强制刷新详情和章节正文缓存，保留缓存优先的普通打开路径。"""
+        abs_url = self._abs_url(source, url)
+        detail_key = f"detail:{source.source_id}:{abs_url}"
+        def _delete(key: str) -> None:
+            if self._cache is None:
+                return
+            deleter = getattr(self._cache, "delete", None)
+            if deleter is not None:
+                deleter(key)
+            else:
+                getattr(self._cache, "values", {}).pop(key, None)
+                getattr(self._cache, "ttls", {}).pop(key, None)
+
+        if self._cache is not None:
+            _delete(detail_key)
+            _delete(f"page:{source.source_id}:{abs_url}")
+            if current_chapter_url:
+                _delete(f"body:{source.source_id}:{self._abs_url(source, current_chapter_url)}")
+        getattr(self, "_detail_html_cache", {}).pop((source.source_id, abs_url), None)
+        getattr(self, "_video_html_cache", {}).pop((source.source_id, abs_url), None)
+        detail = self.fetch_detail(source, url)
+        latest = set()
+        for chapter in detail.chapters or []:
+            chapter_url = chapter.get("url", "") if isinstance(chapter, dict) else getattr(chapter, "url", "")
+            if chapter_url:
+                latest.add(self._abs_url(source, chapter_url))
+        current_abs = self._abs_url(source, current_chapter_url) if current_chapter_url else ""
+        keep = sorted(latest - ({current_abs} if current_abs else set()))
+        if self._repository is not None:
+            book_keys = {
+                url,
+                abs_url,
+                f"{source.source_id}:{url}",
+                f"{source.source_id}:{abs_url}",
+            }
+            for book_key in book_keys:
+                self._repository.evict_book_content(book_key, keep)
+        return detail
+
     def fetch_detail(self, source: SourceConfig, url: str) -> Detail:
         """抓取详情页：元数据 + 章节列表。
 
         优先 api_endpoints.detail（JSON API，可选 sign 签名）；
         否则走 endpoints.detail HTML 解析。
         """
+        cache_key = f"detail:{source.source_id}:{self._abs_url(source, url)}"
+        cached = self._cache_get_detail(cache_key)
+        if cached is not None:
+            return cached
+
         api = source.raw.get("api_endpoints") or {}
         detail_api = api.get("detail") or {}
         if detail_api:
             if detail_api.get("engine") == "ytdlp":
-                return self._fetch_detail_ytdlp(source, url, detail_api)
-            return self._fetch_detail_api(source, url, detail_api)
+                detail = self._fetch_detail_ytdlp(source, url, detail_api)
+            else:
+                detail = self._fetch_detail_api(source, url, detail_api)
+            self._cache_set_detail(cache_key, detail)
+            return detail
 
         # 详情 URL 规范化：endpoints.detail.url_suffix 配置为 URL 尾缀补全
         # （如 MacCMS 变体列表 href 不带 .html 但详情页必须 .html，否则返回
@@ -306,6 +459,10 @@ class Content:
                 url = path + suffix + ("?" + query if query else "")
 
         abs_url = self._abs_url(source, url)
+        cache_key = f"detail:{source.source_id}:{abs_url}"
+        cached = self._cache_get_detail(cache_key)
+        if cached is not None:
+            return cached
         self._bg_check(source, abs_url)
         html = self._get_detail_html(source, url, abs_url)
         if source.content_type == "video":
@@ -374,6 +531,38 @@ class Content:
             elif _val is not None:
                 setattr(detail, _key, self._clean_field(_val, _pairs))
 
+        # 站内相关推荐（detail.related 块，如 hanime1 详情页 #related-tabcontent
+        # 的相关影片卡片）：优先直接用详情页内嵌的相关内容，替代同源关键词搜索。
+        # 无 related 配置/选择器未命中/任何异常 → 保持空列表（UI 回退关键词搜索）。
+        related_cfg = detail_cfg.get("related") or {}
+        if related_cfg:
+            related: List[dict] = []
+            try:
+                rel_root = related_cfg.get("root_selector")
+                rel_fields = related_cfg.get("fields") or {}
+                rel_max = int(related_cfg.get("max") or 8)
+                if rel_root and rel_fields:
+                    items = self._parser.parse_items(
+                        doc, rel_root, rel_fields, source.base_url
+                    )
+                    own = (detail.url or "").rstrip("/").lower()
+                    for it in items:
+                        r_url = (it.get("url") or "").strip()
+                        if not r_url:
+                            continue  # 无 URL 的卡片不可点，跳过
+                        if r_url.rstrip("/").lower() == own:
+                            continue  # 剔除自身
+                        related.append({
+                            "title": it.get("title") or "",
+                            "url": r_url,
+                            "cover": it.get("cover") or "",
+                        })
+                        if len(related) >= rel_max:
+                            break
+            except Exception:  # noqa: BLE001
+                related = []  # 相关推荐失败不影响主流程
+            detail.related = related
+
         # 章节列表（按类型取 content 配置，传书名用于标题清理；
         # html 供目录页 id 从详情页 HTML 提取，如 dm5 COMIC_MID）
         detail.chapters = self._fetch_chapters(
@@ -390,6 +579,7 @@ class Content:
         # 播放源列表（换源站）：解析 source_switch 配置的可用源
         detail.source_list = self._parse_source_list(source, html)
 
+        self._cache_set_detail(cache_key, detail)
         return detail
 
     def _maybe_expand_video_series(self, source, detail, chapters) -> list:
@@ -510,6 +700,45 @@ class Content:
         )
         chapters = d.get("chapters") or []
         detail.chapters = [Chapter(title=c.get("title") or "", url=c.get("url") or url) for c in chapters]
+        # 站内相关推荐（detail.related 块，如 pornhub 详情 HTML 的 relatedVideos
+        # JS 变量）：优先用详情页内嵌的相关影片，替代同源关键词搜索。详情元数据
+        # 走 ytdlp，但详情 URL 本身可 GET（复用 transports 请求头）。异常静默空。
+        related_cfg = cfg.get("related") or {}
+        if related_cfg:
+            related: List[dict] = []
+            try:
+                html = self._get(source, url)
+                pat = str(
+                    related_cfg.get("js_regex")
+                    or r"relatedVideos\s*=\s*(\[.*?\]);"
+                )
+                m = _re.search(pat, html, _re.DOTALL)
+                data = json.loads(m.group(1)) if m else None
+                if isinstance(data, list):
+                    own = (detail.url or "").rstrip("/").lower()
+                    rel_max = int(related_cfg.get("max") or 8)
+                    for it in data:
+                        if not isinstance(it, dict):
+                            continue
+                        vkey = it.get("vkey")
+                        title = it.get("title") or ""
+                        if not vkey or not title:
+                            continue  # 缺 vkey/title 无法构造卡片
+                        r_url = self._abs_url(
+                            source, "/view_video.php?viewkey=" + str(vkey)
+                        )
+                        if r_url.rstrip("/").lower() == own:
+                            continue  # 剔除自身
+                        related.append({
+                            "title": title,
+                            "url": r_url,
+                            "cover": "",  # 未知字段留空，卡片支持无封面纯文字
+                        })
+                        if len(related) >= rel_max:
+                            break
+            except Exception:  # noqa: BLE001
+                related = []  # 相关推荐失败不影响主流程
+            detail.related = related
         return detail
 
     # ------------------------------------------------------------------ #
@@ -522,21 +751,28 @@ class Content:
             title / number 每项标题/序号字段名
             url_template   章节 URL 模板（可用 {cid} / {page} / {part} 占位）
         """
-        from urllib.parse import urlencode, urljoin
+        from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
         filled = {}
-        m_bv = _re.search(r"(BV[0-9A-Za-z]+)", url)
-        bvid = m_bv.group(1) if m_bv else url.split("/")[-1]
+        # 详情 URL 的 query（?title=... 等）并入占位符：detail POST 接口需要
+        # 精确标题等额外字段（如 ikanpp /api/detail 要 title 才命中正确 vod），
+        # bvid 只取 URL 的 path 末段（BV 号优先，query 不参与）。
+        _sp = urlsplit(url)
+        m_bv = _re.search(r"(BV[0-9A-Za-z]+)", _sp.path)
+        bvid = m_bv.group(1) if m_bv else _sp.path.rstrip("/").split("/")[-1] or url
+        _ph = {"id": bvid, "bvid": bvid}
+        if _sp.query:
+            _ph.update({k: v[0] for k, v in parse_qs(_sp.query).items()})
         method = (cfg.get("method") or "GET").upper()
         if method == "POST":
-            # JSON API（GraphQL 等）：POST body 递归替换 {id}/{bvid}
+            # JSON API（GraphQL 等）：POST body 递归替换 {id}/{bvid}/{query 参数}
             body_filled = utils.fill_json(
-                cfg.get("body") or {}, id=bvid, bvid=bvid
+                cfg.get("body") or {}, **_ph
             )
             for k, v in params.items():
-                body_filled.setdefault(k, utils.fill_json(v, id=bvid, bvid=bvid))
+                body_filled.setdefault(k, utils.fill_json(v, **_ph))
             sign_cfg = cfg.get("sign") or {}
             strategy = sign_cfg.get("strategy")
             if strategy:
@@ -554,9 +790,14 @@ class Content:
             )
         else:
             # URL 路径占位符同样替换（同 episode 分支处理，avgood 类路径 {id} 原样发出会 404）
-            api_url = str(cfg.get("url") or "").replace("{id}", bvid).replace("{bvid}", bvid)
+            api_url = str(cfg.get("url") or "")
+            for _k, _v in _ph.items():
+                api_url = api_url.replace("{" + _k + "}", str(_v))
             for k, v in params.items():
-                filled[k] = str(v).replace("{bvid}", bvid).replace("{id}", bvid)
+                _val = str(v)
+                for _pk, _pv in _ph.items():
+                    _val = _val.replace("{" + _pk + "}", str(_pv))
+                filled[k] = _val
             sign_cfg = cfg.get("sign") or {}
             strategy = sign_cfg.get("strategy")
             if strategy:
@@ -902,7 +1143,7 @@ class Content:
         if items is None:
             items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
         chapters: List[Chapter] = []
-        seen_norm = set()
+        seen_norm = {}
         seen_title = set()
 
         def _norm_url(url: str) -> str:
@@ -928,25 +1169,29 @@ class Content:
             t = _re.sub(r"\s+", " ", t)
             return t
 
+        start_reading_titles = {
+            "从第一章开始阅读", "开始阅读", "从第一话开始阅读", "从头开始阅读"
+        }
         for it in items:
             url = it.get("url", "")
             if not url:
                 continue
-            # URL 归一化去重（不同 URL 可能指向同一章节，如末尾 /、参数顺序）
+            title = it.get("title", "")
+            raw_title = str(title or "").strip()
+            title = clean_title(raw_title) if list_cfg.get("title_clean") else raw_title
             nurl = _norm_url(url)
             if nurl in seen_norm:
+                existing = chapters[seen_norm[nurl]]
+                if existing.title in start_reading_titles and title not in start_reading_titles:
+                    existing.title = title
                 continue
-            seen_norm.add(nurl)
-            title = it.get("title", "")
-            if list_cfg.get("title_clean"):
-                title = clean_title(title)
-            # 标题规范化去重（清理后标题相同跳过）
             title_key = _re.sub(r"\s+", " ", title.strip().lower())
             if title_key and title_key in seen_title:
                 continue
             if title_key:
                 seen_title.add(title_key)
             chapters.append(Chapter(title=title or f"第{len(chapters)+1}章", url=url))
+            seen_norm[nurl] = len(chapters) - 1
 
         # WordPress 帖子分页（div.page-links）：当前页（详情页自身）是
         # <span class="...current">（无 href），列表只提取后续页 <a> 链接 →
@@ -1107,7 +1352,7 @@ class Content:
         raise ContentMissingError("请求体需 AES 加密但未配置解密器", source_id="")
 
     # ------------------------------------------------------------------ #
-    def fetch_chapter(self, source: SourceConfig, url: str) -> str:
+    def fetch_chapter(self, source: SourceConfig, url: str, use_cache: bool = True) -> str:
         """抓取单章正文。按类型取正文选择器，支持章节分页拼接。
 
         长章节在部分站点会拆成多页（如 xxx.html / xxx_1.html / xxx_2.html）。
@@ -1132,12 +1377,10 @@ class Content:
         seen = set()
         max_pages = int(pag_cfg.get("max_pages") or 20)
         # 开头：cached body 命中直接返回（重启后/预加载后免抓）
-        if self._cache is not None:
-            cached = self._cache.get(
-                f"body:{source.source_id}:{self._abs_url(source, url)}"
-            )
-            if cached is not None:
-                return cached
+        cache_key = f"body:{source.source_id}:{self._abs_url(source, url)}"
+        cached = self._cache_get(cache_key) if use_cache else None
+        if cached is not None:
+            return cached
         while cur and len(pages) < max_pages:
             page_text, nxt = self._fetch_chapter_page(source, cur, pag_enabled)
             if page_text:
@@ -1155,12 +1398,8 @@ class Content:
             break  # 基路径不同 → 是真正的下一章或重复，停止分页
         text = "\n".join(pages)
         # 末尾：写 body: 键（7 天，shelf 池）
-        if self._cache is not None and text:
-            self._cache.set(
-                f"body:{source.source_id}:{self._abs_url(source, url)}",
-                text,
-                ttl=7 * 86400,
-            )
+        if text and use_cache:
+            self._cache_set(cache_key, text, ttl=7 * 86400)
         return text
 
     def precache_chapters(
@@ -1169,17 +1408,22 @@ class Content:
         chapters,
         current_idx: int,
         ahead: int = 3,
+        enabled: bool = True,
+        use_cache: bool = True,
     ) -> None:
         """后台预加载当前章+后 ahead 章正文到缓存。不满 ahead 按实际。
 
-        进入阅读器时调用（novel/comic 都可用）。串行、逐章 fetch_chapter
-        （fetch_chapter 内部已写 body: 缓存）。异常静默。
-
+        enabled=False 时完全 no-op（设置页关闭预加载）。
         chapters：可迭代对象，元素含 .url 属性。current_idx 为当前章下标。
         """
-        if self._cache is None or not chapters:
+        if not enabled:
             return
-        end = min(current_idx + ahead, len(chapters))
+        if not chapters:
+            return
+        if use_cache and self._cache is None and self._repository is None:
+            return
+        ahead = max(0, int(ahead))
+        end = min(current_idx + ahead + 1, len(chapters))
         for i in range(current_idx, end):
             ch = chapters[i]
             url = getattr(ch, "url", "")
@@ -1187,15 +1431,20 @@ class Content:
                 continue
             abs_url = self._abs_url(source, url)
             key = f"body:{source.source_id}:{abs_url}"
-            if self._cache.get(key) is not None:
+            if use_cache and self._cache_get(key) is not None:
                 continue  # 已缓存
             try:
-                text = self.fetch_chapter(source, url)
+                try:
+                    text = self.fetch_chapter(source, url, use_cache=use_cache)
+                except TypeError as exc:
+                    if "use_cache" not in str(exc):
+                        raise
+                    text = self.fetch_chapter(source, url)
             except Exception as exc:  # noqa: BLE001
                 log.warning("[cache] 预加载失败 %s: %s", url, exc)
                 continue
-            if text:
-                self._cache.set(key, text, ttl=7 * 86400)
+            if text and use_cache:
+                self._cache_set(key, text, ttl=7 * 86400)
 
     def _fetch_chapter_page(
         self, source: SourceConfig, url: str, pag_enabled: bool = True
@@ -1396,6 +1645,7 @@ class Content:
         chapter_url: str,
         on_page=None,
         cancel_evt=None,
+        use_cache: bool = True,
     ) -> List[str]:
         """漫画：抓取一话的全部分页图片 URL（带缓存包装）。
 
@@ -1410,19 +1660,27 @@ class Content:
         循环里检查并提前返回（已抓到的部分），旧书取流立即让路给新书，不再
         白跑完一整话（dm5 一话 39 页 ≈74s）。None 表示不取消（下载器等同步调用）。
         """
-        if self._cache is not None:
-            abs_url = self._abs_url(source, chapter_url)
-            cached = self._cache.get(f"pages:{source.source_id}:{abs_url}")
-            if cached is not None:
-                if on_page and cached:
-                    on_page(list(cached))
-                return cached
+        abs_url = self._abs_url(source, chapter_url)
+        # v2 skips entries written by the old implementation, which could
+        # persist a two-image HTML fallback for a week.
+        cache_key = f"pages:v3:{source.source_id}:{abs_url}"
+        cached = self._cache_get(cache_key) if use_cache else None
+        if cached is not None:
+
+            if on_page and cached:
+                on_page(list(cached))
+            return cached
+        degraded: list = []
         imgs = self._fetch_comic_pages_impl(
-            source, chapter_url, on_page=on_page, cancel_evt=cancel_evt
+            source, chapter_url, on_page=on_page, cancel_evt=cancel_evt,
+            degraded_out=degraded,
         )
-        if self._cache is not None and imgs:
-            self._cache.set(
-                f"pages:{source.source_id}:{self._abs_url(source, chapter_url)}",
+        if cancel_evt and cancel_evt.is_set():
+            degraded.append("cancelled partial comic page fetch")
+        if use_cache and imgs and not degraded:
+            self._cache_set(
+
+                cache_key,
                 list(imgs),
                 ttl=7 * 86400,
             )
@@ -1434,7 +1692,13 @@ class Content:
         chapter_url: str,
         on_page=None,
         cancel_evt=None,
+        degraded_out=None,
     ) -> List[str]:
+        """抓取一话分页图片 URL（无缓存包装）。
+
+        degraded_out：可选 list。Playwright 渲染失败降级到 HTML 提取时置位
+        （该结果不完整，调用方据此不入 pages: 缓存）。
+        """
         content_cfg = self._content_block(source)
         block = content_cfg.get("page") or {}
         abs_url = self._abs_url(source, chapter_url)
@@ -1477,6 +1741,9 @@ class Content:
                     # 边滚边分批回调：连续前缀提前给 GUI 渲染（首图秒出，后续边滚边补）
                     on_batch=(lambda prefix: on_page(list(prefix))) if on_page else None,
                 )
+                minimum = int(rc.get("min_images") or 0)
+                if minimum and len(imgs) < minimum and degraded_out is not None:
+                    degraded_out.append("incomplete rendered comic page list")
                 if on_page and imgs:
                     on_page(list(imgs))
                 return imgs
@@ -1484,13 +1751,21 @@ class Content:
                 # Playwright 渲染失败 → 降级到普通 HTML 提取（站点改版/选择器不匹配时
                 # 不整话失败，尝试 HTML 兜底；若 HTML 也提取不到，下方会抛 ContentMissingError）
                 log.warning("[%s] Playwright 渲染失败，降级 HTML 提取：%s", source.source_id, exc)
+                # canvas/分片加密源的页面是 JS 应用，静态 HTML 里只有首屏那几个占位
+                # 元素（如 comicbox 只能提到 2 个 .cropped）——兜底结果不完整，若当
+                # 整话缓存会让该章 7 天内永远只出这 2 张（其余页面再也渲染不出来）。
+                if degraded_out is not None:
+                    degraded_out.append(exc)
 
         self._bg_check(source, abs_url)
         # 图片列表优先 body，兼容旧 list
         list_cfg = body_cfg or block.get("list") or {}
         urls = self._fetch_comic_page_imgs(
-            source, list_cfg, chapter_url, cancel_evt=cancel_evt, on_page=on_page
+            source, list_cfg, chapter_url, cancel_evt=cancel_evt, on_page=on_page,
+            degraded_out=degraded_out,
         )
+        if cancel_evt and cancel_evt.is_set() and degraded_out is not None:
+            degraded_out.append("cancelled partial comic page fetch")
         # 图片解密源（如 18mh AES-CBC 加密图）：下载并把每张解密成 data URI，
         # 使阅读器/下载器无需改动即可显示/保存解密图。
         if urls and source.raw.get("decryption", {}).get("targets", {}).get("image"):
@@ -1572,7 +1847,7 @@ class Content:
 
     def _fetch_comic_page_imgs(
         self, source: SourceConfig, list_cfg: dict, chapter_url: str,
-        cancel_evt=None, on_page=None,
+        cancel_evt=None, on_page=None, degraded_out=None,
     ) -> List[str]:
         """从单话 HTML 提取全部图片 URL，支持图片列表翻页（含并行翻页加速）。
 
@@ -1756,6 +2031,8 @@ class Content:
                 n = first_page
                 while n <= p_max:
                     if cancel_evt and cancel_evt.is_set():
+                        if degraded_out is not None:
+                            degraded_out.append("cancelled partial comic page fetch")
                         break  # 换书取消：停止后续 wave 抓取，返回已收集部分
                     wave = list(range(n, min(n + window, p_max + 1)))
                     # 每 wave 并发抓取（max_workers=min(window, 页数)）
@@ -1767,6 +2044,32 @@ class Content:
                         for fut in as_completed(futs):
                             results[futs[fut]] = fut.result()
                     # 图片按页码顺序收集，与第 1 页拼接
+                    populated = [p for p in wave if results.get(p, ([], ""))[0]]
+                    # Empty trailing probes are the normal way a predictable
+                    # paginator discovers its end. Only a hole before a later
+                    # populated page proves the result is incomplete.
+                    if populated:
+                        last_populated = populated[-1]
+                        if any(
+                            not results.get(p, ([], ""))[0]
+                            for p in wave if p < last_populated
+                        ) and degraded_out is not None:
+                            degraded_out.append("incomplete parallel comic page wave")
+                        last_populated_nxt = results.get(last_populated, ([], ""))[1]
+                        if (
+                            last_populated < wave[-1]
+                            and last_populated_nxt
+                            and self._abs_url(source, last_populated_nxt)
+                            == pred(last_populated + 1)
+                            and not results.get(last_populated + 1, ([], ""))[0]
+                            and degraded_out is not None
+                        ):
+                            degraded_out.append("missing expected parallel comic page")
+                    elif degraded_out is not None:
+                        # Entering this wave means the previous page explicitly
+                        # linked to its first predicted page. An all-empty wave
+                        # is therefore a fetch failure, not a natural ending.
+                        degraded_out.append("missing expected parallel comic page")
                     for p in wave:
                         _add_imgs(results.get(p, ([], ""))[0])
                     # 边抓边回调（连续前缀）：阅读器首批图就绪即可渲染首屏，
@@ -1799,12 +2102,16 @@ class Content:
         page_url = chapter_url
         for _ in range(max_pages if max_pages else 1000):
             if cancel_evt and cancel_evt.is_set():
+                if degraded_out is not None:
+                    degraded_out.append("cancelled partial comic page fetch")
                 break  # 换书取消：停止后续翻页抓取
             if page_url in seen_url:
                 break
             seen_url.add(page_url)
             page_imgs, nxt = _fetch_page(page_url)
             _add_imgs(page_imgs)
+            if nxt and not page_imgs and degraded_out is not None:
+                degraded_out.append("incomplete sequential comic page")
             # 无下一页配置 → 单页即止
             if not next_sel or not nxt:
                 break
@@ -2220,8 +2527,15 @@ class Content:
         （空 / ContentMissingError / 网络异常 / 播放 URL 403/404/超时）时
         自动尝试其他线路，全部失败才抛错。
         """
-        # JSON API 播放地址（api_endpoints.episode）
+        # 直链媒体 passthrough：分集 URL 已是可直接播放的媒体文件
+        # （m3u8/mpd/mp4/flv/webm 等，如 ikanpp 详情 chapters url_template
+        # 直接给出 CDN m3u8）。此时无需再走 episode API / HTML 播放页解析，
+        # 且此类 URL 被当前置 HTML 解析会误抓二进制/列表文本。仅无
+        # api_endpoints.episode 的源生效（episode API 源的分集 URL 是内容页）。
         api = source.raw.get("api_endpoints") or {}
+        if not api.get("episode") and self._looks_like_direct_media(episode_url):
+            return episode_url
+        # JSON API 播放地址（api_endpoints.episode）
         episode_api = api.get("episode") or {}
         if episode_api:
             # yt-dlp 引擎：单流播放地址（合并单流，含音视频，VLC 可直接播）

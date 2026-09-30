@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://www.rousewu.uk/",
     "description": "肉色屋 - 成人小说源（移动端 m.rousewu.uk，UTF-8，章节目录完整）",
     "lang": "zh-CN",

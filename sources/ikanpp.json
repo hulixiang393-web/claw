@@ -1,0 +1,170 @@
+{
+  "$schema_version": 2,
+  "$id": "ikanpp",
+  "$type": "video",
+  "$name": "ikanpp",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.ikanpp.com",
+    "description": "ikanpp 影视聚合站（影片四要素齐备，无需登录）。发现走 /api/library/browse（type=movie/tv/anime/variety/documentary 等，list 分页 36/页，item 含 id/title/cover/url slug）。搜索走 POST /api/search-parallel（text/event-stream，并行聚合 25 个 MacCMS 采集源：巨量/光速/暴风/极速等，body 内嵌 sources 数组，SSE 每源一条 videos 事件，sse_field=videos 合并后得全部结果；item 为 MacCMS vod_* 字段 + source 源标识，url 模板把 source 一并带进 ?source= 参数，detail 取流必须依赖该 source）。详情走 POST /api/detail——POST body 需精确保留标题（含全角标点）且要带 source（字符串或完整源对象，仅空 {} 时服务端 heal 到默认源），用工作 URL 的 ?title=/?source= 参数占位注入。响应 data 含 vod_* 元数据 + episodes 列表（name/url/index，url 为 CDN m3u8 直链）。分集 URL 即 m3u8 → fetch_video_episode 直链 passthrough，播放入口自动 HLS 代理。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "影视",
+      "聚合",
+      "hls"
+    ],
+    "last_verified": "2026-09-25"
+  },
+  "transports": {
+    "base_url": "https://www.ikanpp.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "application/json, text/plain, */*",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.ikanpp.com/"
+    },
+    "timeout": 10,
+    "retries": 2,
+    "interval_ms": 500,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/api/library/browse",
+      "list_item": {
+        "categories": [
+          { "title": "电影", "url": "/api/library/browse?type=movie" },
+          { "title": "剧集", "url": "/api/library/browse?type=tv" },
+          { "title": "动漫", "url": "/api/library/browse?type=anime" },
+          { "title": "综艺", "url": "/api/library/browse?type=variety" },
+          { "title": "纪录片", "url": "/api/library/browse?type=documentary" },
+          { "title": "全部", "url": "/api/library/browse?type=total" }
+        ]
+      }
+    }
+  },
+  "api_endpoints": {
+    "discovery": {
+      "url": "/api/library/browse",
+      "method": "GET",
+      "params": {
+        "page": "{page}",
+        "type": "movie",
+        "limit": "36"
+      },
+      "response_path": "list",
+      "item_fields": {
+        "title": "title",
+        "url": "/title/{id}?title={title}",
+        "cover": "cover",
+        "author": "area",
+        "update": "updatedAt"
+      }
+    },
+    "search": {
+      "url": "/api/search-parallel",
+      "method": "POST",
+      "sse": true,
+      "sse_field": "videos",
+      "body": {
+        "query": "{keyword}",
+        "sources": [
+          { "id": "juliang", "name": "巨量资源", "baseUrl": "https://api.juliang.live", "searchPath": "/api/provide/vod", "detailPath": "/api/provide/vod", "group": "normal", "enabled": true, "priority": 1 },
+          { "id": "guangsu", "name": "光速资源", "baseUrl": "https://api.guangsuapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 2 },
+          { "id": "baofeng", "name": "暴风资源", "baseUrl": "https://bfzyapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 3 },
+          { "id": "wujin", "name": "无尽资源", "baseUrl": "https://api.wujinapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 4 },
+          { "id": "zuida", "name": "最大资源", "baseUrl": "https://api.zuidapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 5 },
+          { "id": "jisu", "name": "极速资源", "baseUrl": "https://jszyapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 6 },
+          { "id": "xinlang", "name": "新浪资源", "baseUrl": "https://api.xinlangapi.com", "searchPath": "/xinlangapi.php/provide/vod", "detailPath": "/xinlangapi.php/provide/vod", "group": "normal", "enabled": true, "priority": 7 },
+          { "id": "dytt", "name": "电影天堂", "baseUrl": "http://caiji.dyttzyapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 8 },
+          { "id": "modu", "name": "魔都资源", "baseUrl": "https://www.mdzyapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 9 },
+          { "id": "zy360", "name": "360资源", "baseUrl": "https://360zy.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 10 },
+          { "id": "json1080", "name": "1080JSON", "baseUrl": "https://api.1080zyku.com", "searchPath": "/inc/apijson.php", "detailPath": "/inc/apijson.php", "group": "normal", "enabled": true, "priority": 11 },
+          { "id": "haitun", "name": "海豚资源", "baseUrl": "https://hhzyapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 12 },
+          { "id": "liangzi", "name": "量子资源", "baseUrl": "http://cj.lziapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 13 },
+          { "id": "feifan", "name": "非凡资源", "baseUrl": "https://api.ffzyapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 14 },
+          { "id": "huya", "name": "虎牙资源", "baseUrl": "https://www.huyaapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 15 },
+          { "id": "ruyi", "name": "如意资源", "baseUrl": "https://cj.rycjapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 16 },
+          { "id": "jinying", "name": "金鹰点播", "baseUrl": "https://jinyingzy.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 17 },
+          { "id": "youku", "name": "优酷资源", "baseUrl": "https://api.ukuapi88.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 18 },
+          { "id": "subo", "name": "速博资源", "baseUrl": "https://subocaiji.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 19 },
+          { "id": "ikun", "name": "iKun资源", "baseUrl": "https://ikunzyapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 20 },
+          { "id": "lezi", "name": "乐子资源", "baseUrl": "https://cj.lziapi.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 21 },
+          { "id": "hongniu", "name": "红牛资源", "baseUrl": "https://www.hongniuzy2.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 22 },
+          { "id": "jingyu", "name": "鲸鱼资源", "baseUrl": "https://jyzyapi.com", "searchPath": "/provide/vod", "detailPath": "/provide/vod", "group": "normal", "enabled": true, "priority": 23 },
+          { "id": "moduys", "name": "魔都影视", "baseUrl": "https://www.moduzy.com", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 24 },
+          { "id": "modu_dm", "name": "魔都动漫", "baseUrl": "https://caiji.moduapi.cc", "searchPath": "/api.php/provide/vod", "detailPath": "/api.php/provide/vod", "group": "normal", "enabled": true, "priority": 25 }
+        ],
+        "page": "{page}"
+      },
+      "item_fields": {
+        "title": "vod_name",
+        "url": "/title/{vod_id}?title={vod_name}&source={source}",
+        "cover": "vod_pic",
+        "author": "vod_area",
+        "update": "vod_remarks"
+      }
+    },
+    "detail": {
+      "url": "/api/detail",
+      "method": "POST",
+      "body": {
+        "id": "{id}",
+        "source": "{source}",
+        "title": "{title}"
+      },
+      "field_extractors": {
+        "title": "vod_name",
+        "cover": "vod_pic",
+        "status": "vod_remarks",
+        "summary": "vod_content",
+        "actor": "vod_actor",
+        "author": "vod_director",
+        "tags": "type_name"
+      },
+      "chapters": {
+        "items": "episodes",
+        "title": "name",
+        "number": "index",
+        "url_template": "{url}"
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    },
+    "hls": {
+      "workers": 4,
+      "network_caching_ms": 30000
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 60
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 100
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

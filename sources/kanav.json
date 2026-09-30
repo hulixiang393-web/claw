@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://kanav.ad",
     "description": "KanAV - 迅雷影视 AV 在线观看（苹果CMS MacCMS，YS008 模板）。纯视频站，每个 id 对应单个视频（无分集/选集），播放地址为 m3u8。播放页含 var player_aaaa（maccms encrypt=2：url 为「按字节 urlencode 后再 base64」密文）→ 需走 content.episode.source_switch 的 player 分支 + decryption.targets.video_url.strategy=maccms_url 解码出真实 m3u8（普通 play_url.regex 分支不解密）。m3u8 托管在 img.11yun.xyz / cdn6.11yun.space 等 CDN，携带来源 Referer 即可取流（实测 200）。站点无 detail 路由（/index.php/vod/detail/ 返回 1 字节），详情即播放页本身；标题/作者/日期/大小在 h1 文本串中，封面取 MacPlayer.Pic，标签取 hr-tags 块的内联 a 链接。全站分类（导航 14 类）：1 中文字幕 / 2 日韩有码 / 3 日韩无码 / 4 国产AV / 22 流出自拍(30 自拍泄密 31 探花约炮 32 主播录制) / 20 动漫番剧(25 里番 26 泡面番 27 Motion Anime 28 3D动画 29 同人作品)；类型页分页 /vod/type/id/{id}/page/{page}.html。全站聚合仅有「热映影片」/index.php/label/hot.html（48 条/单页），供「全部」默认加载；站点无全站分页列表（show 不带 id 返回系统提示错误页）。镜像 m1.kanav.fun。",
     "lang": "zh-CN",
@@ -204,7 +205,7 @@
       "fields": {
         "title": {
           "css": "h1",
-          "regex": "(?s)标题[：:]\\s*(.*?)(?:\\s*作者[：:]|$)"
+          "regex": "(?s)(?:标题[：:]\\s*)?(.*?)(?:\\s*作者[：:]|\\s*#|\\s*\\[支援|\\s*20\\d{2}年|$)"
         },
         "cover": {
           "regex": "MacPlayer\\.Pic\\s*=\\s*\"([^\"]+)\""
@@ -218,7 +219,10 @@
         },
         "clean": {
           "summary": [
-            ["re:\\s*-\\s*KanAV.*$", ""]
+            [
+              "re:\\s*-\\s*KanAV.*$",
+              ""
+            ]
           ]
         }
       }
@@ -249,14 +253,14 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 10,
-      "max_results": 240
+      "max_pages": 20,
+      "max_results": 1000
     },
     "detail": {
       "max_pages": 1
     },
     "episode": {
-      "max_pages": 1,
+      "max_pages": 8,
       "max_items": 1
     }
   },

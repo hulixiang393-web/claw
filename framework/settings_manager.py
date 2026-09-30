@@ -1,7 +1,8 @@
 """全局应用设置（settings_manager.py）。
 
 读写 app_config.json，提供默认值合并。首页读主题、字体缩放等。
-对应 app_config.json 五块：network / ui / download / library / diagnostics。
+对应 app_config.json 六块：network / ui / download / library / diagnostics
+/ video_cache（视频播放磁盘缓存配额）。
 
 用法：
     sm = SettingsManager("app_config.json")
@@ -64,7 +65,38 @@ DEFAULTS: dict = {
     "adblock": {
         "extra_rule_dir": "",
     },
+    "video_cache": {
+        "enabled": True,
+        "max_videos": 5,
+        "max_bytes_mb": 8192,
+    },
+    "hls_prefetch": {
+        # 有界 HLS 预取：按消费位置前瞻 depth 片、并发 workers 路拉取落盘。
+        # 实测部分 CDN 按连接限速，4 并发总带宽可达单连接的 2.1x。
+        # 默认**关闭**：开启会改变对源站的请求模式，需实测确认不触发风控后再手动开。
+        "enabled": False,
+        "depth": 4,
+        "workers": 3,
+    },
+    "content": {
+        # 18+ 源显示策略：true = 在发现/搜索/源管理中显示成人源。
+        "show_adult_sources": True,
+    },
+    "reader": {
+        "prefetch_enabled": True,
+        "prefetch_ahead": 3,
+        "prefetch_behind": 1,
+    },
+    "discover": {
+        "preload_pages": 5,
+        "preload_concurrency": 3,
+    },
+    "shelf_cache": {
+        "max_book_mb": 256,
+        "max_total_mb": 8192,
+    },
     "sources_runtime": {
+
         "broken_source_warn_interval_hours": 24,
         "auto_disable_after_failures": 3,
         "selfcheck_strategy": "soft",
@@ -127,3 +159,36 @@ class SettingsManager:
         with self._lock:
             self._data = json.loads(json.dumps(DEFAULTS))
         self.save()
+
+
+def _clamp_int(value, lo: int, hi: int, fallback: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(lo, min(hi, n))
+
+
+def reader_prefetch_settings(settings_manager) -> dict:
+    g = settings_manager.get
+    return {
+        "enabled": bool(g("reader", "prefetch_enabled", True)),
+        "ahead": _clamp_int(g("reader", "prefetch_ahead", 3), 0, 20, 3),
+        "behind": _clamp_int(g("reader", "prefetch_behind", 1), 0, 10, 1),
+    }
+
+
+def discover_preload_settings(settings_manager) -> dict:
+    g = settings_manager.get
+    return {
+        "pages": _clamp_int(g("discover", "preload_pages", 5), 0, 10, 5),
+        "concurrency": _clamp_int(g("discover", "preload_concurrency", 3), 1, 5, 3),
+    }
+
+
+def shelf_cache_settings(settings_manager) -> dict:
+    g = settings_manager.get
+    return {
+        "max_book_mb": _clamp_int(g("shelf_cache", "max_book_mb", 256), 16, 65536, 256),
+        "max_total_mb": _clamp_int(g("shelf_cache", "max_total_mb", 8192), 256, 131072, 8192),
+    }

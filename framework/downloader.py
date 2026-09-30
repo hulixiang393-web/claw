@@ -437,13 +437,14 @@ class Downloader:
         progress_cb=None, cancel_evt=None, pause_evt=None,
         source=None,
     ) -> int:
-        """HLS（m3u8）逐段下载 → ffmpeg 本地合并成 mp4。
+        """HLS（m3u8）分段并行下载 → ffmpeg 本地合并成 mp4。
 
         ffmpeg 直连 HLS 的缺陷（xuandm 实测 ~9 分钟截断）：a) -headers 不传播
         给分段请求，CDN 校验 Referer 时 403；b) 单段失败即中止，产出截断文件。
-        这里用 HttpClient 逐段下载：每段带源 Referer + 最多 5 次重试 + 递增
-        退避（间歇 403 重试可过），写本地 m3u8 + 本地 key，由 ffmpeg 完成
-        AES-128 解密与 -c copy 合并。彻底失败的分段写空 TS 包占位，不中断整集。
+        这里用 HttpClient 并行下载分段（worker 数取源 media.hls.workers，规避
+        单连接 CDN 限速）：每段带源 Referer + 最多 5 次重试 + 递增退避（间歇
+        403 重试可过），写本地 m3u8 + 本地 key，由 ffmpeg 完成 AES-128 解密与
+        -c copy 合并。彻底失败的分段写空 TS 包占位，不中断整集。
         """
         import shutil
         import tempfile
@@ -492,21 +493,57 @@ class Downloader:
                 key_local = Path(hls_dir) / "key.key"
                 key_local.write_bytes(key_data)
 
-            # 逐段下载：带 Referer + 重试；彻底失败跳过（占位），不中断整集。
-            # 广告段（ad_segs）直接跳过下载，不写占位、不进本地 m3u8。
+            # 并行分段下载：连接数取源 media.hls.workers（默认 4）。单连接 CDN
+            # 常被限速（ikanpp 实测单连接只能跑几百 KB/s，4 连接近 4 倍吞吐）；
+            # ikanpp.json 已声明 media.hls.workers:4 但此前从未被消费。
+            # 限量在飞任务 ≤ workers 段：取消/暂停只需等在跑 ≤workers 段。
+            from concurrent.futures import ThreadPoolExecutor
+            import threading
+            import time
+
+            raw = (source.raw if source is not None else {}) or {}
+            workers = max(1, int(((raw.get("media") or {}).get("hls") or {}).get("workers") or 4))
             ad_set = set(ad_segs)
-            seg_items = []  # (extinf, 本地文件名, 字节数)
-            total = 0
-            for idx, (extinf, seg_url) in enumerate(segs):
+            seg_items = {}  # idx -> (extinf, 本地文件名, 字节数)
+            total = [0]
+            lock = threading.Lock()
+
+            def _dl(idx: int, extinf, seg_url):
                 self._check_abort(cancel_evt, pause_evt)
-                if idx in ad_set:
-                    continue  # 流内广告段：不下载
                 seg_file = Path(hls_dir) / f"seg_{idx + 1:05d}.ts"
                 n = self._download_seg_retry(seg_url, headers, seg_file, cancel_evt, pause_evt)
-                seg_items.append((extinf, seg_file.name, n))
-                total += n
-                if progress_cb is not None:
-                    progress_cb(total)
+                with lock:
+                    seg_items[idx] = (extinf, seg_file.name, n)
+                    total[0] += n
+                    if progress_cb is not None:
+                        progress_cb(total[0])
+
+            n_total = len(segs)
+            futs = {}
+            next_submit = 0
+            done = set()
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                while len(done) < n_total:
+                    while next_submit < n_total and len(futs) < workers:
+                        if next_submit in ad_set:  # 流内广告段：不下载
+                            done.add(next_submit)
+                            next_submit += 1
+                            continue
+                        extinf, seg_url = segs[next_submit]
+                        f = pool.submit(_dl, next_submit, extinf, seg_url)
+                        futs[f] = next_submit
+                        next_submit += 1
+                    self._check_abort(cancel_evt, pause_evt)
+                    finished = [f for f in list(futs) if f.done()]
+                    if not finished:
+                        time.sleep(0.05)
+                        continue
+                    for f in finished:
+                        f.result()  # 段级异常/取消在此抛出
+                        done.add(futs.pop(f))
+
+            seg_items = [seg_items[i] for i in sorted(seg_items)]  # 按原序供 m3u8 引用
+            total = sum(n for _ext, _name, n in seg_items)
 
             # 重写本地 m3u8（key/分段指本地文件），ffmpeg 解密 + remux
             local_m3u8 = Path(hls_dir) / "playlist.m3u8"

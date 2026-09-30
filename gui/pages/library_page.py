@@ -170,6 +170,10 @@ class _ShelfCard(QFrame):
         meta.setText(meta_text)
         meta.setToolTip(meta_text)
         state.addWidget(meta, stretch=1)
+        self._badge_label = QLabel("")
+        self._badge_label.setFixedHeight(16)
+        self._badge_label.setStyleSheet("color: palette(highlight); font-size: 10px;")
+        state.addWidget(self._badge_label)
         layout.addLayout(state)
         # 标题收紧为单行后多余高度 → 底部 stretch（卡片等高不破）
         layout.addStretch(1)
@@ -288,6 +292,10 @@ class LibraryPage(BasePage):
         shelf_export_dir: str | Path = "library",
         shelf_service=None,
         cover_backfiller=None,
+        shelf_cache_repository=None,
+        source_manager=None,
+        content=None,
+        settings=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -300,8 +308,17 @@ class LibraryPage(BasePage):
                 output_dir=output_dir,
                 library_store=library_store,
                 reading_progress=reading_progress,
+                repository=shelf_cache_repository,
             )
-        self._store = library_store
+        self._store = library_store or getattr(self._shelf, "_store", None)
+        self._source_manager = source_manager
+        self._content = content
+        self.settings = settings
+        self._reading_progress = reading_progress
+        self._shelf_cache_repository = shelf_cache_repository
+        self._precache_jobs: dict[str, object] = {}
+        self._cards_by_key: dict[str, _ShelfCard] = {}
+        self._unlocked: set[str] = set()
         self._shelf_export_dir = Path(shelf_export_dir) if shelf_export_dir else Path("library")
         self._scan_task = None  # 后台扫描任务持有引用（防 GC）
         # 缺封面收藏后台补写回调（App 层注入：内容层 fetch_cover → store.set_cover）
@@ -322,12 +339,21 @@ class LibraryPage(BasePage):
         top.addSpacing(12)
         top.addWidget(QLabel("收藏夹"))
         self.folder_combo = QComboBox()
-        self.folder_combo.currentTextChanged.connect(lambda _: self._rebuild())
+        self.folder_combo.currentTextChanged.connect(self._on_folder_changed)
         top.addWidget(self.folder_combo)
+        self._previous_folder = "全部"
 
         self.new_folder_btn = QPushButton("新建收藏夹")
         self.new_folder_btn.clicked.connect(self._new_folder)
         top.addWidget(self.new_folder_btn)
+
+        self.admin_btn = QPushButton("管理员设置")
+        self.admin_btn.clicked.connect(self._manage_admin_password)
+        top.addWidget(self.admin_btn)
+
+        self.delete_folder_btn = QPushButton("删除收藏夹")
+        self.delete_folder_btn.clicked.connect(self._delete_folder)
+        top.addWidget(self.delete_folder_btn)
 
         self.clear_fav_btn = QPushButton("一键清空收藏")
         self.clear_fav_btn.setToolTip("清空当前选中的收藏夹内全部收藏（不删本地文件）")
@@ -350,6 +376,10 @@ class LibraryPage(BasePage):
         self.export_btn.clicked.connect(self._export_shelf)
         top.addWidget(self.export_btn)
 
+        self.import_btn = QPushButton("导入书架")
+        self.import_btn.clicked.connect(self._import_shelf)
+        top.addWidget(self.import_btn)
+
         top.addStretch(1)
         self.count_label = QLabel("")
         self.count_label.setStyleSheet("color: palette(dark);")
@@ -360,6 +390,9 @@ class LibraryPage(BasePage):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 竖直滚动条常显：书籍封面加载不足/下载后封面补齐使内容增长时，滚动条
+        # 出现/消失→视口宽度变化→列表项重排晃动。常显固定宽度消除抖动。
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.container = QWidget()
         self.body = QVBoxLayout(self.container)
         self.body.setContentsMargins(0, 0, 0, 0)
@@ -368,6 +401,51 @@ class LibraryPage(BasePage):
         layout.addWidget(self.scroll, stretch=1)
 
         self._rebuild()
+
+    def is_folder_unlocked(self, name: str) -> bool:
+        info = self._store.folder_info(name) if self._store is not None else None
+        if info is None or not info.get("locked"):
+            return True
+        return name in self._unlocked
+
+    def _prompt_unlock(self, name: str) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from framework.folder_lock import verify_password
+
+        info = self._store.folder_info(name) if self._store is not None else None
+        if info is None or not info.get("locked"):
+            return True
+        pw, ok = QInputDialog.getText(
+            self, f"解锁收藏夹「{name}」", "请输入密码：", QLineEdit.Password
+        )
+        if not ok:
+            return False
+        if verify_password(pw, info.get("pw"), info.get("salt")):
+            self._unlocked.add(name)
+            self._rebuild()
+            return True
+        QMessageBox.warning(self, "解锁失败", "密码不正确。")
+        return False
+
+    def _admin_unlock_folder(self, name: str) -> bool:
+        if not self._require_admin():
+            return False
+        info = self._store.folder_info(name) if self._store is not None else None
+        if info is None or not info.get("locked"):
+            return True
+        if not self._prompt_set_password(name, False, admin_verified=True):
+            return False
+        self._unlocked.add(name)
+        self._rebuild()
+        return True
+
+    def _has_locked_folders(self) -> bool:
+        if self._store is None:
+            return False
+        return any(
+            not self.is_folder_unlocked(fname) and self._store.folder_items(fname)
+            for fname in self._store.list_folders()
+        )
 
     # ------------------------------------------------------------------ #
     def _rebuild(self) -> None:
@@ -395,41 +473,93 @@ class LibraryPage(BasePage):
 
     def _sync_combos(self) -> None:
         """刷新收藏夹下拉（保持当前选择）。"""
-        if self._store is None:
-            return
         cur = self.folder_combo.currentText()
         self.folder_combo.blockSignals(True)
         self.folder_combo.clear()
         self.folder_combo.addItem("全部")
-        self.folder_combo.addItems(self._shelf.folders())
+        if self._store is not None:
+            self.folder_combo.addItems(self._shelf.folders())
         idx = self.folder_combo.findText(cur)
         self.folder_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.folder_combo.blockSignals(False)
-        # 一键清空：仅在具体收藏夹下可用（对应「在具体分类中清空」）
         cur_folder = self.folder_combo.currentText()
-        scoped = bool(cur_folder) and cur_folder != "全部"
-        self.clear_fav_btn.setEnabled(scoped)
-        self.clear_fav_btn.setToolTip(
-            f"清空收藏夹「{cur_folder}」内全部收藏（不删本地文件）" if scoped
-            else "请先在收藏夹下拉中选择一个具体收藏夹"
-        )
+        self._previous_folder = cur_folder or "全部"
+        self.delete_folder_btn.setEnabled(bool(cur_folder and cur_folder != "全部"))
+        if cur_folder and cur_folder != "全部":
+            count = len(self._store.folder_items(cur_folder)) if self._store else 0
+            self.clear_fav_btn.setText(f"清空收藏夹「{cur_folder}」({count})")
+            self.clear_fav_btn.setToolTip(
+                f"清空收藏夹「{cur_folder}」内全部收藏（不删本地文件）"
+            )
+        else:
+            total = self._store.count() if self._store else 0
+            self.clear_fav_btn.setText(f"一键清空全部收藏({total})")
+            self.clear_fav_btn.setToolTip("清空全部收藏（不删本地已下载文件）")
+        self.clear_fav_btn.setEnabled(True)
 
     def _render(self, books: list[dict]) -> None:
         """主线程渲染扫描结果（本地在前）。"""
         if not self._visible_combo_state():
             return  # 筛选/搜索/排序已变化 → 旧结果丢弃，等新任务
-        if not books:
+        selected_folder = self.folder_combo.currentText()
+        def _visible(b: dict) -> bool:
+            folder = b.get("folder", "")
+            info = self._store.folder_info(folder) if self._store is not None and folder else None
+            if selected_folder == "全部" and info and info.get("locked"):
+                return False
+            return self.is_folder_unlocked(folder)
+
+        locals_ = [
+            b for b in books
+            if b.get("kind") == "local" and _visible(b)
+        ]
+        favorites = [
+            b for b in books
+            if b.get("kind") == "favorite" and _visible(b)
+        ]
+        locals_, favorites = self._deduplicate_visible_books(locals_, favorites)
+        type_map = {"全部": "", "小说": "novel", "漫画": "comic", "视频": "video"}
+        want_type = type_map.get(self.type_combo.currentText(), "")
+        selected_folder = self.folder_combo.currentText()
+        keyword = self.search_edit.text().strip().lower()
+        locked = []
+        if self._store is not None:
+            for fname in self._store.list_folders():
+                if self.is_folder_unlocked(fname):
+                    continue
+                if selected_folder == "全部":
+                    continue
+                if selected_folder not in ("", fname):
+                    continue
+                locked_items = [
+                    item for item in self._store.folder_items(fname)
+                    if (not want_type or item.get("content_type") == want_type)
+                    and (not keyword or keyword in (item.get("title") or "").lower())
+                ]
+                if locked_items:
+                    locked.append({
+                        "key": f"__locked__{fname}",
+                        "title": f"🔒 {fname}",
+                        "content_type": "locked",
+                        "folder": fname,
+                        "cover": "",
+                        "url": "",
+                        "source_id": "",
+                        "locked_folder": fname,
+                        "locked_count": len(locked_items),
+                    })
+        if not locals_ and not favorites and not locked:
             self._add_empty()
             self.count_label.setText("书架还空着")
             return
-        locals_ = [b for b in books if b.get("kind") == "local"]
-        favorites = [b for b in books if b.get("kind") == "favorite"]
-        self.count_label.setText(f"共 {len(books)} 本 · 本地{len(locals_)} / 收藏{len(favorites)}")
+        visible_total = len(locals_) + len(favorites) + len(locked)
+        self.count_label.setText(
+            f"共 {visible_total} 本 · 本地{len(locals_)} / 收藏{len(favorites)}"
+        )
         if locals_:
             self._add_group("本地", [{"rec": b} for b in locals_])
-        if favorites:
-            # 收藏先按系列合并（同源+同主书名 → 一张卡）→ 再从每条开卡
-            items: list[dict] = []
+        if favorites or locked:
+            items: list[dict] = [{"rec": b} for b in locked]
             for grp in group_favorites(favorites):
                 items.append(self._to_shelf_item(grp))
             self._add_group("收藏", items)
@@ -453,6 +583,45 @@ class LibraryPage(BasePage):
                 self._cover_backfiller(need)
             except Exception:  # noqa: BLE001 —— 补封面失败不影响书架显示
                 pass
+
+    @staticmethod
+    def _stable_item_key(item: dict):
+        url = item.get("url") or ""
+        if url:
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+            parts = urlsplit(url.strip())
+            host = parts.hostname or ""
+            if parts.port not in (None, 80, 443):
+                host = f"{host}:{parts.port}"
+            query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+            normalized = urlunsplit((parts.scheme.lower(), host.lower(), parts.path.rstrip("/") or "/", query, ""))
+            return (item.get("source_id") or "", normalized)
+        return (item.get("source_id") or "", item.get("path") or item.get("key") or "")
+
+    @classmethod
+    def _deduplicate_visible_books(cls, locals_: list[dict], favorites: list[dict]):
+        favorite_by_key = {}
+        for item in favorites:
+            favorite_by_key[cls._stable_item_key(item)] = item
+        kept_favorites = list(favorite_by_key.values())
+        matched = set()
+        kept_locals = []
+        local_by_key = {}
+        for item in locals_:
+            key = cls._stable_item_key(item)
+            favorite = favorite_by_key.get(key)
+            if favorite is not None:
+                merged = dict(item)
+                for field, value in favorite.items():
+                    if field not in {"kind", "path", "episode_paths"} and value not in (None, "", [], {}):
+                        merged[field] = value
+                item = merged
+                matched.add(key)
+            local_by_key[key] = item
+        kept_locals = list(local_by_key.values())
+        kept_favorites = [item for item in kept_favorites if cls._stable_item_key(item) not in matched]
+        return kept_locals, kept_favorites
 
     def _visible_combo_state(self) -> bool:
         ctype = self.type_combo.currentText()
@@ -482,6 +651,7 @@ class LibraryPage(BasePage):
                 LibraryPage._wipe(item.layout())
 
     def _clear_all(self) -> None:
+        self._cards_by_key.clear()
         LibraryPage._wipe(self.body)
 
     # ------------------------------------------------------------------ #
@@ -496,17 +666,92 @@ class LibraryPage(BasePage):
         grid = QGridLayout()
         grid.setSpacing(12)
         for i, item in enumerate(items):
-            card = _ShelfCard(item["rec"])
+            rec = item["rec"]
+            card = _ShelfCard(rec)
+            book_key = rec.get("url") or ""
+            if rec.get("kind") == "favorite" and book_key:
+                self._cards_by_key[book_key] = card
+                card._badge_label.setText(self._cached_badge(book_key))
             # clicked 信号携带 rec 参数 → 首参吞掉它，闭包 it=item 才能拿到条目
             card.clicked.connect(
                 lambda _rec, it=item: self._on_card_clicked(it)
             )
-            card.menu_requested.connect(
-                lambda r, p, it=item: self._show_card_menu(it["rec"], p)
-            )
+            if not item["rec"].get("locked_folder"):
+                card.menu_requested.connect(
+                    lambda r, p, it=item: self._show_card_menu(it["rec"], p)
+                )
             row, col = divmod(i, 3)
             grid.addWidget(card, row, col)
         self.body.addLayout(grid)
+
+    def _cached_badge(self, book_key: str) -> str:
+        repo = self._shelf_cache_repository
+        if repo is None or not book_key:
+            return ""
+        try:
+            keys = repo.cached_chapter_keys(book_key)
+        except Exception:  # noqa: BLE001
+            return ""
+        return f"已缓存 {len(keys)} 章" if keys else ""
+
+    def _set_precache_badge(self, book_key: str, done: int, total: int, done_state: bool = False) -> None:
+        card = self._cards_by_key.get(book_key)
+        if card is None:
+            return
+        label = getattr(card, "_badge_label", None)
+        if label is None:
+            return
+        if done_state:
+            self._precache_jobs.pop(book_key, None)
+            label.setText(f"已缓存 {done} 章")
+        else:
+            label.setText(f"缓存中 {done}/{total}")
+
+    def _precache_book(self, rec: dict) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        from PySide6.QtCore import QThreadPool
+        from framework.shelf_precache import ShelfPrecacheJob
+        from framework.settings_manager import reader_prefetch_settings
+
+        repo = self._shelf_cache_repository
+        if repo is None:
+            QMessageBox.information(self, "缓存本书", "缓存服务未就绪。")
+            return
+        book_key = rec.get("url") or ""
+        source = self._source_manager.get(rec.get("source_id") or "") if self._source_manager else None
+        if not book_key or source is None or self._content is None:
+            QMessageBox.warning(self, "缓存本书", "找不到对应源或内容服务。")
+            return
+        if book_key in self._precache_jobs:
+            return
+        cfg = reader_prefetch_settings(self.settings) if self.settings is not None else {"enabled": True, "ahead": 3, "behind": 1}
+        if not cfg["enabled"]:
+            QMessageBox.information(self, "缓存本书", "预加载已在设置页关闭。")
+            return
+        chapters = list(getattr(rec.get("detail"), "chapters", None) or [])
+        if not chapters:
+            QMessageBox.information(self, "缓存本书", "目录为空，请先打开一次该书。")
+            return
+        current_url = ""
+        if self._reading_progress is not None:
+            progress = self._reading_progress.resume(book_key) or {}
+            current_url = progress.get("chapter_url", "")
+        start = next((i for i, ch in enumerate(chapters) if getattr(ch, "url", "") == current_url), 0)
+        job = ShelfPrecacheJob(
+            content=self._content,
+            source=source,
+            chapters=chapters,
+            start_idx=start,
+            ahead=cfg["ahead"],
+            repository=repo,
+            book_key=book_key,
+        )
+        job.signals.progress.connect(lambda done, total, bk=book_key: self._set_precache_badge(bk, done, total))
+        job.signals.finished.connect(lambda count, bk=book_key: self._set_precache_badge(bk, count, count, True))
+        job.signals.failed.connect(lambda _error, bk=book_key: self._precache_jobs.pop(bk, None))
+        self._precache_jobs[book_key] = job
+        self._set_precache_badge(book_key, 0, min(cfg["ahead"] + 1, len(chapters) - start))
+        QThreadPool.globalInstance().start(job)
 
     @staticmethod
     def _to_shelf_item(group: list[dict]) -> dict:
@@ -535,20 +780,160 @@ class LibraryPage(BasePage):
         empty.setStyleSheet("color: palette(mid); font-size: 14px; padding: 60px;")
         self.body.addWidget(empty)
 
+    def _on_folder_changed(self, name: str) -> None:
+        if name and name != "全部" and not self.is_folder_unlocked(name):
+            if not self._prompt_unlock(name):
+                from PySide6.QtWidgets import QMessageBox
+
+                choice = QMessageBox.question(
+                    self,
+                    "管理员解锁",
+                    "密码解锁失败。是否使用管理员验证并立即设置新的收藏夹密码？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if choice == QMessageBox.Yes and self._admin_unlock_folder(name):
+                    self._previous_folder = name
+                    self._rebuild()
+                    return
+                self.folder_combo.blockSignals(True)
+                previous = self.folder_combo.findText(self._previous_folder)
+                self.folder_combo.setCurrentIndex(previous if previous >= 0 else 0)
+                self.folder_combo.blockSignals(False)
+                return
+        self._previous_folder = name or "全部"
+        self._rebuild()
+
     # ------------------------------------------------------------------ #
+    def _manage_admin_password(self) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        auth = self._admin_auth()
+        if auth is None:
+            return False
+        if not auth.is_configured():
+            p1, ok1 = QInputDialog.getText(
+                self, "创建管理员密码", "管理员密码：", QLineEdit.Password
+            )
+            if not ok1 or not p1:
+                return False
+            p2, ok2 = QInputDialog.getText(
+                self, "创建管理员密码", "再次输入：", QLineEdit.Password
+            )
+            if not ok2 or p1 != p2:
+                QMessageBox.warning(self, "创建失败", "两次输入的密码不一致。")
+                return False
+            if auth.configure(p1):
+                QMessageBox.information(self, "创建成功", "管理员密码已创建，之后不能通过恢复码重置。")
+                return True
+            QMessageBox.warning(self, "创建失败", "管理员密码已经存在，不能覆盖。")
+            return False
+        old, ok = QInputDialog.getText(
+            self, "修改管理员密码", "当前管理员密码：", QLineEdit.Password
+        )
+        if not ok:
+            return False
+        p1, ok1 = QInputDialog.getText(
+            self, "修改管理员密码", "新管理员密码：", QLineEdit.Password
+        )
+        if not ok1 or not p1:
+            return False
+        p2, ok2 = QInputDialog.getText(
+            self, "修改管理员密码", "再次输入新密码：", QLineEdit.Password
+        )
+        if not ok2 or p1 != p2:
+            QMessageBox.warning(self, "修改失败", "两次输入的密码不一致。")
+            return False
+        if not auth.change(old, p1):
+            QMessageBox.warning(self, "修改失败", "当前管理员密码不正确。")
+            return False
+        QMessageBox.information(self, "修改成功", "管理员密码已修改。")
+        return True
+
     def _new_folder(self) -> None:
-        from PySide6.QtWidgets import QInputDialog
+        from PySide6.QtWidgets import (
+            QCheckBox,
+            QDialog,
+            QDialogButtonBox,
+            QInputDialog,
+            QVBoxLayout,
+        )
 
         name, ok = QInputDialog.getText(self, "新建收藏夹", "收藏夹名称：")
         if not ok or not name.strip():
             return
         name = name.strip()
-        self._shelf.create_folder(name)
+        locked = QCheckBox("设置密码保护")
+        dialog = QDialog(self)
+        dialog.setWindowTitle("新建收藏夹")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(locked)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if locked.isChecked():
+            from PySide6.QtWidgets import QMessageBox
+            if not self._require_admin():
+                return
+            password, ok = QInputDialog.getText(
+                self, "设置收藏夹密码", "密码：", QLineEdit.Password
+            )
+            if not ok or not password:
+                return
+            confirmation, confirmed = QInputDialog.getText(
+                self, "设置收藏夹密码", "再次输入：", QLineEdit.Password
+            )
+            if not confirmed or password != confirmation:
+                QMessageBox.warning(self, "创建失败", "两次输入的密码不一致。")
+                return
+            from framework.folder_lock import hash_password, new_recovery_code, new_salt
+            salt = new_salt()
+            recovery_salt = new_salt()
+            recovery_code = new_recovery_code()
+            if not self._store.create_folder(
+                name,
+                locked=True,
+                pw=hash_password(password, salt),
+                salt=salt,
+                recovery_pw=hash_password(recovery_code, recovery_salt),
+                recovery_salt=recovery_salt,
+            ):
+                return
+            self._unlocked.add(name)
+            self._show_recovery_code(recovery_code)
+        elif not self._shelf.create_folder(name):
+            return
         idx = self.folder_combo.findText(name)
         if idx < 0:
             self.folder_combo.addItem(name)
             idx = self.folder_combo.count() - 1
         self.folder_combo.setCurrentIndex(idx)
+
+    def _delete_folder(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        name = self.folder_combo.currentText()
+        if not name or name == "全部" or self._store is None:
+            return
+        count = len(self._store.folder_items(name))
+        response = QMessageBox.question(
+            self,
+            "删除收藏夹",
+            f"确定删除收藏夹「{name}」吗？其中 {count} 本收藏将移回未归类。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if response != QMessageBox.Yes:
+            return
+        if not self._ensure_folder_unlocked(name):
+            return
+        if not self._shelf.delete_folder(name):
+            return
+        self._previous_folder = "全部"
+        self._rebuild()
 
     def _show_card_menu(self, rec: dict, pos) -> None:
         """右键菜单：本地书 + 收藏操作（合并条目两者都提供）。"""
@@ -557,6 +942,20 @@ class LibraryPage(BasePage):
         menu = QMenu(self)
         is_local = rec.get("kind") == "local"
         is_online = rec.get("online") or rec.get("kind") == "favorite"
+        folder = rec.get("folder", "")
+        info = self._store.folder_info(folder) if self._store is not None and folder else None
+        if is_online and info is not None and info.get("locked") and not self.is_folder_unlocked(folder):
+            menu.addAction("🔓 解锁收藏夹").triggered.connect(
+                lambda: self._prompt_unlock(folder)
+            )
+            menu.addAction("🔐 管理员解锁").triggered.connect(
+                lambda: self._admin_unlock_folder(folder)
+            )
+            menu.addAction("忘记密码 / 使用恢复码").triggered.connect(
+                lambda: self._prompt_recover_folder_password(folder)
+            )
+            menu.exec(pos)
+            return
 
         if is_local:
             menu.addAction("📂 打开所在文件夹").triggered.connect(
@@ -573,6 +972,10 @@ class LibraryPage(BasePage):
                 menu.addSeparator()
             url = rec.get("url", "")
             if url:
+                if rec.get("content_type") in ("novel", "comic") and url not in self._precache_jobs:
+                    menu.addAction("缓存本书（离线可读）").triggered.connect(
+                        lambda: self._precache_book(rec)
+                    )
                 menu.addAction("⬇ 下载到本地").triggered.connect(
                     lambda: self._request_download(rec)
                 )
@@ -595,7 +998,181 @@ class LibraryPage(BasePage):
             menu.addAction("移除收藏").triggered.connect(
                 lambda: self._remove_favorite(rec)
             )
+            if info is not None:
+                menu.addSeparator()
+                if info.get("locked"):
+                    menu.addAction("锁定收藏夹").triggered.connect(
+                        lambda: self._lock_folder_now(folder)
+                    )
+                    menu.addAction("修改密码").triggered.connect(
+                        lambda: self._prompt_set_password(folder, True)
+                    )
+                    menu.addAction("移除密码").triggered.connect(
+                        lambda: self._remove_folder_password(folder)
+                    )
+                    menu.addAction("忘记密码 / 使用恢复码").triggered.connect(
+                        lambda: self._prompt_recover_folder_password(folder)
+                    )
+                else:
+                    menu.addAction("设置密码").triggered.connect(
+                        lambda: self._prompt_set_password(folder, False)
+                    )
         menu.exec(pos)
+
+    def _admin_auth(self):
+        from framework.admin_auth import AdminAuth
+
+        path = getattr(self._store, "_path", None)
+        return AdminAuth(Path(path).with_name("admin_auth.json")) if path else None
+
+    def _require_admin(self) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        auth = self._admin_auth()
+        if auth is None:
+            return False
+        if not auth.is_configured():
+            p1, ok1 = QInputDialog.getText(
+                self, "设置管理员密码", "管理员密码：", QLineEdit.Password
+            )
+            if not ok1 or not p1:
+                return False
+            p2, ok2 = QInputDialog.getText(
+                self, "设置管理员密码", "再次输入：", QLineEdit.Password
+            )
+            if not ok2 or p1 != p2:
+                QMessageBox.warning(self, "设置失败", "两次输入的密码不一致。")
+                return False
+            if auth.configure(p1):
+                return True
+            QMessageBox.warning(self, "设置失败", "管理员密码已经设置，不能重置。")
+            return False
+        password, ok = QInputDialog.getText(
+            self, "管理员验证", "请输入管理员密码：", QLineEdit.Password
+        )
+        if not ok or not auth.verify(password):
+            QMessageBox.warning(self, "验证失败", "管理员密码不正确。")
+            return False
+        return True
+
+    def _prompt_set_password(
+        self, name: str, require_old: bool, admin_verified: bool = False
+    ) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from framework.folder_lock import hash_password, new_recovery_code, new_salt
+
+        if self._store is None or (not admin_verified and not self._require_admin()):
+            return False
+        info = self._store.folder_info(name) or {}
+        p1, ok1 = QInputDialog.getText(
+            self, f"设置密码「{name}」", "新密码：", QLineEdit.Password
+        )
+        if not ok1 or not p1:
+            return False
+        p2, ok2 = QInputDialog.getText(
+            self, f"设置密码「{name}」", "再次输入：", QLineEdit.Password
+        )
+        if not ok2 or p1 != p2:
+            QMessageBox.warning(self, "设置失败", "两次输入的密码不一致。")
+            return False
+        salt = new_salt()
+        recovery_salt = new_salt()
+        recovery_code = new_recovery_code()
+        if not self._store.set_folder_lock(
+            name,
+            True,
+            hash_password(p1, salt),
+            salt,
+            hash_password(recovery_code, recovery_salt),
+            recovery_salt,
+        ):
+            return False
+        self._unlocked.add(name)
+        self._show_recovery_code(recovery_code)
+        self._rebuild()
+        return True
+
+    def _show_recovery_code(self, code: str) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        box = QMessageBox(self)
+        box.setWindowTitle("收藏夹恢复码")
+        box.setText("请立即保存恢复码。关闭此窗口后将无法再次查看：")
+        box.setInformativeText(code)
+        copy_button = box.addButton("复制恢复码", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        if box.clickedButton() is copy_button:
+            QApplication.clipboard().setText(code)
+
+    def _prompt_recover_folder_password(self, name: str) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from framework.folder_lock import (
+            hash_password,
+            new_recovery_code,
+            new_salt,
+            verify_recovery_code,
+        )
+
+        if self._store is None or not self._require_admin():
+            return False
+        info = self._store.folder_info(name) or {}
+        code, ok = QInputDialog.getText(
+            self, f"恢复收藏夹「{name}」", "恢复码：", QLineEdit.Normal
+        )
+        if not ok or not verify_recovery_code(
+            code.strip(), info.get("recovery_pw"), info.get("recovery_salt")
+        ):
+            QMessageBox.warning(self, "恢复失败", "恢复码不正确或尚未配置恢复码。")
+            return False
+        p1, ok1 = QInputDialog.getText(
+            self, f"设置密码「{name}」", "新密码：", QLineEdit.Password
+        )
+        if not ok1 or not p1:
+            return False
+        p2, ok2 = QInputDialog.getText(
+            self, f"设置密码「{name}」", "再次输入：", QLineEdit.Password
+        )
+        if not ok2 or p1 != p2:
+            QMessageBox.warning(self, "恢复失败", "两次输入的密码不一致。")
+            return False
+        salt = new_salt()
+        recovery_salt = new_salt()
+        recovery_code = new_recovery_code()
+        if not self._store.set_folder_lock(
+            name,
+            True,
+            hash_password(p1, salt),
+            salt,
+            hash_password(recovery_code, recovery_salt),
+            recovery_salt,
+        ):
+            return False
+        self._unlocked.add(name)
+        self._show_recovery_code(recovery_code)
+        self._rebuild()
+        return True
+
+    def _lock_folder_now(self, name: str) -> None:
+        self._unlocked.discard(name)
+        self._rebuild()
+
+    def _set_folder_lock(self, name: str) -> bool:
+        result = self._prompt_set_password(name, False)
+        if result:
+            self._unlocked.discard(name)
+        return result
+
+    def _remove_folder_password(self, name: str) -> bool:
+        if self._store is None or not self._require_admin():
+            return False
+        if not self._prompt_unlock(name):
+            return False
+        if not self._store.clear_folder_lock(name):
+            return False
+        self._unlocked.discard(name)
+        self._rebuild()
+        return True
 
     def _copy_url(self, rec: dict) -> None:
         from PySide6.QtWidgets import QApplication
@@ -662,29 +1239,62 @@ class LibraryPage(BasePage):
         self._rebuild()
 
     def _clear_folder(self) -> None:
-        """一键清空当前收藏夹内的全部收藏（仅具体收藏夹可用）。"""
-        folder = self.folder_combo.currentText()
-        if not folder or folder == "全部":
-            return
         from PySide6.QtWidgets import QMessageBox
 
+        cur = self.folder_combo.currentText()
+        if cur and cur != "全部":
+            n = len(self._store.folder_items(cur)) if self._store else 0
+            scope = f"收藏夹「{cur}」"
+        else:
+            n = self._store.count() if self._store else 0
+            scope = "全部收藏"
+
+        if n == 0:
+            QMessageBox.information(self, "清空收藏", f"{scope}当前为空，无需清空。")
+            return
+
         resp = QMessageBox.question(
-            self, "清空收藏夹",
-            f"确定清空收藏夹「{folder}」内的全部收藏吗？\n\n"
-            "仅移除收藏记录，不影响本地已下载文件。",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            self, "清空收藏",
+            f"确定清空{scope}中的 {n} 本收藏吗？\n（不会删除本地已下载的文件）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if resp != QMessageBox.Yes:
             return
-        self._shelf.favorite_clear_folder(folder)
+
+        if cur and cur != "全部":
+            if not self._ensure_folder_unlocked(cur):
+                return
+            removed = self._shelf.favorite_clear_folder(cur)
+        else:
+            locked_folders = {
+                name for name in self._store.list_folders()
+                if self._store.folder_items(name)
+                and self._store.folder_info(name)
+                and self._store.folder_info(name).get("locked")
+            } if self._store is not None else set()
+            removed = self._shelf.clear_all_favorites(exclude_folders=locked_folders)
+        QMessageBox.information(self, "清空收藏", f"已移除 {removed} 本收藏。")
         self._rebuild()
 
+    def _ensure_folder_unlocked(self, *names: str) -> bool:
+        checked = set()
+        for name in names:
+            if not name or name in checked:
+                continue
+            checked.add(name)
+            if not self.is_folder_unlocked(name) and not self._prompt_unlock(name):
+                return False
+        return True
+
     def _move_favorite(self, rec: dict, folder: str) -> None:
+        if not self._ensure_folder_unlocked(rec.get("folder", "")):
+            return
         self._shelf.favorite_move(rec.get("url", ""), folder)
         self._rebuild()
 
     def _remove_favorite(self, rec: dict) -> None:
+        if not self._ensure_folder_unlocked(rec.get("folder", "")):
+            return
         self._shelf.favorite_remove(rec.get("url", ""))
         self._rebuild()
 
@@ -724,6 +1334,58 @@ class LibraryPage(BasePage):
             return
         QMessageBox.information(self, "导出书架", f"已导出到：\n{out}")
 
+    def _import_shelf(self) -> None:
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+        if self._store is None:
+            QMessageBox.information(self, "导入书架", "暂无书架数据。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入书架", str(self._shelf_export_dir), "JSON 文件 (*.json)"
+        )
+        if not path:
+            return
+        info = self._store.inspect_backup(path)
+        if not info["ok"]:
+            QMessageBox.critical(self, "导入书架", f"文件无效：\n{info['error']}")
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("导入书架")
+        box.setText(
+            f"文件含 {info['favorites']} 本收藏、{info['folders']} 个收藏夹。\n"
+            f"当前书架有 {self._store.count()} 本收藏。"
+        )
+        merge_btn = box.addButton("合并导入", QMessageBox.AcceptRole)
+        replace_btn = box.addButton("替换导入", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is merge_btn:
+            mode = "merge"
+        elif clicked is replace_btn:
+            resp = QMessageBox.question(
+                self, "确认替换",
+                f"替换将丢弃当前 {self._store.count()} 本收藏，确定继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+            mode = "replace"
+        else:
+            return
+
+        try:
+            result = self._store.import_backup(path, mode=mode)
+        except Exception as exc:
+            QMessageBox.critical(self, "导入失败", str(exc))
+            return
+        QMessageBox.information(
+            self, "导入完成",
+            f"导入 {result['imported']} 本收藏，新增 {result['folders_added']} 个收藏夹。",
+        )
+        self._rebuild()
+
     # ------------------------------------------------------------------ #
     def _on_card_clicked(self, item: dict) -> None:
         """点击书架卡片。item = {"rec": 记录, "members"?=系列成员列表}。
@@ -731,6 +1393,10 @@ class LibraryPage(BasePage):
         系列合并卡（members>1）→ 弹成员选集列表，逐个打开；
         单本 → 原打开逻辑（本地优先加载，无本地走网络）。
         """
+        locked_folder = item.get("rec", {}).get("locked_folder")
+        if locked_folder:
+            self._prompt_unlock(locked_folder)
+            return
         members = item.get("members")
         if members:
             self._pick_series_member(item["rec"], members)

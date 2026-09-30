@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://hanime1.me/",
     "description": "Hanime1 - 成人動漫/裏番/線上看（繁体站，HTML 直链 mp4，无登录）",
     "lang": "zh-Hant",
@@ -156,6 +157,27 @@
           "css": "meta[property='og:video:duration']",
           "attr": "content"
         }
+      },
+      "related": {
+        "root_selector": {
+          "css": "div#related-tabcontent div.video-item-container"
+        },
+        "fields": {
+          "title": {
+            "css": "h4.video-title a, .video-title a"
+          },
+          "url": {
+            "css": "a[href*='watch?v=']",
+            "attr": "href"
+          },
+          "cover": {
+            "fallback": [
+              {"css": "img.main-thumb", "attr": "src"},
+              {"css": "img", "attr": "src"}
+            ]
+          }
+        },
+        "max": 8
       }
     },
     "content": {
@@ -221,6 +243,7 @@
   },
   "media": {
     "format": "mp4",
+    "proxy_mode": "force_proxy",
     "select": {
       "video": {
         "quality": "best"

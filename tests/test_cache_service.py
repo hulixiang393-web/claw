@@ -237,6 +237,73 @@ def test_content_fetch_chapter_caches_body():
     assert http.calls.get(url, 0) == 1
 
 
+def test_content_repository_is_used_for_chapter_reads_and_writes():
+    from framework.content import Content
+    from framework.shelf_cache_repository import ShelfCacheRepository
+
+    class Repo:
+        def __init__(self):
+            self.values = {}
+        def get_content(self, book_key, chapter_key):
+            return self.values.get((book_key, chapter_key))
+        def upsert_book(self, *args):
+            pass
+        def put_content(self, book_key, chapter_key, content_type, payload, metadata):
+            self.values[(book_key, chapter_key)] = payload
+
+    repo = Repo()
+    c = _make_content(None)
+    c._cache = None
+    c._repository = repo
+    src = _fake_source()
+    repo.values[("https://x.com/book", "body")] = "repo body"
+    assert c.fetch_chapter(src, "https://x.com/book") == "repo body"
+
+
+def test_content_repository_is_used_for_comic_page_reads_and_writes():
+    from framework.content import Content
+
+    class Repo:
+        def __init__(self):
+            self.values = {}
+        def get_content(self, book_key, chapter_key):
+            return self.values.get((book_key, chapter_key))
+        def put_content(self, book_key, chapter_key, content_type, payload, metadata):
+            self.values[(book_key, chapter_key)] = payload
+
+    repo = Repo()
+    c = _make_content(None)
+    c._cache = None
+    c._repository = repo
+    src = _fake_source()
+    repo.values[("https://x.com", "pages")] = '["p1"]'
+    assert c.fetch_comic_pages(src, "https://x.com") == ["p1"]
+
+
+def test_content_precache_uses_repository(tmp_path):
+    from framework.content import Content
+
+    class Repo:
+        def __init__(self):
+            self.values = {}
+        def get_content(self, book_key, chapter_key):
+            return self.values.get((book_key, chapter_key))
+        def upsert_book(self, *args):
+            pass
+        def put_content(self, book_key, chapter_key, content_type, payload, metadata):
+            self.values[(book_key, chapter_key)] = payload
+
+    repo = Repo()
+    c = _make_content(None)
+    c._cache = None
+    c._repository = repo
+    src = _fake_source()
+    chapters = [type("Ch", (), {"url": f"https://x.com/b/{i}.html"})() for i in range(3)]
+    c.precache_chapters(src, chapters, 0, ahead=2)
+    assert ("https://x.com/b/0.html", "body") in repo.values
+    assert ("https://x.com/b/1.html", "body") in repo.values
+
+
 def test_content_precache_chapters():
     """预加载当前章+后3章：只抓没缓存的章 + 写 body 键。"""
     store = make_store()

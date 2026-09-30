@@ -869,11 +869,24 @@ async def fetch_rendered_images(
                                     while (node && !(node.classList && node.classList.contains('cropped'))) {
                                         node = node.parentElement;
                                     }
-                                    if (!node || !node.id) continue;
-                                    try {
-                                        const uri = c.toDataURL('image/jpeg', 0.85);
-                                        if (uri.length > 2000) out.push([node.id, uri]);
-                                    } catch(e) {}
+                                     if (!node || !node.id) continue;
+                                     try {
+                                         const ctx = c.getContext('2d');
+                                         const sample = ctx.getImageData(
+                                             0, 0, c.width, c.height
+                                         ).data;
+                                         let ink = 0;
+                                         for (let i = 0; i < sample.length; i += 4) {
+                                             if (sample[i + 3] > 0 &&
+                                                 (sample[i] < 252 || sample[i + 1] < 252 || sample[i + 2] < 252)) {
+                                                 ink += 1;
+                                                 break;
+                                             }
+                                         }
+                                         if (ink < 1) continue;
+                                         const uri = c.toDataURL('image/jpeg', 0.85);
+                                         if (uri.length > 2000) out.push([node.id, uri]);
+                                     } catch(e) {}
                                 }
                                 return out;
                             }"""
@@ -885,28 +898,61 @@ async def fetch_rendered_images(
                     # 不再机械滚满 150 步。新的页 id 不再增长即视为结束（更快）。
                     # wheel_scroll=true 时用 mouse.wheel 派发 wheel 事件（翻页式阅读器
                     # 靠 wheel 事件翻页加载后续图片）；false 保持 window.scrollBy。
-                    step = max(scroll_step_px, 1000)
-                    no_new_pages = 0
-                    for _scroll_step in range(120):
-                        if wheel_scroll:
-                            await page.mouse.wheel(0, step)
-                        else:
-                            await page.evaluate(f"window.scrollBy(0, {step})")
-                        await page.wait_for_timeout(80)  # 80ms/步，更快
-                        prev_count = len(drawn_pages)
+                    if page_container_selector:
+                        # Virtual-canvas readers may recycle canvases between large
+                        # scroll events. Visit every known container so no page is
+                        # skipped by the browser's intersection/loading threshold.
+                        container_count = await page.locator(page_container_selector).count()
+                        for container_index in range(container_count):
+                            await page.evaluate(
+                                """({selector, index}) => {
+                                    const node = document.querySelectorAll(selector)[index];
+                                    if (node) node.scrollIntoView({block: 'center'});
+                                }""",
+                                {"selector": page_container_selector, "index": container_index},
+                            )
+                            node_id = await page.evaluate(
+                                """({selector, index}) => {
+                                    const node = document.querySelectorAll(selector)[index];
+                                    return node ? node.id : '';
+                                }""",
+                                {"selector": page_container_selector, "index": container_index},
+                            )
+                            prev_count = len(drawn_pages)
+                            # Wait for this exact virtual container to paint.
+                            # Slow devices/site responses can take close to a
+                            # second; moving away earlier recycles its canvas.
+                            for _paint_round in range(max(2, scroll_stale_rounds)):
+                                await page.wait_for_timeout(150)
+                                await _collect_drawn()
+                                if node_id and node_id in drawn_pages:
+                                    break
+                            if len(drawn_pages) > prev_count:
+                                _emit_on_batch()
+                        await page.wait_for_timeout(max(1200, min(extra_delay_ms, 3000)))
                         await _collect_drawn()
-                        if len(drawn_pages) > prev_count:
-                            no_new_pages = 0
-                            _emit_on_batch()  # 边滚边回调连续前缀
-                        else:
-                            no_new_pages += 1
-                        # 连续 10 步无新页 → 已近末尾，提前结束滚动
-                        if no_new_pages >= 10:
-                            break
-                    # 到底/结束：短等尾部 canvas 集中绘制，再补一轮收集 + 回调
-                    await page.wait_for_timeout(2500)
-                    await _collect_drawn()
-                    _emit_on_batch()
+                        _emit_on_batch()
+                    else:
+                        step = max(scroll_step_px, 1000)
+                        no_new_pages = 0
+                        for _scroll_step in range(120):
+                            if wheel_scroll:
+                                await page.mouse.wheel(0, step)
+                            else:
+                                await page.evaluate(f"window.scrollBy(0, {step})")
+                            await page.wait_for_timeout(80)  # 80ms/步，更快
+                            prev_count = len(drawn_pages)
+                            await _collect_drawn()
+                            if len(drawn_pages) > prev_count:
+                                no_new_pages = 0
+                                _emit_on_batch()
+                            else:
+                                no_new_pages += 1
+                            if no_new_pages >= 10:
+                                break
+                        await page.wait_for_timeout(2500)
+                        await _collect_drawn()
+                        _emit_on_batch()
 
                 # 给 JS 绘制留时间
                 await page.wait_for_timeout(extra_delay_ms)

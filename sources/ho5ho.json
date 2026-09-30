@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://www.ho5ho.com",
     "description": "HO5HO - 繁體中文全彩成人漫畫（WordPress + Madara 主題）",
     "lang": "zh-TW",

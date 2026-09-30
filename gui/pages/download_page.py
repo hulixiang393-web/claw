@@ -422,6 +422,9 @@ class DownloadPage(BasePage):
         self.list_scroll = QScrollArea()
         self.list_scroll.setWidgetResizable(True)
         self.list_scroll.setFrameShape(QFrame.NoFrame)
+        # 竖直滚动条常显：任务条目含封面缩略图，滚动条出现/消失→视口宽度变化→
+        # 条目重排晃动。常显固定宽度。
+        self.list_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.list_container = QWidget()
         self.list_layout = QVBoxLayout(self.list_container)
         self.list_layout.setContentsMargins(0, 0, 0, 0)

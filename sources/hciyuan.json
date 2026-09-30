@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://h-ciyuan.com/",
     "description": "H次元 - 里番系列合集/动画视频（WordPress，合集文章=帖子分页，视频为 voe.sx iframe 嵌入）",
     "lang": "zh-CN",

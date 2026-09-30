@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://www.acgxmh.com",
     "description": "ACG漫画网 - 里番/全彩工口漫画源（分页阅读）",
     "lang": "zh-CN",

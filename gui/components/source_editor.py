@@ -628,6 +628,8 @@ class SourceEditor(QDialog):
                                  "源管理页图标，留空用默认")
         self._f_lang = sec._line("语言", "$metadata.lang", "例：zh-CN")
         self._f_region = sec._line("地区", "$metadata.region", "例：cn、global")
+        self._f_adult = sec._check("18+ 内容源", "$metadata.adult",
+                                   "在发现、搜索和源管理中按内容设置过滤")
         self._f_weight = sec._double("权重", "$weight", 0.0, 10.0,
                                      hint="搜索排序权重，默认 1.0")
         self.tabs.addTab(self._wrap_scroll(sec), "基本信息")
@@ -1705,6 +1707,7 @@ class SourceEditor(QDialog):
         self._f_icon.setText(_deep_get(raw, "$metadata.icon", ""))
         self._f_lang.setText(_deep_get(raw, "$metadata.lang", ""))
         self._f_region.setText(_deep_get(raw, "$metadata.region", ""))
+        self._f_adult.setChecked(bool(_deep_get(raw, "$metadata.adult", False)))
         self._f_weight.setValue(float(_deep_get(raw, "$weight", 1.0)))
 
         # 网络
@@ -1845,9 +1848,13 @@ class SourceEditor(QDialog):
         _deep_set(raw, "$name", self._f_name.text())
         _deep_set(raw, "$metadata.homepage", self._f_home.text())
         _deep_set(raw, "$metadata.description", self._f_desc.text())
+        metadata = raw.setdefault("$metadata", {})
+        if self._f_adult.isChecked() or "adult" in metadata:
+            metadata["adult"] = self._f_adult.isChecked()
         tags = [t.strip() for t in self._f_tags.text().split(",") if t.strip()]
         metadata = raw.setdefault("$metadata", {})
-        metadata["tags"] = tags
+        if tags or "tags" in metadata:
+            metadata["tags"] = tags
         raw["$weight"] = self._f_weight.value()
         raw["$type"] = self.type_combo.currentText()
         if not raw.get("$schema_version"):
@@ -1868,13 +1875,21 @@ class SourceEditor(QDialog):
         _deep_set(raw, "transports.timeout", self._f_timeout.value())
         _deep_set(raw, "transports.retries", self._f_retries.value())
         _deep_set(raw, "transports.interval_ms", self._f_interval.value())
-        _deep_set(raw, "transports.follow_redirects", self._f_follow.isChecked())
+        # 只在「原配置已有该键」或「用户主动关闭」时才写 follow_redirects，
+        # 避免未配置的源每次保存都被注入默认 true
+        follow = self._f_follow.isChecked()
+        if not follow or "follow_redirects" in raw.setdefault("transports", {}):
+            raw["transports"]["follow_redirects"] = follow
         self._apply_text(raw.setdefault("transports", {}), "charset",
                          self._f_charset.text())
-        rb = raw.setdefault("transports", {}).setdefault("retry_backoff", {})
-        rb["base_sec"] = self._f_rb_base.value()
-        rb["max_sec"] = self._f_rb_max.value()
-        rb["jitter"] = round(self._f_rb_jitter.value(), 4)
+        prev_rb = (raw.get("transports") or {}).get("retry_backoff")
+        rb_vals = (self._f_rb_base.value(), self._f_rb_max.value(),
+                   self._f_rb_jitter.value())
+        if isinstance(prev_rb, dict) or any(rb_vals):
+            rb = raw.setdefault("transports", {}).setdefault("retry_backoff", {})
+            rb["base_sec"] = rb_vals[0]
+            rb["max_sec"] = rb_vals[1]
+            rb["jitter"] = round(rb_vals[2], 4)
 
         # 发现（未勾选则移除）
         if self._f_disc_enable.isChecked():
@@ -1959,10 +1974,18 @@ class SourceEditor(QDialog):
         _deep_set(raw, "constraints.detail.max_pages", self._f_detail_pages.value())
         _deep_set(raw, f"constraints.{block}.max_pages", self._f_content_pages.value())
         _deep_set(raw, f"constraints.{block}.max_items", self._f_content_items.value())
-        _deep_set(raw, "constraints.max_concurrency", self._f_max_cc.value())
-        _deep_set(raw, "constraints.detail.timeout_per_page_sec",
-                  self._f_detail_tmo.value())
-        _deep_set(raw, "constraints.global.total_timeout_sec", self._f_global_tmo.value())
+        # 以下三个键只在原配置已有、或用户改过默认值时才写，避免每次保存注入默认限制
+        cc_prev = (raw.get("constraints") or {}).get("max_concurrency")
+        if cc_prev is not None or self._f_max_cc.value() != 8:
+            _deep_set(raw, "constraints.max_concurrency", self._f_max_cc.value())
+        dt_cfg = (raw.get("constraints") or {}).get("detail") or {}
+        if "timeout_per_page_sec" in dt_cfg or self._f_detail_tmo.value() != 30:
+            _deep_set(raw, "constraints.detail.timeout_per_page_sec",
+                      self._f_detail_tmo.value())
+        g_cfg = (raw.get("constraints") or {}).get("global")
+        if isinstance(g_cfg, dict) or self._f_global_tmo.value() != 600:
+            _deep_set(raw, "constraints.global.total_timeout_sec",
+                      self._f_global_tmo.value())
 
         # 诊断（自检）
         # 仅当源已配置自检、或表单填入了策略/选择器时才保留块，
@@ -2046,13 +2069,28 @@ class SourceEditor(QDialog):
         elif ctype == "video":
             self._apply_selector(lst.setdefault("fields", {}), "title",
                                  self._c_list_title.text())
-            _deep_set(raw, "media.format", self._f_media_format.currentText())
-            _deep_set(raw, "media.select.video.quality",
-                      self._f_media_quality.currentText())
-            merge = raw.setdefault("media", {}).setdefault("merge", {})
+            # media 键只在「原配置已有」或「用户改过默认值」时才写，
+            # 避免未配置 media.select 等键的源每次保存被注入默认 dict
+            media_prev = raw.get("media")
+            media_prev = media_prev if isinstance(media_prev, dict) else {}
+            media = raw.setdefault("media", {})
+            fmt = self._f_media_format.currentText()
+            if "format" in media_prev or (fmt and fmt != "hls"):
+                media["format"] = fmt or "hls"
+            q = self._f_media_quality.currentText()
+            if "select" in media_prev or q != "best":
+                media.setdefault("select", {}).setdefault("video", {})["quality"] = q
+            merge_prev = media_prev.get("merge") if isinstance(media_prev, dict) else None
+            merge = {}
             self._apply_text(merge, "tool", self._f_media_merge_tool.currentText())
             self._apply_text(merge, "output_format",
                              self._f_media_output.currentText())
+            if merge:
+                media["merge"] = merge
+            elif isinstance(merge_prev, dict):
+                media["merge"] = merge_prev
+            else:
+                media.pop("merge", None)
             play = b.setdefault("play_url", {})
             psel = self._c_play_sel.text().strip()
             pattr = self._c_play_attr.text().strip()
@@ -2098,7 +2136,9 @@ class SourceEditor(QDialog):
                         ser.pop("part_map", None)
                 else:
                     b.pop("series", None)
-            # 换源（source_switch）：勾选且至少填了关键字段才写入
+            # 换源（source_switch）：勾选时写入表单值，并保留表单未覆盖的键
+            # （如只配了 play_regex 的 MacCMS 变体，无 list_selector/ep_list_selector）；
+            # 只有用户显式取消勾选才视为移除。
             ss = {}
             if hasattr(self, "_ss_enable") and self._ss_enable.isChecked():
                 _deep_set(ss, "param", self._ss_param.text())
@@ -2109,16 +2149,30 @@ class SourceEditor(QDialog):
                 _deep_set(ss, "play_regex", self._ss_play_regex.text())
                 _deep_set(ss, "playerconfig_url", self._ss_pc_url.text())
             ep_block = content.setdefault("episode", {})
-            if ss and ss.get("list_selector") and ss.get("ep_list_selector"):
-                ep_block["source_switch"] = self._keep_extra(
-                    ep_block.get("source_switch"), ss
-                )
-            elif "source_switch" in ep_block:
-                del ep_block["source_switch"]
+            if hasattr(self, "_ss_enable"):
+                if self._ss_enable.isChecked():
+                    prev_sw = ep_block.get("source_switch")
+                    if isinstance(prev_sw, dict):
+                        merged = {k: v for k, v in prev_sw.items()}
+                        merged.update(ss)
+                        ep_block["source_switch"] = merged
+                    elif ss:
+                        ep_block["source_switch"] = ss
+                elif "source_switch" in ep_block:
+                    del ep_block["source_switch"]
 
         # 清理空壳：fields 无任何字段时删除，避免留下 {}
         if "fields" in lst and not lst["fields"]:
             del lst["fields"]
+        # 清理空壳：list / play_url / body 为空 dict 时也删除，避免保存注入 {} 块
+        for empty_key in ("list", "play_url", "body"):
+            if empty_key in b and not b.get(empty_key):
+                del b[empty_key]
+        # 原无 media 配置且表单没填任何媒体项时，不留空 media 壳
+        if not isinstance(raw.get("media"), dict) or raw["media"] == {}:
+            md = raw.get("media")
+            if md == {}:
+                raw.pop("media", None)
 
         # 广告过滤
         orig_ad = raw.get("ad_block")
@@ -2222,6 +2276,11 @@ class SourceEditor(QDialog):
         prev_dec = raw.get("decryption")
         prev_t = prev_dec.get("targets") if isinstance(prev_dec, dict) else prev_dec
         targets = {}
+        # 表单未覆盖的 target（如 video_url=maccms_url）原样保留，避免保存即删解密块
+        if isinstance(prev_t, dict):
+            for tk, tv in prev_t.items():
+                if tk not in ("image", "content", "chapter"):
+                    targets[tk] = tv
         img0 = {}
         self._apply_text(img0, "strategy", self._dec_img_strategy.currentText())
         self._apply_text(img0, "key", self._dec_img_key.text())
@@ -2260,29 +2319,41 @@ class SourceEditor(QDialog):
                 prev_t.get("chapter") if isinstance(prev_t, dict) else None, c0b
             )
         if targets:
-            raw["decryption"] = {"targets": targets}
+            dec = {}
+            if isinstance(prev_dec, dict):
+                dec = {k: v for k, v in prev_dec.items() if k != "targets"}
+            dec["targets"] = targets
+            raw["decryption"] = dec
         else:
             raw.pop("decryption", None)
 
         # 登录（auth）
         prev_auth = raw.get("auth")
-        auth = {}
-        auth["login_required"] = self._f_auth_required.isChecked()
-        self._apply_text(auth, "note", self._f_auth_note.text())
-        ck = {}
-        self._apply_text(ck, "field", self._f_auth_field.text())
-        self._apply_text(ck, "on_expired", self._f_auth_on.currentText())
-        if self._f_auth_min.value() > 0:
-            ck["min_length"] = self._f_auth_min.value()
-        if ck:
-            auth["cookie_check"] = ck
-        auth = self._keep_extra(
-            prev_auth if isinstance(prev_auth, dict) else None, auth
-        )
-        if not self._is_deep_empty(auth):
-            raw["auth"] = auth
+        need_auth = self._f_auth_required.isChecked()
+        auth_cfgd = bool(self._f_auth_note.text().strip()
+                         or self._f_auth_field.text().strip()
+                         or self._f_auth_on.currentText().strip()
+                         or self._f_auth_min.value() > 0)
+        if prev_auth is None and not need_auth and not auth_cfgd:
+            pass  # 从未配置登录且保持默认 → 不注入 auth
         else:
-            raw.pop("auth", None)
+            auth = {}
+            auth["login_required"] = need_auth
+            self._apply_text(auth, "note", self._f_auth_note.text())
+            ck = {}
+            self._apply_text(ck, "field", self._f_auth_field.text())
+            self._apply_text(ck, "on_expired", self._f_auth_on.currentText())
+            if self._f_auth_min.value() > 0:
+                ck["min_length"] = self._f_auth_min.value()
+            if ck:
+                auth["cookie_check"] = ck
+            auth = self._keep_extra(
+                prev_auth if isinstance(prev_auth, dict) else None, auth
+            )
+            if not self._is_deep_empty(auth):
+                raw["auth"] = auth
+            else:
+                raw.pop("auth", None)
 
         return raw
 

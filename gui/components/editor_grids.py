@@ -222,6 +222,14 @@ class SelectorGrid(QWidget):
             css = css_edit.text().strip()
             attr = attr_edit.text().strip()
             if not css and not attr:
+                # 原字段只有 fallback/xpath/regex 等键、没有 css/attr 时，
+                # 网格显示为空，但用户未改动时不丢数据（原样保留）。
+                base = self._orig_entries.get(name)
+                if isinstance(base, dict):
+                    had_css_attr = "css" in base or "attr" in base
+                    extras = {k: v for k, v in base.items() if k not in ("css", "attr")}
+                    if not had_css_attr and extras:
+                        out[name] = extras
                 continue
             item = {}
             base = self._orig_entries.get(name)

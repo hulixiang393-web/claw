@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from framework.events import EventBus
+from framework.events import EventBus, EVENT_SOURCE_VISIBILITY_CHANGED
 from framework.settings_manager import SettingsManager
 from framework.source_manager import SourceManager
 from framework.search_history import SearchHistory
@@ -281,8 +281,13 @@ class HomePage(BasePage):
         # 订阅 EventBus → 吉祥物
         if event_bus is not None:
             event_bus.subscribe(self.mascot.on_event)
+            event_bus.subscribe(self._on_visibility_changed)
 
         self.refresh()
+
+    def _on_visibility_changed(self, event) -> None:
+        if getattr(event, "type", "") == EVENT_SOURCE_VISIBILITY_CHANGED:
+            self.refresh()
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:

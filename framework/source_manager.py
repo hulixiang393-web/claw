@@ -11,12 +11,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import CONTENT_TYPES, SourceConfig, load_source
 from .errors import ConfigError, SourceNotFoundError
+
+log = logging.getLogger(__name__)
 
 HEALTH_OK = "ok"        # 绿
 HEALTH_WARN = "warn"    # 黄
@@ -51,6 +54,8 @@ class SourceManager:
         self._cookie_provider = None  # 可选: load(source_id) -> cookie_header 字符串
         self._auto_disabled: set = set()  # 因连续失败被自动禁用的 source_id（恢复路径专用）
         self._soft_deleted: set = set()  # 软删除了的 source_id（配置保留，列表/发现均不出现）
+        self._adult_visible: bool = True  # 18+ 源是否显示（设置 content.show_adult_sources）
+        self._bus = None
         if self._health_file is not None:
             self._load_health()
         if sources_dir is not None:
@@ -103,7 +108,48 @@ class SourceManager:
             raise SourceNotFoundError(f"未找到数据源：{source_id}", source_id=source_id)
 
     def all(self) -> List[SourceConfig]:
-        return list(self._sources.values())
+        return self._visible(self._sources.values())
+
+    def set_adult_visible(self, visible: bool) -> None:
+        """设置 18+ 源是否可见。列表出口统一过滤，避免各页面各写一遍。"""
+        visible = bool(visible)
+        if visible == self._adult_visible:
+            return
+        self._adult_visible = visible
+        self._emit_visibility_changed()
+
+    def is_adult_visible(self) -> bool:
+        return self._adult_visible
+
+    def is_adult(self, source_id: str) -> bool:
+        """只读元数据判断，不过滤列表。未知 source_id 视为非成人。"""
+        cfg = self._sources.get(source_id)
+        return bool(getattr(cfg, "adult", False)) if cfg is not None else False
+
+    def _visible(self, items) -> List[SourceConfig]:
+        if self._adult_visible:
+            return list(items)
+        return [s for s in items if not getattr(s, "adult", False)]
+
+    def _emit_visibility_changed(self) -> None:
+        """通知订阅者刷新源列表；无 EventBus 时静默返回。
+
+        EventBus.emit 是单参接口（framework/events.py:68）。
+        """
+        bus = self._bus
+        if bus is None:
+            return
+        try:
+            from framework.events import Event, EVENT_SOURCE_VISIBILITY_CHANGED
+            bus.emit(Event(EVENT_SOURCE_VISIBILITY_CHANGED, {
+                "visible": self._adult_visible,
+            }))
+        except Exception:
+            log.warning("[source] 源可见性事件广播失败", exc_info=True)
+
+    def set_event_bus(self, bus) -> None:
+        """注入 EventBus（App 层在 source_manager 建好后调用一次）。"""
+        self._bus = bus
 
     def soft_deleted_ids(self) -> List[str]:
         return list(self._soft_deleted)
@@ -141,7 +187,9 @@ class SourceManager:
         self.add(cfg)
 
     def by_type(self, content_type: str) -> List[SourceConfig]:
-        return [s for s in self._sources.values() if s.content_type == content_type]
+        return self._visible(
+            s for s in self._sources.values() if s.content_type == content_type
+        )
 
     def types(self) -> set:
         return {s.content_type for s in self._sources.values()}
@@ -158,21 +206,25 @@ class SourceManager:
     def count_by_type(self) -> Dict[str, int]:
         """按类型统计源数（含禁用）。"""
         counts = {t: 0 for t in CONTENT_TYPES}
-        for s in self._sources.values():
+        for s in self._visible(self._sources.values()):
             counts[s.content_type] += 1
         return counts
 
     def count_enabled(self) -> int:
-        return sum(1 for s in self._sources.values() if s.enabled)
+        return len(self.enabled_sources())
 
     def count_broken(self) -> int:
-        return sum(1 for h in self._health.values() if h.state == HEALTH_BROKEN)
+        return sum(
+            1
+            for sid, health in self._health.items()
+            if health.state == HEALTH_BROKEN and self._is_visible_source_id(sid)
+        )
 
     def list_broken(self) -> List[dict]:
         """不可用源列表：{source_id, name, content_type, error}（供首页/管理页展示）。"""
         out = []
         for sid, health in self._health.items():
-            if health.state != HEALTH_BROKEN:
+            if health.state != HEALTH_BROKEN or not self._is_visible_source_id(sid):
                 continue
             src = self._sources.get(sid)
             out.append({
@@ -182,6 +234,10 @@ class SourceManager:
                 "error": health.last_error or "结构变更/不可用",
             })
         return out
+
+    def _is_visible_source_id(self, source_id: str) -> bool:
+        source = self._sources.get(source_id)
+        return source is None or self._adult_visible or not source.adult
 
     # ------------------------------------------------------------------ #
     # 启停 / 权重（源管理用）
@@ -204,7 +260,7 @@ class SourceManager:
 
     def enabled_sources(self) -> List[SourceConfig]:
         """当前启用的源（搜索页源范围、发现页源列表据此过滤）。"""
-        return [s for s in self._sources.values() if s.enabled]
+        return self._visible(s for s in self._sources.values() if s.enabled)
 
     def apply_enabled_selection(self, selected_ids) -> None:
         """按「源选择引导」勾选结果批量启停，并把 $enabled 持久化到各源 JSON。
@@ -347,4 +403,6 @@ class SourceManager:
 
     def discoverable_sources(self) -> List[SourceConfig]:
         """配置了发现规则且已启用的源（发现界面只列这些）。"""
-        return [s for s in self._sources.values() if s.has_discovery() and s.enabled]
+        return self._visible(
+            s for s in self._sources.values() if s.has_discovery() and s.enabled
+        )

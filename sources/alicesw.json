@@ -6,6 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "$metadata": {
+    "adult": true,
     "homepage": "https://www.alicesw1.homes/",
     "description": "爱丽丝书屋 - 全属性免费小说创作网站（成人）",
     "lang": "zh-CN",

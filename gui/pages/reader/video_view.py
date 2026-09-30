@@ -19,7 +19,10 @@
 
 from __future__ import annotations
 
+import logging
+import time
 import webbrowser
+from types import SimpleNamespace
 
 from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
@@ -42,6 +45,8 @@ from PySide6.QtWidgets import (
 from framework.content import Content, Detail
 
 from gui.components.hover_title import HoverTitle
+
+log = logging.getLogger(__name__)
 
 
 class _PlayPanel(QWidget):
@@ -298,6 +303,18 @@ class VideoView(QWidget):
     download_requested = Signal(object)  # (source_id, detail.url, content_type) → 下载当前作品
     recommend_open_requested = Signal(object)  # (source_id, url, content_type) → 打开推荐视频
 
+    # 外部播放器正在播第几集（由 media_proxy 的 /e/ 钩子在**代理线程** emit，
+    # 队列连接自动投递到主线程执行槽，绝不跨线程碰 Qt 对象）
+    # 首参是**播放代数**（_play_gen）：换源/换作品后旧系列仍可能回调（VLC 还
+    # 开着），代数不符即整条丢弃——否则旧源的流会写进新源的 _stream_cache，
+    # 而 _load_episode 命中缓存后不复验，App 于是拿 A 源的流播 B 源的集。
+    # **首参必须在「建会话那一刻」捕获**（_play / _open_external 里的 gen 局部量），
+    # 绝不能写成 emit 时才读 self._play_gen —— 那样恒等匹配，守卫静默失效。
+    _external_now_playing = Signal(int, int, str, str)  # (代数, 集下标, video, audio)
+    # 握手线程建好的 {集下标: vlc_id} 映射（同上：后台 emit，主线程消费）
+    # 代数的取法同上：建会话时捕获，不能在 emit 时读 self._play_gen。
+    _vlc_playlist_ready = Signal(int, object)           # (代数, 映射)
+
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
         "操作指南\n"
@@ -306,6 +323,7 @@ class VideoView(QWidget):
         "  单击面板 / 中央播放键    在外部播放器中打开当前集\n"
         "  双击面板                  打开外部播放器（VLC）\n"
         "  设置 → 外部播放器         手动重新拉起播放器\n"
+        "  空格 / ← → / ↑ ↓ / N / P  焦点在 App 内时转发给外部播放器\n"
         "  ?                        显示 / 隐藏本帮助\n"
         "──────────────\n"
         "播放器内操作（VLC 桌面版）\n"
@@ -346,6 +364,22 @@ class VideoView(QWidget):
         self._has_played = False  # 是否真正开始过播放（未播放不落盘，防覆盖恢复进度）
         self._pending_play = None  # 取流完成但视图不可见 → 暂存 (video, audio, title)，显示后再播
         self._click_pending = False  # 单击/双击判定
+        self._external_active = False  # 外播会话进行中（App 内快捷键 → VLC 转发）
+        # 惰性系列外播：_series_key = media_proxy 注册表 key；_series_urls[i]
+        # = 第 i 集惰性 URL（与传给 open_with_player 的 episodes 同序）；
+        # _vlc_item_ids = {集下标: vlc_id}，有它才能 App 内切集指挥 VLC 而不重开
+        self._series_key = ""
+        self._series_urls: list[str] = []
+        self._vlc_item_ids: dict[int, int] = {}
+        # 映射所属会话的代数：_try_external_goto 指挥 VLC 前校验它 == _play_gen，
+        # 否则会用上一支播放列表的 id 跳集（切源时旧映射会被故意保留，见 _stop_player）
+        self._vlc_ids_gen: int = -1
+        # 播放代数：每次「换作品/换源/新起一次外播」自增。已注册系列的回调
+        # 都带着注册时的代数回来，对不上即陈旧 → 整条丢弃（见 _build_series_playlist）
+        self._play_gen = 0
+        self._external_now_playing.connect(self._on_external_now_playing)
+        self._vlc_playlist_ready.connect(self._on_vlc_playlist_ready)
+        self._last_ep_toast_ts = 0.0  # 「已是最后一集」提示去抖时间戳
         from framework.media_tuner import MediaTuner
 
         self._tuner = MediaTuner()  # 卡顿统计/缓冲升级（每次 load 重置）
@@ -404,6 +438,9 @@ class VideoView(QWidget):
         self._cards_scroll = QScrollArea()
         self._cards_scroll.setWidgetResizable(True)
         self._cards_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 竖直滚动条常显：分集/相关推荐卡片含大量封面，异步加载使高度越过视口时
+        # 滚动条出现→视口变窄→卡片重排晃动。常显固定宽度。
+        self._cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self._cards_container = QWidget()
         self._cards_vbox = QVBoxLayout(self._cards_container)
         self._cards_vbox.setContentsMargins(0, 0, 0, 0)
@@ -674,7 +711,7 @@ class VideoView(QWidget):
         self.ep_menu.menuAction().setVisible(bool(self._episodes))
 
     def _select_episode(self, idx: int) -> None:
-        """播放器内选集：加载该集并同步卡片选中态/选集菜单。
+        """播放器内选集：外播会话优先指挥 VLC 切集，否则加载该集。
 
         选集态下点当前高亮集也视为选择 → 立即取流播放；
         播放中点同一集不重载。
@@ -683,8 +720,42 @@ class VideoView(QWidget):
             return
         if idx == self._current_idx and not self._selection_mode:
             return
+        # 外播且有**当前会话**的 vlc_id 映射 → pl_play 指挥 VLC 切集（不重开进程、
+        # 进度不丢）。无映射（握手未完成/失败）或 pl_play 失败 → 落回重开路径。
+        if self._try_external_goto(idx):
+            self._refresh_ep_menu()
+            return
         self._load_episode(idx)
         self._refresh_ep_menu()
+
+    def _try_external_goto(self, idx: int) -> bool:
+        """外播会话中指挥 VLC 切到第 idx 集（不重开进程）。
+
+        需要 _external_active **且**映射属于当前会话（_vlc_ids_gen == _play_gen）：
+        切源时 _stop_player 会故意保留旧注册与旧映射以便仍开着的 VLC 继续请求
+        /e/，那份映射属于上一支播放列表，拿它指挥会跳到上一个源的集。
+
+        成功 → 乐观更新 _current_idx 并返回 True；真实生效由 /e/ 的 on_play 钩子
+        最终确认（用户在 VLC 内手动跳集也由它纠正）。失败/不可用 → False，
+        调用方回落「重开 VLC」路径。
+        """
+        if not self._external_active:
+            return False
+        if self._vlc_ids_gen != self._play_gen:
+            return False
+        item_id = self._vlc_item_ids.get(idx)
+        if item_id is None:
+            return False
+        try:
+            from framework.external_player import player_goto
+
+            if not player_goto(item_id):
+                return False
+        except Exception:  # noqa: BLE001 —— 无控制会话/网络失败：回落重开
+            return False
+        self._current_idx = idx
+        self._paint_card_selection()
+        return True
 
     def _refresh_source_menu(self) -> None:
         """重建播放源菜单：站内多线路（⇄）。
@@ -738,9 +809,38 @@ class VideoView(QWidget):
             self.setCursor(Qt.BlankCursor)
 
     def _handle_key(self, event) -> None:
-        """键盘快捷键（外部播放器方案：仅保留帮助；播放/暂停/快进等
-        由外部播放器自身快捷键接管，App 内不再重复绑定）。"""
+        """键盘快捷键（外部播放器方案）。
+
+        播放/暂停/快进快退等由外部播放器自身快捷键接管（VLC 内置 P/N/空格）；
+        同时焦点在 App 内时，把常见按键转发成 VLC 控制命令（player_command）
+        —— 不必切到播放器窗口也能控制。内嵌 libvlc（_player 非 None）时不抢键
+        （内嵌画面键由 VLC 处理）；无外播会话时仅保留 ? 帮助。
+        """
         key = event.key()
+        if self._player is None and self._external_active:
+            cmd = None
+            if key == Qt.Key_Space:
+                cmd = ("pl_pause", "")
+            elif key == Qt.Key_Left:
+                cmd = ("seek", "-10")
+            elif key == Qt.Key_Right:
+                cmd = ("seek", "+10")
+            elif key == Qt.Key_Up:
+                cmd = ("volume", "+10")
+            elif key == Qt.Key_Down:
+                cmd = ("volume", "-10")
+            elif key == Qt.Key_N:
+                cmd = ("pl_next", "")
+            elif key == Qt.Key_P:
+                cmd = ("pl_previous", "")   # VLC 没有 pl_prev（P 从未生效过）
+            if cmd is not None:
+                try:
+                    from framework.external_player import player_command as _vlc_cmd
+                    _vlc_cmd(cmd[0], cmd[1])
+                except Exception:  # noqa: BLE001 —— 转发失败（无控制会话）静默
+                    pass
+                event.accept()
+                return
         if key == Qt.Key_Question or key == Qt.Key_Slash:
             self._toggle_help()
             event.accept()
@@ -939,8 +1039,17 @@ class VideoView(QWidget):
         return (getattr(detail, "title", "") or "").strip()[:3]
 
     def _maybe_load_recommendations(self) -> None:
-        """后台搜索当前作品同源相关视频（换源/换作品后重搜）。"""
-        if self._search is None or self._source is None or self._detail is None:
+        """装载相关推荐：优先详情页内嵌 related（如 hanime1/pornhub），
+        缺失或过滤为空才回退同源关键词搜索（换源/换作品后重搜）。"""
+        if self._source is None or self._detail is None:
+            return
+        rel = getattr(self._detail, "related", None) or []
+        if rel:
+            picks = self._picks_from_related(rel)
+            if picks:
+                self._render_rec_cards(picks)
+                return  # related 有货即渲染；keyword 去重只属于搜索分支
+        if self._search is None:
             return
         kw = self._recommend_keyword_of(self._detail)
         if not kw or kw == self._recommend_keyword:
@@ -950,6 +1059,31 @@ class VideoView(QWidget):
         task.signals.finished.connect(self._on_recommend_done)
         self._recommend_task = task  # 防 GC
         QThreadPool.globalInstance().start(task)
+
+    def _picks_from_related(self, rel: list) -> list:
+        """detail.related → 推荐卡 mini 对象（剔除自身 + URL 去重，取前 8）。
+
+        产物为 SimpleNamespace（title/url/cover/source_id），与搜索分支的
+        _render_rec_cards/_on_rec_card 完全兼容；过滤后为空返回 []（走搜索）。
+        """
+        picks = []
+        seen_urls = set()
+        cur = (self._detail.url or "").rstrip("/").lower()
+        sid = getattr(self._source, "source_id", "") or ""
+        for item in rel:
+            url = (item.get("url") or "").strip()
+            if not url or url.rstrip("/").lower() == cur or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            picks.append(SimpleNamespace(
+                title=item.get("title") or "",
+                url=url,
+                cover=item.get("cover") or "",
+                source_id=sid,
+            ))
+            if len(picks) >= 8:
+                break
+        return picks
 
     def _on_recommend_done(self, source_id, keyword, results, err) -> None:
         """推荐搜索结果落地：剔除自身 + URL 去重，取前 8 条渲染；空则隐藏推荐区。"""
@@ -1007,6 +1141,8 @@ class VideoView(QWidget):
         self._source = source
         self._detail = detail
         self._pending_play = None  # 换书清掉旧暂存播放
+        # 换作品：代数自增，旧系列（若有）的回调全部作废
+        self._play_gen += 1
         self._has_played = False  # 未真正播放不把选集态误存为续读进度
         self._selection_mode = False  # 换书重置选集态
         self._tuner.reset()  # 新播放会话重置卡顿统计
@@ -1018,6 +1154,7 @@ class VideoView(QWidget):
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用）。
         self._stop_player()
+        self._invalidate_current_stream()  # 与 reload_detail 同一不变量，防两处分叉
         self._episodes = detail.chapters
         self._stream_cache.clear()
         self._prefetch_idx = -2
@@ -1056,6 +1193,10 @@ class VideoView(QWidget):
     def reload_detail(self, new_detail: Detail) -> None:
         """换源重载分集后调用：多集源停选集态等用户选择，单集/无分集自动取流播放。"""
         self._stop_player()  # 换源先停旧播放流
+        # 换源：代数自增。关键——多集源分支**不调用 _play**，若不在此自增，
+        # 旧系列的 on_play 会带着仍然有效的代数回来，把旧源流写进新源的
+        # _stream_cache（_load_episode 命中缓存不复验 → 持久播错集）。
+        self._play_gen += 1
         self._detail = new_detail
         self._episodes = new_detail.chapters
         self._stream_cache.clear()
@@ -1064,6 +1205,9 @@ class VideoView(QWidget):
         self._recommend_keyword = ""  # 换源后按新源重搜推荐
         self._has_played = False  # 新源尚未播放，不把选集态误存为续读进度
         self._selection_mode = False  # 重置选集态
+        # 「当前流」三元组一并作废：_stop_player() 刚停完，界面上摆的已是新源的集，
+        # 留着 _current_play 的话它指的是**旧源**的流（见 _invalidate_current_stream）
+        self._invalidate_current_stream()
         self._populate_ep_cards(new_detail.chapters)
         self._switching = False
         self._sync_overlay_state(playing=False)
@@ -1116,8 +1260,37 @@ class VideoView(QWidget):
         if self._player is not None:
             self._player.close()
             self._player = None
+        # App 退出：**先**终止外部 VLC 再注销惰性系列——反了就出现「VLC 还在
+        # 请求 /e/ 而 key 已注销」；且 terminate 连带放掉本次会话的代理租约
+        # （租约无 TTL、只由进程退出/重启/本路径释放，漏一次就让空闲看门狗在
+        # 整个 App 生命周期内失效）。
+        try:
+            from framework.external_player import _terminate_previous
+
+            _terminate_previous()
+        except Exception:  # noqa: BLE001 —— 进程已退出/句柄失效：静默
+            pass
+        self._external_active = False
+        self._unregister_series()
 
     # ------------------------------------------------------------------ #
+    def _external_vlc_running(self) -> bool:
+        """最近拉起的外部播放器进程是否仍在运行。
+
+        取不到 player_running（含 ImportError：符号被改名/删除）时**必须留声**：
+        静默按「未运行」处理会让 _stop_player 无条件注销系列，等于悄悄恢复
+        「VLC 还在请求 /e/ → 404」这个 3f 存在的意义就是为了防的故障。
+        """
+        try:
+            from framework.external_player import player_running
+
+            return bool(player_running())
+        except Exception:  # noqa: BLE001 —— 模块异常：按未运行处理，但记日志
+            log.warning("取不到 external_player.player_running，"
+                        "按「外部播放器已退出」处理（可能误注销惰性系列）",
+                        exc_info=True)
+            return False
+
     def _stop_player(self) -> None:
         """停止当前视频播放并释放媒体/代理（保留播放器实例复用）。
 
@@ -1126,10 +1299,15 @@ class VideoView(QWidget):
         if self._player is not None:
             self._player.release()
             self.play_btn.setText("▶")
+        self._external_active = False  # 外播会话结束（换视频/换源/停止）
         self._sync_overlay_state(playing=False)
         self.buffer_spinner.hide()
         self.control_bar.show()  # 停播后未播放状态 → 控制条常驻
         self._hide_timer.stop()
+        # 外部播放器还在播就别注销系列（VLC 可能继续请求 /e/，注销即 404）；
+        # 播放器已退出才回收（代理侧 _SERIES_MAX=8 另有 FIFO 兜底）。
+        if not self._external_vlc_running():
+            self._unregister_series()
 
     def stop_playback(self) -> None:
         """离开视频视图时释放资源：停播放 + 清空播放缓存（不堆积）。
@@ -1148,6 +1326,24 @@ class VideoView(QWidget):
         self.time_label.setText("00:00 / 00:00")
         self.play_label.hide()
         self.setCursor(Qt.ArrowCursor)
+
+    def _invalidate_current_stream(self) -> None:
+        """作废「当前流」三元组（换作品 `load` / 换源 `reload_detail` 两处共用）。
+
+        这三个字段是「界面此刻放的是什么」的唯一记录，`_stop_player()` 不碰它们
+        （它只负责停播）。换作品/换源后若留着，界面摆的是新的一集，
+        `_current_play` 却还指着**上一个作品/源**的流 → ⚙外部播放器（无系列时
+        的单集回退）、`▶_toggle_play_pause`、复制流地址三处都会把旧流当新一集
+        交出去/复制出去（静默播错，App 里看不出来）。
+
+        收成具名方法是为了让 `load()` 与 `reload_detail()` 两个 reset 块无法再
+        分叉：今天两边都安全，只是因为 `reader_page` 恰好在 `load()` 之前调了
+        `stop_playback()`（它会清 `_current_play`）；将来多出一条不经它的 `load()`
+        路径（刷新按钮 / 重复 open）就会把这个 bug 静默放回来。
+        """
+        self._current_play = ""
+        self._current_audio = ""
+        self._current_title = ""
 
     # ------------------------------------------------------------------ #
     def _show_status(self, text: str) -> None:
@@ -1262,10 +1458,15 @@ class VideoView(QWidget):
             self._select_episode(idx)
 
     def _on_next_ep(self) -> None:
-        """下一集（全屏/非全屏均可用）。"""
+        """下一集（全屏/非全屏均可用）。
+
+        已是最后一集/无分集（season 页）→ 提示「已是最后一集」而非静默。
+        """
         idx = self._current_idx + 1
         if 0 <= idx < len(self._episodes):
             self._select_episode(idx)
+        else:
+            self._notify_last_episode()
 
     def _on_speed_changed(self, text: str) -> None:
         """倍速（0.5x~2.0x，VLC set_rate）。"""
@@ -1348,6 +1549,9 @@ class VideoView(QWidget):
         self._current_play = video
         self._current_audio = audio  # DASH 音频轨（重开播放器时 input-slave 挂入）
         self._current_title = title  # 状态浮层/重开提示用
+        # 新起一次外播 = 新代数：上一次会话的握手/on_play 回调就此作废
+        self._play_gen += 1
+        gen = self._play_gen
         hdrs = {}
         _rh = getattr(self._source, "request_headers", None)
         if callable(_rh):
@@ -1360,15 +1564,220 @@ class VideoView(QWidget):
             ad_block = (self._source.raw or {}).get("ad_block") or {}
         except Exception:  # noqa: BLE001
             pass
+        # 组装全集惰性播放列表（VLC 内可任意点集、App 内切集不重开）：
+        # 每集一个 /e/ 惰性 URL，流地址播到时才取；不足 2 集 → None 退回单集。
+        series = self._build_series_playlist(
+            video, audio, hdrs, ad_block, self._force_proxy_enabled())
+        # 开播 MRL 取**返回列表**里当前集那一项（与交给 VLC 的列表同源，
+        # 不再回头读 self._series_urls —— 两处下标必须恒等，容易漂）
+        start_ep_url = series[self._current_idx][0] if series else ""
+        if start_ep_url:
+            start_url = start_ep_url
+            real_url = video      # 分类用真实流地址（惰性 URL 判不出 HLS）
+        else:
+            # 无系列，或当前集是「无 ep.url」的坏集（入列 URL 为空）→ 单集
+            series, start_url, real_url = None, video, video
         msg = open_with_player(
-            video, audio=audio,
+            start_url, audio=audio,
             referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
-            headers=hdrs, ad_block=ad_block,
+            headers=hdrs, ad_block=ad_block, force_proxy=self._force_proxy_enabled(),
+            episodes=series,
+            classify_url=real_url,
+            start_idx=self._current_idx,
+            # 握手在**后台线程**回调：交信号 emit 而不是裸槽，Qt 自动投递到
+            # 主线程执行（裸槽会在后台线程改视图状态 = 线程归属违规）。
+            # 代数随映射一起带过去，槽才知道这是不是陈旧会话的握手结果。
+            on_playlist_ready=lambda m: self._vlc_playlist_ready.emit(gen, m),
+            caching_ms=self._source_network_caching_ms(),
         )
         self._show_status(f"{msg}：{title or video}")
         self.play_btn.setText("▶")
         self._sync_overlay_state(playing=False)
         self.control_bar.show()  # 外部播放器接管画面 → 控制条常驻
+        self._external_active = True  # 外播会话在 → App 内快捷键转发 VLC
+        if msg:
+            self._notify_last_episode()  # 末集/单集：提示不再有下一集
+
+    def _force_proxy_enabled(self) -> bool:
+        """源 media.proxy_mode == force_proxy → 播放代理强制走系统代理。
+
+        hanime1 的 CDN 直连不稳（0.3~1MB/s 波动）而系统代理稳定
+        （1.8~2.6MB/s）；force_proxy 由 external_player 透传主 MRL/音频轨/
+        分集列表每一集。
+        """
+        try:
+            media_cfg = (getattr(self._source, "raw", None) or {}).get("media") or {}
+            return media_cfg.get("proxy_mode") == "force_proxy"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _notify_last_episode(self) -> None:
+        """「已是最后一集」提示：非末集静默；去抖 3s 防连点/播放连开重复弹。"""
+        if self._episodes:
+            if 0 <= self._current_idx < len(self._episodes) - 1:
+                return  # 还有下一集 → 非末集静默
+        # 无分集（season 页单集）或处于末集 → 提示
+        now = time.monotonic()
+        if now - self._last_ep_toast_ts < 3.0:
+            return
+        self._last_ep_toast_ts = now
+        self._show_status("已是最后一集")
+
+    def _on_external_now_playing(self, gen: int, idx: int, video: str,
+                                 audio: str) -> None:
+        """VLC 实际开始播第 idx 集（代理 /e/ 钩子经信号投递到主线程）。
+
+        这是「App 侧集号」的**唯一真实来源**：用户在 VLC 内手动点另一集、
+        或 App 切集成功后，真实生效的集都以这里为准（纠正乐观更新的漂移）。
+        代理每次 /e/ 请求都会回调（memo 命中也回调），故对同一集重复调用
+        必须完全无副作用——本槽是幂等的。
+
+        gen 与当前代数不符 = 陈旧会话（换源/换作品/重开播放器后旧系列残留）：
+        整条丢弃。**不能**只靠越界守卫——换源后新旧分集数可能相同、下标合法，
+        那样会把旧源的流写进新源 ep.url 的缓存键，且 _load_episode 命中缓存
+        后不复验 → App 持续拿旧源的流播新源的集。
+        """
+        if gen != self._play_gen:
+            log.debug("丢弃陈旧 on_play：代数 %s ≠ 当前 %s", gen, self._play_gen)
+            return
+        if not (0 <= idx < len(self._episodes)):
+            return  # 越界（陈旧/异常集位）：不改状态，避免把 _current_idx 带歪
+        self._current_idx = idx
+        ep = self._episodes[idx]
+        self._stream_cache[(ep.url, self._quality)] = (video, audio)
+        self._current_play = video
+        self._current_audio = audio
+        self._current_title = ep.title or ""
+        self.episode_changed.emit((self._detail, ep.title, ep.url))  # 进度记忆
+        self._paint_card_selection()
+        self._refresh_ep_menu()
+
+    def _on_vlc_playlist_ready(self, gen: int, mapping) -> None:
+        """握手线程经信号投递的 {集下标: vlc_id} 映射 → 写 _vlc_item_ids。
+
+        gen 与当前代数不符 = 陈旧会话（旧系列的握手线程最长还活 3s）：整条
+        丢弃，否则切集命令会拿着上一支播放列表的 id 发给 VLC。
+
+        握手每轮轮询都会回调（3s 内可达数十次）且**可能只覆盖部分集**，
+        故本槽保存的值恒等于「最后一次报告的映射」：重复投递无副作用
+        （幂等），而映射变小或项 id 变了也必须跟到新值——只增不删的合并
+        会把握手早已宣告作废的 id 永久留下（切集命令拿着死 id 发给 VLC）。
+
+        id 已在 player_playlist_items 单点归一化成 int，这里**不再 int()**：
+        强转会把「上游 guard 漏了非 int」重新掩盖成一份看着可用的假映射
+        （症状是切集命令拿着假 id 发给 VLC，永远没反应）。非 int → 丢弃本轮
+        映射并告警，让缺陷可见。
+        """
+        if gen != self._play_gen:
+            log.debug("丢弃陈旧握手映射：代数 %s ≠ 当前 %s", gen, self._play_gen)
+            return
+        try:
+            new = dict(mapping or {})
+            bad = [(k, v) for k, v in new.items()
+                   if not (isinstance(k, int) and isinstance(v, int))]
+            if bad:
+                log.warning("VLC 播放列表映射含非 int 项 id，已丢弃本轮映射：%r",
+                            bad[:4])
+                return
+        except Exception:  # noqa: BLE001 —— 握手侧异常被上游静默吞掉，这里必须留痕
+            log.warning("VLC 播放列表映射无法处理", exc_info=True)
+            return
+        self._vlc_item_ids = new
+        self._vlc_ids_gen = gen   # 与映射同时落账：_try_external_goto 据此辨会话
+
+    def _unregister_series(self) -> None:
+        """注销惰性系列并清映射（_series_key 为空 → 幂等无操作）。"""
+        if not self._series_key:
+            return
+        key, self._series_key = self._series_key, ""
+        self._series_urls = []
+        self._vlc_item_ids = {}
+        self._vlc_ids_gen = -1
+        try:
+            from framework.media_proxy import MediaProxy
+
+            MediaProxy.instance().unregister_series(key)
+        except Exception:  # noqa: BLE001 —— 代理不可用：本地状态已清
+            log.debug("惰性系列 %s 注销失败（代理不可用）", key, exc_info=True)
+
+    def _build_series_playlist(self, video: str, audio: str, hdrs: dict,
+                               ad_block: dict, force_proxy: bool) -> list | None:
+        """注册惰性系列，返回**全集严格 0..N-1 顺序**的 episodes 列表。
+
+        每集只给一个惰性 URL（http://127.0.0.1:PORT/e/<key>/<idx>）与标题，
+        流地址**不在这里取**——VLC 真正播到该集时由 media_proxy 调 resolver
+        再取（零预请求）。注册与注销成对：本次注册前先注销旧系列。
+
+        不足 2 集 / 无 source / 代理不可用 → None（退回单集播放）。
+        副作用：写 self._series_key 与 self._series_urls。
+
+        video / audio 两个形参**刻意不用**：全集每集只给惰性 URL，真实流地址
+        由 resolver 在播到该集时才取；调用方另用 video 做缓冲分类、用 audio
+        走单集路径的 input-slave（系列路径一律丢弃 audio，见设计规格 §7）。
+        """
+        if self._source is None or not (0 <= self._current_idx < len(self._episodes)):
+            return None
+        if len(self._episodes) < 2:
+            return None
+        self._unregister_series()   # 新系列注册前先注销旧系列
+        from framework.media_proxy import MediaProxy
+
+        try:
+            proxy = MediaProxy.instance()
+        except Exception:  # noqa: BLE001 —— 代理起不来 → 退回单集
+            return None
+
+        # **注册时刻快照**：resolver 由代理在「VLC 真正播到该集时」才调用，
+        # 那时视图可能已换源/换作品。若现场读 self._source / self._episodes，
+        # 新旧分集彼此自洽 → fetch_video_streams 成功返回**新源**的流，旧 VLC
+        # 于是静默播出新源的集（不报错，所以更难发现）。
+        source = self._source
+        quality = self._quality
+        episodes = self._episodes
+        gen = self._play_gen
+
+        def _resolve(idx: int):
+            """惰性取流：与 _FetchStreamTask.run() 完全同一条调用。"""
+            ep = episodes[idx]
+            v, a = self._content.fetch_video_streams(
+                source, ep.url, quality=quality, merged=True)
+            if not v:
+                raise ValueError(f"第{idx + 1}集取流失败")
+            # a 恒为空（merged=True 合并流）：input-slave 对 DASH/fMP4 不可靠
+            # 会黑屏，系列路径直接忽略（已知限制，见设计规格 §7）。
+            return v, a, hdrs, ad_block
+
+        def _on_play(idx: int, v: str, a: str) -> None:
+            """代理线程执行：只 emit 信号，槽在主线程跑。"""
+            self._external_now_playing.emit(gen, idx, v, a)
+
+        try:
+            key = proxy.register_series(_resolve, _on_play,
+                                        count=len(episodes),
+                                        force_proxy=force_proxy)
+            # 立即记账：此后任何异常（含下面建 URL 失败）都能被 _unregister_series
+            # 找到并回收；否则注册表里就留下一条持视图强引用、谁也注销不掉的孤儿
+            self._series_key = key
+            urls = [proxy.series_episode_url(key, i)
+                    for i in range(len(episodes))]
+        except Exception:  # noqa: BLE001 —— 注册/建 URL 失败 → 退回单集
+            self._unregister_series()
+            return None
+        self._series_urls = urls
+        # 标题：源章节标题自带集号时**不再**加「第NN集」前缀（否则播放列表里
+        # 会出现「第1集 第1集 章节名」）；源无标题才用「第NN集」兜底。
+        # 非数字开头由 _sanitize_title 兜底防御。
+        out = []
+        for i, ep in enumerate(episodes):
+            title = (ep.title or "").strip() or f"第{i + 1}集"
+            # 无 ep.url 的分集取流必失败：给它一个**空 URL** 入列，让
+            # _fit_series（external_player.py:214 `if not entry[0]: continue`）
+            # 跳过——那道守卫对 /e/ 代理 URL 永不生效（代理 URL 恒非空），
+            # 不显式置空就会给 VLC 留一个点了永远 502 的死条目。_fit_series
+            # 按**入列位置**记 idx，跳过不挪位，故其余集的集下标仍与 App 侧
+            # 严格对齐（Task 7 的 集下标→vlc_id 映射依赖这个对齐）。
+            out.append((urls[i] if (ep.url or "").strip() else "", "", title))
+        return out
 
     def _retry_play(self) -> None:
         """刷新播放：清当前集取流缓存后重新取流播放（播放失败后的重试入口）。
@@ -1538,24 +1947,29 @@ class VideoView(QWidget):
 
     # ------------------------------------------------------------------ #
     def _prefetch_next(self, idx: int = -1) -> None:
-        """后台预拉下一集播放流（串行，命中缓存/无下一集/正在预拉则跳过）。"""
-        if self._source is None:
-            return
+        """后台预拉下一集播放流（命中缓存/无下一集/正在预拉则跳过）。"""
         if idx < 0:
             idx = self._current_idx
-        nxt = idx + 1
-        if not (0 <= nxt < len(self._episodes)):
+        self._prefetch_episode(idx + 1)
+
+    def _prefetch_episode(self, idx: int) -> None:
+        """后台预拉指定集播放流（串行防反爬限流，命中/越界/在拉则跳过）。
+
+        与旧 _prefetch_next 同参数同回调：实际在预拉中（_prefetch_idx >= 0）
+        或已缓存则跳过；预拉完成后由 _on_prefetch_done 写缓存并解锁。
+        """
+        if self._source is None:
             return
-        nxt_ep = self._episodes[nxt]
-        key = (nxt_ep.url, self._quality)
+        if not (0 <= idx < len(self._episodes)):
+            return
+        ep = self._episodes[idx]
+        key = (ep.url, self._quality)
         if key in self._stream_cache:
             return
-        if self._prefetch_idx == nxt:
-            return
-        if self._prefetch_idx >= 0 and self._prefetch_idx != nxt:
+        if self._prefetch_idx >= 0:
             return  # 已有其他集在预拉（串行）
-        self._prefetch_idx = nxt
-        task = _FetchStreamTask(self._content, self._source, nxt_ep.url, self._quality)
+        self._prefetch_idx = idx
+        task = _FetchStreamTask(self._content, self._source, ep.url, self._quality)
         task.signals.finished.connect(self._on_prefetch_done)
         self._prefetch_task = task
         QThreadPool.globalInstance().start(task)
@@ -1594,6 +2008,16 @@ class VideoView(QWidget):
         媒体直链；VLC 不可用时回退浏览器打开集页面（页面播放绕开防盗链）。
         """
         if not self._current_play:
+            # 有意为之：本入口的契约是「把**当前集**交外部播放器」（帮助文案：手动
+            # 重新拉起播放器），选集态压根没有当前集 → 无可交之物。选集态要开播请用
+            # ▶/点集卡（_toggle_play_pause 会按高亮集取流，顺带拿到全集播放列表）。
+            # 换源后走到这里也正是靠 _current_play 已作废——否则会把**旧源**的流
+            # 当新源的当前集交出去。
+            # 但不能一声不吭：_toggle_play_pause 在同一状态下是有反馈的，⚙ 静默
+            # return 会让用户以为功能坏了。_current_play 为空即「当前无流」是权威
+            # 信号（见 _invalidate_current_stream），据此给对应文案。
+            self._show_status("请先选择要播放的集数" if self._selection_mode
+                              else "当前没有正在播放的集")
             return
         audio = getattr(self, "_current_audio", "")
         hdrs = {}
@@ -1614,12 +2038,67 @@ class VideoView(QWidget):
 
                 webbrowser.open(urljoin(self._source.base_url, page_url))
                 return
+        # 新起一次外播 = 新代数：上一次会话的回调就此作废（与 _play 同理。
+        # 必须**在装配系列之前**自增，新注册才捕获得到新代数，在途的旧回调
+        # （握手最长重试 3s + 旧系列 /e/ 的 on_play）则已对不上）
+        self._play_gen += 1
+        gen = self._play_gen
+        ad_block = {}
+        try:
+            ad_block = (self._source.raw or {}).get("ad_block") or {}
+        except Exception:  # noqa: BLE001
+            pass
+        force_proxy = self._force_proxy_enabled()
+        # 已知取舍（本轮记录，留待 Task 8 真机验证）：这里重注册会注销**仍在播**的
+        # 旧系列，上一个 VLC 窗口点集/拖进度条时它的 /e/ 已注销 → 404。VLC 单实例
+        # 会把本次拉起并入**旧窗口**（不新开窗口），故在途 /e/ 仍可解析，窗口里的
+        # 旧分集条目则确实失效。旧窗口把「点集」报给 App 时，App 已用新系列重开
+        # 播放，源相同，落在同一集上无感。
+        series = self._build_series_playlist(
+            self._current_play, audio, hdrs, ad_block, force_proxy)
+        # 开播 MRL 取**返回列表**里当前集那一项（不回头读 self._series_urls ——
+        # 两处下标必须恒等；且无 ep.url 的坏集该项为 ""，读 _series_urls 会误取 /e/）
+        start_ep_url = series[self._current_idx][0] if series else ""
+        if start_ep_url:
+            start_url = start_ep_url
+            real_url = self._current_play  # 分类用真实流地址（惰性 URL 判不出 HLS）
+        else:
+            # 无系列，或当前集是「无 ep.url」的坏集（入列 URL 为空）→ 单集
+            series, start_url, real_url = None, self._current_play, self._current_play
         msg = open_with_player(
-            self._current_play, audio=audio,
+            start_url, audio=audio,
             referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
-            headers=hdrs,
+            headers=hdrs, ad_block=ad_block, force_proxy=force_proxy,
+            episodes=series,
+            classify_url=real_url,
+            start_idx=self._current_idx,
+            # 握手在**后台线程**回调：交信号 emit 而不是裸槽，Qt 自动投递到
+            # 主线程执行（裸槽会在后台线程改视图状态 = 线程归属违规）。
+            # 代数随映射一起带过去，槽才知道这是不是陈旧会话的握手结果。
+            on_playlist_ready=lambda m: self._vlc_playlist_ready.emit(gen, m),
+            caching_ms=self._source_network_caching_ms(),
         )
         self._show_status(msg)
+        # 起播后与 _play 同规格地把 App 侧 UI 拉回「未播放」一致态（幂等同步：
+        # 播放按钮文案、中央浮层、控制条）。两处保持一致，将来若让 control_bar
+        # 真能被自动隐藏、或给 play_btn 换文案（⏸/▶），⚙ 不会静默与 _play 分叉。
+        self.play_btn.setText("▶")
+        self._sync_overlay_state(playing=False)
+        self.control_bar.show()  # 外部播放器接管画面 → 控制条常驻
+        self._external_active = True  # 外播会话在 → App 内快捷键转发 VLC
+        if msg:
+            self._notify_last_episode()  # 末集/单集：提示不再有下一集
+
+    def _source_network_caching_ms(self) -> int:
+        """读源配置 media.hls.network_caching_ms（缺省 0 = 用分类默认值）。
+
+        CDN 按连接限速的源需要更大的 VLC 网络缓冲（见 external_player 注释）。
+        """
+        try:
+            hls = ((self._source.raw or {}).get("media") or {}).get("hls") or {}
+            return int(hls.get("network_caching_ms") or 0)
+        except Exception:  # noqa: BLE001 —— 配置缺失/损坏按默认缓冲走
+            return 0
 
     def _media_needs_referer(self) -> bool:
         """媒体直链是否被 Referer 保护：源配了 Referer 且媒体域名 ≠ 源站域名。"""

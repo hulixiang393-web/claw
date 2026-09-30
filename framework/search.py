@@ -747,6 +747,60 @@ class Search:
             )
         return results
 
+    @staticmethod
+    def _parse_sse_items(text: str, field: str) -> List[dict]:
+        """解析 text/event-stream 响应，合并所有事件的指定数组字段。
+
+        事件流由空行分隔；每个事件的负载可能跨多物理行，兼容两种流：
+        - 标准流：多行 data 均带 `data:` 前缀，续行 join('\n') 复原
+        - 非标准拆块流（如 ikanpp search-parallel）：超大 JSON 被服务器按固定
+          字节切成多行，仅首行带 `data:` 前缀，续行为裸 UTF-8 片段（多字节
+          字符可能被截断跨行），必须 join('') 复原——逐行解析会丢掉续行
+
+        策略：空行切块；块内若全行带 `data:` 前缀 → 标准流 join('\n')；
+        仅首行带前缀 → 拆块流 join('')；单行 → 直接解析。
+        """
+        blocks: List[List[str]] = []
+        cur: List[str] = []
+        for line in text.split("\n"):
+            s = line.rstrip("\r")
+            if s.strip() == "":
+                if cur:
+                    blocks.append(cur)
+                    cur = []
+            else:
+                cur.append(s)
+        if cur:
+            blocks.append(cur)
+
+        items: List[dict] = []
+        for block in blocks:
+            payload = None
+            all_data = all(b.startswith("data:") for b in block)
+            if len(block) == 1:
+                if block[0].startswith("data:"):
+                    payload = block[0][len("data:"):]
+                else:
+                    payload = block[0]
+            elif all_data:
+                payload = "\n".join(b[len("data:"):] for b in block)
+            else:
+                # 拆块流：首行去 data: 前缀，续行裸拼（不引入换行）
+                first = block[0][len("data:"):] if block[0].startswith("data:") else block[0]
+                payload = first + "".join(block[1:])
+            if not payload or not payload.strip():
+                continue
+            try:
+                ev = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            batch = ev.get(field)
+            if isinstance(batch, list) and batch:
+                items.extend(batch)
+        return items
+
     def _search_api(
         self, source: SourceConfig, keyword: str, http: Optional[HttpClient] = None
     ) -> List[SearchResult]:
@@ -772,6 +826,8 @@ class Search:
 
         results: List[SearchResult] = []
         seen_urls: set = set()
+        sse_field = str(cfg.get("sse_field") or "")
+        is_sse = bool(cfg.get("sse"))
         for page in range(1, max_pages + 1):
             if method == "POST":
                 # JSON API（GraphQL 等）：POST body 递归替换占位符
@@ -785,13 +841,29 @@ class Search:
 
                     signer = get_signer(strategy, http)
                     body_filled = signer.sign(body_filled)
-                resp = http.post_json(
-                    urljoin(source.base_url, api_url),
-                    json_body=body_filled,
-                    headers=source.request_headers(),
-                    timeout=float(source.transports().get("timeout") or http.defaults.timeout),
-                    proxy_pool=source.proxy_pool(),
-                )
+                if is_sse:
+                    # text/event-stream：POST JSON 拿原文，合并各事件数组字段
+                    sse_text = http.post_text(
+                        urljoin(source.base_url, api_url),
+                        json_body=body_filled,
+                        headers=source.request_headers(),
+                        timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+                        encoding=source.transports().get("charset"),
+                        proxy_pool=source.proxy_pool(),
+                    )
+                    items = self._parse_sse_items(sse_text, sse_field or "videos")
+                else:
+                    resp = http.post_json(
+                        urljoin(source.base_url, api_url),
+                        json_body=body_filled,
+                        headers=source.request_headers(),
+                        timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+                        proxy_pool=source.proxy_pool(),
+                    )
+                    items = resp
+                    rpath = cfg.get("response_path")
+                    if rpath:
+                        items = self._simple_getpath(resp, rpath)
             elif params:
                 filled = {}
                 for k, v in params.items():
@@ -813,16 +885,17 @@ class Search:
             else:
                 api_url2 = api_url.replace("{keyword}", quote(keyword)).replace("{page}", str(page))
                 abs_url = urljoin(source.base_url, api_url2)
-            resp = http.get_json(
-                abs_url,
-                headers=source.request_headers(),
-                timeout=float(source.transports().get("timeout") or http.defaults.timeout),
-                proxy_pool=source.proxy_pool(),
-            )
-            items = resp
-            rpath = cfg.get("response_path")
-            if rpath:
-                items = self._simple_getpath(resp, rpath)
+            if not is_sse and method != "POST":
+                resp = http.get_json(
+                    abs_url,
+                    headers=source.request_headers(),
+                    timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+                    proxy_pool=source.proxy_pool(),
+                )
+                items = resp
+                rpath = cfg.get("response_path")
+                if rpath:
+                    items = self._simple_getpath(resp, rpath)
             if not isinstance(items, list) or not items:
                 break
             item_fields = cfg.get("item_fields") or {}

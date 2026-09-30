@@ -175,7 +175,10 @@ class SettingsPage(BasePage):
         self._build_library()
         self._build_diag()
         self._build_adblock()
+        self._build_content()
+        self._build_reader()
         layout.addWidget(self.tabs, stretch=1)
+
 
         # 底部按钮
         btns = QHBoxLayout()
@@ -378,8 +381,30 @@ class SettingsPage(BasePage):
         self._ad_dir = sec._line("额外规则目录", "extra_rule_dir", "追加/覆盖内置规则")
         self.tabs.addTab(sec, "广告规则")
 
+    def _build_content(self) -> None:
+        sec = _Section()
+        self._content_adult = sec._check(
+            "显示 18+ 内容源", "show_adult_sources", "关闭后成人源在发现/搜索/源管理中隐藏"
+        )
+        self.tabs.addTab(sec, "内容")
+
+    def _build_reader(self) -> None:
+        sec = _Section()
+        self._reader_prefetch_enabled = sec._check(
+            "预加载后续章节", "prefetch_enabled",
+            "串行预取，同时只跑 1 个任务；关闭后翻章不再预加载",
+        )
+        self._reader_prefetch_ahead = sec._spin(
+            "向后预加载(章/话)", "prefetch_ahead", 0, 20, " 章", "0=不预加载"
+        )
+        self._reader_prefetch_behind = sec._spin(
+            "向前预加载(章)", "prefetch_behind", 0, 10, " 章", "0=不向前缓存"
+        )
+        self.tabs.addTab(sec, "阅读")
+
 
     # ------------------------------------------------------------------ #
+
     # 小工具
     # ------------------------------------------------------------------ #
     def _browse_file(self, line_edit, pattern, caption):
@@ -428,8 +453,15 @@ class SettingsPage(BasePage):
         self._diag_strategy.setCurrentText(g("sources_runtime", "selfcheck_strategy", "soft"))
 
         self._ad_dir.setText(g("adblock", "extra_rule_dir", ""))
+        self._content_adult.setChecked(bool(g("content", "show_adult_sources", True)))
+        self._reader_prefetch_enabled.setChecked(
+            bool(g("reader", "prefetch_enabled", True))
+        )
+        self._reader_prefetch_ahead.setValue(int(g("reader", "prefetch_ahead", 3)))
+        self._reader_prefetch_behind.setValue(int(g("reader", "prefetch_behind", 1)))
 
     def _on_apply(self) -> None:
+
         """把所有控件值写回 settings 并保存。"""
         s = self._sm
         s.set("network", "default_user_agent", self._net_ua.text().strip())
@@ -465,8 +497,13 @@ class SettingsPage(BasePage):
         s.set("sources_runtime", "selfcheck_strategy", self._diag_strategy.currentText())
 
         s.set("adblock", "extra_rule_dir", self._ad_dir.text().strip())
+        s.set("content", "show_adult_sources", self._content_adult.isChecked())
+        s.set("reader", "prefetch_enabled", self._reader_prefetch_enabled.isChecked())
+        s.set("reader", "prefetch_ahead", self._reader_prefetch_ahead.value())
+        s.set("reader", "prefetch_behind", self._reader_prefetch_behind.value())
 
         s.save()
+
         self.settings_applied.emit()
 
     def _on_theme_selected(self, idx: int) -> None:

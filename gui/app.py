@@ -81,6 +81,35 @@ def network_defaults_from_settings(settings) -> NetworkDefaults:
     )
 
 
+def _sync_source_visibility(settings, source_manager, event_bus=None) -> None:
+    """把内容可见性设置同步到 SourceManager。"""
+    if event_bus is not None:
+        source_manager.set_event_bus(event_bus)
+    source_manager.set_adult_visible(
+        bool(settings.get("content", "show_adult_sources", True))
+    )
+
+
+def _make_reading_progress(path: Path, shelf_cb, repository=None):
+    from framework.reading_progress import ReadingProgress
+    return ReadingProgress(path, shelf_cb=shelf_cb, repository=repository)
+
+
+def _legacy_chapters_root(base_dir: Path) -> Path:
+    return base_dir / "data" / "chapters"
+
+
+def _run_startup_migration(repository, progress_path, shelf_service, legacy_cache, base_dir):
+    from framework.shelf_cache_migration import migrate_legacy_data
+    return migrate_legacy_data(
+        repository,
+        progress_path,
+        shelf_service,
+        legacy_cache,
+        legacy_chapters_root=_legacy_chapters_root(base_dir),
+    )
+
+
 def _app_base_dir() -> Path:
     """应用根目录：PyInstaller 打包后为 exe 所在目录（sources/data/docs 随 exe 旁），
     开发运行时为项目根（gui/ 的上一级）。"""
@@ -218,15 +247,54 @@ class MainWindow(QMainWindow):
         self.cookie_manager = CookieManager(base_dir / "data")
         self.source_manager.set_cookie_provider(self.cookie_manager.to_cookie_header)
         self.search_history = SearchHistory(base_dir / "data" / "search_history.json")
-        # 阅读进度记忆（当天续读，24h 未入书架则清理）
-        self.reading_progress = None
-        from framework.reading_progress import ReadingProgress
-
-        self.reading_progress = ReadingProgress(
+        from framework.shelf_cache_repository import ShelfCacheRepository
+        from framework.library_store import LibraryStore
+        from framework.shelf_service import ShelfService
+        from framework.cache_service import get_shelf_cache, get_search_cache
+        shelf_cache = None
+        try:
+            shelf_cache = get_shelf_cache(str(base_dir / "data" / "cache"))
+        except Exception:
+            shelf_cache = None
+        self.shelf_cache_repository = None
+        try:
+            from framework.settings_manager import shelf_cache_settings
+            cfg = shelf_cache_settings(self.settings)
+            self.shelf_cache_repository = ShelfCacheRepository(
+                base_dir / "data" / "shelf.sqlite3",
+                base_dir / "data" / "cache",
+                max_book_bytes=cfg["max_book_mb"] * 1024 * 1024,
+                max_total_bytes=cfg["max_total_mb"] * 1024 * 1024,
+            )
+        except Exception:
+            self.shelf_cache_repository = None
+        self.reading_progress = _make_reading_progress(
             base_dir / "data" / "reading_progress.json",
-            shelf_cb=self._favorite_has,  # 收藏的书续读永久保留，未收藏 24h 清理
+            self._favorite_has,
+            self.shelf_cache_repository,
         )
-        self.reading_progress.prune(shelf_cb=self._favorite_has)  # 启动清理（收藏保留）
+        if self.shelf_cache_repository is not None:
+            try:
+                legacy_store = LibraryStore(base_dir / "data" / "library.json")
+                legacy_shelf = ShelfService(
+                    self.settings.get("download", "output_dir", "downloads"),
+                    library_store=legacy_store,
+                    data_dir=base_dir / "data",
+                )
+                _run_startup_migration(
+                    self.shelf_cache_repository,
+                    base_dir / "data" / "reading_progress.json",
+                    legacy_shelf,
+                    shelf_cache,
+                    base_dir,
+                )
+            except Exception:
+                self.shelf_cache_repository = None
+                self.reading_progress = _make_reading_progress(
+                    base_dir / "data" / "reading_progress.json",
+                    self._favorite_has,
+                )
+        self.reading_progress.prune(shelf_cb=self._favorite_has)
 
         # 爬取执行链（网络默认值从 settings 接线：impersonate/user_agents 默认关闭）
         self.http = HttpClient(defaults=network_defaults_from_settings(self.settings))
@@ -242,6 +310,7 @@ class MainWindow(QMainWindow):
         self.content = Content(
             self.http, self.parser, self.checker, self.decrypter,
             health_reporter=self.source_manager,
+            repository=self.shelf_cache_repository,
         )
         self.bulk_fetch = BulkFetch(
             self.discovery,
@@ -265,9 +334,6 @@ class MainWindow(QMainWindow):
         self.event_bus.subscribe(self._on_download_event)
         # Redis 持久化缓存注入：书架池（封面/详情/正文/漫画页）+ 搜索&发现池（搜索/列表）。
         # 数据目录随 data/ 走 settings（与首页索引同目录）。
-        from framework.cache_service import get_shelf_cache, get_search_cache
-
-        shelf_cache = get_shelf_cache(str(base_dir / "data" / "cache"))
         search_cache = get_search_cache(str(base_dir / "data" / "cache"))
         self.discovery.cache = search_cache
         self.content._cache = shelf_cache
@@ -286,6 +352,7 @@ class MainWindow(QMainWindow):
         # （爱丽丝等直连源封面经系统代理会失败/变慢 → 封面空白）
         for _src in self.source_manager.all():
             CoverLoader.instance().register_source(_src)
+        _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
 
         # Tab 索引映射
         self._tab_index = {key: i for i, (_, key) in enumerate(TABS)}
@@ -362,6 +429,7 @@ class MainWindow(QMainWindow):
             reading_progress=self.reading_progress,
             font_scale=float(self.settings.get("ui", "font_scale", 1.0)),
             search=self.search,
+            settings=self.settings,
         )
         # 阅读器「收藏」→ 写书架收藏库（与发现详情抽屉同一入口 _on_favorite）
         self.reader.favorite_requested.connect(self._on_favorite)
@@ -436,6 +504,7 @@ class MainWindow(QMainWindow):
             event_bus=self.event_bus,
             theme_manager=self.theme_manager,
             session_cache=get_session_cache(),
+            settings=self.settings,
         )
         page.read_requested.connect(self._open_reader)
         page.download_requested.connect(self._open_download_dialog)
@@ -499,11 +568,12 @@ class MainWindow(QMainWindow):
             page.refresh()
 
     # ------------------------------------------------------------------ #
-    def _on_batch_add_shelf(self, items) -> None:
+    def _on_batch_add_shelf(self, items, folder="") -> None:
         """搜索页勾选批量 → 加入书架（写收藏库）。"""
         store = self._ensure_library_store()
         if store is None or not items:
             return
+        folder = folder if folder and folder != "全部" else ""
         added = 0
         for r in items:
             url = getattr(r, "url", "") or ""
@@ -516,6 +586,7 @@ class MainWindow(QMainWindow):
                 content_type=getattr(r, "content_type", "") or "",
                 cover=getattr(r, "cover", ""),
                 author=getattr(r, "author", ""),
+                folder=folder,
             )
             added += 1
         # 刷新书架（若已构建）
@@ -618,11 +689,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, "download_page"):
             self.tabs.setCurrentWidget(self.download_page)
 
+    def _available_shelf_folders(self) -> list[str]:
+        store = self._ensure_library_store()
+        if store is None:
+            return []
+        return store.list_folders()
+
     def _build_search(self) -> SearchPage:
         page = SearchPage(
             source_manager=self.source_manager,
             search=self.search,
             content=self.content,
+            event_bus=self.event_bus,
+            shelf_folder_provider=self._available_shelf_folders,
         )
         page.open_requested.connect(self._open_from_search)
         page.add_to_shelf_requested.connect(self._on_batch_add_shelf)
@@ -675,6 +754,10 @@ class MainWindow(QMainWindow):
             reading_progress=self.reading_progress,
             shelf_export_dir=shelf_export_dir,
             cover_backfiller=self._backfill_favorite_covers,
+            shelf_cache_repository=self.shelf_cache_repository,
+            source_manager=getattr(self, "source_manager", None),
+            content=getattr(self, "content", None),
+            settings=self.settings,
         )
         # 点本地 epub → 内置阅读器打开（续读）
         self.library_page.open_epub_requested.connect(self._open_epub)
@@ -926,6 +1009,7 @@ class MainWindow(QMainWindow):
             checker=self.checker,
             sources_dir=base_dir / "sources",
             cookie_manager=self.cookie_manager,
+            event_bus=self.event_bus,
         )
         # 编辑某源 → 打开编辑器对话框
         self.source_page.edit_requested.connect(self._open_source_editor)
@@ -1335,28 +1419,74 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
 }}
 """
 
-    def _on_settings_applied(self) -> None:
-        """设置页点「应用」→ 重跑主题 QSS（含背景图）+ 字体缩放 + 网络默认值 + 封面缓存。"""
-        # 重跑主题（含背景图合成 QSS + 字体缩放）
-        self._apply_theme_qss(self.theme_manager.current_key())
-        # 字体缩放 → 阅读器
-        font_scale = float(self.settings.get("ui", "font_scale", 1.0))
-        if hasattr(self, "reader") and self.reader is not None:
-            self.reader.apply_font_scale(font_scale)
-            self.reader.apply_reading_style(
-                self.settings.get("ui", "reading_bg", "") or "",
-                int(self.settings.get("ui", "reading_font_size", 0) or 0),
+    def _schedule_source_visibility_sync(self) -> None:
+        """把设置应用后的源可见性刷新合并到下一轮事件循环。"""
+        if getattr(self, "_source_visibility_sync_scheduled", False):
+            return
+        self._source_visibility_sync_scheduled = True
+
+        from PySide6.QtCore import QTimer
+
+        def _sync():
+            self._source_visibility_sync_scheduled = False
+            _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
+
+        QTimer.singleShot(0, _sync)
+
+    def _schedule_cover_cache_refresh(self) -> None:
+        """把封面缓存配置刷新合并到下一轮事件循环，采用最新设置。"""
+        if getattr(self, "_cover_cache_refresh_scheduled", False):
+            return
+        self._cover_cache_refresh_scheduled = True
+
+        from PySide6.QtCore import QTimer
+
+        def _refresh():
+            self._cover_cache_refresh_scheduled = False
+            from gui.components.cover_loader import CoverLoader
+            from framework.cache_service import get_shelf_cache
+
+            CoverLoader.instance().configure(
+                self.settings.get("ui", "cover_cache_size_mb", 256),
+                shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
             )
-        # 网络默认值 → 已读的 http.defaults 跟不上（构造时快照），但超时等走 per-source
-        # 封面缓存预算（保留已注入的书架持久化缓存，避免覆盖为 None）
-        from gui.components.cover_loader import CoverLoader
 
-        from framework.cache_service import get_shelf_cache
+        QTimer.singleShot(0, _refresh)
 
-        CoverLoader.instance().configure(
-            self.settings.get("ui", "cover_cache_size_mb", 256),
-            shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
-        )
+    def _schedule_settings_refresh(self) -> None:
+        """合并设置应用后的 GUI 刷新，并在主线程下一轮读取最新设置。"""
+        if getattr(self, "_settings_refresh_scheduled", False):
+            return
+        self._settings_refresh_scheduled = True
+
+        from PySide6.QtCore import QTimer
+
+        def _refresh():
+            self._settings_refresh_scheduled = False
+            _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
+
+            from gui.components.cover_loader import CoverLoader
+            from framework.cache_service import get_shelf_cache
+
+            CoverLoader.instance().configure(
+                self.settings.get("ui", "cover_cache_size_mb", 256),
+                shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
+            )
+            self._apply_theme_qss(self.theme_manager.current_key())
+
+            font_scale = float(self.settings.get("ui", "font_scale", 1.0))
+            if hasattr(self, "reader") and self.reader is not None:
+                self.reader.apply_font_scale(font_scale)
+                self.reader.apply_reading_style(
+                    self.settings.get("ui", "reading_bg", "") or "",
+                    int(self.settings.get("ui", "reading_font_size", 0) or 0),
+                )
+
+        QTimer.singleShot(0, _refresh)
+
+    def _on_settings_applied(self) -> None:
+        """设置页点「应用」→ 合并并延后主题、可见性、缓存和字体刷新。"""
+        self._schedule_settings_refresh()
 
     # ------------------------------------------------------------------ #
     def _install_shortcuts(self) -> None:
