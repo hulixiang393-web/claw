@@ -347,6 +347,10 @@ class LibraryPage(BasePage):
         self.new_folder_btn.clicked.connect(self._new_folder)
         top.addWidget(self.new_folder_btn)
 
+        self.admin_btn = QPushButton("管理员设置")
+        self.admin_btn.clicked.connect(self._manage_admin_password)
+        top.addWidget(self.admin_btn)
+
         self.delete_folder_btn = QPushButton("删除收藏夹")
         self.delete_folder_btn.clicked.connect(self._delete_folder)
         top.addWidget(self.delete_folder_btn)
@@ -422,6 +426,18 @@ class LibraryPage(BasePage):
             return True
         QMessageBox.warning(self, "解锁失败", "密码不正确。")
         return False
+
+    def _admin_unlock_folder(self, name: str) -> bool:
+        if not self._require_admin():
+            return False
+        info = self._store.folder_info(name) if self._store is not None else None
+        if info is None or not info.get("locked"):
+            return True
+        if not self._prompt_set_password(name, False, admin_verified=True):
+            return False
+        self._unlocked.add(name)
+        self._rebuild()
+        return True
 
     def _has_locked_folders(self) -> bool:
         if self._store is None:
@@ -767,6 +783,19 @@ class LibraryPage(BasePage):
     def _on_folder_changed(self, name: str) -> None:
         if name and name != "全部" and not self.is_folder_unlocked(name):
             if not self._prompt_unlock(name):
+                from PySide6.QtWidgets import QMessageBox
+
+                choice = QMessageBox.question(
+                    self,
+                    "管理员解锁",
+                    "密码解锁失败。是否使用管理员验证并立即设置新的收藏夹密码？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if choice == QMessageBox.Yes and self._admin_unlock_folder(name):
+                    self._previous_folder = name
+                    self._rebuild()
+                    return
                 self.folder_combo.blockSignals(True)
                 previous = self.folder_combo.findText(self._previous_folder)
                 self.folder_combo.setCurrentIndex(previous if previous >= 0 else 0)
@@ -776,6 +805,51 @@ class LibraryPage(BasePage):
         self._rebuild()
 
     # ------------------------------------------------------------------ #
+    def _manage_admin_password(self) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        auth = self._admin_auth()
+        if auth is None:
+            return False
+        if not auth.is_configured():
+            p1, ok1 = QInputDialog.getText(
+                self, "创建管理员密码", "管理员密码：", QLineEdit.Password
+            )
+            if not ok1 or not p1:
+                return False
+            p2, ok2 = QInputDialog.getText(
+                self, "创建管理员密码", "再次输入：", QLineEdit.Password
+            )
+            if not ok2 or p1 != p2:
+                QMessageBox.warning(self, "创建失败", "两次输入的密码不一致。")
+                return False
+            if auth.configure(p1):
+                QMessageBox.information(self, "创建成功", "管理员密码已创建，之后不能通过恢复码重置。")
+                return True
+            QMessageBox.warning(self, "创建失败", "管理员密码已经存在，不能覆盖。")
+            return False
+        old, ok = QInputDialog.getText(
+            self, "修改管理员密码", "当前管理员密码：", QLineEdit.Password
+        )
+        if not ok:
+            return False
+        p1, ok1 = QInputDialog.getText(
+            self, "修改管理员密码", "新管理员密码：", QLineEdit.Password
+        )
+        if not ok1 or not p1:
+            return False
+        p2, ok2 = QInputDialog.getText(
+            self, "修改管理员密码", "再次输入新密码：", QLineEdit.Password
+        )
+        if not ok2 or p1 != p2:
+            QMessageBox.warning(self, "修改失败", "两次输入的密码不一致。")
+            return False
+        if not auth.change(old, p1):
+            QMessageBox.warning(self, "修改失败", "当前管理员密码不正确。")
+            return False
+        QMessageBox.information(self, "修改成功", "管理员密码已修改。")
+        return True
+
     def _new_folder(self) -> None:
         from PySide6.QtWidgets import (
             QCheckBox,
@@ -802,6 +876,8 @@ class LibraryPage(BasePage):
             return
         if locked.isChecked():
             from PySide6.QtWidgets import QMessageBox
+            if not self._require_admin():
+                return
             password, ok = QInputDialog.getText(
                 self, "设置收藏夹密码", "密码：", QLineEdit.Password
             )
@@ -813,11 +889,21 @@ class LibraryPage(BasePage):
             if not confirmed or password != confirmation:
                 QMessageBox.warning(self, "创建失败", "两次输入的密码不一致。")
                 return
-            from framework.folder_lock import hash_password, new_salt
+            from framework.folder_lock import hash_password, new_recovery_code, new_salt
             salt = new_salt()
-            if not self._store.create_folder(name, locked=True, pw=hash_password(password, salt), salt=salt):
+            recovery_salt = new_salt()
+            recovery_code = new_recovery_code()
+            if not self._store.create_folder(
+                name,
+                locked=True,
+                pw=hash_password(password, salt),
+                salt=salt,
+                recovery_pw=hash_password(recovery_code, recovery_salt),
+                recovery_salt=recovery_salt,
+            ):
                 return
             self._unlocked.add(name)
+            self._show_recovery_code(recovery_code)
         elif not self._shelf.create_folder(name):
             return
         idx = self.folder_combo.findText(name)
@@ -861,6 +947,12 @@ class LibraryPage(BasePage):
         if is_online and info is not None and info.get("locked") and not self.is_folder_unlocked(folder):
             menu.addAction("🔓 解锁收藏夹").triggered.connect(
                 lambda: self._prompt_unlock(folder)
+            )
+            menu.addAction("🔐 管理员解锁").triggered.connect(
+                lambda: self._admin_unlock_folder(folder)
+            )
+            menu.addAction("忘记密码 / 使用恢复码").triggered.connect(
+                lambda: self._prompt_recover_folder_password(folder)
             )
             menu.exec(pos)
             return
@@ -918,26 +1010,60 @@ class LibraryPage(BasePage):
                     menu.addAction("移除密码").triggered.connect(
                         lambda: self._remove_folder_password(folder)
                     )
+                    menu.addAction("忘记密码 / 使用恢复码").triggered.connect(
+                        lambda: self._prompt_recover_folder_password(folder)
+                    )
                 else:
                     menu.addAction("设置密码").triggered.connect(
                         lambda: self._prompt_set_password(folder, False)
                     )
         menu.exec(pos)
 
-    def _prompt_set_password(self, name: str, require_old: bool) -> bool:
-        from PySide6.QtWidgets import QInputDialog, QMessageBox
-        from framework.folder_lock import hash_password, new_salt, verify_password
+    def _admin_auth(self):
+        from framework.admin_auth import AdminAuth
 
-        if self._store is None:
+        path = getattr(self._store, "_path", None)
+        return AdminAuth(Path(path).with_name("admin_auth.json")) if path else None
+
+    def _require_admin(self) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        auth = self._admin_auth()
+        if auth is None:
+            return False
+        if not auth.is_configured():
+            p1, ok1 = QInputDialog.getText(
+                self, "设置管理员密码", "管理员密码：", QLineEdit.Password
+            )
+            if not ok1 or not p1:
+                return False
+            p2, ok2 = QInputDialog.getText(
+                self, "设置管理员密码", "再次输入：", QLineEdit.Password
+            )
+            if not ok2 or p1 != p2:
+                QMessageBox.warning(self, "设置失败", "两次输入的密码不一致。")
+                return False
+            if auth.configure(p1):
+                return True
+            QMessageBox.warning(self, "设置失败", "管理员密码已经设置，不能重置。")
+            return False
+        password, ok = QInputDialog.getText(
+            self, "管理员验证", "请输入管理员密码：", QLineEdit.Password
+        )
+        if not ok or not auth.verify(password):
+            QMessageBox.warning(self, "验证失败", "管理员密码不正确。")
+            return False
+        return True
+
+    def _prompt_set_password(
+        self, name: str, require_old: bool, admin_verified: bool = False
+    ) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from framework.folder_lock import hash_password, new_recovery_code, new_salt
+
+        if self._store is None or (not admin_verified and not self._require_admin()):
             return False
         info = self._store.folder_info(name) or {}
-        if require_old:
-            old, ok = QInputDialog.getText(
-                self, f"修改密码「{name}」", "当前密码：", QLineEdit.Password
-            )
-            if not ok or not verify_password(old, info.get("pw"), info.get("salt")):
-                QMessageBox.warning(self, "修改失败", "当前密码不正确。")
-                return False
         p1, ok1 = QInputDialog.getText(
             self, f"设置密码「{name}」", "新密码：", QLineEdit.Password
         )
@@ -950,9 +1076,80 @@ class LibraryPage(BasePage):
             QMessageBox.warning(self, "设置失败", "两次输入的密码不一致。")
             return False
         salt = new_salt()
-        if not self._store.set_folder_lock(name, True, hash_password(p1, salt), salt):
+        recovery_salt = new_salt()
+        recovery_code = new_recovery_code()
+        if not self._store.set_folder_lock(
+            name,
+            True,
+            hash_password(p1, salt),
+            salt,
+            hash_password(recovery_code, recovery_salt),
+            recovery_salt,
+        ):
             return False
         self._unlocked.add(name)
+        self._show_recovery_code(recovery_code)
+        self._rebuild()
+        return True
+
+    def _show_recovery_code(self, code: str) -> None:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        box = QMessageBox(self)
+        box.setWindowTitle("收藏夹恢复码")
+        box.setText("请立即保存恢复码。关闭此窗口后将无法再次查看：")
+        box.setInformativeText(code)
+        copy_button = box.addButton("复制恢复码", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        if box.clickedButton() is copy_button:
+            QApplication.clipboard().setText(code)
+
+    def _prompt_recover_folder_password(self, name: str) -> bool:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from framework.folder_lock import (
+            hash_password,
+            new_recovery_code,
+            new_salt,
+            verify_recovery_code,
+        )
+
+        if self._store is None or not self._require_admin():
+            return False
+        info = self._store.folder_info(name) or {}
+        code, ok = QInputDialog.getText(
+            self, f"恢复收藏夹「{name}」", "恢复码：", QLineEdit.Normal
+        )
+        if not ok or not verify_recovery_code(
+            code.strip(), info.get("recovery_pw"), info.get("recovery_salt")
+        ):
+            QMessageBox.warning(self, "恢复失败", "恢复码不正确或尚未配置恢复码。")
+            return False
+        p1, ok1 = QInputDialog.getText(
+            self, f"设置密码「{name}」", "新密码：", QLineEdit.Password
+        )
+        if not ok1 or not p1:
+            return False
+        p2, ok2 = QInputDialog.getText(
+            self, f"设置密码「{name}」", "再次输入：", QLineEdit.Password
+        )
+        if not ok2 or p1 != p2:
+            QMessageBox.warning(self, "恢复失败", "两次输入的密码不一致。")
+            return False
+        salt = new_salt()
+        recovery_salt = new_salt()
+        recovery_code = new_recovery_code()
+        if not self._store.set_folder_lock(
+            name,
+            True,
+            hash_password(p1, salt),
+            salt,
+            hash_password(recovery_code, recovery_salt),
+            recovery_salt,
+        ):
+            return False
+        self._unlocked.add(name)
+        self._show_recovery_code(recovery_code)
         self._rebuild()
         return True
 
@@ -967,7 +1164,7 @@ class LibraryPage(BasePage):
         return result
 
     def _remove_folder_password(self, name: str) -> bool:
-        if self._store is None:
+        if self._store is None or not self._require_admin():
             return False
         if not self._prompt_unlock(name):
             return False

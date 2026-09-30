@@ -28,12 +28,15 @@ def _normalize_lock_text(raw) -> Optional[str]:
     return raw if isinstance(raw, str) and raw else None
 
 
-def _folder_record(name, locked=False, pw=None, salt=None) -> dict:
+def _folder_record(name, locked=False, pw=None, salt=None,
+                   recovery_pw=None, recovery_salt=None) -> dict:
     return {
         "name": _normalize_folder_name(name),
         "locked": _normalize_locked(locked),
         "pw": _normalize_lock_text(pw),
         "salt": _normalize_lock_text(salt),
+        "recovery_pw": _normalize_lock_text(recovery_pw),
+        "recovery_salt": _normalize_lock_text(recovery_salt),
     }
 
 
@@ -43,7 +46,8 @@ def _normalize_folder_entry(raw) -> dict:
         return _folder_record(raw)
     if isinstance(raw, dict):
         return _folder_record(
-            raw.get("name"), raw.get("locked", False), raw.get("pw"), raw.get("salt")
+            raw.get("name"), raw.get("locked", False), raw.get("pw"), raw.get("salt"),
+            raw.get("recovery_pw"), raw.get("recovery_salt")
         )
     return _folder_record("")
 
@@ -103,7 +107,8 @@ class LibraryStore:
     # 收藏夹
     # ------------------------------------------------------------------ #
     def create_folder(self, name: str, locked: bool = False,
-                      pw=None, salt=None) -> bool:
+                      pw=None, salt=None, recovery_pw=None,
+                      recovery_salt=None) -> bool:
         """新建收藏夹（空夹也保留）。同名返回 False。"""
         name = _normalize_folder_name(name)
         if not name:
@@ -111,7 +116,9 @@ class LibraryStore:
         with self._lock:
             if name in self._folder_locks:
                 return False
-            self._folder_locks[name] = _folder_record(name, locked, pw, salt)
+            self._folder_locks[name] = _folder_record(
+                name, locked, pw, salt, recovery_pw, recovery_salt
+            )
             self._save()
         return True
 
@@ -174,7 +181,8 @@ class LibraryStore:
             return dict(rec) if rec is not None else None
 
     def set_folder_lock(self, name: str, locked: bool,
-                        pw=None, salt=None) -> bool:
+                        pw=None, salt=None, recovery_pw=None,
+                        recovery_salt=None) -> bool:
         """更新收藏夹锁状态和凭据元数据。"""
         name = _normalize_folder_name(name)
         with self._lock:
@@ -184,6 +192,8 @@ class LibraryStore:
             rec["locked"] = _normalize_locked(locked)
             rec["pw"] = _normalize_lock_text(pw)
             rec["salt"] = _normalize_lock_text(salt)
+            rec["recovery_pw"] = _normalize_lock_text(recovery_pw)
+            rec["recovery_salt"] = _normalize_lock_text(recovery_salt)
             self._save()
         return True
 
