@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import re
@@ -105,30 +104,7 @@ class BilibiliWbiSigner(Signer):
         return sorted_params
 
 
-class MacCmsVerifySigner(Signer):
-    """MacCMS search verification token signer."""
-
-    name = "maccms_verify"
-    _KEY = bytes([
-        0x4E, 0x3F, 0xA9, 0xC2, 0x12, 0x7D, 0x88, 0xEF,
-        0x55, 0xAA, 0x0B, 0xCD, 0xDE, 0xAD, 0xBE, 0xEF,
-    ])
-
-    def __init__(self, http=None):
-        self._http = http
-
-    def sign(self, params: Dict[str, object]) -> Dict[str, object]:
-        out = copy.copy(params)
-        out["i"] = base64.b64encode(
-            bytes(
-                byte ^ self._KEY[index % len(self._KEY)]
-                for index, byte in enumerate(str(int(time.time() * 1000)).encode())
-            )
-        ).decode()
-        return out
-
-
-_REGISTRY = {x.name: x for x in (BilibiliWbiSigner, MacCmsVerifySigner)}
+_REGISTRY = {x.name: x for x in (BilibiliWbiSigner,)}
 
 
 def _md5(s: str) -> str:

@@ -2767,49 +2767,13 @@ class Content:
                                 if "mp4=" in abs_step_url
                                 else abs_step_url + ("&" if "?" in abs_step_url else "?") + "mp4=0")
             try:
-                method = str(step.get("method") or "GET").upper()
-                if method == "POST":
-                    capture = step.get("capture") or {}
-                    captured = {}
-                    capture_regex = capture.get("json_regex") or ""
-                    if capture_regex:
-                        cm = _re.search(capture_regex, cur_text, _re.IGNORECASE | _re.DOTALL)
-                        if not cm:
-                            raise ValueError(f"未匹配 capture.json_regex: {capture_regex[:80]}")
-                        captured = json.loads(cm.group(1))
-                    body = {}
-                    for key, value in (step.get("json_body") or {}).items():
-                        if isinstance(value, str) and isinstance(captured, dict):
-                            exact = _re.fullmatch(r"\{([^{}]+)\}", value)
-                            if exact and exact.group(1) in captured:
-                                value = captured[exact.group(1)]
-                            else:
-                                for ref_key, ref_value in captured.items():
-                                    value = value.replace("{" + ref_key + "}", str(ref_value))
-                        body[key] = value
-                    response = self._http.post_json(
-                        abs_step_url, json_body=body, headers=headers,
-                        timeout=self._timeout(source), retries=self._retries(source),
-                        proxy_pool=source.proxy_pool(),
-                    )
-                    json_path = str(step.get("json_path") or "")
-                    value = response
-                    for part in json_path.split(".") if json_path else ():
-                        if isinstance(value, dict):
-                            value = value.get(part)
-                        else:
-                            value = None
-                            break
-                    cur_text = str(value or "")
-                    val = cur_text
-                else:
-                    cur_text = self._http.get_text(
-                        abs_step_url, headers=headers,
-                        timeout=self._timeout(source), retries=self._retries(source),
-                        interval_ms=self._interval_ms(source),
-                        encoding=source.transports().get("charset"),
-                        proxy_pool=source.proxy_pool(),
-                    )
+                cur_text = self._http.get_text(
+                    abs_step_url, headers=headers,
+                    timeout=self._timeout(source), retries=self._retries(source),
+                    interval_ms=self._interval_ms(source),
+                    encoding=source.transports().get("charset"),
+                    proxy_pool=source.proxy_pool(),
+                )
             except Exception as exc:  # noqa: BLE001
                 raise ContentMissingError(
                     f"http_chain 第{i}步请求失败 {abs_step_url}: {exc}",
