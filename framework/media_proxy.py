@@ -55,12 +55,13 @@ _READ_CHUNK = 64 * 1024
 # （慢 CDN 上就是肉眼可见的起播延迟）。
 _SNIFF_BYTES = 16
 _CACHE_FETCH_WAIT = 30.0
-_PREFETCH_MAX_DEPTH = 16
+_PREFETCH_MAX_DEPTH = 64
 _PREFETCH_MAX_WORKERS = 8
 _PREFETCH_MAX_PENDING = 32
 _PREFETCH_TIMEOUT = 10.0
 _PREFETCH_CANCEL_WAIT = 1.0
 _PREFETCH_FAILURE_LIMIT = 3
+_MANIFEST_CACHE_TTL = 10.0
 # 媒体响应透传的头
 _MEDIA_HDRS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
 
@@ -813,6 +814,7 @@ class MediaProxy:
         self._cache = cache  # 可注入测试用缓存实例；None → 懒加载单例
         # cache_ctx key → (base_url, headers, ad_block, force_proxy)（四元组）
         self._cache_ctx: dict[str, tuple] = {}
+        self._manifest_cache: dict[str, tuple[float, str]] = {}
         self._mp4_tee: dict[str, _FileTee] = {}  # key → 进行中的 mp4 落盘
         # HLS 有界预取（默认关，见 _pf_cfg）
         self._pf_cfg = self._resolve_prefetch_cfg(prefetch)
@@ -880,6 +882,11 @@ class MediaProxy:
                     max_workers=self._pf_cfg["workers"],
                     thread_name_prefix="claw-pf")
             return self._pf_pool
+
+    def configure_prefetch(self, enabled: bool, depth: int = 16, workers: int = 3) -> None:
+        self._pf_cfg["enabled"] = bool(enabled)
+        self._pf_cfg["depth"] = max(1, min(int(depth), _PREFETCH_MAX_DEPTH))
+        self._pf_cfg["workers"] = max(1, min(int(workers), _PREFETCH_MAX_WORKERS))
 
     def _prefetch_enabled(self) -> bool:
         return bool(self._pf_cfg.get("enabled")) and not self._pf_disabled
@@ -1478,6 +1485,13 @@ class MediaProxy:
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
         # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
         # 默认直连优先，失败后回退系统代理。
+        manifest_key = target + "|" + repr(sorted((req_headers or {}).items()))
+        cached_manifest = self._manifest_cache.get(manifest_key)
+        now = time.monotonic()
+        if cached_manifest and now - cached_manifest[0] < _MANIFEST_CACHE_TTL:
+            self._serve_m3u8_text(handler, cached_manifest[1], target, req_headers,
+                                  ad_block, force_proxy)
+            return
         resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
         try:
             # 上游错误（403/404/5xx）不发 body 给播放器：原 urllib 会抛
@@ -1498,6 +1512,7 @@ class MediaProxy:
                 self._send_body(handler, resp, body)
                 return
             text = body.decode("utf-8", "replace")
+            self._manifest_cache[manifest_key] = (time.monotonic(), text)
             self._serve_m3u8_text(handler, text, target, req_headers, ad_block,
                                   force_proxy)
         finally:

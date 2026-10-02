@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re as _re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from urllib.parse import quote, urlencode, urljoin
@@ -82,12 +83,14 @@ class Search:
         discovery: Optional[Discovery] = None,
         concurrent: int = 1,
         cookie_manager=None,
+        provider_memory=None,
     ):
         self._http = http
         self._parser = parser
         self._discovery = discovery
         self._concurrent = max(1, int(concurrent or 1))
         self._cookie_manager = cookie_manager  # 渲染搜索页注入登录 cookie
+        self._provider_memory = provider_memory
         self._ytdlp = None  # 懒加载单例
 
     # ------------------------------------------------------------------ #
@@ -819,6 +822,24 @@ class Search:
         params = cfg.get("params") or {}
         method = (cfg.get("method") or "GET").upper()
         body = cfg.get("body") or {}
+        provider_memory = self._provider_memory if source.source_id == "ikanpp" else None
+        provider_ids = []
+        if provider_memory and method == "POST":
+            raw_sources = body.get("sources") if isinstance(body, dict) else None
+            if isinstance(raw_sources, list):
+                provider_ids = [
+                    str(item.get("id"))
+                    for item in raw_sources
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                ranked_ids = provider_memory.rank(provider_ids)
+                by_id = {
+                    str(item.get("id")): item
+                    for item in raw_sources
+                    if isinstance(item, dict) and item.get("id")
+                }
+                body = dict(body)
+                body["sources"] = [by_id[provider_id] for provider_id in ranked_ids]
 
         # 翻页：读 constraints.search.max_pages（默认 1），多页合并去重
         constraints = source.raw.get("constraints") or {}
@@ -829,6 +850,7 @@ class Search:
         sse_field = str(cfg.get("sse_field") or "")
         is_sse = bool(cfg.get("sse"))
         for page in range(1, max_pages + 1):
+            request_started = time.perf_counter()
             if method == "POST":
                 # JSON API（GraphQL 等）：POST body 递归替换占位符
                 body_filled = fill_json(body, keyword=keyword, page=str(page))
@@ -896,6 +918,19 @@ class Search:
                 rpath = cfg.get("response_path")
                 if rpath:
                     items = self._simple_getpath(resp, rpath)
+            if provider_memory and provider_ids:
+                elapsed_ms = (time.perf_counter() - request_started) * 1000.0
+                observed = {
+                    str(item.get("source"))
+                    for item in (items if isinstance(items, list) else [])
+                    if isinstance(item, dict) and item.get("source")
+                }
+                for provider_id in provider_ids:
+                    provider_memory.record(
+                        provider_id,
+                        elapsed_ms,
+                        success=provider_id in observed,
+                    )
             if not isinstance(items, list) or not items:
                 break
             item_fields = cfg.get("item_fields") or {}

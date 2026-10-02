@@ -15,6 +15,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -83,6 +84,17 @@ class _ShelfCard(QFrame):
     def __init__(self, rec: dict, parent=None):
         super().__init__(parent)
         self.rec = rec
+        self.batch_box = QCheckBox(self)
+        self.batch_box.setFixedSize(26, 26)
+        self.batch_box.setText("✓")
+        self.batch_box.setToolTip("选择后可右键执行批量操作")
+        self.batch_box.setStyleSheet(
+            "QCheckBox { background: rgba(255,255,255,235); color: #333;"
+            " border-radius: 4px; padding: 2px; }"
+        )
+        self.batch_box.move(178, 8)
+        self.batch_box.raise_()
+        self.batch_box.show()
         self.setObjectName("shelfCard")
         self.setCursor(Qt.PointingHandCursor)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -179,6 +191,8 @@ class _ShelfCard(QFrame):
         layout.addStretch(1)
 
         self._apply_style()
+        self.batch_box.raise_()
+        self.batch_box.show()
 
     def _load_cover(self, url: str) -> None:
         """异步加载书架卡片封面（CoverLoader 全局限流）。"""
@@ -318,6 +332,7 @@ class LibraryPage(BasePage):
         self._shelf_cache_repository = shelf_cache_repository
         self._precache_jobs: dict[str, object] = {}
         self._cards_by_key: dict[str, _ShelfCard] = {}
+        self._batch_selected: dict[str, dict] = {}
         self._unlocked: set[str] = set()
         self._shelf_export_dir = Path(shelf_export_dir) if shelf_export_dir else Path("library")
         self._scan_task = None  # 后台扫描任务持有引用（防 GC）
@@ -668,10 +683,14 @@ class LibraryPage(BasePage):
         for i, item in enumerate(items):
             rec = item["rec"]
             card = _ShelfCard(rec)
-            book_key = rec.get("url") or ""
+            card.batch_box.stateChanged.connect(
+                lambda state, r=rec: self._on_batch_state(r, state)
+            )
+            book_key = rec.get("url") or rec.get("key") or ""
             if rec.get("kind") == "favorite" and book_key:
                 self._cards_by_key[book_key] = card
-                card._badge_label.setText(self._cached_badge(book_key))
+                if rec.get("content_type") != "video":
+                    card._badge_label.setText(self._cached_badge(book_key))
             # clicked 信号携带 rec 参数 → 首参吞掉它，闭包 it=item 才能拿到条目
             card.clicked.connect(
                 lambda _rec, it=item: self._on_card_clicked(it)
@@ -683,6 +702,52 @@ class LibraryPage(BasePage):
             row, col = divmod(i, 3)
             grid.addWidget(card, row, col)
         self.body.addLayout(grid)
+
+    def _toggle_batch_item(self, rec: dict) -> None:
+        key = rec.get("url") or rec.get("key") or rec.get("path") or ""
+        if key in self._batch_selected:
+            self._batch_selected.pop(key, None)
+        elif key:
+            self._batch_selected[key] = rec
+
+    def _on_batch_state(self, rec: dict, state: int) -> None:
+        key = rec.get("url") or rec.get("key") or rec.get("path") or ""
+        if not key:
+            return
+        if state:
+            self._batch_selected[key] = rec
+        else:
+            self._batch_selected.pop(key, None)
+
+    def _batch_move(self) -> None:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        items = list(self._batch_selected.values())
+        if not items or self._store is None:
+            return
+        folders = [f for f in self._shelf.folders()]
+        target, ok = QInputDialog.getItem(self, "批量迁移", "目标收藏夹：", folders, 0, False)
+        if not ok or not target:
+            return
+        if QMessageBox.question(self, "批量迁移", f"迁移 {len(items)} 项到「{target}」？") != QMessageBox.Yes:
+            return
+        for rec in items:
+            self._shelf.favorite_move(rec.get("url", ""), target)
+        self._batch_selected.clear()
+        self._rebuild()
+
+    def _batch_delete(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        items = list(self._batch_selected.values())
+        if not items or self._store is None:
+            return
+        if QMessageBox.question(self, "批量删除", f"确定删除选中的 {len(items)} 项收藏？") != QMessageBox.Yes:
+            return
+        for rec in items:
+            self._shelf.favorite_remove(rec.get("url", ""))
+        self._batch_selected.clear()
+        self._rebuild()
 
     def _cached_badge(self, book_key: str) -> str:
         repo = self._shelf_cache_repository
@@ -850,6 +915,43 @@ class LibraryPage(BasePage):
         QMessageBox.information(self, "修改成功", "管理员密码已修改。")
         return True
 
+    def _password_pair_dialog(self, title: str) -> tuple[str, bool]:
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        form = QFormLayout(dialog)
+        password = QLineEdit()
+        password.setEchoMode(QLineEdit.Password)
+        confirmation = QLineEdit()
+        confirmation.setEchoMode(QLineEdit.Password)
+        error = QLabel("")
+        error.setStyleSheet("color: #D32F2F;")
+        form.addRow("密码：", password)
+        form.addRow("确认密码：", confirmation)
+        form.addRow(error)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        form.addRow(buttons)
+        result = {"value": "", "ok": False}
+
+        def accept():
+            if not password.text():
+                error.setText("密码不能为空。")
+                return
+            if password.text() != confirmation.text():
+                error.setText("两次密码不一致，请重新输入确认密码。")
+                confirmation.selectAll()
+                confirmation.setFocus()
+                return
+            result["value"] = password.text()
+            result["ok"] = True
+            dialog.accept()
+
+        buttons.accepted.connect(accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec()
+        return result["value"], result["ok"]
+
     def _new_folder(self) -> None:
         from PySide6.QtWidgets import (
             QCheckBox,
@@ -876,18 +978,8 @@ class LibraryPage(BasePage):
             return
         if locked.isChecked():
             from PySide6.QtWidgets import QMessageBox
-            if not self._require_admin():
-                return
-            password, ok = QInputDialog.getText(
-                self, "设置收藏夹密码", "密码：", QLineEdit.Password
-            )
-            if not ok or not password:
-                return
-            confirmation, confirmed = QInputDialog.getText(
-                self, "设置收藏夹密码", "再次输入：", QLineEdit.Password
-            )
-            if not confirmed or password != confirmation:
-                QMessageBox.warning(self, "创建失败", "两次输入的密码不一致。")
+            password, ok = self._password_pair_dialog("设置收藏夹密码")
+            if not ok:
                 return
             from framework.folder_lock import hash_password, new_recovery_code, new_salt
             salt = new_salt()
@@ -940,6 +1032,16 @@ class LibraryPage(BasePage):
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
+        key = rec.get("url") or rec.get("key") or rec.get("path") or ""
+        selected = key in self._batch_selected
+        menu.addAction("取消选择" if selected else "选择此项").triggered.connect(
+            lambda: self._toggle_batch_item(rec)
+        )
+        if self._batch_selected:
+            menu.addSeparator()
+            menu.addAction(f"批量迁移（已选 {len(self._batch_selected)} 项）").triggered.connect(self._batch_move)
+            menu.addAction(f"批量删除（已选 {len(self._batch_selected)} 项）").triggered.connect(self._batch_delete)
+            menu.addSeparator()
         is_local = rec.get("kind") == "local"
         is_online = rec.get("online") or rec.get("kind") == "favorite"
         folder = rec.get("folder", "")
@@ -1061,19 +1163,19 @@ class LibraryPage(BasePage):
         from PySide6.QtWidgets import QInputDialog, QMessageBox
         from framework.folder_lock import hash_password, new_recovery_code, new_salt
 
-        if self._store is None or (not admin_verified and not self._require_admin()):
+        if self._store is None:
             return False
         info = self._store.folder_info(name) or {}
-        p1, ok1 = QInputDialog.getText(
-            self, f"设置密码「{name}」", "新密码：", QLineEdit.Password
-        )
-        if not ok1 or not p1:
-            return False
-        p2, ok2 = QInputDialog.getText(
-            self, f"设置密码「{name}」", "再次输入：", QLineEdit.Password
-        )
-        if not ok2 or p1 != p2:
-            QMessageBox.warning(self, "设置失败", "两次输入的密码不一致。")
+        if require_old:
+            old, old_ok = QInputDialog.getText(
+                self, f"修改密码「{name}」", "当前密码：", QLineEdit.Password
+            )
+            from framework.folder_lock import verify_password
+            if not old_ok or not verify_password(old, info.get("pw"), info.get("salt")):
+                QMessageBox.warning(self, "修改失败", "当前密码不正确。")
+                return False
+        p1, ok1 = self._password_pair_dialog(f"设置密码「{name}」")
+        if not ok1:
             return False
         salt = new_salt()
         recovery_salt = new_salt()
@@ -1164,7 +1266,7 @@ class LibraryPage(BasePage):
         return result
 
     def _remove_folder_password(self, name: str) -> bool:
-        if self._store is None or not self._require_admin():
+        if self._store is None:
             return False
         if not self._prompt_unlock(name):
             return False

@@ -58,7 +58,7 @@
       "response_path": "list",
       "item_fields": {
         "title": "title",
-        "url": "/title/{id}?title={title}",
+        "url": "/title/{id}?title={title}&source=bfzy",
         "cover": "cover",
         "author": "area",
         "update": "updatedAt"

@@ -820,7 +820,8 @@ class DiscoverPage(BasePage):
         self._current_page = max(self._current_page, page)
         epoch = self._source_epoch
 
-        self.status_label.setText(f"正在加载第 {page} 页...")
+        if page == 1:
+            self.status_label.setText(f"正在加载第 {page} 页...")
         self.status_label.setVisible(True)
 
         runnable = _FetchWorksTask(self._discovery, self._current_source, self._current_cat_url, page)
@@ -838,6 +839,10 @@ class DiscoverPage(BasePage):
         if epoch != self._source_epoch:
             return
         self._active_pages.discard(page)
+        if self._loaded_pages:
+            self.status_label.setText(
+                f"已加载 {len(self._loaded_pages)} 页 · 共 {self._work_count} 部"
+            )
         self._pump_preload()
         if err:
             # 单页失败不标记 _has_more=False（其他页可能成功，继续加载）
@@ -1029,6 +1034,7 @@ class DiscoverPage(BasePage):
                 cover_url, lambda pix, c=card: c.set_cover_pixmap(pix),
                 source_id=card.work.source_id, source=source,
             )
+        self.status_label.setText(f"已加载 {len(self._loaded_pages)} 页 · 共 {self._work_count} 部")
 
     def _maybe_preload(self) -> None:
         """内容未填满视口时补足加载（只预加载下 2 页缓冲）。
@@ -1051,7 +1057,9 @@ class DiscoverPage(BasePage):
         self._load_next_page(page=next_page)
 
     def _columns(self) -> int:
-        """按可视宽度计算作品列数，避免固定列数导致横向溢出。"""
+        """首次布局确定列数，后续加载保持一致，避免首屏/后续页重排。"""
+        if self._last_columns > 0:
+            return self._last_columns
         view_w = self.scroll.viewport().width() or self.width() or 900
         return self.grid_columns(view_w)
 

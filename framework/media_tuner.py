@@ -58,7 +58,7 @@ def classify(url: str) -> MediaProfile:
     - 未知：保守 2500ms
     """
     if _hint(url, _HLS_HINTS):
-        return MediaProfile("hls", 3500, 8000)
+        return MediaProfile("hls", 60000, 60000)
     if _hint(url, _DASH_HINTS):
         return MediaProfile("dash", 4000, 8000)
     if _hint(url, _LIVE_HINTS):

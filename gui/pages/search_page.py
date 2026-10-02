@@ -316,7 +316,8 @@ class SearchPage(BasePage):
         self.status_bar_layout = QHBoxLayout(self.status_bar)
         self.status_bar_layout.setContentsMargins(0, 0, 0, 0)
         self.status_bar_layout.setSpacing(8)
-        self.status_bar.setVisible(False)
+        self.status_bar.setFixedHeight(28)
+        self.status_bar.setVisible(True)
         layout.addWidget(self.status_bar)
 
         # ---- 来源过滤 chip ----
@@ -331,12 +332,14 @@ class SearchPage(BasePage):
         self.filter_bar.addStretch(1)
         self.filter_bar_widget = QWidget()
         self.filter_bar_widget.setLayout(self.filter_bar)
-        self.filter_bar_widget.setVisible(False)
+        self.filter_bar_widget.setFixedHeight(28)
+        self.filter_bar_widget.setVisible(True)
         layout.addWidget(self.filter_bar_widget)
 
         # ---- 来源筛选 chips 行（结果完成后聚合可筛选来源）----
         self._source_chip_row = QWidget()
-        self._source_chip_row.setVisible(False)
+        self._source_chip_row.setFixedHeight(32)
+        self._source_chip_row.setVisible(True)
         self._source_chip_hbox = QHBoxLayout(self._source_chip_row)
         self._source_chip_hbox.setContentsMargins(0, 0, 0, 0)
         self._source_chip_hbox.setSpacing(6)
@@ -440,7 +443,7 @@ class SearchPage(BasePage):
         epoch = self._search_epoch
         self._filter_source = ""
         self._saved_unfiltered_shown = None
-        self.filter_bar_widget.setVisible(False)
+        self.filter_bar_widget.setVisible(True)
         self._reset_source_chips()
         self.status_label.setText("搜索中...")
         self._clear_grid()
@@ -510,7 +513,7 @@ class SearchPage(BasePage):
                 widget.setParent(None)
                 widget.deleteLater()
         self._status_chips = {}
-        self.status_bar.setVisible(False)
+        self.status_bar.setVisible(True)
 
     def _set_source_status(self, source, state: str, err: str = "") -> None:
         """更新单源状态 chip：🔄进行中 ✅完成 ❌失败。"""
@@ -787,11 +790,17 @@ class SearchPage(BasePage):
             return
         cols = self._columns()
         new_shown = min(len(display), self._first_screen_limit())
-        while self._shown_count < new_shown:
-            r = display[self._shown_count]
-            self._append_card(r, cols)
-            self._shown_count += 1
-        self._apply_column_stretch(cols)
+        self.grid_container.setUpdatesEnabled(False)
+        try:
+            while self._shown_count < new_shown:
+                r = display[self._shown_count]
+                self._append_card(r, cols)
+                self._shown_count += 1
+            self._apply_column_stretch(cols)
+            self.grid_layout.activate()
+        finally:
+            self.grid_container.setUpdatesEnabled(True)
+            self.grid_container.update()
         self._update_batch_status()
         self._maybe_preload_results()
 
@@ -846,11 +855,17 @@ class SearchPage(BasePage):
         # 高估算行数（卡片高约 292px，4 列）再留一行缓冲，让首屏渲染后
         # 滚动条必然出现；仍保留上限防一次性建太多卡片闪屏。
         new_shown = min(len(display), self._first_screen_limit())
-        while self._shown_count < new_shown:
-            r = display[self._shown_count]
-            self._append_card(r, cols)
-            self._shown_count += 1
-        self._apply_column_stretch(cols)
+        self.grid_container.setUpdatesEnabled(False)
+        try:
+            while self._shown_count < new_shown:
+                r = display[self._shown_count]
+                self._append_card(r, cols)
+                self._shown_count += 1
+            self._apply_column_stretch(cols)
+            self.grid_layout.activate()
+        finally:
+            self.grid_container.setUpdatesEnabled(True)
+            self.grid_container.update()
         self._update_batch_status()
         self._maybe_preload_results()
 
@@ -934,11 +949,17 @@ class SearchPage(BasePage):
         prev_value = vbar.value()
         was_at_bottom = vbar.maximum() > 0 and prev_value >= vbar.maximum() - 8
         new_shown = min(len(display), self._shown_count + self._page_size)
-        while self._shown_count < new_shown:
-            r = display[self._shown_count]
-            self._append_card(r, cols)
-            self._shown_count += 1
-        self._apply_column_stretch(cols)
+        self.grid_container.setUpdatesEnabled(False)
+        try:
+            while self._shown_count < new_shown:
+                r = display[self._shown_count]
+                self._append_card(r, cols)
+                self._shown_count += 1
+            self._apply_column_stretch(cols)
+            self.grid_layout.activate()
+        finally:
+            self.grid_container.setUpdatesEnabled(True)
+            self.grid_container.update()
         self._update_batch_status()
         self._maybe_preload_results()
         # 恢复动作排在预加载/布局之后：单帧内 scrollbar 范围已含全部新加入的
@@ -983,11 +1004,17 @@ class SearchPage(BasePage):
             return  # 首屏已填满，等滚动触发
         cols = self._columns()
         new_shown = min(len(display), limit)
-        while self._shown_count < new_shown:
-            r = display[self._shown_count]
-            self._append_card(r, cols)
-            self._shown_count += 1
-        self._apply_column_stretch(cols)
+        self.grid_container.setUpdatesEnabled(False)
+        try:
+            while self._shown_count < new_shown:
+                r = display[self._shown_count]
+                self._append_card(r, cols)
+                self._shown_count += 1
+            self._apply_column_stretch(cols)
+            self.grid_layout.activate()
+        finally:
+            self.grid_container.setUpdatesEnabled(True)
+            self.grid_container.update()
         self._update_batch_status()
 
     def _columns(self) -> int:
@@ -1179,7 +1206,7 @@ class SearchPage(BasePage):
             self._source_chip_hbox.removeWidget(btn)
             btn.deleteLater()
         self._source_chip_btns = {}
-        self._source_chip_row.setVisible(False)
+        self._source_chip_row.setVisible(True)
 
     def _available_sources(self) -> dict:
         """当前结果（合并后为 _results_display，否则 _results）聚合来源。
@@ -1267,7 +1294,7 @@ class SearchPage(BasePage):
     def _clear_filter(self) -> None:
         self._filter_source = ""
         self.filter_label.setText("")
-        self.filter_bar_widget.setVisible(False)
+        self.filter_bar_widget.setVisible(True)
         if self._saved_unfiltered_shown is not None:
             self._shown_count = self._saved_unfiltered_shown
             self._saved_unfiltered_shown = None
@@ -1417,7 +1444,7 @@ class SearchPage(BasePage):
         self._pending_count = 0
         self._filter_source = ""
         self._saved_unfiltered_shown = None
-        self.filter_bar_widget.setVisible(False)
+        self.filter_bar_widget.setVisible(True)
         self.batch_bar.setVisible(False)
         self.select_all_check.blockSignals(True)
         self.select_all_check.setChecked(False)

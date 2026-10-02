@@ -290,6 +290,10 @@ class Content:
     def _cache_set_detail(self, key: str, detail: Detail) -> None:
         if self._cache is None:
             return
+        if detail.content_type == "video" and any(
+            self._looks_like_direct_media(ch.url) for ch in (detail.chapters or [])
+        ):
+            return
         try:
             self._cache.set(
                 key,
@@ -435,7 +439,10 @@ class Content:
         """
         cache_key = f"detail:{source.source_id}:{self._abs_url(source, url)}"
         cached = self._cache_get_detail(cache_key)
-        if cached is not None:
+        if cached is not None and not (
+            cached.content_type == "video"
+            and any(self._looks_like_direct_media(ch.url) for ch in (cached.chapters or []))
+        ):
             return cached
 
         api = source.raw.get("api_endpoints") or {}

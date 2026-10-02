@@ -46,6 +46,12 @@ from framework.download_queue import TaskStatus
 
 from gui.pages.base_page import BasePage
 
+
+def _format_remaining_seconds(seconds: float) -> int:
+    value = max(0.0, float(seconds or 0.0))
+    return int((value + 2.5) // 5 * 5)
+
+
 STATUS_OPTIONS = [("全部状态", None), ("下载中", "active"), ("已完成", "done"), ("失败", "failed")]
 TYPE_OPTIONS = [("全部类型", None), ("小说", "novel"), ("漫画", "comic"), ("视频", "video")]
 
@@ -234,7 +240,9 @@ class _TaskCard(QFrame):
         else:
             self.speed_label.setText("")
         if t.elapsed > 0:
-            self.time_label.setText(f"已用{int(t.elapsed)}秒 剩余{int(t.remaining_s)}秒")
+            self.time_label.setText(
+                f"已用{int(t.elapsed)}秒 剩余{_format_remaining_seconds(t.remaining_s)}秒"
+            )
         else:
             self.time_label.setText("")
         # 并发下载中的章节（章节级进度展示）

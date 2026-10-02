@@ -317,10 +317,16 @@ class MainWindow(QMainWindow):
             event_bus=self.event_bus,
             index_dir=base_dir / "data",
         )
+        from framework.ikanpp_provider_memory import ProviderMemory
+
+        self.ikanpp_provider_memory = ProviderMemory(
+            base_dir / "data" / "ikanpp_provider_memory.json"
+        )
         self.search = Search(
             self.http, self.parser, self.discovery,
             concurrent=int(self.settings.get("network", "concurrent_search_sources", 4)),
             cookie_manager=self.cookie_manager,
+            provider_memory=self.ikanpp_provider_memory,
         )
         self.download_queue = DownloadQueue(
             content=self.content,

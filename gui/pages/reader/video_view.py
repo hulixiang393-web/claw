@@ -1557,6 +1557,12 @@ class VideoView(QWidget):
         if callable(_rh):
             hdrs = _rh() or {}
         from framework.external_player import open_with_player
+        from framework.media_proxy import MediaProxy
+        from framework.media_tuner import classify
+        profile = classify(video)
+        MediaProxy.instance().configure_prefetch(
+            profile.kind == "hls", depth=30, workers=3
+        )
 
         # 源 ad_block 配置：播放代理转发 m3u8 时过滤广告段（下载已有过滤）
         ad_block = {}

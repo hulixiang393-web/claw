@@ -21,7 +21,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from framework.config import SourceConfig  # noqa: E402
-from framework.content import Content  # noqa: E402
+from framework.content import Chapter, Content, Detail  # noqa: E402
 from framework.discovery import Discovery  # noqa: E402
 from framework.parser import Parser  # noqa: E402
 
@@ -199,7 +199,7 @@ def test_discovery_browse_works():
     assert w.title == "生化危机：爆发夜"
     assert w.cover == "https://image.tmdb.org/t/p/w500/abc.jpg"
     # 详情 URL 携带 ?title=<精确标题>（detail POST 按 title 命中逻辑必需）
-    assert w.url == f"{_BASE}/title/ik020581?title=生化危机：爆发夜"
+    assert w.url == f"{_BASE}/title/ik020581?title=生化危机：爆发夜&source=bfzy"
 
 
 # --------------------------------------------------------------------------- #
@@ -300,3 +300,19 @@ def test_looks_like_direct_media():
     assert Content._looks_like_direct_media("https://x/a.html") is False
     assert Content._looks_like_direct_media("/title/ik020581?title=x") is False
     assert Content._looks_like_direct_media("") is False
+
+
+def test_direct_media_detail_is_not_persisted_in_long_detail_cache():
+    class Cache:
+        def __init__(self):
+            self.calls = []
+
+        def set(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    _, content = _content()
+    cache = Cache()
+    content._cache = cache
+    detail = Detail(title="demo", source_id="ikanpp", content_type="video", url="demo", chapters=[Chapter(title="1", url=_M3U8)])
+    content._cache_set_detail("detail:ikanpp:demo", detail)
+    assert cache.calls == []
