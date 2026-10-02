@@ -1538,8 +1538,12 @@ class LibraryPage(BasePage):
             elif rec.get("path"):
                 self.open_epub_requested.emit(rec["path"])
         elif rec.get("url"):
+            content_type = rec.get("content_type", "") or ""
+            if not content_type and self._source_manager is not None:
+                source = self._source_manager.get(rec.get("source_id", ""))
+                content_type = getattr(source, "content_type", "") if source else ""
             self.open_online_requested.emit(
-                (rec.get("source_id", ""), rec.get("url", ""), rec.get("content_type", ""))
+                (rec.get("source_id", ""), rec.get("url", ""), content_type)
             )
 
     def _pick_epub(self, rec: dict) -> None:
