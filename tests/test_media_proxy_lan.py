@@ -267,7 +267,23 @@ def test_lan_thread_start_failure_rolls_back(monkeypatch, proxy_ctx):
     assert proxy_ctx._lan_base is None
 
 
-def test_lan_shutdown_failure_never_reuses_old_base(monkeypatch, proxy_ctx):
+def _assert_failed_lan_base_rejected(proxy, base):
+    before_tokens = set(proxy._tokens)
+    before_lan_tokens = set(proxy._lan_tokens)
+    with pytest.raises((ValueError, OSError)):
+        proxy.build_url("https://cdn.example/video.m3u8", public_base=base)
+    with pytest.raises((ValueError, OSError)):
+        proxy._rewrite_m3u8(
+            "#EXTM3U\nsegment.ts",
+            "https://cdn.example/index.m3u8",
+            {},
+            public_base=base,
+        )
+    assert set(proxy._tokens) == before_tokens
+    assert set(proxy._lan_tokens) == before_lan_tokens
+
+
+def test_lan_shutdown_failure_rejects_old_base_without_token_leak(monkeypatch, proxy_ctx):
     base = proxy_ctx.start_lan_endpoint("127.0.0.1")
     server = proxy_ctx._lan_server
     original_shutdown = server.shutdown
@@ -279,9 +295,104 @@ def test_lan_shutdown_failure_never_reuses_old_base(monkeypatch, proxy_ctx):
     proxy_ctx.stop_lan_endpoint()
     assert proxy_ctx._lan_server is server
     assert proxy_ctx._lan_base == base
+    _assert_failed_lan_base_rejected(proxy_ctx, base)
     with pytest.raises(OSError, match="failed"):
         proxy_ctx.start_lan_endpoint("127.0.0.1")
     monkeypatch.setattr(server, "shutdown", original_shutdown)
+
+
+def test_lan_server_close_failure_rejects_old_base_without_token_leak(monkeypatch, proxy_ctx):
+    base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    server = proxy_ctx._lan_server
+    original_close = server.server_close
+
+    def fail_close():
+        raise OSError("close failed")
+
+    monkeypatch.setattr(server, "server_close", fail_close)
+    proxy_ctx.stop_lan_endpoint()
+    assert proxy_ctx._lan_error is not None
+    _assert_failed_lan_base_rejected(proxy_ctx, base)
+    monkeypatch.setattr(server, "server_close", original_close)
+    proxy_ctx.stop_lan_endpoint()
+
+
+def test_lan_join_failure_rejects_old_base_without_token_leak(proxy_ctx):
+    base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    server = proxy_ctx._lan_server
+    thread = proxy_ctx._lan_thread
+    original_join = thread.join
+
+    def fail_join(*args, **kwargs):
+        raise RuntimeError("join failed")
+
+    thread.join = fail_join
+    proxy_ctx.stop_lan_endpoint()
+    assert proxy_ctx._lan_error is not None
+    _assert_failed_lan_base_rejected(proxy_ctx, base)
+    thread.join = original_join
+    thread.join(timeout=2)
+    server.server_close()
+    proxy_ctx._lan_server = None
+    proxy_ctx._lan_thread = None
+    proxy_ctx._lan_base = None
+    proxy_ctx._lan_error = None
+
+
+def test_lan_stale_cleanup_catches_join_exception(monkeypatch, proxy_ctx):
+    base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    server = proxy_ctx._lan_server
+    thread = proxy_ctx._lan_thread
+    original_is_alive = thread.is_alive
+    original_join = thread.join
+    original_shutdown = server.shutdown
+    thread.is_alive = lambda: False
+    thread.join = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("join failed"))
+    try:
+        with pytest.raises(OSError, match="restart"):
+            proxy_ctx.start_lan_endpoint("127.0.0.1")
+        assert proxy_ctx._lan_error is not None
+        _assert_failed_lan_base_rejected(proxy_ctx, base)
+    finally:
+        thread.is_alive = original_is_alive
+        thread.join = original_join
+        original_shutdown()
+        original_join(timeout=2)
+        server.server_close()
+        proxy_ctx._lan_server = None
+        proxy_ctx._lan_thread = None
+        proxy_ctx._lan_base = None
+        proxy_ctx._lan_error = None
+
+
+def test_lan_stale_cleanup_catches_non_oserror(monkeypatch, proxy_ctx):
+    base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    server = proxy_ctx._lan_server
+    thread = proxy_ctx._lan_thread
+    original_is_alive = thread.is_alive
+    original_shutdown = server.shutdown
+    original_join = thread.join
+    thread.is_alive = lambda: False
+
+    def fail_shutdown():
+        raise RuntimeError("shutdown failed")
+
+    monkeypatch.setattr(server, "shutdown", fail_shutdown)
+    try:
+        with pytest.raises(OSError, match="restart"):
+            proxy_ctx.start_lan_endpoint("127.0.0.1")
+        assert proxy_ctx._lan_error is not None
+        _assert_failed_lan_base_rejected(proxy_ctx, base)
+    finally:
+        thread.is_alive = original_is_alive
+        monkeypatch.setattr(server, "shutdown", original_shutdown)
+        original_shutdown()
+        original_join(timeout=2)
+        server.server_close()
+        proxy_ctx._lan_server = None
+        proxy_ctx._lan_thread = None
+        proxy_ctx._lan_base = None
+        proxy_ctx._lan_error = None
 
 
 def test_lan_start_stop_is_serialized(monkeypatch, proxy_ctx):

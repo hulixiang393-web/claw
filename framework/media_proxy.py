@@ -1211,6 +1211,8 @@ class MediaProxy:
         if public_base:
             public_base = public_base.rstrip("/")
             with self._lan_lock:
+                if self._lan_error is not None:
+                    raise OSError("LAN endpoint is in a failed lifecycle state") from self._lan_error
                 if public_base != self._lan_base:
                     raise ValueError("public_base must be the active LAN endpoint")
             return public_base
@@ -1231,10 +1233,6 @@ class MediaProxy:
         """
         if not target_url:
             return ""
-        if public_base:
-            with self._lan_lock:
-                if public_base.rstrip("/") != self._lan_base:
-                    raise ValueError("public_base must be the active LAN endpoint")
         base = self._base_url(public_base)
         token = uuid.uuid4().hex
         with self._lock:
@@ -1267,15 +1265,13 @@ class MediaProxy:
                 try:
                     stale_server.shutdown()
                     stale_server.server_close()
-                except OSError as exc:
+                    if stale_thread is not None:
+                        stale_thread.join(timeout=2.0)
+                    if stale_thread is not None and stale_thread.is_alive():
+                        raise RuntimeError("LAN endpoint thread did not stop")
+                except Exception as exc:
                     self._lan_error = exc
                     raise OSError("LAN endpoint could not be restarted cleanly") from exc
-                if stale_thread is not None:
-                    stale_thread.join(timeout=2.0)
-                if stale_thread is not None and stale_thread.is_alive():
-                    error = RuntimeError("LAN endpoint thread did not stop")
-                    self._lan_error = error
-                    raise OSError("LAN endpoint thread did not stop") from error
                 self._lan_server = None
                 self._lan_thread = None
                 self._lan_base = None
