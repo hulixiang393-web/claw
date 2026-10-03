@@ -54,19 +54,36 @@ def parse_ssdp_response(data: bytes) -> dict[str, str]:
 
 def parse_device_description(location: str, body: bytes) -> DlnaRenderer:
     root = ET.fromstring(body)
-    device = next((element for element in root.iter() if _local_name(element.tag) == "device"), None)
-    if device is None:
+    devices = [
+        element for element in root.iter()
+        if _local_name(element.tag) == "device"
+    ]
+    if not devices:
         raise ValueError("device description has no device")
 
+    device = next(
+        (
+            element for element in devices
+            if _text(next(
+                (child for child in element if _local_name(child.tag) == "deviceType"),
+                None,
+            )).endswith(":MediaRenderer:1")
+        ),
+        devices[0],
+    )
     values = {
         _local_name(element.tag): _text(element)
         for element in device
         if _local_name(element.tag) in {"UDN", "friendlyName"}
     }
-    services = [
-        element for element in device.iter()
-        if _local_name(element.tag) == "service"
-    ]
+    service_list = next(
+        (child for child in device if _local_name(child.tag) == "serviceList"),
+        None,
+    )
+    services = (
+        [child for child in service_list if _local_name(child.tag) == "service"]
+        if service_list is not None else []
+    )
     av_transport = None
     rendering = None
     for service in services:
@@ -102,7 +119,7 @@ def discover_renderers(timeout: float = 2.0) -> list[DlnaRenderer]:
         "MX: 1\r\n"
         f"ST: {_MEDIA_RENDERER_ST}\r\n\r\n"
     ).encode("ascii")
-    responses = []
+    responses = {}
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(timeout)
         sock.sendto(request, _SSDP_ADDRESS)
@@ -115,24 +132,28 @@ def discover_renderers(timeout: float = 2.0) -> list[DlnaRenderer]:
                 break
             parsed = parse_ssdp_response(data)
             location = parsed.get("location")
-            if location:
+            response_st = parsed.get("st")
+            if location and (not response_st or response_st == _MEDIA_RENDERER_ST):
                 usn = parsed.get("usn", "")
                 udn = usn.split("::", 1)[0] if usn else location
-                if udn not in {item[0] for item in responses}:
-                    responses.append((udn, location))
+                responses.setdefault(udn, [])
+                if location not in responses[udn]:
+                    responses[udn].append(location)
 
     renderers = []
     seen = set()
-    for _, location in responses:
-        try:
-            req = urllib.request.Request(location)
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                renderer = parse_device_description(location, response.read())
-        except (OSError, ValueError, ET.ParseError, urllib.error.URLError):
-            continue
-        if renderer.udn not in seen:
-            seen.add(renderer.udn)
-            renderers.append(renderer)
+    for locations in responses.values():
+        for location in locations:
+            try:
+                req = urllib.request.Request(location)
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    renderer = parse_device_description(location, response.read())
+            except (OSError, ValueError, ET.ParseError, urllib.error.URLError):
+                continue
+            if renderer.udn not in seen:
+                seen.add(renderer.udn)
+                renderers.append(renderer)
+                break
     return renderers
 
 
@@ -168,10 +189,6 @@ def _metadata(uri: str, title: str, mime_type: str) -> str:
     return ET.tostring(item, encoding="unicode")
 
 
-def _children_by_name(element: ET.Element, name: str) -> list[ET.Element]:
-    return [child for child in element.iter() if _local_name(child.tag) == name]
-
-
 class DlnaClient:
     def __init__(self, renderer: DlnaRenderer, timeout: float = 5.0):
         self.renderer = renderer
@@ -204,6 +221,8 @@ class DlnaClient:
         fault = next((element for element in root.iter() if _local_name(element.tag) == "Fault"), None)
         if fault is not None:
             code_text = _text(next((item for item in fault.iter() if _local_name(item.tag) == "errorCode"), None))
+            if not code_text:
+                code_text = _text(next((item for item in fault.iter() if _local_name(item.tag) == "faultcode"), None))
             description = _text(next((item for item in fault.iter() if _local_name(item.tag) == "errorDescription"), None))
             if not description:
                 description = _text(next((item for item in fault.iter() if _local_name(item.tag) == "faultstring"), None))
