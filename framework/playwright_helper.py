@@ -29,6 +29,7 @@ import logging
 import queue
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -1731,19 +1732,22 @@ def fetch_rendered_video_sync(
 
                 page.on("request", _on_request)
                 page.goto(url, timeout=timeout_ms, wait_until=wait_until)
-                page.wait_for_timeout(extra_delay_ms)
-                # 遍历全部 frame（含 iframe 解析站）找 video src
-                for _ in range(3):  # 多轮重试等解析站渲染
+
+                def _scan() -> str:
+                    """扫全部 frame（含 iframe 解析站）找 video src / 媒体请求。
+
+                    优先 .m3u8（HLS 稳定地址）再兜底 .mp4（带签名时效预览变体）；
+                    blob src 跳过、由 media_hits 兜底。返回 "" = 尚未就绪。
+                    """
                     for f in page.frames:
                         try:
                             vids = f.query_selector_all("video")
                             found_mp4 = ""
                             for v in vids:
-                                # videojs/VHS 会把 HLS 渲染成 blob: src（不以 http 开头，
-                                # 原逻辑直接跳过），真实 m3u8 留在 <video> 的 <source> 子节点
-                                # 上（5238 播放页）。因此同时读 video 自身 src 与其全部
-                                # <source> 子节点 src：优先 .m3u8（HLS 稳定地址），
-                                # 再兜底 .mp4（带签名时效的预览变体）。
+                                # videojs/VHS 会把 HLS 渲染成 blob: src（不以 http
+                                # 开头，原逻辑直接跳过），真实 m3u8 留在 <video> 的
+                                # <source> 子节点上（5238 播放页）。因此同时读
+                                # video 自身 src 与其全部 <source> 子节点 src。
                                 for src in (v.get_attribute("src") or "",
                                             *(sv.get_attribute("src") or ""
                                               for sv in v.query_selector_all("source"))):
@@ -1757,12 +1761,29 @@ def fetch_rendered_video_sync(
                                 return found_mp4
                         except Exception:
                             continue
-                    # video src 为 blob 的播放器：等待其真正发出的媒体请求出现
                     if media_hits:
                         return media_hits[0]
+                    return ""
+
+                # extra_delay 从「固定死等」改为**轮询上限**：每 250ms 扫一次，
+                # src/媒体请求就绪即返回——dm84 页面加载完即直填 src（delay=0
+                # 实测可播），原 2.5s 死等里通常前几百毫秒就绪，省 ~1-2s；
+                # 慢注入站（agedm 类 8s）扫不到就等满，最坏耗时与旧实现相同。
+                deadline = time.monotonic() + max(extra_delay_ms, 0) / 1000.0
+                while True:
+                    found = _scan()
+                    if found:
+                        return found
+                    if time.monotonic() >= deadline:
+                        break
+                    page.wait_for_timeout(250)
+                # 等满 extra_delay 仍无 → 慢注入站多轮渲染窗口（原 3 轮语义：
+                # 每轮扫描 + 轮间 4000ms），最后一次仍不中返回媒体请求兜底。
+                for _ in range(3):
+                    found = _scan()
+                    if found:
+                        return found
                     page.wait_for_timeout(4000)
-                if media_hits:
-                    return media_hits[0]
                 return ""
     except Exception as exc:  # noqa: BLE001
         # 内部异常（greenlet.error / TimeoutError / playwright 错误）归一化为

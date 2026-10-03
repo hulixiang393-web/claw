@@ -186,6 +186,49 @@ def test_on_play_called_every_request(proxy_ctx):
     assert seen[0][1] == "https://cdn.example.com/0.m3u8"
 
 
+def test_warm_series_episode_skips_resolver_on_first_request(proxy_ctx):
+    """点集流程（_FetchStreamTask，merged=True）已取过当前集的流；warm 预写
+    memo 后 VLC 首次请求 /e/ 直接 302——同一条流不再重复 resolver（省
+    2.6-4.0s 串行取流等待，这是点集→出画面链路里最大的纯重复段）。"""
+    calls = []
+
+    def _resolve(idx):
+        calls.append(idx)
+        return f"https://cdn.example.com/e{idx}.m3u8", "", {"Referer": "r"}, None
+
+    proxy, key, urls = _series(proxy_ctx, _resolve, count=3)
+    assert proxy.warm_series_episode(
+        key, 1, "https://cdn.example.com/pre.m3u8", "",
+        {"Referer": "r"}, None) is True
+    r = requests.get(urls[1], allow_redirects=False, timeout=5)
+    assert r.status_code == 302
+    assert "/s/" in r.headers["Location"]     # 与 resolver 产出同款 token URL
+    assert calls == []                        # resolver 未被调用
+    # 未预热的集不受影响：照常走 resolver（不误伤其它集）
+    r2 = requests.get(urls[0], allow_redirects=False, timeout=5)
+    assert r2.status_code == 302
+    assert calls == [0]
+
+
+def test_warm_series_episode_rejects_unknown_key_range_and_empty(proxy_ctx):
+    """warm 是纯优化：key 不存在 / idx 越界 / 空流一律 False 且不写 memo，
+    调用方无需回退分支——VLC 请求时照常走 resolver。"""
+    proxy, key, urls = _series(proxy_ctx,
+                               lambda i: ("v", "", {}, None), count=2)
+    assert proxy.warm_series_episode("nope", 0, "v", "", {}, None) is False
+    assert proxy.warm_series_episode(key, 5, "v", "", {}, None) is False
+    assert proxy.warm_series_episode(key, 0, "", "", {}, None) is False
+    # 未写入任何 memo：请求仍走 resolver（行为与未 warm 完全一致）
+    calls = []
+    proxy.unregister_series(key)
+    key2 = proxy.register_series(
+        lambda i: (calls.append(i) or "https://c/x.m3u8", "", {}, None), count=2)
+    assert proxy.warm_series_episode(key2, 9, "v", "", {}, None) is False
+    requests.get(proxy.series_episode_url(key2, 0), allow_redirects=False,
+                 timeout=5)
+    assert calls == [0]
+
+
 def test_unregister_series_404_after(proxy_ctx):
     calls = []
     proxy, key, urls = _series(

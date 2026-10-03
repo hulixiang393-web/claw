@@ -53,12 +53,14 @@ def _view(detail, n):
 
 
 class _FakeProxy:
-    """最小 MediaProxy 替身：记录 register/unregister 参数。"""
+    """最小 MediaProxy 替身：记录 register/unregister/warm/prefetch 参数。"""
 
     def __init__(self, port=9999):
         self.port = port
         self.registered = []
         self.unregistered = []
+        self.warmed = []
+        self.prefetch_calls = []
         self._n = 0
 
     def register_series(self, resolver, on_play=None, count=0,
@@ -76,6 +78,17 @@ class _FakeProxy:
 
     def unregister_series(self, key):
         self.unregistered.append(key)
+
+    def warm_series_episode(self, key, idx, video, audio="", headers=None,
+                            ad_block=None):
+        self.warmed.append({
+            "key": key, "idx": idx, "video": video, "audio": audio,
+            "headers": headers, "ad_block": ad_block,
+        })
+        return True
+
+    def configure_prefetch(self, enabled, depth=4, workers=3):
+        self.prefetch_calls.append((enabled, depth, workers))
 
 
 class _FakeContent:
@@ -510,6 +523,28 @@ def test_play_passes_series_playlist_and_real_url(_qapp, monkeypatch):
     assert [u for u, _a, _t in seen["episodes"]] == [
         f"http://127.0.0.1:9999/e/k1/{i}" for i in range(4)]
     assert all(a == "" for _u, a, _t in seen["episodes"])
+    # 当前集点集时已取的流（_FetchStreamTask 产物）预热进 memo：VLC 首个
+    # /e/ 请求直接 302，免把同一条流再 resolver 一遍（省 2.6-4.0s）
+    assert proxy.warmed == [{
+        "key": "k1", "idx": 2,
+        "video": "https://cdn/real2.m3u8",
+        "audio": "https://cdn/real2-audio.m4a",
+        "headers": {}, "ad_block": {},
+    }]
+
+
+def test_play_does_not_warm_without_series(_qapp, monkeypatch):
+    """单集（不足 2 集）不走 /e/ 惰性 URL → 无 memo 可热，warm 不应发生。"""
+    view = _view(_video_detail(1), 0)
+    proxy = _FakeProxy()
+    _install_proxy(monkeypatch, proxy)
+    view._source = object()
+    view._content = _FakeContent()
+    monkeypatch.setattr(ep, "open_with_player",
+                        lambda url, **kw: "已用外部播放器打开")
+    view._play("https://cdn/only.m3u8", "", "第1集 标题0")
+    assert proxy.warmed == []
+    assert proxy.registered == []
 
 
 def test_play_falls_back_to_single_url_without_series(_qapp, monkeypatch):

@@ -1242,6 +1242,40 @@ class MediaProxy:
         with self._lock:
             self._series.pop(key, None)
 
+    def warm_series_episode(self, key: str, idx: int, video: str,
+                            audio: str = "", headers: dict | None = None,
+                            ad_block: dict | None = None) -> bool:
+        """把**已知的**取流结果预写入系列 memo（纯优化，无副作用）。
+
+        点集流程 _FetchStreamTask 已用同款 merged=True 取过当前集的流，
+        再让 VLC 首个 /e/ 请求同步跑 resolver 是 2.6-4.0s 的纯重复等待；
+        warm 后首个 /e/ 命中 memo 直接 302，resolver 留给其它集/换集。
+        与 _serve_series 同一写法：锁内校验 key/idx（注销竞态守卫同款
+        cur is not None），build_url 铸 token 在锁外 try 包裹——铸失败
+        返回 False 且不写 memo，VLC 请求时照常回落 resolver。
+        越界 / 未知 key / 空流一律 False：调用方无需回退分支。
+        """
+        if not video:
+            return False
+        with self._lock:
+            ser = self._series.get(key)
+            if ser is None or not (0 <= int(idx) < int(ser["count"])):
+                return False
+            force_proxy = ser["force_proxy"]
+        try:
+            entry = (video, audio,
+                     self.build_url(video, headers or {},
+                                    ad_block=ad_block,
+                                    force_proxy=force_proxy))
+        except Exception:  # noqa: BLE001 —— 铸 token 失败：回落 resolver
+            return False
+        with self._lock:
+            cur = self._series.get(key)   # 解析期间可能已被注销
+            if cur is None:
+                return False
+            cur["memo"][int(idx)] = entry
+        return True
+
     def series_episode_url(self, key: str, idx: int) -> str:
         """第 idx 集的惰性 URL（绝对地址，不含 #标题 fragment）。"""
         self._ensure_server()

@@ -1580,6 +1580,14 @@ class VideoView(QWidget):
         if start_ep_url:
             start_url = start_ep_url
             real_url = video      # 分类用真实流地址（惰性 URL 判不出 HLS）
+            # 当前集的流点集时已取过（_FetchStreamTask 同款 merged=True）→
+            # 预热 series memo：VLC 首个 /e/ 请求直接 302，免把同一条流再取
+            # 一遍（2.6-4.0s 纯重复等待，点集→出画面链路的最大重复段）。
+            # warm 纯优化无副作用：失败/未命中时 VLC 请求照常回落 resolver。
+            if video:
+                MediaProxy.instance().warm_series_episode(
+                    self._series_key, self._current_idx,
+                    video, audio, hdrs, ad_block)
         else:
             # 无系列，或当前集是「无 ep.url」的坏集（入列 URL 为空）→ 单集
             series, start_url, real_url = None, video, video
