@@ -112,6 +112,49 @@ def test_public_base_must_be_active_lan_base(proxy_ctx):
         proxy_ctx.build_url("https://cdn.example/video.m3u8", public_base=lan_base)
 
 
+def test_local_m3u8_tokens_survive_lan_stop(upstream, proxy_ctx):
+    target = _upstream_url(upstream, "/hls/index.m3u8")
+    local_manifest_url = proxy_ctx.build_url(target, {"Referer": "r"})
+    proxy_ctx.start_lan_endpoint("127.0.0.1")
+    manifest = requests.get(local_manifest_url, timeout=10)
+    local_tokens = [url for url in _http_urls(manifest.text) if "/s/" in url]
+    assert local_tokens
+    proxy_ctx.stop_lan_endpoint()
+    assert all(requests.get(url, timeout=10).status_code == 200 for url in local_tokens)
+    assert all(_token(url) not in proxy_ctx._lan_tokens for url in local_tokens)
+
+
+def test_rewrite_rejects_foreign_base_without_token_leak(proxy_ctx):
+    proxy_ctx.start_lan_endpoint("127.0.0.1")
+    before_tokens = set(proxy_ctx._tokens)
+    before_lan_tokens = set(proxy_ctx._lan_tokens)
+    with pytest.raises(ValueError, match="public_base"):
+        proxy_ctx._rewrite_m3u8(
+            "#EXTM3U\nsegment.ts",
+            "https://cdn.example/index.m3u8",
+            {},
+            public_base="http://127.0.0.1:1",
+        )
+    assert set(proxy_ctx._tokens) == before_tokens
+    assert set(proxy_ctx._lan_tokens) == before_lan_tokens
+
+
+def test_rewrite_rejects_stale_base_without_token_leak(proxy_ctx):
+    stale_base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    proxy_ctx.stop_lan_endpoint()
+    before_tokens = set(proxy_ctx._tokens)
+    before_lan_tokens = set(proxy_ctx._lan_tokens)
+    with pytest.raises(ValueError, match="public_base"):
+        proxy_ctx._rewrite_m3u8(
+            "#EXTM3U\nsegment.ts",
+            "https://cdn.example/index.m3u8",
+            {},
+            public_base=stale_base,
+        )
+    assert set(proxy_ctx._tokens) == before_tokens
+    assert set(proxy_ctx._lan_tokens) == before_lan_tokens
+
+
 def test_start_lan_endpoint_does_not_reset_prefetch_circuit_breaker(proxy_ctx):
     proxy_ctx._pf_disabled = True
     proxy_ctx._pf_failures = 3
@@ -196,6 +239,49 @@ def test_build_url_defaults_to_localhost(proxy_ctx):
     assert parts.hostname == "127.0.0.1"
     assert parts.port
     assert parts.path.startswith("/s/")
+
+
+def test_lan_thread_start_failure_rolls_back(monkeypatch, proxy_ctx):
+    real_server = mp.ThreadingHTTPServer
+    closed = []
+
+    class _TrackingServer(real_server):
+        def server_close(self):
+            closed.append(True)
+            return super().server_close()
+
+    class _FailingThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(mp, "ThreadingHTTPServer", _TrackingServer)
+    monkeypatch.setattr(mp.threading, "Thread", _FailingThread)
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        proxy_ctx.start_lan_endpoint("127.0.0.1")
+    assert closed == [True]
+    assert proxy_ctx._lan_server is None
+    assert proxy_ctx._lan_thread is None
+    assert proxy_ctx._lan_base is None
+
+
+def test_lan_shutdown_failure_never_reuses_old_base(monkeypatch, proxy_ctx):
+    base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    server = proxy_ctx._lan_server
+    original_shutdown = server.shutdown
+
+    def fail_shutdown():
+        raise OSError("shutdown failed")
+
+    monkeypatch.setattr(server, "shutdown", fail_shutdown)
+    proxy_ctx.stop_lan_endpoint()
+    assert proxy_ctx._lan_server is server
+    assert proxy_ctx._lan_base == base
+    with pytest.raises(OSError, match="failed"):
+        proxy_ctx.start_lan_endpoint("127.0.0.1")
+    monkeypatch.setattr(server, "shutdown", original_shutdown)
 
 
 def test_lan_start_stop_is_serialized(monkeypatch, proxy_ctx):

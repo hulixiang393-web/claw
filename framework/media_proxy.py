@@ -727,7 +727,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
     def do_GET(self):  # noqa: N802
         proxy: "MediaProxy" = self.server.proxy  # type: ignore[attr-defined]
-        public_base = getattr(self.server, "public_base", None)
+        public_base = (
+            getattr(self.server, "public_base", None)
+            if getattr(self.server, "is_lan", False) else None
+        )
         proxy._touch()
         proxy._begin()  # 活动请求计数：长连接流式期间看门狗不停止、不移除 token
         try:
@@ -807,6 +810,7 @@ class MediaProxy:
         self._lan_base: str | None = None
         self._lan_tokens: set[str] = set()
         self._lan_lock = threading.RLock()
+        self._lan_error: Exception | None = None
         self._last_use = time.time()
         self._idle_watch: threading.Thread | None = None
         self._active = 0  # 进行中的请求数（含流式长连接）：>0 时 stop 不执行
@@ -1207,11 +1211,8 @@ class MediaProxy:
         if public_base:
             public_base = public_base.rstrip("/")
             with self._lan_lock:
-                local_base = (
-                    self._server.public_base if self._server is not None else None
-                )
-                if public_base not in (self._lan_base, local_base):
-                    raise ValueError("public_base must be an active endpoint base")
+                if public_base != self._lan_base:
+                    raise ValueError("public_base must be the active LAN endpoint")
             return public_base
         self._ensure_server()
         return self._server.public_base  # type: ignore[union-attr]
@@ -1257,6 +1258,8 @@ class MediaProxy:
             raise ValueError("bind_host must not be a wildcard/unspecified address")
         with self._lan_lock:
             if self._lan_server is not None:
+                if self._lan_error is not None:
+                    raise OSError("LAN endpoint is in a failed lifecycle state") from self._lan_error
                 if self._lan_thread is not None and self._lan_thread.is_alive():
                     return self._lan_base  # type: ignore[return-value]
                 stale_server = self._lan_server
@@ -1264,15 +1267,19 @@ class MediaProxy:
                 try:
                     stale_server.shutdown()
                     stale_server.server_close()
-                except OSError:
-                    raise OSError("LAN endpoint could not be restarted cleanly")
+                except OSError as exc:
+                    self._lan_error = exc
+                    raise OSError("LAN endpoint could not be restarted cleanly") from exc
                 if stale_thread is not None:
                     stale_thread.join(timeout=2.0)
                 if stale_thread is not None and stale_thread.is_alive():
-                    raise OSError("LAN endpoint thread did not stop")
+                    error = RuntimeError("LAN endpoint thread did not stop")
+                    self._lan_error = error
+                    raise OSError("LAN endpoint thread did not stop") from error
                 self._lan_server = None
                 self._lan_thread = None
                 self._lan_base = None
+                self._lan_error = None
             server = ThreadingHTTPServer((bind_host, 0), _ProxyHandler)
             host = f"[{bind_host}]" if address.version == 6 else bind_host
             base = f"http://{host}:{server.server_address[1]}"
@@ -1283,7 +1290,18 @@ class MediaProxy:
             self._lan_server = server
             self._lan_thread = thread
             self._lan_base = base
-            thread.start()
+            self._lan_error = None
+            try:
+                thread.start()
+            except Exception:
+                try:
+                    server.server_close()
+                finally:
+                    self._lan_server = None
+                    self._lan_thread = None
+                    self._lan_base = None
+                    self._lan_error = None
+                raise
             return base
 
     def release_lan_tokens(self) -> None:
@@ -1305,15 +1323,17 @@ class MediaProxy:
             try:
                 server.shutdown()
                 server.server_close()
-            except OSError:
-                return
-            if thread is not None:
-                thread.join(timeout=2.0)
-            if thread is not None and thread.is_alive():
+                if thread is not None:
+                    thread.join(timeout=2.0)
+                if thread is not None and thread.is_alive():
+                    raise RuntimeError("LAN endpoint thread did not stop")
+            except Exception as exc:
+                self._lan_error = exc
                 return
             self._lan_server = None
             self._lan_thread = None
             self._lan_base = None
+            self._lan_error = None
 
     # ------------------------------------------------------------------ #
     # 惰性系列：外部播放器全集播放列表
@@ -1516,10 +1536,11 @@ class MediaProxy:
                    ad_block: dict | None = None,
                    force_proxy: bool = False,
                    public_base: str | None = None) -> str:
+        output_base = self._base_url(public_base)
         full = urljoin(base, target)
         token = self._new_token(full, headers, ad_block, force_proxy,
                                 public_base)
-        return f"{self._base_url(public_base)}/s/{token}"
+        return f"{output_base}/s/{token}"
 
     # ------------------------------------------------------------------ #
     def _abort_tee_on_gap(self, target: str, rng: str) -> None:
