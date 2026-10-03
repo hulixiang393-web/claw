@@ -69,8 +69,10 @@ def parse_device_description(location: str, body: bytes) -> DlnaRenderer:
                 None,
             )).endswith(":MediaRenderer:1")
         ),
-        devices[0],
+        None,
     )
+    if device is None:
+        raise ValueError("device description has no MediaRenderer device")
     values = {
         _local_name(element.tag): _text(element)
         for element in device

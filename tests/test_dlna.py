@@ -62,6 +62,20 @@ NESTED_DEVICE_XML = """<root xmlns='urn:schemas-upnp-org:device-1-0'>
   </device>
 </root>""".encode("utf-8")
 
+NON_RENDERER_DEVICE_XML = """<root xmlns='urn:schemas-upnp-org:device-1-0'>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+    <UDN>uuid:server-1</UDN>
+    <friendlyName>媒体服务器</friendlyName>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <controlURL>/server/avtransport</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>""".encode("utf-8")
+
 
 class _Response:
     def __init__(self, body):
@@ -131,6 +145,13 @@ def test_parse_device_description_uses_only_target_renderer_services():
     assert renderer.rendering_control_url == (
         "http://192.168.1.20:80/child/rendering"
     )
+
+
+def test_parse_device_description_requires_media_renderer_device():
+    with pytest.raises(ValueError, match="MediaRenderer"):
+        dlna.parse_device_description(
+            "http://192.168.1.20:80/root.xml", NON_RENDERER_DEVICE_XML
+        )
 
 
 def test_dlna_time_round_trips_and_invalid_values_return_none():
@@ -333,17 +354,82 @@ def test_discovery_sends_ssdp_request_with_timeout_and_keeps_fallback_locations(
     assert renderers[0].udn == "uuid:tv-1"
 
 
-def test_get_position_info_normalizes_time_track_and_uri(monkeypatch):
+def test_discovery_rejects_wrong_st_but_accepts_missing_st_for_compatibility(monkeypatch):
+    wrong_st = SSDP_RESPONSE.replace(
+        b"urn:schemas-upnp-org:device:MediaRenderer:1",
+        b"urn:schemas-upnp-org:device:MediaServer:1",
+        1,
+    )
+    missing_st = SSDP_RESPONSE.replace(
+        b"ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n", b""
+    ).replace(b"uuid:renderer-1", b"uuid:renderer-missing")
+    packets = iter([wrong_st, missing_st])
+    fetches = []
+
+    class _Socket:
+        def __init__(self, *args):
+            pass
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendto(self, data, target):
+            pass
+
+        def recvfrom(self, size):
+            try:
+                return next(packets), ("192.168.1.20", 1900)
+            except StopIteration:
+                raise socket.timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    monkeypatch.setattr(dlna.socket, "socket", _Socket)
+
+    def fake_urlopen(request, timeout):
+        fetches.append((request.full_url, timeout))
+        return _Response(DEVICE_XML)
+
+    monkeypatch.setattr(dlna.urllib.request, "urlopen", fake_urlopen)
+
+    renderers = dlna.discover_renderers(timeout=0.5)
+
+    assert len(renderers) == 1
+    assert fetches == [("http://192.168.1.20:80/root.xml", 0.5)]
+
+
+def test_get_position_info_normalizes_values_and_sends_expected_request(monkeypatch):
     body = b"""<s:Envelope xmlns:s='http://schemas.xmlsoap.org/soap/envelope/'>
       <s:Body><u:GetPositionInfoResponse xmlns:u='urn:schemas-upnp-org:service:AVTransport:1'>
         <Track>2</Track><TrackDuration>01:02:03</TrackDuration>
         <RelTime>00:01:05</RelTime><TrackURI>http://tv/video.m3u8</TrackURI>
       </u:GetPositionInfoResponse></s:Body>
     </s:Envelope>"""
-    monkeypatch.setattr(dlna.urllib.request, "urlopen", lambda request, timeout: _Response(body))
+    captured = {}
 
-    result = dlna.DlnaClient(_renderer()).get_position_info()
+    def fake_urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return _Response(body)
 
+    monkeypatch.setattr(dlna.urllib.request, "urlopen", fake_urlopen)
+
+    result = dlna.DlnaClient(_renderer(), timeout=2.75).get_position_info()
+
+    request = captured["request"]
+    request_body = request.data.decode("utf-8")
+    assert request.full_url == _renderer().av_transport_control_url
+    assert request.method == "POST"
+    assert request.get_header("Soapaction") == (
+        '"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo"'
+    )
+    assert request.get_header("Content-type") == "text/xml; charset=\"utf-8\""
+    assert "<InstanceID>0</InstanceID>" in request_body
+    assert captured["timeout"] == 2.75
     assert result == {
         "position": 65,
         "duration": 3723,
