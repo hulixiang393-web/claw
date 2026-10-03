@@ -30,6 +30,7 @@ VLC 3.0.23 无效（恒发 VLC 默认 UA，多数 CDN 拒绝）。本模块起�
 from __future__ import annotations
 
 import atexit
+import ipaddress
 import mimetypes
 from contextlib import nullcontext
 import re
@@ -298,10 +299,6 @@ def _get_direct_session() -> requests.Session:
 def _tuple_force_proxy(entry) -> bool:
     """兼容解包：老三元组 / 四元组 / 带 public_base 的五元组取 force_proxy。"""
     return len(entry) >= 4 and bool(entry[3])
-
-
-def _tuple_public_base(entry) -> str | None:
-    return entry[4] if len(entry) >= 5 else None
 
 
 def _strip_stale_headers(headers: dict) -> dict:
@@ -730,17 +727,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
     def do_GET(self):  # noqa: N802
         proxy: "MediaProxy" = self.server.proxy  # type: ignore[attr-defined]
-        public_base = (
-            getattr(self.server, "public_base", None)
-            if getattr(self.server, "is_lan", False) else None
-        )
+        public_base = getattr(self.server, "public_base", None)
         proxy._touch()
         proxy._begin()  # 活动请求计数：长连接流式期间看门狗不停止、不移除 token
         try:
             path = unquote(self.path.split("?", 1)[0])
             if path.startswith("/c/"):
                 try:
-                    proxy._serve_cache(self, path)
+                    proxy._serve_cache(self, path, public_base)
                 except Exception as exc:  # noqa: BLE001 —— 网络波动直接断流
                     try:
                         self.send_error(502, f"proxy error: {exc}")
@@ -749,7 +743,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/e/"):
                 try:
-                    proxy._serve_series(self, path)
+                    proxy._serve_series(self, path, public_base)
                 except Exception as exc:  # noqa: BLE001 —— 解析异常已在内部归类
                     try:
                         self.send_error(502, f"proxy error: {exc}")
@@ -812,6 +806,7 @@ class MediaProxy:
         self._lan_thread: threading.Thread | None = None
         self._lan_base: str | None = None
         self._lan_tokens: set[str] = set()
+        self._lan_lock = threading.RLock()
         self._last_use = time.time()
         self._idle_watch: threading.Thread | None = None
         self._active = 0  # 进行中的请求数（含流式长连接）：>0 时 stop 不执行
@@ -821,11 +816,13 @@ class MediaProxy:
         # 重开播放器 / App 退出时由 external_player 释放。
         self._leases: set[str] = set()
         # 惰性系列注册表：key → {resolver, on_play, count, memo, sem}
-        #   memo: {idx: (video, audio, location)} 按集缓存，重复请求（VLC 重试/重播）不回源
+        #   memo: {(endpoint_base, idx): (video, audio, location)} 按端点缓存，
+        #   避免 localhost 与 LAN Location 互相污染。
         #   sem:  该系列独占的解析并发信号量
         self._series: dict[str, dict] = {}
         self._cache = cache  # 可注入测试用缓存实例；None → 懒加载单例
-        # cache_ctx key → (base_url, headers, ad_block, force_proxy)（四元组）
+        # cache_ctx key → (base_url, headers, ad_block, force_proxy)（当前四元组；
+        # 旧五元组读取仍兼容，endpoint base 不存入 cache_ctx）
         self._cache_ctx: dict[str, tuple] = {}
         self._manifest_cache: dict[str, tuple[float, str]] = {}
         self._mp4_tee: dict[str, _FileTee] = {}  # key → 进行中的 mp4 落盘
@@ -1196,20 +1193,26 @@ class MediaProxy:
         return False
 
     # 缓存上下文注册：m3u8 被重写时把 key →
-    # (base_url, headers, ad_block, force_proxy, public_base) 记下，
-    # /c/<key>/ 缓存未命中时据此回落上游（分片相对 urljoin 到 base）。
+    # (base_url, headers, ad_block, force_proxy) 记下；endpoint base
+    # 由当前收到请求的 server 提供，避免 local/LAN 串线。
     def _register_cache_ctx(self, key: str, target: str, headers: dict,
                             ad_block: dict | None,
-                            force_proxy: bool = False,
-                            public_base: str | None = None) -> None:
+                            force_proxy: bool = False) -> None:
         with self._lock:
             self._cache_ctx[key] = (target, _strip_stale_headers(headers),
-                                    ad_block, force_proxy, public_base)
+                                    ad_block, force_proxy)
 
     # ------------------------------------------------------------------ #
     def _base_url(self, public_base: str | None = None) -> str:
         if public_base:
-            return public_base.rstrip("/")
+            public_base = public_base.rstrip("/")
+            with self._lan_lock:
+                local_base = (
+                    self._server.public_base if self._server is not None else None
+                )
+                if public_base not in (self._lan_base, local_base):
+                    raise ValueError("public_base must be an active endpoint base")
+            return public_base
         self._ensure_server()
         return self._server.public_base  # type: ignore[union-attr]
 
@@ -1227,6 +1230,10 @@ class MediaProxy:
         """
         if not target_url:
             return ""
+        if public_base:
+            with self._lan_lock:
+                if public_base.rstrip("/") != self._lan_base:
+                    raise ValueError("public_base must be the active LAN endpoint")
         base = self._base_url(public_base)
         token = uuid.uuid4().hex
         with self._lock:
@@ -1239,23 +1246,45 @@ class MediaProxy:
 
     def start_lan_endpoint(self, bind_host: str) -> str:
         """启动 LAN server，返回 http://<bind_host>:<port>。"""
-        if self._lan_server is not None:
-            return self._lan_base  # type: ignore[return-value]
-        with self._pf_lock:
-            self._pf_cancel.clear()
-            self._pf_disabled = False
-            self._pf_failures = 0
-        server = ThreadingHTTPServer((bind_host, 0), _ProxyHandler)
-        base = f"http://{bind_host}:{server.server_address[1]}"
-        server.proxy = self  # type: ignore[attr-defined]
-        server.public_base = base  # type: ignore[attr-defined]
-        server.is_lan = True  # type: ignore[attr-defined]
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        self._lan_server = server
-        self._lan_thread = thread
-        self._lan_base = base
-        thread.start()
-        return base
+        if not isinstance(bind_host, str) or not bind_host.strip():
+            raise ValueError("bind_host must be a non-empty IP address")
+        bind_host = bind_host.strip()
+        try:
+            address = ipaddress.ip_address(bind_host)
+        except ValueError as exc:
+            raise ValueError("bind_host must be a literal IP address") from exc
+        if address.is_unspecified:
+            raise ValueError("bind_host must not be a wildcard/unspecified address")
+        with self._lan_lock:
+            if self._lan_server is not None:
+                if self._lan_thread is not None and self._lan_thread.is_alive():
+                    return self._lan_base  # type: ignore[return-value]
+                stale_server = self._lan_server
+                stale_thread = self._lan_thread
+                try:
+                    stale_server.shutdown()
+                    stale_server.server_close()
+                except OSError:
+                    raise OSError("LAN endpoint could not be restarted cleanly")
+                if stale_thread is not None:
+                    stale_thread.join(timeout=2.0)
+                if stale_thread is not None and stale_thread.is_alive():
+                    raise OSError("LAN endpoint thread did not stop")
+                self._lan_server = None
+                self._lan_thread = None
+                self._lan_base = None
+            server = ThreadingHTTPServer((bind_host, 0), _ProxyHandler)
+            host = f"[{bind_host}]" if address.version == 6 else bind_host
+            base = f"http://{host}:{server.server_address[1]}"
+            server.proxy = self  # type: ignore[attr-defined]
+            server.public_base = base  # type: ignore[attr-defined]
+            server.is_lan = True  # type: ignore[attr-defined]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            self._lan_server = server
+            self._lan_thread = thread
+            self._lan_base = base
+            thread.start()
+            return base
 
     def release_lan_tokens(self) -> None:
         """只清理投屏端点生成的 tokens。"""
@@ -1266,16 +1295,25 @@ class MediaProxy:
 
     def stop_lan_endpoint(self) -> None:
         """只停止 LAN server，并清理 LAN-owned tokens。"""
-        self.release_lan_tokens()
-        server, self._lan_server = self._lan_server, None
-        self._lan_thread = None
-        self._lan_base = None
-        if server is not None:
+        with self._lan_lock:
+            server = self._lan_server
+            thread = self._lan_thread
+            if server is None:
+                self.release_lan_tokens()
+                return
+            self.release_lan_tokens()
             try:
                 server.shutdown()
                 server.server_close()
-            except Exception:
-                pass
+            except OSError:
+                return
+            if thread is not None:
+                thread.join(timeout=2.0)
+            if thread is not None and thread.is_alive():
+                return
+            self._lan_server = None
+            self._lan_thread = None
+            self._lan_base = None
 
     # ------------------------------------------------------------------ #
     # 惰性系列：外部播放器全集播放列表
@@ -1309,7 +1347,8 @@ class MediaProxy:
 
     def warm_series_episode(self, key: str, idx: int, video: str,
                             audio: str = "", headers: dict | None = None,
-                            ad_block: dict | None = None) -> bool:
+                            ad_block: dict | None = None,
+                            public_base: str | None = None) -> bool:
         """把**已知的**取流结果预写入系列 memo（纯优化，无副作用）。
 
         点集流程 _FetchStreamTask 已用同款 merged=True 取过当前集的流，
@@ -1322,6 +1361,8 @@ class MediaProxy:
         """
         if not video:
             return False
+        endpoint_base = self._base_url(public_base)
+        lan_base = public_base if public_base == self._lan_base else None
         with self._lock:
             ser = self._series.get(key)
             if ser is None or not (0 <= int(idx) < int(ser["count"])):
@@ -1331,23 +1372,25 @@ class MediaProxy:
             entry = (video, audio,
                      self.build_url(video, headers or {},
                                     ad_block=ad_block,
-                                    force_proxy=force_proxy))
+                                    force_proxy=force_proxy,
+                                    public_base=lan_base))
         except Exception:  # noqa: BLE001 —— 铸 token 失败：回落 resolver
             return False
         with self._lock:
             cur = self._series.get(key)   # 解析期间可能已被注销
             if cur is None:
                 return False
-            cur["memo"][int(idx)] = entry
+            cur["memo"][(endpoint_base, int(idx))] = entry
         return True
 
-    def series_episode_url(self, key: str, idx: int) -> str:
+    def series_episode_url(self, key: str, idx: int,
+                           public_base: str | None = None) -> str:
         """第 idx 集的惰性 URL（绝对地址，不含 #标题 fragment）。"""
-        self._ensure_server()
-        return (f"http://127.0.0.1:{self._server.server_address[1]}"
-                f"/e/{key}/{int(idx)}")
+        base = self._base_url(public_base)
+        return f"{base}/e/{key}/{int(idx)}"
 
-    def _serve_series(self, handler, path: str) -> None:
+    def _serve_series(self, handler, path: str,
+                      public_base: str | None = None) -> None:
         """/e/<key>/<idx>：按集惰性解析 → 302 到 /s/<token>。"""
         parts = path[len("/e/"):].split("/")
         if len(parts) != 2 or not parts[0] or not parts[1]:
@@ -1361,6 +1404,8 @@ class MediaProxy:
             handler.send_error(404, "bad episode index")
             return
         idx = int(raw_idx)
+        endpoint_base = self._base_url(public_base)
+        lan_base = public_base if public_base == self._lan_base else None
         with self._lock:
             ser = self._series.get(key)
             if ser is None:
@@ -1369,7 +1414,7 @@ class MediaProxy:
             if not (0 <= idx < int(ser["count"])):
                 handler.send_error(404, "episode out of range")
                 return
-            entry = ser["memo"].get(idx)
+            entry = ser["memo"].get((endpoint_base, idx))
             sem = ser["sem"]
             resolver, on_play = ser["resolver"], ser["on_play"]
             force_proxy = ser["force_proxy"]
@@ -1391,11 +1436,12 @@ class MediaProxy:
             # 既不回源也不用再扫 _tokens 反查。
             entry = (video, audio,
                      self.build_url(video, headers, ad_block=ad_block,
-                                    force_proxy=force_proxy))
+                                    force_proxy=force_proxy,
+                                    public_base=lan_base))
             with self._lock:
                 cur = self._series.get(key)      # 解析期间可能已被注销
                 if cur is not None:
-                    cur["memo"][idx] = entry
+                    cur["memo"][(endpoint_base, idx)] = entry
         if on_play is not None:
             try:
                 on_play(idx, entry[0], entry[1])
@@ -1570,7 +1616,7 @@ class MediaProxy:
                 key = cache.key_of(target)
                 cache.playlist_write(key, text.encode("utf-8", "replace"))
                 self._register_cache_ctx(key, target, req_headers, ad_block,
-                                         force_proxy, public_base)
+                                         force_proxy)
             except Exception:  # noqa: BLE001 —— 缓存写失败不阻断播放
                 key = None
         rewritten = self._rewrite_m3u8(text, target, req_headers, ad_block,
@@ -1831,7 +1877,8 @@ class MediaProxy:
         handler.wfile.write(body)
 
     # ------------------------------------------------------------------ #
-    def _serve_cache(self, handler: "_ProxyHandler", path: str) -> None:
+    def _serve_cache(self, handler: "_ProxyHandler", path: str,
+                     public_base: str | None = None) -> None:
         """/c/<key>/<segment> 路由：HLS 分片磁盘缓存。
 
         命中（本地 final 文件已完整存在）→ 直接 serve 本地文件（支持 Range）；
@@ -1857,7 +1904,6 @@ class MediaProxy:
             handler.send_error(502, "cache context lost")
             return
         base_url, base_headers, ad_block = ctx[0], ctx[1], ctx[2]
-        public_base = _tuple_public_base(ctx)
         force_proxy = _tuple_force_proxy(ctx)
         target = urljoin(base_url, seg_name)
         # 分片级预取钩子：取到第 seg_name 片后把后续 depth 片排队落盘。
@@ -1904,6 +1950,8 @@ class MediaProxy:
                         cache_on=True, cache_key=sub_key,
                         force_proxy=force_proxy, public_base=public_base)
                     self._emit_m3u8(handler, rewritten)
+                    if fetch_owner:
+                        cache.finish_fetch(fetch_key, fetch_state, None)
                     return
                 # 未缓存 → 走下路（fetch + 嗅探 + _serve_m3u8_text 会登记 sub_key）
             else:
@@ -1913,6 +1961,8 @@ class MediaProxy:
                     cache.touch(cache_key)
                     _record_cache_diagnostic(target, base_headers, "hit")
                     self._serve_local_file(handler, final)
+                    if fetch_owner:
+                        cache.finish_fetch(fetch_key, fetch_state, None)
                     return
 
             req_headers = dict(base_headers)

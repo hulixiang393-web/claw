@@ -1,10 +1,83 @@
 # -*- coding: utf-8 -*-
 import re
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 import pytest
+import requests
 
+import framework.media_proxy as mp
+from framework.media_cache import MediaCache
 from framework.media_proxy import MediaProxy
+
+
+class _FakeUpstream(BaseHTTPRequestHandler):
+    hits = {}
+
+    def do_GET(self):  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        type(self).hits[path] = type(self).hits.get(path, 0) + 1
+        if path == "/hls/index.m3u8":
+            body = (
+                '#EXTM3U\n'
+                '#EXT-X-KEY:METHOD=AES-128,URI="/hls/key.bin"\n'
+                '#EXTINF:1,\n/hls/seg.ts\n'
+                '#EXTINF:1,\nnested.m3u8\n'
+                '#EXT-X-ENDLIST\n'
+            ).encode()
+            self._send(body, "application/vnd.apple.mpegurl")
+            return
+        if path == "/hls/nested.m3u8":
+            body = b"#EXTM3U\n#EXTINF:1,\n/hls/nested-seg.ts\n#EXT-X-ENDLIST\n"
+            self._send(body, "application/vnd.apple.mpegurl")
+            return
+        if path in ("/hls/seg.ts", "/hls/nested-seg.ts"):
+            self._send(path.encode(), "video/mp2t")
+            return
+        if path == "/hls/key.bin":
+            self._send(b"key", "application/octet-stream")
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _send(self, body, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def upstream():
+    _FakeUpstream.hits = {}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeUpstream)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def _upstream_url(server, path):
+    return f"http://127.0.0.1:{server.server_port}{path}"
+
+
+def _http_urls(text):
+    return re.findall(r'http://[^"\n]+', text)
+
+
+def _urls_with_path(text, path):
+    return [url for url in _http_urls(text) if path in url]
 
 
 class _OffCache:
@@ -24,6 +97,98 @@ def _token(url: str) -> str:
     return url.rsplit("/", 1)[-1]
 
 
+def test_start_lan_endpoint_rejects_wildcard_hosts(proxy_ctx):
+    for bind_host in ("", "0.0.0.0", "::", "0:0:0:0:0:0:0:0"):
+        with pytest.raises(ValueError, match="bind_host"):
+            proxy_ctx.start_lan_endpoint(bind_host)
+
+
+def test_public_base_must_be_active_lan_base(proxy_ctx):
+    with pytest.raises(ValueError, match="public_base"):
+        proxy_ctx.build_url("https://cdn.example/video.m3u8", public_base="http://127.0.0.1:1")
+    lan_base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    proxy_ctx.stop_lan_endpoint()
+    with pytest.raises(ValueError, match="public_base"):
+        proxy_ctx.build_url("https://cdn.example/video.m3u8", public_base=lan_base)
+
+
+def test_start_lan_endpoint_does_not_reset_prefetch_circuit_breaker(proxy_ctx):
+    proxy_ctx._pf_disabled = True
+    proxy_ctx._pf_failures = 3
+    proxy_ctx._pf_cancel.set()
+    proxy_ctx.start_lan_endpoint("127.0.0.1")
+    assert proxy_ctx._pf_disabled is True
+    assert proxy_ctx._pf_failures == 3
+    assert proxy_ctx._pf_cancel.is_set()
+
+
+def test_lan_http_s_and_c_and_nested_manifest_use_requesting_endpoint(upstream, tmp_path):
+    cache = MediaCache(root=tmp_path / "cache", max_videos=3, max_bytes=32 * 1024 ** 2)
+    proxy = MediaProxy(cache=cache)
+    try:
+        target = _upstream_url(upstream, "/hls/index.m3u8")
+        local_manifest_url = proxy.build_url(target, {"Referer": "r"})
+        lan_base = proxy.start_lan_endpoint("127.0.0.1")
+        lan_manifest_url = proxy.build_url(
+            target, {"Referer": "r"}, public_base=lan_base)
+        local_base = local_manifest_url.rsplit("/s/", 1)[0]
+
+        local_manifest = requests.get(local_manifest_url, timeout=10)
+        lan_manifest = requests.get(lan_manifest_url, timeout=10)
+        assert local_manifest.status_code == 200
+        assert lan_manifest.status_code == 200
+
+        local_segments = _urls_with_path(local_manifest.text, "/c/")
+        lan_segments = _urls_with_path(lan_manifest.text, "/c/")
+        assert local_segments and lan_segments
+        assert all(url.startswith(local_base + "/c/") for url in local_segments)
+        assert all(url.startswith(lan_base + "/c/") for url in lan_segments)
+        assert all(urlsplit(url).port == urlsplit(local_base).port for url in local_segments)
+        assert all(urlsplit(url).port == urlsplit(lan_base).port for url in lan_segments)
+
+        local_nested = _urls_with_path(local_manifest.text, "/nested.m3u8")
+        lan_nested = _urls_with_path(lan_manifest.text, "/nested.m3u8")
+        assert local_nested and lan_nested
+        assert requests.get(local_segments[0], timeout=10).status_code == 200
+        assert requests.get(lan_segments[0], timeout=10).status_code == 200
+        local_nested_manifest = requests.get(local_nested[0], timeout=10)
+        lan_nested_manifest = requests.get(lan_nested[0], timeout=10)
+        assert local_nested_manifest.status_code == 200
+        assert lan_nested_manifest.status_code == 200
+        assert all(url.startswith(local_base + "/c/") for url in _http_urls(local_nested_manifest.text))
+        assert all(url.startswith(lan_base + "/c/") for url in _http_urls(lan_nested_manifest.text))
+
+        proxy.stop_lan_endpoint()
+        local_nested_after_stop = requests.get(local_nested[0], timeout=10)
+        assert local_nested_after_stop.status_code == 200
+        assert all(url.startswith(local_base + "/c/") for url in _http_urls(local_nested_after_stop.text))
+    finally:
+        proxy.stop_lan_endpoint()
+        proxy.stop()
+
+
+def test_lan_http_series_memo_isolated_by_endpoint(proxy_ctx):
+    calls = []
+
+    def resolve(idx):
+        calls.append(idx)
+        return "https://cdn.example/video.m3u8", "", {"Referer": "r"}, None
+
+    proxy_ctx._ensure_server()
+    lan_base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    key = proxy_ctx.register_series(resolve, count=1)
+    local_url = proxy_ctx.series_episode_url(key, 0)
+    lan_url = proxy_ctx.series_episode_url(key, 0, public_base=lan_base)
+    local_response = requests.get(local_url, allow_redirects=False, timeout=10)
+    lan_response = requests.get(lan_url, allow_redirects=False, timeout=10)
+    assert local_response.status_code == 302
+    assert lan_response.status_code == 302
+    assert local_response.headers["Location"].startswith(local_url.rsplit("/e/", 1)[0] + "/s/")
+    assert lan_response.headers["Location"].startswith(lan_base + "/s/")
+    assert local_response.headers["Location"] != lan_response.headers["Location"]
+    assert calls == [0, 0]
+
+
 def test_build_url_defaults_to_localhost(proxy_ctx):
     url = proxy_ctx.build_url("https://cdn.example/video.m3u8", {"Referer": "r"})
     parts = urlsplit(url)
@@ -31,6 +196,43 @@ def test_build_url_defaults_to_localhost(proxy_ctx):
     assert parts.hostname == "127.0.0.1"
     assert parts.port
     assert parts.path.startswith("/s/")
+
+
+def test_lan_start_stop_is_serialized(monkeypatch, proxy_ctx):
+    real_server = mp.ThreadingHTTPServer
+    created = []
+
+    def slow_server(*args, **kwargs):
+        time.sleep(0.05)
+        server = real_server(*args, **kwargs)
+        created.append(server)
+        return server
+
+    monkeypatch.setattr(mp, "ThreadingHTTPServer", slow_server)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(proxy_ctx.start_lan_endpoint("127.0.0.1")))
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    try:
+        assert len(results) == 8
+        assert len(set(results)) == 1
+        thread = proxy_ctx._lan_thread
+        proxy_ctx.stop_lan_endpoint()
+        assert proxy_ctx._lan_server is None
+        assert thread is not None
+        assert not thread.is_alive()
+    finally:
+        for server in created:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
 
 
 def test_start_lan_endpoint_binds_requested_host_and_reuses(proxy_ctx):
