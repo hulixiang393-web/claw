@@ -21,7 +21,7 @@ from urllib.parse import quote, urlencode, urljoin
 from .config import SourceConfig
 from .discovery import Discovery
 from .errors import SourceError
-from .http import HttpClient
+from .http import AntiScrapeError, HttpClient
 from .parser import Parser
 from .utils import fill_json, fill_template, jsonpath
 
@@ -32,6 +32,21 @@ log = logging.getLogger(__name__)
 # 触发空页停"的死循环，绝不是搜索结果限制。正常源空页即停，远达不到此值。
 # 源显式配置了 constraints.search.max_pages 则尊重源值（不覆盖）。
 _SEARCH_MAX_PAGES_HARD_CAP = 2000
+
+
+def _maccms_ts_b64(key_hex: str, ms: Optional[int] = None) -> str:
+    """MacCMS「系统安全验证」令牌：b64(XOR(毫秒时间戳字符串, 固定密钥))。
+
+    站点前端 refresh() 的等价实现（key 为页面 JS 里的 16 字节定值，
+    以 hex 配置在 sources/*.json 的 search.verify.token.key_hex）。
+    """
+    import base64 as _b64
+
+    if ms is None:
+        ms = int(time.time() * 1000)
+    key = bytes.fromhex(key_hex)
+    data = str(ms).encode("ascii")
+    return _b64.b64encode(bytes(b ^ key[i % len(key)] for i, b in enumerate(data))).decode("ascii")
 
 
 def _response_pages(rc: dict, source: SourceConfig) -> int:
@@ -92,6 +107,7 @@ class Search:
         self._cookie_manager = cookie_manager  # 渲染搜索页注入登录 cookie
         self._provider_memory = provider_memory
         self._ytdlp = None  # 懒加载单例
+        self._verified: set = set()  # 已过安全验证的 (source_id, url)（PHPSESSID 24h）
 
     # ------------------------------------------------------------------ #
     def _search_decrypter(self, source: SourceConfig, http: Optional[HttpClient] = None):
@@ -109,6 +125,58 @@ class Search:
         from .decrypter import Decrypter
 
         return Decrypter(http or self._http)
+
+    def _verify_search(self, source: SourceConfig, http: Optional[HttpClient] = None) -> None:
+        """搜索前置安全验证（MacCMS「系统安全验证」类站点，如 omofuna /search/）。
+
+        endpoints.search.verify 配置：
+            url     验证接口（如 /index.php/ajax/verify_check?type=search）
+            method  缺省 POST（JSON body）
+            body    请求体，值中的 $token 替换为生成的令牌
+            token   {strategy: "maccms_ts_b64", key_hex: "…"}
+        成功后服务端置 PHPSESSID（会话 cookie，24h），同会话后续搜索直接放行；
+        每源每 Search 实例只验证一次（失败不缓存，下次搜索重试）。
+        """
+        vcfg = (source.get_search_config() or {}).get("verify") or {}
+        url = vcfg.get("url")
+        if not url:
+            return
+        key = (source.source_id, url)
+        if key in self._verified:
+            return
+        body = json.loads(json.dumps(vcfg.get("body") or {}))
+        tok_cfg = vcfg.get("token") or {}
+        if tok_cfg.get("strategy") == "maccms_ts_b64" and tok_cfg.get("key_hex"):
+            token = _maccms_ts_b64(str(tok_cfg["key_hex"]))
+
+            def _subst(obj):
+                if isinstance(obj, str):
+                    return obj.replace("$token", token)
+                if isinstance(obj, dict):
+                    return {k: _subst(x) for k, x in obj.items()}
+                if isinstance(obj, list):
+                    return [_subst(x) for x in obj]
+                return obj
+
+            body = _subst(body)
+        abs_url = urljoin(source.base_url, url)
+        if (vcfg.get("method") or "POST").upper() != "POST":
+            return
+        try:
+            resp = (http or self._http).post_json(
+                abs_url,
+                body,
+                headers=source.request_headers(),
+            )
+        except Exception as exc:  # noqa: BLE001 —— 验证失败不阻断搜索（降级空结果）
+            log.warning("[%s] 搜索安全验证失败：%s", source.source_id, exc)
+            return
+        if isinstance(resp, dict) and resp and resp.get("code") not in (None, 1):
+            log.warning(
+                "[%s] 搜索安全验证被拒：%s", source.source_id, resp.get("msg") or resp
+            )
+            return
+        self._verified.add(key)
 
     def _decrypt_results(
         self,
@@ -282,6 +350,8 @@ class Search:
 
         # 标题/作者字体混淆解密（番茄等）：decryption.targets.title/author → 逐条还原
         dec = self._search_decrypter(source, http)
+        # 搜索前置安全验证（omofuna 等：无验证时 /search/ 只回验证页空壳）
+        self._verify_search(source, http)
 
         def _fetch(page: int):
             """抓取并解析第 page 页，返回 (page, items)。失败返回空列表。"""
@@ -316,7 +386,17 @@ class Search:
                         url_template=url_template,
                         keyword_replace=keyword_replace,
                     )
-                    text = self._http_get(source, abs_url, http=http)
+                    try:
+                        text = self._http_get(source, abs_url, http=http)
+                    except AntiScrapeError:
+                        # 限流型反爬（如 dm84「搜索时间间隔为10秒」的系统提示页）：
+                        # 站点按搜索端点请求间隔拒绝，等 11s 窗口过去后重试一次
+                        log.info(
+                            "[%s] 搜索命中限流页，11s 后重试：%s",
+                            source.source_id, abs_url,
+                        )
+                        time.sleep(11)
+                        text = self._http_get(source, abs_url, http=http)
             except Exception as exc:  # noqa: BLE001
                 # 404 是分页探测末页的正常信号（超过站点总页数），静默不报；
                 # 其余失败才警告（网络/反爬）。

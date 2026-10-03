@@ -250,8 +250,11 @@ class Decrypter:
         import urllib.parse
 
         text = content.strip()
+        decoded_text = urllib.parse.unquote(text).strip()
+        if decoded_text.startswith(("http://", "https://")):
+            return decoded_text
         try:
-            s = urllib.parse.unquote(text).strip()
+            s = decoded_text
             raw = base64.b64decode(s + "=" * (-len(s) % 4))
             if base64.b64encode(raw).rstrip(b"=") != s.encode().rstrip(b"="):
                 return content
