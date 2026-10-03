@@ -240,3 +240,54 @@ def test_omofuna_switch_derives_detail_url_from_episode():
     assert cont._detail_url_from_episode(src, ep) == (
         "https://www.omofuna.com/anime/59e5d4cdb1bcefc84eb4b1f4.html"
     )
+
+
+_PLAY3_DEAD = (
+    '<html><body><script>var player_aaaa={"flag":"play","encrypt":0,'
+    '"url":"https://dead.example/xx.m3u8","from":"player","ps":0}'
+    "</script></body></html>"
+)
+_PLAY1_LIVE = (
+    '<html><body><script>var player_aaaa={"flag":"play","encrypt":0,'
+    '"url":"https://live.example/xx.m3u8","from":"player","ps":0}'
+    "</script></body></html>"
+)
+
+
+def test_omofuna_dead_line_remembered_and_skipped(monkeypatch):
+    """probe 失败的线路记入 TTL 黑名单：复播同集不再重抓死线路播放页、
+    不再打已知死链 probe（死线路串行轮换是取流 8.9s 的最大耗时段）。"""
+    calls = []
+
+    class _RouterHttp(_FakeHttp):
+        def get_text(self, url, *a, **k):
+            calls.append(url)
+            return super().get_text(url, *a, **k)
+
+    pages = {
+        "play/3/1.html": _PLAY3_DEAD,
+        "play/1/1.html": _PLAY1_LIVE,
+        "e7f12f9fc5b567f379a2cc2b.html": _DETAIL_HTML,
+    }
+    src = source()
+    http = _RouterHttp(pages)
+    cont = Content(http, Parser(), _Checker(), decrypter=Decrypter(http))
+    probes = []
+
+    def _fake_probe(self, source, url):
+        probes.append(url)
+        return "dead" not in url
+
+    monkeypatch.setattr(Content, "_play_url_probe", _fake_probe)
+    ep = "https://www.omofuna.com/anime/e7f12f9fc5b567f379a2cc2b/play/3/1.html?sid=3"
+
+    v1 = cont.fetch_video_episode(src, ep)
+    assert v1 == "https://live.example/xx.m3u8"
+    assert sum(1 for u in calls if "/play/3/" in u) == 1
+
+    v2 = cont.fetch_video_episode(src, ep)
+    assert v2 == "https://live.example/xx.m3u8"
+    # 死线路播放页复播时不再抓（首轮已判死）
+    assert sum(1 for u in calls if "/play/3/" in u) == 1
+    # 已知死链不再重复 probe
+    assert sum(1 for u in probes if "dead.example" in u) == 1

@@ -137,6 +137,10 @@ class Content:
         # （慢站反爬延迟下详情+取流各一次，复用省约一半同步等待）。只留最近一部
         # （每次详情加载重新填充，天然不过期）。
         self._video_html_cache: dict = {}
+        # 已知失效线路黑名单：source_id -> {episode_key: 判死时刻(monotonic)}。
+        # probe 明确失败（403/404/空/超时）的分集线路记入，TTL 内复播/换集
+        # 直接跳过（死线路串行轮换是 omofuna 类站取流的最大耗时段）。
+        self._dead_episode_lines: dict = {}
         # 详情页 HTML 短 TTL 缓存：重复打开同一本书免二次整页下载（慢站详情慢）。
         # 含目录页（chapters_url 二次抓取也走此缓存，见 _fetch_chapters）。
         # 只缓存最近 _detail_html_max 条，防长期会话无界增长（dict 保持插入序）。
@@ -2572,26 +2576,21 @@ class Content:
         """
         abs_ep = self._abs_url(source, episode_url)
         self._bg_check(source, abs_ep)
-        # single_chapter 视频源：取流 URL == 详情 URL，复用 fetch_detail 已取回的
-        # HTML，免对慢站（如 missav 反爬延迟）二次整页下载（详情+取流省约一半等待）。
-        # 非单章源（episode URL 与详情不同）key 不命中 → 正常请求。
-        html = self._video_html_cache.get((source.source_id, abs_ep))
-        if html is None:
-            html = self._get(source, episode_url)
-        doc = self._parser.parse(html)
 
         content_cfg = self._content_block(source)
         block = content_cfg.get("episode") or {}
         play_cfg = block.get("play_url") or {}
         switch_cfg = block.get("source_switch") or {}
 
-        # Playwright 渲染播放页 → iframe 解析站 → video src（agedm 类嵌套 iframe 站）
+        # Playwright 渲染播放页 → iframe 解析站 → video src（agedm 类嵌套 iframe 站）。
+        # 渲染分支不消费播放页 HTML：URL 交给 Playwright 即可，跳过此前的纯 HTTP
+        # 抓取（同 URL 会抓两次，实测 dm84 每次多耗 1.6-1.9s）。
         if play_cfg.get("render") == "playwright":
             rc = block.get("render_config") or {}
             from .playwright_helper import fetch_rendered_video_sync
 
             vurl = fetch_rendered_video_sync(
-                self._abs_url(source, episode_url),
+                abs_ep,
                 wait_until=rc.get("wait_until") or "networkidle",
                 timeout_ms=int(rc.get("timeout_ms") or 45000),
                 extra_delay_ms=int(rc.get("extra_delay_ms") or 8000),
@@ -2602,6 +2601,14 @@ class Content:
                     f"渲染未获取到视频源（{episode_url}）", source_id=source.source_id
                 )
             return vurl
+
+        # single_chapter 视频源：取流 URL == 详情 URL，复用 fetch_detail 已取回的
+        # HTML，免对慢站（如 missav 反爬延迟）二次整页下载（详情+取流省约一半等待）。
+        # 非单章源（episode URL 与详情不同）key 不命中 → 正常请求。
+        html = self._video_html_cache.get((source.source_id, abs_ep))
+        if html is None:
+            html = self._get(source, episode_url)
+        doc = self._parser.parse(html)
 
         # 链式 HTTP 提取（play_url.http_chain）：多跳播放地址链，纯 HTTP 秒级完成、
         # 不依赖 Playwright。每步从前一步响应（或详情页）提取 URL/数据，逐步收敛
@@ -2818,6 +2825,17 @@ class Content:
         """
         switch_cfg = self._get_source_switch_cfg(source)
         max_attempts = max(1, int(switch_cfg.get("max_switch_attempts") or 3))
+        # 已知死线路黑名单：TTL 600s 惰性过期（站点修复后自动恢复尝试）。
+        now = time.monotonic()
+        dead: dict = {
+            k: ts
+            for k, ts in (self._dead_episode_lines.get(source.source_id) or {}).items()
+            if now - ts < 600.0
+        }
+        if dead:
+            self._dead_episode_lines[source.source_id] = dead
+        else:
+            self._dead_episode_lines.pop(source.source_id, None)
         attempted: set = set()
         candidates: list = []
         current = episode_url
@@ -2827,18 +2845,28 @@ class Content:
             if key in attempted:
                 break
             attempted.add(key)
-            try:
-                play = self._fetch_play_url_once(source, current)
-                if play and self._play_url_probe(source, play):
-                    return play
-                last_err = ContentMissingError(
-                    f"播放地址不可访问（{current} → {str(play)[:80]}），"
-                    f"已尝试 {len(attempted)} 条线路",
-                    source_id=source.source_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-                log.info("[%s] 线路取流失败 %s：%s", source.source_id, current, exc)
+            if key in dead:
+                # probe 曾明确失败（403/404/空/超时）的线路：跳过抓取与 probe，
+                # 直接进入候选轮换（省一次播放页 HTTP + 一次死链 probe）。
+                log.info("[%s] 跳过已知失效线路：%s", source.source_id, current)
+            else:
+                try:
+                    play = self._fetch_play_url_once(source, current)
+                    if play and self._play_url_probe(source, play):
+                        return play
+                    if play:
+                        # 取流成功但 probe 判死 → 记入黑名单；提取失败（play 空，
+                        # 如渲染临时未出流）不记，保留下次重试。
+                        dead[key] = now
+                        self._dead_episode_lines[source.source_id] = dead
+                    last_err = ContentMissingError(
+                        f"播放地址不可访问（{current} → {str(play)[:80]}），"
+                        f"已尝试 {len(attempted)} 条线路",
+                        source_id=source.source_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    log.info("[%s] 线路取流失败 %s：%s", source.source_id, current, exc)
             if not candidates:
                 try:
                     candidates = self._switch_candidate_episode_urls(source, current)

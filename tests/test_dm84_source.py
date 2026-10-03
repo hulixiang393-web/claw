@@ -207,3 +207,27 @@ def test_dm84_render_delay_bounded():
     出流（video src 为 artplayer 直填），7000ms 死等纯属浪费（11.2s → ~4s）。"""
     rc = source().raw["endpoints"]["content"]["episode"]["render_config"]
     assert rc["extra_delay_ms"] <= 2500
+
+
+def test_dm84_render_branch_skips_plain_http_fetch(monkeypatch):
+    """render=playwright 分支不消费播放页 HTML：该分支只把 URL 交给 Playwright，
+    此前先纯 HTTP 抓一次同 URL 是纯浪费（实测 1.6-1.9s/次，占取流总时 1/3）。"""
+    from unittest.mock import patch
+
+    src = source()
+    src.raw.setdefault("diagnostics", {})["selfcheck"] = {"strategy": "off"}
+
+    class _NoEpisodeFetchHttp(_FakeHttp):
+        def get_text(self, url, *a, **k):
+            assert "/p/" not in url, f"render 分支不应纯 HTTP 抓播放页: {url}"
+            return super().get_text(url, *a, **k)
+
+    http = _NoEpisodeFetchHttp()
+    cont = Content(http, Parser(), _Checker(), decrypter=Decrypter(http))
+    with patch(
+        "framework.playwright_helper.fetch_rendered_video_sync",
+        return_value="https://cdn.example.com/v.m3u8",
+    ) as mocked:
+        url = cont.fetch_video_episode(src, "/p/4183-1-1.html")
+    assert url == "https://cdn.example.com/v.m3u8"
+    assert mocked.call_count == 1
