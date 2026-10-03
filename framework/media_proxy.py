@@ -296,8 +296,12 @@ def _get_direct_session() -> requests.Session:
 
 
 def _tuple_force_proxy(entry) -> bool:
-    """兼容解包：老三元组 / 新四元组 entry 里取 force_proxy（第 4 位）。"""
-    return len(entry) == 4 and bool(entry[3])
+    """兼容解包：老三元组 / 四元组 / 带 public_base 的五元组取 force_proxy。"""
+    return len(entry) >= 4 and bool(entry[3])
+
+
+def _tuple_public_base(entry) -> str | None:
+    return entry[4] if len(entry) >= 5 else None
 
 
 def _strip_stale_headers(headers: dict) -> dict:
@@ -726,6 +730,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
     def do_GET(self):  # noqa: N802
         proxy: "MediaProxy" = self.server.proxy  # type: ignore[attr-defined]
+        public_base = (
+            getattr(self.server, "public_base", None)
+            if getattr(self.server, "is_lan", False) else None
+        )
         proxy._touch()
         proxy._begin()  # 活动请求计数：长连接流式期间看门狗不停止、不移除 token
         try:
@@ -760,7 +768,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 # 本次 mp4 tee（不做半截文件）；本次请求仍照常走上游 206。
                 if self.headers.get("Range"):
                     proxy._abort_tee_on_gap(target, self.headers.get("Range"))
-                proxy._forward(self, target, headers, ad_block, force_proxy)
+                proxy._forward(self, target, headers, ad_block, force_proxy,
+                               public_base)
             except Exception as exc:  # noqa: BLE001 —— 网络波动直接断流，播放器会提示
                 try:
                     self.send_error(502, f"proxy error: {exc}")
@@ -799,6 +808,10 @@ class MediaProxy:
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._lan_server: ThreadingHTTPServer | None = None
+        self._lan_thread: threading.Thread | None = None
+        self._lan_base: str | None = None
+        self._lan_tokens: set[str] = set()
         self._last_use = time.time()
         self._idle_watch: threading.Thread | None = None
         self._active = 0  # 进行中的请求数（含流式长连接）：>0 时 stop 不执行
@@ -1182,35 +1195,87 @@ class MediaProxy:
             return True
         return False
 
-    # 缓存上下文注册：m3u8 被重写时把 key → (base_url, headers, ad_block, force_proxy) 记下，
+    # 缓存上下文注册：m3u8 被重写时把 key →
+    # (base_url, headers, ad_block, force_proxy, public_base) 记下，
     # /c/<key>/ 缓存未命中时据此回落上游（分片相对 urljoin 到 base）。
     def _register_cache_ctx(self, key: str, target: str, headers: dict,
                             ad_block: dict | None,
-                            force_proxy: bool = False) -> None:
+                            force_proxy: bool = False,
+                            public_base: str | None = None) -> None:
         with self._lock:
             self._cache_ctx[key] = (target, _strip_stale_headers(headers),
-                                    ad_block, force_proxy)
+                                    ad_block, force_proxy, public_base)
 
     # ------------------------------------------------------------------ #
+    def _base_url(self, public_base: str | None = None) -> str:
+        if public_base:
+            return public_base.rstrip("/")
+        self._ensure_server()
+        return self._server.public_base  # type: ignore[union-attr]
+
     def build_url(self, target_url: str, headers: dict | None = None,
                   ad_block: dict | None = None,
-                  force_proxy: bool = False) -> str:
+                  force_proxy: bool = False,
+                  public_base: str | None = None) -> str:
         """把目标媒体 URL 打包成本地代理 URL（播放器直接播这个）。
 
         ad_block：可选源 ad_block 配置。存在时代理转发 m3u8 会剔除广告段
         （下载路径已有过滤；播放路径此前无过滤，广告分片会照播）。
         force_proxy：True 时该 token 的所有上游转发一律走系统代理会话
         （跳过直连探测）；默认策略为直连优先、失败回退代理。
+        public_base：非空时使用投屏 LAN 端点，并将 token 归入 LAN 生命周期。
         """
         if not target_url:
             return ""
-        self._ensure_server()
+        base = self._base_url(public_base)
         token = uuid.uuid4().hex
         with self._lock:
             self._tokens[token] = (
                 target_url, _strip_stale_headers(headers or {}), ad_block, force_proxy,
             )
-        return f"http://127.0.0.1:{self._server.server_address[1]}/s/{token}"
+            if public_base:
+                self._lan_tokens.add(token)
+        return f"{base}/s/{token}"
+
+    def start_lan_endpoint(self, bind_host: str) -> str:
+        """启动 LAN server，返回 http://<bind_host>:<port>。"""
+        if self._lan_server is not None:
+            return self._lan_base  # type: ignore[return-value]
+        with self._pf_lock:
+            self._pf_cancel.clear()
+            self._pf_disabled = False
+            self._pf_failures = 0
+        server = ThreadingHTTPServer((bind_host, 0), _ProxyHandler)
+        base = f"http://{bind_host}:{server.server_address[1]}"
+        server.proxy = self  # type: ignore[attr-defined]
+        server.public_base = base  # type: ignore[attr-defined]
+        server.is_lan = True  # type: ignore[attr-defined]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self._lan_server = server
+        self._lan_thread = thread
+        self._lan_base = base
+        thread.start()
+        return base
+
+    def release_lan_tokens(self) -> None:
+        """只清理投屏端点生成的 tokens。"""
+        with self._lock:
+            for token in tuple(self._lan_tokens):
+                self._tokens.pop(token, None)
+            self._lan_tokens.clear()
+
+    def stop_lan_endpoint(self) -> None:
+        """只停止 LAN server，并清理 LAN-owned tokens。"""
+        self.release_lan_tokens()
+        server, self._lan_server = self._lan_server, None
+        self._lan_thread = None
+        self._lan_base = None
+        if server is not None:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # 惰性系列：外部播放器全集播放列表
@@ -1349,9 +1414,12 @@ class MediaProxy:
             self._pf_cancel.clear()
             self._pf_disabled = False
             self._pf_failures = 0
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
-        self._server.proxy = self  # type: ignore[attr-defined]
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
+        server.proxy = self  # type: ignore[attr-defined]
+        server.public_base = f"http://127.0.0.1:{server.server_address[1]}"  # type: ignore[attr-defined]
+        server.is_lan = False  # type: ignore[attr-defined]
+        self._server = server
+        self._thread = threading.Thread(target=server.serve_forever, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -1373,6 +1441,7 @@ class MediaProxy:
         if cache is not None and hasattr(cache, "cancel_fetches"):
             cache.cancel_fetches()
         self._shutdown_prefetch()
+        self.stop_lan_endpoint()
         srv, self._server = self._server, None
         if srv is not None:
             try:
@@ -1383,22 +1452,28 @@ class MediaProxy:
         with self._lock:
             self._series.clear()   # memo 一并作废（Task 2 审查）
             self._tokens.clear()
+            self._lan_tokens.clear()
 
     # ------------------------------------------------------------------ #
     def _new_token(self, target: str, headers: dict, ad_block: dict | None = None,
-                   force_proxy: bool = False) -> str:
+                   force_proxy: bool = False,
+                   public_base: str | None = None) -> str:
         token = uuid.uuid4().hex
         with self._lock:
             self._tokens[token] = (target, _strip_stale_headers(headers),
                                    ad_block, force_proxy)
+            if public_base:
+                self._lan_tokens.add(token)
         return token
 
     def _proxy_url(self, target: str, base: str, headers: dict,
                    ad_block: dict | None = None,
-                   force_proxy: bool = False) -> str:
+                   force_proxy: bool = False,
+                   public_base: str | None = None) -> str:
         full = urljoin(base, target)
-        token = self._new_token(full, headers, ad_block, force_proxy)
-        return f"http://127.0.0.1:{self._server.server_address[1]}/s/{token}"
+        token = self._new_token(full, headers, ad_block, force_proxy,
+                                public_base)
+        return f"{self._base_url(public_base)}/s/{token}"
 
     # ------------------------------------------------------------------ #
     def _abort_tee_on_gap(self, target: str, rng: str) -> None:
@@ -1429,7 +1504,8 @@ class MediaProxy:
     # ------------------------------------------------------------------ #
     def _forward(self, handler: "_ProxyHandler", target: str, headers: dict,
                  ad_block: dict | None = None,
-                 force_proxy: bool = False) -> None:
+                 force_proxy: bool = False,
+                 public_base: str | None = None) -> None:
         """转发一次请求：m3u8 重写内部 URL（含广告过滤），否则流式转发。
 
         ad_block：源 ad_block 配置。非空时 m3u8 重写前先剔除广告段
@@ -1464,15 +1540,18 @@ class MediaProxy:
         # m3u8 播放列表：重写（并缓存过滤结果/分片）。mp4 等大文件：本地缓存
         # 命中直接 serve，未命中流式转发 + tee 落盘。
         if is_hls_url:
-            self._forward_m3u8(handler, target, req_headers, ad_block, force_proxy)
+            self._forward_m3u8(handler, target, req_headers, ad_block,
+                               force_proxy, public_base)
             return
-        self._forward_media(handler, target, req_headers, ad_block, force_proxy)
+        self._forward_media(handler, target, req_headers, ad_block,
+                            force_proxy, public_base)
 
     # ------------------------------------------------------------------ #
     def _serve_m3u8_text(self, handler: "_ProxyHandler", text: str,
                          target: str, req_headers: dict,
                          ad_block: dict | None = None,
-                         force_proxy: bool = False) -> None:
+                         force_proxy: bool = False,
+                         public_base: str | None = None) -> None:
         """把已取回的 m3u8 文本：广告过滤 → 缓存过滤结果 → 重写内部 URL → 发送。
 
         由 _forward_m3u8（URL 是 .m3u8）与 _forward_media（短链/参数化 URL
@@ -1491,12 +1570,13 @@ class MediaProxy:
                 key = cache.key_of(target)
                 cache.playlist_write(key, text.encode("utf-8", "replace"))
                 self._register_cache_ctx(key, target, req_headers, ad_block,
-                                         force_proxy)
+                                         force_proxy, public_base)
             except Exception:  # noqa: BLE001 —— 缓存写失败不阻断播放
                 key = None
         rewritten = self._rewrite_m3u8(text, target, req_headers, ad_block,
                                        cache_on=bool(key), cache_key=key,
-                                       force_proxy=force_proxy)
+                                       force_proxy=force_proxy,
+                                       public_base=public_base)
         self._emit_m3u8(handler, rewritten)
 
     # ------------------------------------------------------------------ #
@@ -1512,10 +1592,12 @@ class MediaProxy:
 
     # ------------------------------------------------------------------ #
     def _forward_m3u8(self, handler: "_ProxyHandler", target: str,
-                      req_headers: dict, ad_block: dict | None = None,
-                      force_proxy: bool = False) -> None:
+                       req_headers: dict, ad_block: dict | None = None,
+                       force_proxy: bool = False,
+                       public_base: str | None = None) -> None:
         """转发 m3u8 播放列表：整读 → 重写内部 URL（含广告过滤/缓存）。"""
         # 连接池复用：requests.Session 保持到 CDN 的 keep-alive 连接，
+
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
         # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
         # 默认直连优先，失败后回退系统代理。
@@ -1524,7 +1606,7 @@ class MediaProxy:
         now = time.monotonic()
         if cached_manifest and now - cached_manifest[0] < _MANIFEST_CACHE_TTL:
             self._serve_m3u8_text(handler, cached_manifest[1], target, req_headers,
-                                  ad_block, force_proxy)
+                                  ad_block, force_proxy, public_base)
             return
         resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
         try:
@@ -1548,7 +1630,7 @@ class MediaProxy:
             text = body.decode("utf-8", "replace")
             self._manifest_cache[manifest_key] = (time.monotonic(), text)
             self._serve_m3u8_text(handler, text, target, req_headers, ad_block,
-                                  force_proxy)
+                                  force_proxy, public_base)
         finally:
             try:
                 resp.close()
@@ -1558,7 +1640,8 @@ class MediaProxy:
     # ------------------------------------------------------------------ #
     def _forward_media(self, handler: "_ProxyHandler", target: str,
                        req_headers: dict, ad_block: dict | None = None,
-                       force_proxy: bool = False) -> None:
+                       force_proxy: bool = False,
+                       public_base: str | None = None) -> None:
         """转发普通媒体（mp4/mp3/ts/audio…）：优先本地缓存命中，否则流式转发。
 
         - mp4 已完整缓存 → 直接 serve 本地文件（支持 Range/206/416）
@@ -1644,7 +1727,7 @@ class MediaProxy:
                 _update_upstream_diagnostic(resp, len(rest), finished=True)
                 text = (first + rest).decode("utf-8", "replace")
                 self._serve_m3u8_text(handler, text, target, req_headers,
-                                      ad_block, force_proxy)
+                                      ad_block, force_proxy, public_base)
                 return
 
             # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
@@ -1774,6 +1857,7 @@ class MediaProxy:
             handler.send_error(502, "cache context lost")
             return
         base_url, base_headers, ad_block = ctx[0], ctx[1], ctx[2]
+        public_base = _tuple_public_base(ctx)
         force_proxy = _tuple_force_proxy(ctx)
         target = urljoin(base_url, seg_name)
         # 分片级预取钩子：取到第 seg_name 片后把后续 depth 片排队落盘。
@@ -1818,7 +1902,7 @@ class MediaProxy:
                     rewritten = self._rewrite_m3u8(
                         cached, target, base_headers, ad_block,
                         cache_on=True, cache_key=sub_key,
-                        force_proxy=force_proxy)
+                        force_proxy=force_proxy, public_base=public_base)
                     self._emit_m3u8(handler, rewritten)
                     return
                 # 未缓存 → 走下路（fetch + 嗅探 + _serve_m3u8_text 会登记 sub_key）
@@ -1870,7 +1954,7 @@ class MediaProxy:
                     _update_upstream_diagnostic(resp, len(rest or b""), finished=True)
                     text = (first + (rest or b"")).decode("utf-8", "replace")
                     self._serve_m3u8_text(handler, text, target, req_headers,
-                                          ad_block, force_proxy)
+                                          ad_block, force_proxy, public_base)
                     return
                 if seg_name.endswith(".m3u8"):
                     # 上游非 m3u8（动态校验失败/错误页）→ 原样回给播放器
@@ -2008,7 +2092,8 @@ class MediaProxy:
                       ad_block: dict | None = None,
                       cache_on: bool = False,
                       cache_key: str | None = None,
-                      force_proxy: bool = False) -> str:
+                      force_proxy: bool = False,
+                      public_base: str | None = None) -> str:
         """把 m3u8 内部 URL 重写为本机代理 URL（返回完整新文本）。
 
         - cache_on=False（无磁盘缓存路径）→ 全部走 /s/<token>
@@ -2034,17 +2119,20 @@ class MediaProxy:
                 tag = line.split(":", 1)[0].strip()
                 if tag in ("#EXT-X-KEY", "#EXT-X-SESSION-KEY"):
                     new_uri = self._proxy_url(m.group(1), base, headers,
-                                              ad_block, force_proxy)
+                                              ad_block, force_proxy,
+                                              public_base)
                     out.append(line.replace(f'URI="{m.group(1)}"', f'URI="{new_uri}"'))
                     continue
                 uri = m.group(1)
                 out.append(line.replace(f'URI="{uri}"',
-                                        f'URI="{self._rewrite_cache_or_token(uri, base, headers, ad_block, cache_on, cache_key, force_proxy)}"'))
+                                         f'URI="{self._rewrite_cache_or_token(uri, base, headers, ad_block, cache_on, cache_key, force_proxy, public_base)}"'))
                 self._note_segment(segs, uri, base, cache_on, cache_key)
                 continue
+
             uri = line
             out.append(self._rewrite_cache_or_token(
-                uri, base, headers, ad_block, cache_on, cache_key, force_proxy))
+                uri, base, headers, ad_block, cache_on, cache_key, force_proxy,
+                public_base))
             self._note_segment(segs, uri, base, cache_on, cache_key)
         if cache_on and cache_key is not None:
             self._set_seg_order(cache_key, segs)
@@ -2063,22 +2151,24 @@ class MediaProxy:
 
     # ------------------------------------------------------------------ #
     def _rewrite_cache_or_token(self, uri: str, base: str, headers: dict,
-                                ad_block: dict | None, cache_on: bool,
-                                cache_key: str | None,
-                                force_proxy: bool = False) -> str:
+                                 ad_block: dict | None, cache_on: bool,
+                                 cache_key: str | None,
+                                 force_proxy: bool = False,
+                                 public_base: str | None = None) -> str:
         """单个资源重写：cache_on 且已知缓存 key → /c/<key>/<full>，否则 /s/。
 
 /c/ 资源名 = quote 解析后的完整上游 URL：_serve_cache 反解时无需再次
+
 urljoin 猜测上下文（分片可能是绝对路径 /hls/x.ts 或相对 hls/x.ts），
 unquote 即得上游原 URL，直接取回/落盘（文件存名由 _safe_seg_name 压平）。
 """
         full = urljoin(base, uri)
         cache = self._ensure_cache() if cache_on else None
         if cache_on and cache is not None and cache_key is not None:
-            port = self._server.server_address[1] if self._server else 0
             name = quote(full, safe="/:@")
-            return f"http://127.0.0.1:{port}/c/{cache_key}/{name}"
-        return self._proxy_url(full, base, headers, ad_block, force_proxy)
+            return f"{self._base_url(public_base)}/c/{cache_key}/{name}"
+        return self._proxy_url(full, base, headers, ad_block, force_proxy,
+                               public_base)
 
 
 def proxy_url_for(url: str, headers: dict | None = None,
