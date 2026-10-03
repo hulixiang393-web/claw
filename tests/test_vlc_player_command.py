@@ -279,6 +279,42 @@ def test_playlist_items_non_list_payload(monkeypatch):
     assert ep.player_playlist_items() == []
 
 
+def test_playlist_items_parses_vlc3_tree_shape(monkeypatch):
+    """VLC 3.0 的 playlist.json 是**嵌套树 dict**（实测 3.0.23：root node →
+    children → leaf），不是平铺数组。旧代码 isinstance(list) 判否 → 恒返回 []
+    → 握手永远 0 项、pl_play 定位从未执行 → 用户必须手动点播放且只能从列表
+    第一项（第 1 集）开始（10-01~10-03 日志全部「握手超时…读到 0 项」）。
+    """
+    _state(monkeypatch)
+    tree = {
+        "ro": "rw", "type": "node", "name": "", "id": "0",
+        "children": [
+            {"type": "node", "name": "播放列表", "id": "1", "children": [
+                {"type": "leaf", "name": "第01集", "id": "4",
+                 "uri": "http://x/e/k/0", "current": "current"},
+                {"type": "leaf", "name": "第02集", "id": "3",
+                 "uri": "http://x/e/k/1"},
+            ]},
+            {"type": "node", "name": "媒体库", "id": "2", "children": []},
+        ],
+    }
+    monkeypatch.setattr(ep.requests, "get", lambda *a, **k: _Resp(200, tree))
+    items = ep.player_playlist_items()
+    assert [it["id"] for it in items] == [4, 3]     # 字符串 id → int
+    assert items[0]["uri"] == "http://x/e/k/0"
+    assert items[0].get("current") == "current"     # current 标志透传
+    assert items[1]["uri"] == "http://x/e/k/1"
+    # 分组节点（带子节点无 uri）不作为项；空媒体库节点被跳过
+    assert all("name" in it for it in items)
+    # 深层分组下的叶子也要收集（VLC 分组播放列表文件夹场景）
+    tree["children"][0]["children"].append(
+        {"type": "node", "name": "分组", "id": "9", "children": [
+            {"type": "leaf", "name": "第03集", "id": "7", "uri": "http://x/e/k/2"},
+        ]})
+    monkeypatch.setattr(ep.requests, "get", lambda *a, **k: _Resp(200, tree))
+    assert [it["id"] for it in ep.player_playlist_items(refresh=True)] == [4, 3, 7]
+
+
 def test_command_without_control_state_returns_false(monkeypatch):
     _state(monkeypatch)
     monkeypatch.setattr(ep, "_control_state", None)

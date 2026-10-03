@@ -493,6 +493,34 @@ def player_command(command: str, val: str = "", item_id=None) -> bool:
         return False
 
 
+def _flatten_playlist_tree(node) -> list[dict]:
+    """VLC 3.0 playlist.json 嵌套树 → 平铺叶子项列表（DFS 序）。
+
+    实测 3.0.23 返回 {"type":"node","id":"0","children":[
+      {"type":"node","name":"播放列表","children":[
+        {"type":"leaf","id":"4","uri":"...","current":"current"}, ...]},
+      {"type":"node","name":"媒体库",...}]}——根是 dict 不是数组，
+    旧代码 isinstance(list) 判否恒返回 []（握手永远 0 项的根因）。
+    收集规则：节点带 uri 即为项（leaf 必有 uri），否则下钻 children；
+    媒体库等无关项 uri 匹配不上入列 MRL，进不了映射，无害。
+    """
+    out: list[dict] = []
+
+    def walk(n) -> None:
+        if not isinstance(n, dict):
+            return
+        if n.get("uri"):
+            out.append(n)
+            return
+        children = n.get("children")
+        if isinstance(children, list):
+            for child in children:
+                walk(child)
+
+    walk(node)
+    return out
+
+
 def player_playlist_items(timeout: float = 2.0,
                           refresh: bool = False) -> list[dict]:
     """读最近一次 VLC 会话的完整播放列表（GET /requests/playlist.json）。
@@ -528,6 +556,8 @@ def player_playlist_items(timeout: float = 2.0,
         items = r.json()
     except Exception:  # noqa: BLE001 —— 网络失败/未就绪/非 JSON：静默 []
         return []
+    if isinstance(items, dict):
+        items = _flatten_playlist_tree(items)
     if not isinstance(items, list):
         return []
     out = []
