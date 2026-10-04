@@ -46,17 +46,26 @@ def _safe_stderr(stderr: bytes | str, media_url: str | None = None) -> str:
     return " | ".join(lines[-3:])[:1000]
 
 
-def run_ffprobe(ffmpeg_path: str, media_url: str, timeout: float = 10.0) -> dict:
+def run_ffprobe(
+    ffmpeg_path: str,
+    media_url: str,
+    timeout: float = 10.0,
+    allow_extensionless: bool = False,
+) -> dict:
     command = [
         _ffprobe_path(ffmpeg_path),
         "-v",
         "error",
+    ]
+    if allow_extensionless:
+        command.extend(["-extension_picky", "0"])
+    command.extend([
         "-show_entries",
         "format=format_name,duration:stream=codec_type,codec_name",
         "-of",
         "json",
         media_url,
-    ]
+    ])
     try:
         completed = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
@@ -85,7 +94,13 @@ def run_ffprobe(ffmpeg_path: str, media_url: str, timeout: float = 10.0) -> dict
     return result
 
 
-def decode_probe(ffmpeg_path: str, media_url: str, seconds: float = 3.0, timeout: float = 20.0) -> dict:
+def decode_probe(
+    ffmpeg_path: str,
+    media_url: str,
+    seconds: float = 3.0,
+    timeout: float = 20.0,
+    allow_extensionless: bool = False,
+) -> dict:
     command = [
         ffmpeg_path,
         "-hide_banner",
@@ -93,6 +108,10 @@ def decode_probe(ffmpeg_path: str, media_url: str, seconds: float = 3.0, timeout
         "error",
         "-t",
         str(seconds),
+    ]
+    if allow_extensionless:
+        command.extend(["-extension_picky", "0"])
+    command.extend([
         "-i",
         media_url,
         "-map",
@@ -102,7 +121,7 @@ def decode_probe(ffmpeg_path: str, media_url: str, seconds: float = 3.0, timeout
         "-f",
         "null",
         "-",
-    ]
+    ])
     try:
         completed = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
@@ -142,8 +161,24 @@ class VirtualMediaFetcher:
         if not self.ffmpeg_path:
             raise FileNotFoundError("FFmpeg path is required for decode")
         http = self.fetch(url)
-        probe = run_ffprobe(self.ffmpeg_path, url, self.timeout)
-        decoded = decode_probe(self.ffmpeg_path, url, timeout=max(20.0, self.timeout))
+        allow_extensionless = http.get("content_type") in {
+            "application/vnd.apple.mpegurl",
+            "application/x-mpegURL",
+            "audio/mpegurl",
+        }
+        probe = run_ffprobe(
+            self.ffmpeg_path,
+            url,
+            self.timeout,
+            allow_extensionless=allow_extensionless,
+        )
+        decoded = decode_probe(
+            self.ffmpeg_path,
+            url,
+            timeout=max(20.0, self.timeout),
+            allow_extensionless=allow_extensionless,
+        )
+
         result = {**http, **probe, **decoded}
         return result
 
