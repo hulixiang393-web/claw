@@ -4,9 +4,10 @@ import json
 import shutil
 import subprocess
 import time
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -157,3 +158,280 @@ def start_media_server(root: Path) -> tuple[ThreadingHTTPServer, str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
     return server, f"http://127.0.0.1:{server.server_port}"
+
+
+_SOAP_ENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+_AV_TRANSPORT_NS = "urn:schemas-upnp-org:service:AVTransport:1"
+_DEVICE_NS = "urn:schemas-upnp-org:device-1-0"
+
+
+class VirtualRenderer:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        ffmpeg_path: str | None = None,
+        fetch_timeout: float = 10.0,
+    ):
+        self.host = host
+        self.port = port
+        self.ffmpeg_path = ffmpeg_path
+        self.fetch_timeout = fetch_timeout
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: Thread | None = None
+        self._lock = Lock()
+        self._transport_state = "NO_MEDIA_PRESENT"
+        self._transport_status = "OK"
+        self._uri = ""
+        self._duration = 0.0
+        self._position = 0.0
+        self._playing_since: float | None = None
+        self._error = ""
+
+    def start(self):
+        if self._server is not None:
+            return self._descriptor()
+
+        renderer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.path.split("?", 1)[0] in {"/description.xml", "/device.xml"}:
+                    self._send_xml(200, renderer._device_description())
+                    return
+                self.send_error(404)
+
+            def do_POST(self) -> None:
+                if self.path.split("?", 1)[0] != "/upnp/control/avtransport1":
+                    self.send_error(404)
+                    return
+                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    action, arguments = renderer._parse_soap(self.rfile.read(length))
+                    response = renderer._handle_action(action, arguments)
+                except Exception:
+                    response = renderer._soap_fault()
+                    self._send_xml(500, response)
+                    return
+                self._send_xml(200, response)
+
+            def _send_xml(self, status: int, body: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", 'text/xml; charset="utf-8"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self._server = ThreadingHTTPServer((self.host, self.port), Handler)
+        self._thread = Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self._descriptor()
+
+    def stop(self) -> None:
+        server = self._server
+        thread = self._thread
+        self._server = None
+        self._thread = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def state(self) -> dict[str, Any]:
+        with self._lock:
+            position = self._current_position_locked()
+            return {
+                "state": self._transport_state,
+                "status": self._transport_status,
+                "speed": "1",
+                "uri": self._uri or None,
+                "position": int(position),
+                "duration": int(self._duration),
+                "error": self._error or None,
+            }
+
+    def set_uri(self, uri: str, title: str = "", mime_type: str = "video/mp4") -> None:
+        del title, mime_type
+        with self._lock:
+            self._uri = uri
+            self._duration = 0.0
+            self._position = 0.0
+            self._playing_since = None
+            self._error = ""
+            self._transport_status = "OK"
+            self._transport_state = "TRANSITIONING"
+
+    def play(self) -> None:
+        with self._lock:
+            if not self._uri:
+                self._transport_state = "ERROR"
+                self._transport_status = "ERROR_OCCURRED"
+                self._error = "No media URI configured"
+                raise RuntimeError("No media URI configured")
+            if self._transport_state == "PAUSED_PLAYBACK":
+                self._playing_since = time.monotonic()
+                self._transport_state = "PLAYING"
+                return
+            uri = self._uri
+        try:
+            result = VirtualMediaFetcher(self.ffmpeg_path, self.fetch_timeout).decode(uri)
+        except Exception:
+            result = {"decoded": False}
+        if not result.get("decoded"):
+            with self._lock:
+                self._transport_state = "ERROR"
+                self._transport_status = "ERROR_OCCURRED"
+                self._playing_since = None
+                self._error = "Media playback failed"
+            raise RuntimeError("Media playback failed")
+        with self._lock:
+            self._duration = max(0.0, float(result.get("duration") or 0.0))
+            self._position = min(self._position, self._duration) if self._duration else self._position
+            self._playing_since = time.monotonic()
+            self._transport_state = "PLAYING"
+            self._transport_status = "OK"
+            self._error = ""
+
+    def pause(self) -> None:
+        with self._lock:
+            if self._transport_state == "PLAYING":
+                self._position = self._current_position_locked()
+                self._playing_since = None
+            self._transport_state = "PAUSED_PLAYBACK"
+
+    def stop_playback(self) -> None:
+        with self._lock:
+            self._position = 0.0
+            self._playing_since = None
+            self._transport_state = "STOPPED"
+            self._transport_status = "OK"
+
+    def seek(self, seconds: int) -> None:
+        with self._lock:
+            self._position = max(0.0, min(float(seconds), self._duration)) if self._duration else max(0.0, float(seconds))
+            if self._transport_state == "PLAYING":
+                self._playing_since = time.monotonic()
+
+    def _descriptor(self):
+        from framework.dlna import DlnaRenderer
+
+        location = self._base_url() + "/description.xml"
+        return DlnaRenderer(
+            udn="uuid:virtual-dlna-renderer",
+            friendly_name="Virtual DLNA Renderer",
+            location=location,
+            av_transport_control_url=self._base_url() + "/upnp/control/avtransport1",
+            rendering_control_url=None,
+            service_type=_AV_TRANSPORT_NS,
+        )
+
+    def _base_url(self) -> str:
+        if self._server is None:
+            raise RuntimeError("Virtual renderer is not started")
+        host = self.host
+        if host in {"0.0.0.0", "::"}:
+            host = "127.0.0.1"
+        return f"http://{host}:{self._server.server_port}"
+
+    def _device_description(self) -> bytes:
+        root = ET.Element(f"{{{_DEVICE_NS}}}root", {"configId": "1"})
+        ET.SubElement(root, f"{{{_DEVICE_NS}}}specVersion")
+        spec = root[0]
+        ET.SubElement(spec, f"{{{_DEVICE_NS}}}major").text = "1"
+        ET.SubElement(spec, f"{{{_DEVICE_NS}}}minor").text = "0"
+        device = ET.SubElement(root, f"{{{_DEVICE_NS}}}device")
+        ET.SubElement(device, f"{{{_DEVICE_NS}}}deviceType").text = "urn:schemas-upnp-org:device:MediaRenderer:1"
+        ET.SubElement(device, f"{{{_DEVICE_NS}}}friendlyName").text = "Virtual DLNA Renderer"
+        ET.SubElement(device, f"{{{_DEVICE_NS}}}manufacturer").text = "claw"
+        ET.SubElement(device, f"{{{_DEVICE_NS}}}UDN").text = "uuid:virtual-dlna-renderer"
+        services = ET.SubElement(device, f"{{{_DEVICE_NS}}}serviceList")
+        service = ET.SubElement(services, f"{{{_DEVICE_NS}}}service")
+        ET.SubElement(service, f"{{{_DEVICE_NS}}}serviceType").text = _AV_TRANSPORT_NS
+        ET.SubElement(service, f"{{{_DEVICE_NS}}}serviceId").text = "urn:upnp-org:serviceId:AVTransport"
+        ET.SubElement(service, f"{{{_DEVICE_NS}}}controlURL").text = "/upnp/control/avtransport1"
+        ET.SubElement(service, f"{{{_DEVICE_NS}}}eventSubURL").text = "/upnp/event/avtransport1"
+        ET.SubElement(service, f"{{{_DEVICE_NS}}}SCPDURL").text = "/upnp/avtransport1.xml"
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _parse_soap(self, payload: bytes) -> tuple[str, dict[str, str]]:
+        root = ET.fromstring(payload)
+        action_element = next(element for element in root.iter() if element.tag.rsplit("}", 1)[-1] not in {"Envelope", "Body"})
+        action = action_element.tag.rsplit("}", 1)[-1]
+        arguments = {
+            element.tag.rsplit("}", 1)[-1]: element.text or ""
+            for element in action_element
+        }
+        return action, arguments
+
+    def _handle_action(self, action: str, arguments: dict[str, str]) -> bytes:
+        if action == "SetAVTransportURI":
+            self.set_uri(arguments.get("CurrentURI", ""), arguments.get("CurrentURIMetaData", ""), "")
+            return self._soap_response(action)
+        if action == "Play":
+            self.play()
+            return self._soap_response(action)
+        if action == "Pause":
+            self.pause()
+            return self._soap_response(action)
+        if action == "Stop":
+            self.stop_playback()
+            return self._soap_response(action)
+        if action == "Seek":
+            target = arguments.get("Target", "00:00:00")
+            parts = target.split(":")
+            self.seek(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2])))
+            return self._soap_response(action)
+        if action == "GetTransportInfo":
+            current = self.state()
+            return self._soap_response(action, {
+                "CurrentTransportState": current["state"],
+                "CurrentTransportStatus": current["status"],
+                "CurrentSpeed": current["speed"],
+            })
+        if action == "GetPositionInfo":
+            current = self.state()
+            return self._soap_response(action, {
+                "Track": "1" if current["uri"] else "0",
+                "TrackDuration": _format_duration(current["duration"]),
+                "RelTime": _format_duration(current["position"]),
+                "TrackURI": current["uri"] or "",
+            })
+        raise RuntimeError("Unsupported action")
+
+    def _current_position_locked(self) -> float:
+        if self._transport_state == "PLAYING" and self._playing_since is not None:
+            position = self._position + time.monotonic() - self._playing_since
+            return min(position, self._duration) if self._duration else position
+        return self._position
+
+    def _soap_response(self, action: str, values: dict[str, str] | None = None) -> bytes:
+        envelope = ET.Element(f"{{{_SOAP_ENV_NS}}}Envelope")
+        body = ET.SubElement(envelope, f"{{{_SOAP_ENV_NS}}}Body")
+        response = ET.SubElement(body, f"{{{_AV_TRANSPORT_NS}}}{action}Response")
+        for name, value in (values or {}).items():
+            ET.SubElement(response, name).text = value
+        return ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
+
+    def _soap_fault(self) -> bytes:
+        envelope = ET.Element(f"{{{_SOAP_ENV_NS}}}Envelope")
+        body = ET.SubElement(envelope, f"{{{_SOAP_ENV_NS}}}Body")
+        fault = ET.SubElement(body, f"{{{_SOAP_ENV_NS}}}Fault")
+        ET.SubElement(fault, "faultcode").text = "s:Client"
+        ET.SubElement(fault, "faultstring").text = "Action failed"
+        detail = ET.SubElement(fault, "detail")
+        error = ET.SubElement(detail, "UPnPError")
+        ET.SubElement(error, "errorCode").text = "501"
+        ET.SubElement(error, "errorDescription").text = "Action failed"
+        return ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
+
+
+def _format_duration(seconds: int) -> str:
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
