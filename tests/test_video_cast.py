@@ -839,6 +839,29 @@ def test_playing_timer_stops_once_tv_plays(_qapp, monkeypatch):
     assert view._cast_state == "playing"
 
 
+def test_paused_playback_does_not_confirm_cast_start(_qapp):
+    """启动未确认时 PAUSED_PLAYBACK 不得撤销超时保护或进入 paused。"""
+    view = _view(_video_detail(3), idx=0)
+    view._cast_session = _FakeSession()
+    view._cast_poll_task = object()
+    view._cast_state = "connecting"
+    view._cast_playing_timer.start()
+
+    view._on_cast_state({"state": "PAUSED_PLAYBACK", "position": 0,
+                         "duration": 10, "track": 1, "uri": "u"},
+                        view._cast_poll_task)
+
+    assert view._cast_playing_timer.isActive() is True
+    assert view._cast_state == "connecting"
+
+    view._on_cast_state({"state": "PLAYING", "position": 0,
+                         "duration": 10, "track": 1, "uri": "u"},
+                        view._cast_poll_task)
+
+    assert view._cast_playing_timer.isActive() is False
+    assert view._cast_state == "playing"
+
+
 # --------------------------------------------------------------------- #
 # 5. 生命周期清理
 # --------------------------------------------------------------------- #

@@ -2442,15 +2442,14 @@ class VideoView(QWidget):
                 f"{_fmt_hms(position)} / {_fmt_hms(self._cast_duration)}")
         if transport == "PLAYING":
             self._cast_state = "playing"
+            self._cast_playing_timer.stop()
         elif transport == "PAUSED_PLAYBACK":
-            self._cast_state = "paused"
+            if not self._cast_playing_timer.isActive():
+                self._cast_state = "paused"
         elif transport in ("STOPPED", "NO_MEDIA_PRESENT"):
             self._cast_state = "stopped"
         # TRANSITIONING（切集中）不改状态：启动期仍是 connecting（按钮禁用），
         # 已投屏则维持原状态，避免切集瞬间把「停止投屏」入口关掉。
-        if transport in ("PLAYING", "PAUSED_PLAYBACK"):
-            # 电视已进 PLAYING（或其后被暂停）= 启动成功 → 撤掉 8s 超时定时器
-            self._cast_playing_timer.stop()
         self._update_play_button()
         device = self._cast_device
         if self._cast_state == "playing":
