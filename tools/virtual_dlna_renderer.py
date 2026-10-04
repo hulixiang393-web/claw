@@ -179,7 +179,7 @@ class VirtualMediaFetcher:
             allow_extensionless=allow_extensionless,
         )
 
-        result = {**http, **probe, **decoded}
+        result = {**http, **probe, **decoded, "probe": probe, "decode": decoded}
         return result
 
 
@@ -222,6 +222,7 @@ class VirtualRenderer:
         self._position = 0.0
         self._playing_since: float | None = None
         self._error = ""
+        self._last_result: dict[str, Any] = {}
 
     def start(self):
         if self._server is not None:
@@ -291,6 +292,10 @@ class VirtualRenderer:
                 "error": self._error or None,
             }
 
+    def diagnostics(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._last_result)
+
     def set_uri(self, uri: str, title: str = "", mime_type: str = "video/mp4") -> None:
         del title, mime_type
         with self._lock:
@@ -316,8 +321,10 @@ class VirtualRenderer:
             uri = self._uri
         try:
             result = VirtualMediaFetcher(self.ffmpeg_path, self.fetch_timeout).decode(uri)
-        except Exception:
-            result = {"decoded": False}
+        except Exception as exc:
+            result = {"decoded": False, "error": type(exc).__name__}
+        with self._lock:
+            self._last_result = dict(result)
         if not result.get("decoded"):
             with self._lock:
                 self._transport_state = "ERROR"
