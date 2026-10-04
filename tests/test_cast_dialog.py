@@ -433,6 +433,10 @@ def test_refresh_keeps_history_group_on_top(app):
     assert dialog.device_list.count() == 1  # 历史保留、上次扫描结果被清掉
     assert dialog.device_list.item(0).data(Qt.UserRole) == "uuid:tv-1"
     assert not dialog.clear_history_btn.isHidden()
+    # 刷新后恢复「上次使用」默认选中：与打开时一致，直接点确定即可投
+    assert dialog.device_list.currentRow() == 0
+    assert dialog.select_btn.isEnabled() is True
+    assert dialog.selected_device().udn == "uuid:tv-1"
 
 
 def test_clear_history_emits_signal_and_drops_history_items(app):
@@ -466,3 +470,32 @@ def test_clear_history_emits_signal_and_drops_history_items(app):
     assert dialog.device_list.currentItem() is None
     assert dialog.select_btn.isEnabled() is False
     assert "1" in dialog.status_label.text()  # 设备数按剩余数量刷新
+
+
+def test_clear_history_during_scan_restores_empty_hint(app):
+    """扫描进行中点「清除历史」：_finish_scan_ui 被跳过，空提示仍即时回显。
+
+    扫描 worker 运行中（≤2s）清历史时，走不到 _finish_scan_ui，移除后空列表
+    却不给提示，要等扫描结束才自愈。
+    """
+    history = [_history_entry("uuid:tv-1", "客厅电视")]
+    dialog = cd.CastDeviceDialog("第 1 集", history=history)
+    assert dialog.empty_hint.isHidden()                  # 有历史 → 打开即隐藏
+
+    with patch.object(
+        cd.dlna, "discover_renderers",
+        side_effect=lambda timeout=2.0: time.sleep(0.5) or [],
+    ):
+        dialog._start_scan()
+        assert dialog._worker is not None and dialog._worker.isRunning()
+        assert dialog.empty_hint.isHidden()              # 扫描中先藏起空提示
+        dialog.clear_history_btn.click()
+        assert not dialog.empty_hint.isHidden()          # 清完立即回显
+        assert dialog.device_list.count() == 0
+        assert dialog.clear_history_btn.isHidden()
+        _wait_thread_idle(app, dialog._worker)
+        app.processEvents()
+
+    assert not dialog.empty_hint.isHidden()              # 扫描收口后仍是空提示
+    assert "未找到设备" in dialog.status_label.text()
+    assert dialog.select_btn.isEnabled() is False

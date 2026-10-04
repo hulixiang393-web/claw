@@ -1260,3 +1260,104 @@ def test_dialog_clear_history_signal_clears_store(
     assert view._cast_history().last() is None      # 视图侧存储同步清空
     assert view._cast_state == "idle"               # 取消投屏：回到干净 idle
     assert view._cast_active is False
+
+
+def test_direct_cast_sync_failure_falls_back_to_device_dialog(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """IMP-1：_start_cast 同步异常（构造/建线程）在直投下也必须回落对话框。
+
+    历史条目不会因失败被清除：若这条分支只报错不开框，用户每次点投屏都直投
+    失败、又拿不到「清除历史」入口 —— 死路（决策 2 的「start 失败再弹框」
+    只写在后台任务槽里，漏了同步异常这条）。
+    """
+    _seed_history(_isolated_cast_history, _renderer(udn="uuid:tv-1"))
+    view = _view(_video_detail(3), idx=0)
+
+    def _boom(proxy, client_factory, on_local_player_stop=None):
+        raise RuntimeError("LAN 端点被占用")
+
+    monkeypatch.setattr(cs, "CastSession", _boom)
+    _install_proxy(monkeypatch)
+    seen = _install_dialog(monkeypatch, accepted=False)  # 用户看过框后取消
+    statuses = []
+    monkeypatch.setattr(view, "_show_status", lambda text: statuses.append(text))
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    view._on_cast_clicked()                              # 直投 → 同步构造失败
+
+    assert seen["titles"] == ["第1集 标题0"]              # 回落打开了设备选择框
+    assert seen["history"] and seen["history"][0][0]["udn"] == "uuid:tv-1"
+    assert any("连接上次投屏设备失败" in text for text in statuses)
+    assert view._cast_direct is False                    # 回落已复位，不会连环弹框
+    assert view._cast_error == ""                        # 不是「报错死」而是「可换设备」
+    assert view._cast_state == "idle"                    # 用户取消 → 干净 idle
+    assert view.cast_btn.isEnabled() is True
+    assert view._cast_start_task is None                 # 守卫不被残留任务卡死
+
+
+def test_stale_direct_cast_result_never_opens_fallback_dialog(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """IMP-2a：作废的直投结果（gen 守卫丢弃的迟到失败）不触发对话框回落。"""
+    _seed_history(_isolated_cast_history, _renderer(udn="uuid:tv-1"))
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession(start_error=OSError("connection timed out"))
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    seen = _install_dialog(monkeypatch, renderer=_renderer(udn="uuid:tv-2"))
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    view._on_cast_clicked()                              # 直投在途（不开框）
+    assert view._cast_state == "connecting"
+    assert seen["titles"] == []
+    view._stop_cast()                                    # 换源/关页作废在途 start
+
+    assert _wait_for(lambda: view._cast_start_task is None,
+                     timeout=_CAST_WAIT), "陈旧启动未收尾"
+    _drain()                                             # 迟到的失败信号落地
+
+    assert seen["titles"] == []                          # 作废结果不回落弹框
+    assert view._cast_state == "idle"
+    assert view._cast_error == ""
+    assert view._cast_active is False
+
+
+def test_episode_switch_never_enters_direct_cast_branch(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """IMP-2b：切集（kind == "episode"）不进直投分支——不开框、不重新 start。"""
+    _seed_history(_isolated_cast_history, _renderer(udn="uuid:tv-1"))
+    view = _view(_video_detail(5), idx=0)
+    session, _captured, seen = _start_cast(view, monkeypatch)
+    assert seen["titles"] == []                          # 有历史：首播走直投
+
+    ep1 = view._episodes[1]
+    view._stream_cache[(ep1.url, view._quality)] = ("https://cdn/e1.m3u8", "")
+    view._cast_set_episode(1)
+
+    assert seen["titles"] == []                          # 切集不弹设备选择框
+    assert [call[0] for call in session.calls].count("start") == 1  # 没有第二次 start
+    assert ("set_episode", 1, "https://cdn/e1.m3u8", "第2集 标题1") in session.calls
+    assert view._cast_direct is False
+    assert view._cast_active is True
+    assert view._current_idx == 1
+
+
+def test_direct_cast_success_rewrites_history_entry(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """IMP-2c：直投成功后历史被写入——文件 last_used 被刷新（对话框未开）。"""
+    from framework.cast_history import CastHistory
+
+    seeded_at = 1730000000.0
+    store = CastHistory(_isolated_cast_history)
+    store.record(_renderer(udn="uuid:tv-1"), now=seeded_at)   # 旧时间戳播种
+
+    view = _view(_video_detail(3), idx=0)
+    session, _captured, seen = _start_cast(view, monkeypatch)
+
+    assert seen["titles"] == []                          # 确实走的直投路径
+    assert session.calls[0][0] == "start"
+    assert view._cast_active is True
+    entries = CastHistory(_isolated_cast_history).entries()   # 重新读文件
+    assert [entry["udn"] for entry in entries] == ["uuid:tv-1"]
+    assert entries[0]["last_used"] > seeded_at           # start 成功即刷新

@@ -2215,12 +2215,13 @@ class VideoView(QWidget):
     def _cast_pick_device(self, idx: int, video: str) -> None:
         """取流完成选目标设备：有历史直投上次设备，否则开选择对话框。
 
-        直投在 _start_cast 后台 start；连接失败（SOAP 超时等）由
-        _on_cast_start_finished 的回落分支打开对话框让用户换设备。
+        直投在 _start_cast 后台 start；连接失败（SOAP 超时、构造/建线程同步
+        异常）由 _cast_direct_fallback 打开对话框让用户换设备。
         切集（kind == "episode"）走不到这里，不受直投影响。
         """
         renderer = self._last_cast_renderer()
         if renderer is None:
+            self._cast_direct = False  # 显式复位：不依赖 _begin_cast 的前置复位
             self._open_cast_dialog(idx, video)
             return
         self._cast_direct = True
@@ -2283,8 +2284,9 @@ class VideoView(QWidget):
         self._cast_state = "connecting"
         self._update_cast_button()
         # 构造会话 / 建线程 / 起线程都在 try 内：任何一步抛错都收敛到
-        # _cast_fail_start → _stop_cast(error)，否则异常冒到 Qt 槽只打印一行，
-        # 状态卡死在 connecting、按钮禁用、_cast_start_task 残留（F5-2）。
+        # _cast_fail_start（直投则走 _cast_direct_fallback），否则异常冒到
+        # Qt 槽只打印一行，状态卡死在 connecting、按钮禁用、
+        # _cast_start_task 残留（F5-2）。
         try:
             from framework.cast_session import CastSession
             from framework.dlna import DlnaClient
@@ -2307,7 +2309,30 @@ class VideoView(QWidget):
             # 没有真正在途的任务：必须清掉引用，否则 _begin_cast 的串行守卫
             # 会永久拦截「上一次投屏启动尚未结束」，用户再也无法重试。
             self._cast_start_task = None
+            if self._cast_direct:
+                # 直投的同步异常与后台 start 失败同样要回落对话框：历史条目
+                # 不会被清除，只报错不开框 = 下次点投屏仍直投、仍到不了选择
+                # 入口的死路（决策 2 的「start 失败再弹框」唯一的漏网分支）。
+                self._cast_direct_fallback(exc, idx, video)
+                return
             self._cast_fail_start(exc)
+
+    def _cast_direct_fallback(self, exc: BaseException, idx: int,
+                              video: str) -> None:
+        """直投上次设备失败 → 回落选设备对话框（同步异常与后台失败共用）。
+
+        把失败原因带状态栏，让用户换一台电视继续，而不是报错死：清
+        _cast_direct（只回落一层，第二次失败走 _cast_fail_start 不再弹框）、
+        状态回 preparing_stream（保证对话框确认后可续投）。
+        """
+        self._cast_direct = False
+        self._cast_state = "preparing_stream"  # 对话框确认后可续投
+        self._show_status(
+            f"连接上次投屏设备失败：{str(exc) or exc.__class__.__name__}，"
+            "请选择投屏设备"
+        )
+        self._update_cast_button()
+        self._open_cast_dialog(idx, video)
 
     def _on_cast_start_finished(self, gen: int, session, exc) -> None:
         """start 后台完成（主线程槽）：按代数分流——新鲜才装配，陈旧只收尾。"""
@@ -2330,14 +2355,7 @@ class VideoView(QWidget):
             if self._cast_direct:
                 # 直投上次设备失败（SOAP 超时/拒连等）→ 回落选设备对话框，
                 # 把失败原因带状态栏，让用户换一台电视继续，而不是报错死。
-                self._cast_direct = False
-                self._cast_state = "preparing_stream"  # 对话框确认后可续投
-                self._show_status(
-                    f"连接上次投屏设备失败：{str(exc) or exc.__class__.__name__}，"
-                    "请选择投屏设备"
-                )
-                self._update_cast_button()
-                self._open_cast_dialog(task.idx, task.video)
+                self._cast_direct_fallback(exc, task.idx, task.video)
                 return
             self._cast_fail_start(exc)
             return

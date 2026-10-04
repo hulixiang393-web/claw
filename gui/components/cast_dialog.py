@@ -267,6 +267,10 @@ class CastDeviceDialog(QDialog):
             self.select_btn.setEnabled(False)
         if self._worker is None or not self._worker.isRunning():
             self._finish_scan_ui()  # 状态行设备数按移除后的实际数量刷新
+        else:
+            # 扫描仍在进行：_finish_scan_ui 被跳过，空提示要按移除后的实际
+            # 数量即时回显（状态行此刻是「正在扫描…」，无陈旧计数可修）。
+            self.empty_hint.setVisible(self.device_list.count() == 0)
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -364,6 +368,10 @@ class CastDeviceDialog(QDialog):
         self.select_btn.setEnabled(False)
         for renderer in self._history_renderers:
             self._append_item(renderer)
+        if self._history_renderers:
+            # 与打开对话框时一致：恢复「上次使用」默认选中，刷新后不必
+            # 再多点一次（选中经 itemSelectionChanged 同步启用确定按钮）
+            self.device_list.setCurrentRow(0)
         self._start_scan()
 
     # ------------------------------------------------------------------ #
