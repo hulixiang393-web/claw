@@ -1,7 +1,7 @@
 # Task 3 Report
 
 status: PASS
-commit: HEAD（fix(cast): use public proxy API and session-owned title in rollback）
+commit: 1e0ebff（fix(cast): use public proxy API and session-owned title in rollback）
 
 ## 测试结果
 

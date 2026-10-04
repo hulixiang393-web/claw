@@ -19,10 +19,22 @@ def _local_ip_for_renderer(renderer) -> str:
 class CastSession:
     """投屏会话。
 
-    并发契约：start/stop/set_episode 等状态变更方法在同一把锁下串行执行；
+    并发契约：start/stop/set_episode 等状态变更方法在同一把锁下串行执行，
+    其中 start()/stop()/set_episode() 在**持锁状态下**完成各自的网络 IO
+    （DlnaClient SOAP 调用、LAN 端点启停），最坏可让其他线程（如轮询线程取
+    快照、GUI 调 play/pause/seek）同步等待数秒至十余秒——这是延迟风险而非
+    死锁；play/pause/seek 仅在锁内取 client 快照，网络调用在锁外。
     poll_state() 在轮询线程运行，client 网络调用在锁外做，仅「检查并标记
-    local_player_stopped」临界区持锁，on_local_player_stop 回调在持锁状态下
+    local_player_stopped」临界区持锁（临界区复验 _active：会话在本轮网络
+    调用期间被 stop() 则不再触发回调），on_local_player_stop 回调在持锁状态下
     于轮询线程执行，实现方不得在回调里阻塞等待其他线程调用本会话方法。
+    回调标记遵循「只尝试一次」：local_player_stopped 先于回调置位，回调抛
+    异常也不会在下一轮 PLAYING 时重复触发。
+
+    proxy 契约：注入的 proxy 必须实现 start_lan_endpoint / build_url /
+    release_token / stop_lan_endpoint / lan_endpoint_error 五个公开方法；
+    stop() 无条件调用 lan_endpoint_error()，缺失该方法将以 AttributeError
+    失败（finally 中的 _clear_state() 仍会执行，LAN 端点也已停止）。
     """
 
     def __init__(self, proxy, client_factory, on_local_player_stop=None):
@@ -131,7 +143,7 @@ class CastSession:
 
                 client.play()
 
-            except Exception:
+            except Exception as original_error:
                 if uri_set:
                     try:
                         client.set_av_transport_uri(old_url, old_title,
@@ -140,7 +152,10 @@ class CastSession:
                     except Exception as recovery_error:
                         if new_url is not None:
                             self.proxy.release_token(new_url)
-                        raise RuntimeError(f"set_episode failed and recovery failed: {recovery_error}") from recovery_error
+                        raise RuntimeError(
+                            f"set_episode failed and recovery failed: {recovery_error}"
+                            f" (original: {original_error})"
+                        ) from recovery_error
 
                 self.current_episode_index = old_index
                 self._current_url = old_url
@@ -172,10 +187,10 @@ class CastSession:
         }
         if state == "PLAYING":
             with self._lock:
-                if not self.local_player_stopped:
+                if self._active and not self.local_player_stopped:
+                    self.local_player_stopped = True
                     if self.on_local_player_stop is not None:
                         self.on_local_player_stop()
-                    self.local_player_stopped = True
         return result
 
     def _require_active(self):

@@ -132,6 +132,62 @@ def test_poll_transitional_then_playing_stops_local_player_once(monkeypatch, ren
     assert stopped == ["stopped"]
 
 
+def test_poll_marks_stopped_even_when_stop_callback_raises(monkeypatch, renderer):
+    # R-3/M-2：回调抛异常时也必须置位，「只尝试一次」不得重复触发
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(
+        calls,
+        states=[{"state": "PLAYING"}, {"state": "PLAYING"}],
+        positions=[{"position": 0, "duration": 90, "track": 1, "uri": "u"}] * 2,
+    )
+    attempts = []
+
+    def exploding_callback():
+        attempts.append("attempt")
+        raise RuntimeError("callback boom")
+
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, exploding_callback)
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    with pytest.raises(RuntimeError, match="callback boom"):
+        session.poll_state()
+
+    assert session.local_player_stopped is True
+    assert session.poll_state()["state"] == "PLAYING"
+    assert attempts == ["attempt"]
+
+
+def test_poll_skips_stop_callback_when_session_stopped_mid_poll(monkeypatch, renderer):
+    # R-2：轮询网络调用在锁外，期间另一线程完成 stop() 后不得再触发回调
+    proxy = FakeProxy()
+    stopped = []
+    client = FakeClient(
+        [],
+        states=[{"state": "PLAYING"}],
+        positions=[{"position": 0, "duration": 90, "track": 1, "uri": "u"}],
+    )
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, lambda: stopped.append("stopped"))
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    original_position_info = client.get_position_info
+
+    def stop_during_poll():
+        # 同线程重入模拟「锁外网络调用期间另一线程完成 stop()」
+        session.stop()
+        return original_position_info()
+
+    client.get_position_info = stop_during_poll
+
+    result = session.poll_state()
+
+    assert result["state"] == "PLAYING"
+    assert stopped == []
+    assert session.local_player_stopped is False
+
+
 def test_pause_and_seek_delegate_to_client(monkeypatch, renderer):
     proxy = FakeProxy()
     calls = []
@@ -394,13 +450,17 @@ def test_set_episode_recovery_failure_wraps_error(monkeypatch, renderer):
         def __init__(self, calls, events):
             super().__init__(calls, events=events)
             self.set_episode_started = False
+            self.play_fails = 0
 
         def play(self):
             if self.set_episode_started:
+                self.play_fails += 1
                 self.calls.append(("play",))
                 if self.events is not self.calls:
                     self.events.append(("play", "after_uri_set"))
-                raise RuntimeError("play after new uri failed")
+                if self.play_fails == 1:
+                    raise RuntimeError("play after new uri failed")
+                raise RuntimeError("recovery play failed")
             super().play()
 
     client = PartialFailClient(calls, events=events)
@@ -414,9 +474,13 @@ def test_set_episode_recovery_failure_wraps_error(monkeypatch, renderer):
 
     client.set_episode_started = True
 
-    with pytest.raises(RuntimeError,
-                        match="set_episode failed and recovery failed: play after new uri failed"):
+    with pytest.raises(RuntimeError) as excinfo:
         session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
+
+    # F-2：包装消息需同时含恢复失败与原始失败（GUI 直接展示 str(exc)）
+    message = str(excinfo.value)
+    assert "set_episode failed and recovery failed: recovery play failed" in message
+    assert "original: play after new uri failed" in message
 
     # 恢复失败分支：会话保持 active，索引/URL 未被改写，仅新 token 被释放
     assert session._active is True
