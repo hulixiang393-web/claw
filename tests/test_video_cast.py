@@ -1361,3 +1361,36 @@ def test_direct_cast_success_rewrites_history_entry(
     entries = CastHistory(_isolated_cast_history).entries()   # 重新读文件
     assert [entry["udn"] for entry in entries] == ["uuid:tv-1"]
     assert entries[0]["last_used"] > seeded_at           # start 成功即刷新
+
+
+def test_broken_history_module_import_degrades_to_dialog(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """F1：framework.cast_history 导入异常 → 不冒泡，降级「无历史」开对话框。
+
+    历史模块损坏是 IMP-1 的入口侧镜像：_last_cast_renderer 的 import 若抛出，
+    异常从 _cast_pick_device → _cast_stream_arrived 冒到 Qt 槽只打印一行，
+    _cast_state 卡死在 preparing_stream、按钮禁用、_begin_cast 防连点守卫
+    永久拦截，而对话框（唯一的「清除历史」入口）始终不开 = 死路。
+    """
+    _seed_history(_isolated_cast_history, _renderer(udn="uuid:tv-1"))
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession()
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    seen = _install_dialog(monkeypatch, renderer=_renderer(udn="uuid:tv-2"))
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+    # 历史模块本身损坏：任何 from framework.cast_history import ... 都抛
+    monkeypatch.setitem(sys.modules, "framework.cast_history", None)
+
+    assert view._last_cast_renderer() is None      # 修复前：ImportError 在此冒泡
+    view._on_cast_clicked()                        # 修复前：同样冒泡、状态卡死
+
+    assert _wait_for(lambda: view._cast_session is not None,
+                     timeout=_CAST_WAIT), "降级到对话框后未完成投屏"
+    assert seen["titles"] == ["第1集 标题0"]       # 走了对话框（而非卡死/直投）
+    assert seen["history"] == [[]]                 # 降级为「无历史」
+    assert view._cast_direct is False
+    assert view._cast_start_task is None           # 串行守卫不被残留任务卡死
+    assert view._cast_state != "preparing_stream"  # 没卡在入口侧死路状态
+    assert view.cast_btn.isEnabled() is True

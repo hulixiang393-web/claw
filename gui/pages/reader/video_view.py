@@ -2186,11 +2186,17 @@ class VideoView(QWidget):
             return []
 
     def _last_cast_renderer(self):
-        """上次投屏成功的设备（DlnaRenderer）；无历史/条目非法返回 None。"""
-        from framework.cast_history import renderer_from_entry
+        """上次投屏成功的设备（DlnaRenderer）；无历史/历史不可用返回 None。"""
+        try:
+            from framework.cast_history import renderer_from_entry
 
-        entries = self._cast_history_entries()
-        return renderer_from_entry(entries[0]) if entries else None
+            entries = self._cast_history_entries()
+            return renderer_from_entry(entries[0]) if entries else None
+        except Exception:  # noqa: BLE001 —— 模块损坏按无历史处理，落到弹框
+            # 不兜底则异常冒到 Qt 槽，状态卡死 preparing_stream、按钮禁用，
+            # 对话框（唯一「清除历史」入口）永不开 = IMP-1 的入口侧镜像。
+            log.warning("读取上次投屏设备失败", exc_info=True)
+            return None
 
     def _record_cast_history(self, renderer) -> None:
         """投屏 start 成功即写历史（不等 PLAYING；写失败不影响投屏）。"""
