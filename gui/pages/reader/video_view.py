@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import webbrowser
 from types import SimpleNamespace
@@ -135,6 +136,84 @@ class _FetchStreamTask(QRunnable):
             self.signals.finished.emit(self._url, video, audio, err, self._quality)
         except RuntimeError:
             pass
+
+
+class _CastSignals(QObject):
+    state_changed = Signal(object)  # poll_state() 结果 dict（worker emit）
+    poll_failed = Signal(str)       # 连续失败达阈值（worker emit）
+
+
+class _CastPollTask:
+    """投屏状态后台轮询：每 interval 秒调一次 session.poll_state()。
+
+    **只发 Qt 信号，绝不碰控件**——控件更新全在 VideoView 的主线程槽里。
+    连续 max_failures 次抛错才判定失败并停止轮询，中途任一次成功即清零计数
+    （网络抖一下不该把会话判死）。
+
+    用普通守护线程而非 QRunnable：线程池只持**裸指针**，Python 侧先 GC 就把
+    C++ QRunnable 释放了，池随后再排到它 → 悬垂指针（全量回归里直接 AV 崩）。
+    改用 threading 后，线程的 target 是本对象的 run()，线程活着就自持引用，
+    不依赖任何外部持有者。
+    """
+
+    def __init__(self, session, interval: float = 1.0, max_failures: int = 3):
+        self.signals = _CastSignals()
+        self._session = session
+        self._interval = interval
+        self._max_failures = max_failures
+        self._running = True
+        self.failures = 0
+        self._thread = None
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def start(self) -> None:
+        """起后台线程（幂等）。"""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self.run, daemon=True,
+                                        name="cast-poll")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def tick(self) -> bool:
+        """单轮轮询；返回 False 表示应停止轮询。"""
+        if not self._running:
+            return False
+        try:
+            state = self._session.poll_state()
+        except Exception as exc:  # noqa: BLE001 —— 网络/SOAP 全部按轮询失败计
+            self.failures += 1
+            if self.failures >= self._max_failures:
+                self._running = False
+                try:
+                    self.signals.poll_failed.emit(str(exc) or exc.__class__.__name__)
+                except RuntimeError:
+                    pass
+                return False
+            return True
+        self.failures = 0
+        try:
+            self.signals.state_changed.emit(state)
+        except RuntimeError:
+            pass
+        return True
+
+    def run(self) -> None:
+        while self._running:
+            if not self.tick():
+                break
+            # 分段睡眠：stop() 能在一个 step 内生效，不用等满整个 interval
+            deadline = time.monotonic() + self._interval
+            while self._running:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                time.sleep(min(0.1, left))
 
 
 class _RecommendSignals(QObject):
@@ -314,6 +393,10 @@ class VideoView(QWidget):
     # 握手线程建好的 {集下标: vlc_id} 映射（同上：后台 emit，主线程消费）
     # 代数的取法同上：建会话时捕获，不能在 emit 时读 self._play_gen。
     _vlc_playlist_ready = Signal(int, object)           # (代数, 映射)
+    # CastSession 的 on_local_player_stop 回调在**轮询线程**里被调用 → 这里
+    # emit 后队列投递到主线程才真正停本地播放器（跨线程绝不碰 Qt 对象）。
+    # 顺序保证：start() 不停本地 VLC，只有电视报 PLAYING 才走到这条信号。
+    _cast_local_player_stop = Signal()
 
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
@@ -386,6 +469,21 @@ class VideoView(QWidget):
         self._hide_timer = QTimer(self)  # 控制条自动隐藏
         self._hide_timer.setInterval(3000)
         self._hide_timer.timeout.connect(self._hide_controls)
+
+        # ---- 投屏（DLNA）状态：idle / preparing_stream / connecting /
+        #      playing / paused / stopped / error ----
+        self._cast_session = None       # framework.cast_session.CastSession
+        self._cast_renderer = None      # 当前投屏的 DlnaRenderer
+        self._cast_device = ""          # 电视 friendly_name（按钮悬停展示）
+        self._cast_active = False       # 电视端接管中（控制路由切到会话）
+        self._cast_state = "idle"
+        self._cast_error = ""           # 最近一次投屏失败原因（清空 = 干净 idle）
+        self._cast_duration = 0         # 电视端总时长（秒，轮询回填）
+        self._cast_poll_task = None     # _CastPollTask（防 GC + 供 stop()）
+        self._cast_stream_task = None   # 投屏取流任务（防 GC）
+        self._cast_stream_pending = None  # (目标集下标, "start"|"episode")
+        self._cast_status_text = ""     # 最近一次投屏状态文案（轮询去抖）
+        self._cast_local_player_stop.connect(self._on_cast_local_player_stop)
 
         self.setFocusPolicy(Qt.StrongFocus)  # 视图级快捷键
         self._build_ui()
@@ -574,6 +672,9 @@ class VideoView(QWidget):
         )
         cb.addWidget(self.progress, stretch=1)
 
+        # 投屏进度：仅 cast_active 下生效（槽内自校验），未投屏的拖拽是空操作
+        self.progress.sliderReleased.connect(self._on_cast_progress_released)
+
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setStyleSheet("color: palette(dark); font-size: 11px;")
         cb.addWidget(self.time_label)
@@ -609,6 +710,11 @@ class VideoView(QWidget):
         self.source_menu.aboutToHide.connect(self._video_frame.setFocus)
         cb.addWidget(self.source_btn)
 
+        # 投屏（📺）：换源按钮旁的 DLNA 入口。未投屏显示「投屏」，投屏中
+        # 显示「停止投屏 - <设备名>」；状态/可用性由 _update_cast_button 统一刷。
+        self.cast_btn = self._icon_btn("📺", "投屏", self._on_cast_clicked, width=32)
+        cb.addWidget(self.cast_btn)
+
         # 设置菜单（⚙）：画质 + 复制地址 + 刷新 + 外部播放器 + 帮助
         self.settings_btn = QToolButton()
         self.settings_btn.setText("⚙")
@@ -632,6 +738,10 @@ class VideoView(QWidget):
         # 下载当前作品（⏬）：与顶部「下载」同链路，播放器内即可触发
         self.dl_btn = self._icon_btn("⏬", "下载当前作品", self._on_download_clicked, width=32)
         cb.addWidget(self.dl_btn)
+
+        # 初始可用性：无源/无当前集 → 禁用（_disable_embedded_controls 不碰它，
+        # 外部播放器模式下投屏入口依旧可用）
+        self._update_cast_button()
 
     def _on_download_clicked(self) -> None:
         """播放器内「⏬ 下载」→ 转发 App 层弹章节范围（默认当前集→末集）。
@@ -719,6 +829,10 @@ class VideoView(QWidget):
         if not (0 <= idx < len(self._episodes)):
             return
         if idx == self._current_idx and not self._selection_mode:
+            return
+        # 投屏中：选集走 CastSession.set_episode（电视端切集），不碰本地播放路径
+        if self._cast_active:
+            self._cast_set_episode(idx)
             return
         # 外播且有**当前会话**的 vlc_id 映射 → pl_play 指挥 VLC 切集（不重开进程、
         # 进度不丢）。无映射（握手未完成/失败）或 pl_play 失败 → 落回重开路径。
@@ -987,6 +1101,7 @@ class VideoView(QWidget):
         """按当前集刷新分集卡片选中态高亮。"""
         for i, card in enumerate(self._ep_cards):
             card.set_selected(i == self._current_idx)
+        self._update_cast_button()  # 当前集变化 → 投屏按钮可用性跟随
 
     def _wipe_grid(self, grid) -> None:
         """清空网格布局项（卡片对象由持有列表管理，不在此销毁）。"""
@@ -1153,6 +1268,7 @@ class VideoView(QWidget):
         if restore_position is not None:
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用）。
+        self._stop_cast()  # 换作品 → 投屏会话/轮询/代理 LAN 端点一并收掉
         self._stop_player()
         self._invalidate_current_stream()  # 与 reload_detail 同一不变量，防两处分叉
         self._episodes = detail.chapters
@@ -1169,6 +1285,7 @@ class VideoView(QWidget):
                     idx = i
                     break
         self._current_idx = idx if detail.chapters else -1
+        self._update_cast_button()
         self._sync_overlay_state(playing=False)
         self._refresh_ep_menu()
         self._maybe_load_recommendations()
@@ -1192,6 +1309,7 @@ class VideoView(QWidget):
 
     def reload_detail(self, new_detail: Detail) -> None:
         """换源重载分集后调用：多集源停选集态等用户选择，单集/无分集自动取流播放。"""
+        self._stop_cast()    # 换源 → 投屏会话一并收掉（旧源的流不能再推电视）
         self._stop_player()  # 换源先停旧播放流
         # 换源：代数自增。关键——多集源分支**不调用 _play**，若不在此自增，
         # 旧系列的 on_play 会带着仍然有效的代数回来，把旧源流写进新源的
@@ -1212,6 +1330,7 @@ class VideoView(QWidget):
         self._switching = False
         self._sync_overlay_state(playing=False)
         self._current_idx = 0 if new_detail.chapters else -1
+        self._update_cast_button()
         self._refresh_ep_menu()
         self._maybe_load_recommendations()
         if not new_detail.chapters:
@@ -1257,6 +1376,7 @@ class VideoView(QWidget):
 
     def shutdown_video(self) -> None:
         """App 退出释放 VLC 播放器。"""
+        self._stop_cast()  # 退出 → 先停投屏轮询并 Stop/释放 DLNA 会话与 LAN 端点
         if self._player is not None:
             self._player.close()
             self._player = None
@@ -1317,6 +1437,7 @@ class VideoView(QWidget):
         """
         if self._fs_win is not None:
             self._exit_fullscreen()
+        self._stop_cast()  # 离开视频页 → 投屏会话清理（会话回调不会再来停本地播放）
         self._stop_player()
         self._current_play = ""
         self._detail_url_for_play = ""
@@ -1348,6 +1469,7 @@ class VideoView(QWidget):
     # ------------------------------------------------------------------ #
     def _show_status(self, text: str) -> None:
         """状态浮层显示（加载/错误提示，覆盖在视频区内不占布局；成功后自动清空）。"""
+        self._cast_status_text = text  # 投屏轮询用它去抖（每秒同文案不重排 UI）
         if text:
             self.play_label.setText(text)
             self.play_label.adjustSize()
@@ -1819,6 +1941,372 @@ class VideoView(QWidget):
             QThreadPool.globalInstance().start(task)
 
     # ------------------------------------------------------------------ #
+    # 投屏（DLNA）：📺 入口 / 启停 / 双向控制 / 后台轮询状态同步
+    # ------------------------------------------------------------------ #
+    def _update_cast_button(self) -> None:
+        """刷新投屏按钮的可用性与悬停文案（未投屏「投屏」/ 投屏中「停止投屏」）。"""
+        btn = getattr(self, "cast_btn", None)
+        if btn is None:  # 构建控制条前（__init__ 早期）可能被调
+            return
+        has_source = self._source is not None
+        has_episode = 0 <= self._current_idx < len(self._episodes)
+        if self._cast_session is not None or self._cast_active:
+            # 投屏中始终可点（这是「停止投屏」入口），并展示设备名
+            tip = "停止投屏"
+            if self._cast_device:
+                tip += f" - {self._cast_device}"
+            btn.setEnabled(True)
+            btn.setToolTip(tip)
+            return
+        if self._cast_error:
+            # 上次失败 → 悬停可见原因；仍可点（点击即重试）
+            btn.setEnabled(has_source and has_episode)
+            btn.setToolTip(f"投屏失败：{self._cast_error}")
+            return
+        busy = self._cast_state in ("preparing_stream", "connecting")
+        btn.setEnabled(has_source and has_episode and not busy)
+        btn.setToolTip("正在投屏..." if busy else "投屏")
+
+    def _on_cast_clicked(self) -> None:
+        """📺 按钮：投屏中 → 停止投屏；否则启动投屏。"""
+        if self._cast_session is not None or self._cast_active:
+            self._stop_cast()
+            return
+        self._begin_cast()
+
+    # ---- 启动：取流 → 选设备 → CastSession.start ---- #
+    def _begin_cast(self) -> None:
+        """投屏第一步：解析当前集播放流（缓存命中不重复取流）。"""
+        if self._source is None or not (0 <= self._current_idx < len(self._episodes)):
+            return
+        if self._cast_state in ("preparing_stream", "connecting"):
+            return  # 防连点
+        self._cast_state = "preparing_stream"
+        self._cast_error = ""  # 重试入口：清掉上次失败，按钮文案回到「正在投屏...」
+        self._update_cast_button()
+        self._cast_resolve_stream(self._current_idx, "start")
+
+    def _cast_resolve_stream(self, idx: int, kind: str) -> None:
+        """取第 idx 集播放流；命中 _stream_cache 直接续接，否则复用 _FetchStreamTask。"""
+        ep = self._episodes[idx]
+        key = (ep.url, self._quality)
+        cached = self._stream_cache.get(key)
+        if cached:
+            self._cast_stream_arrived(idx, kind, cached[0])
+            return
+        self._cast_stream_pending = (idx, kind)
+        self._show_status(f"正在获取播放流：{ep.title}...")
+        task = _FetchStreamTask(self._content, self._source, ep.url, self._quality)
+        # 连**方法**（非 lambda）：接收方是本视图（主线程亲和），跨线程 emit
+        # 才会被排队投递到主线程；连 lambda 则线程归属不确定。
+        task.signals.finished.connect(self._on_cast_stream_ready)
+        self._cast_stream_task = task  # 防 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_cast_stream_ready(self, ep_url, video, audio, err, quality) -> None:
+        """投屏取流完成：写缓存 → 仍对应当初那集则续接启停流程。"""
+        pending, self._cast_stream_pending = self._cast_stream_pending, None
+        self._cast_stream_task = None
+        if pending is None:
+            return  # 已被清理（换作品/换源/停投屏）
+        idx, kind = pending
+        if err or not video:
+            self._show_status(f"获取播放流失败：{err or '无播放地址'}")
+            self._cast_state = "idle"
+            self._update_cast_button()
+            return
+        self._stream_cache[(ep_url, quality)] = (video, audio)
+        if not (0 <= idx < len(self._episodes)) or self._episodes[idx].url != ep_url:
+            return  # 集已切换：陈旧结果只进缓存
+        self._cast_stream_arrived(idx, kind, video)
+
+    def _cast_stream_arrived(self, idx: int, kind: str, video: str) -> None:
+        if kind == "start":
+            if idx == self._current_idx and self._cast_state == "preparing_stream":
+                self._open_cast_dialog(idx, video)
+            return
+        if self._cast_active:
+            self._cast_apply_episode(idx, video)
+
+    def _open_cast_dialog(self, idx: int, video: str) -> None:
+        """投屏第二步：选目标电视（用户取消 → 回到干净 idle）。"""
+        title = self._episodes[idx].title or f"第{idx + 1}集"
+        try:
+            from gui.components.cast_dialog import CastDeviceDialog
+        except ImportError as exc:  # 组件未就位：**不**自建该文件
+            self._cast_state = "idle"
+            self._show_status(f"投屏组件不可用：{exc}")
+            self._update_cast_button()
+            return
+        # 真实接口：CastDeviceDialog(current_episode_title, parent)，
+        # 确认后经 selected_device() 取设备（未选中抛 RuntimeError）。
+        dialog = CastDeviceDialog(title, self)
+        if not dialog.exec():  # Accepted=1 真 / Rejected=0 假
+            self._cast_state = "idle"
+            self._show_status("")
+            self._update_cast_button()
+            return
+        try:
+            renderer = dialog.selected_device()
+        except RuntimeError:
+            renderer = None
+        if renderer is None:
+            self._cast_state = "idle"
+            self._show_status("")
+            self._update_cast_button()
+            return
+        self._start_cast(idx, video, renderer)
+
+    def _start_cast(self, idx: int, video: str, renderer) -> None:
+        """投屏第三步：起会话 + 开后台轮询。start **不**动本地播放器。"""
+        from framework.cast_session import CastSession
+        from framework.dlna import DlnaClient
+        from framework.media_proxy import MediaProxy
+
+        title = self._episodes[idx].title or f"第{idx + 1}集"
+        headers, ad_block, force_proxy = self._cast_media_args()
+        self._cast_state = "connecting"
+        self._update_cast_button()
+        try:
+            # 顺序保证：本地 VLC 的停止**只**挂在这条回调上，而它由
+            # poll_state() 在电视报 PLAYING 时才调用 → start 前后本地都在播。
+            session = CastSession(
+                MediaProxy.instance(),
+                lambda r: DlnaClient(r),
+                on_local_player_stop=lambda: self._cast_local_player_stop.emit(),
+            )
+            session.start(renderer, idx, video, title, headers, ad_block,
+                          force_proxy)
+        except Exception as exc:  # noqa: BLE001 —— 网络/SOAP/设备拒绝
+            self._cast_fail_start(exc)
+            return
+        self._cast_session = session
+        self._cast_renderer = renderer
+        self._cast_device = getattr(renderer, "friendly_name", "") or ""
+        self._cast_active = True
+        self._cast_state = "connecting"
+        self._cast_error = ""
+        self._cast_duration = 0
+        self._cast_status_text = ""
+        self._apply_cast_controls(True)
+        self._start_cast_poll(session)
+        self._set_cast_status(f"正在连接电视 {self._cast_device}" if self._cast_device
+                              else "正在连接电视")
+        self._update_cast_button()
+
+    def _cast_fail_start(self, exc: BaseException) -> None:
+        """start 失败：保留本地播放器（绝不碰停止入口），只提示错误。"""
+        self._stop_cast(error=str(exc) or exc.__class__.__name__)
+
+    def _cast_media_args(self):
+        """当前源的请求头 / 广告过滤 / 强制代理（与本地播放同一套来源）。"""
+        headers = {}
+        request_headers = getattr(self._source, "request_headers", None)
+        if callable(request_headers):
+            try:
+                headers = request_headers() or {}
+            except Exception:  # noqa: BLE001
+                headers = {}
+        try:
+            ad_block = (getattr(self._source, "raw", None) or {}).get("ad_block") or {}
+        except Exception:  # noqa: BLE001
+            ad_block = {}
+        return headers, ad_block, self._force_proxy_enabled()
+
+    # ---- 后台轮询：1s → Qt signal → 主线程更新 UI ---- #
+    def _start_cast_poll(self, session) -> None:
+        task = _CastPollTask(session, interval=1.0, max_failures=3)
+        task.signals.state_changed.connect(self._on_cast_state)
+        task.signals.poll_failed.connect(self._on_cast_poll_failed)
+        self._cast_poll_task = task
+        task.start()
+
+    def _on_cast_state(self, state: dict) -> None:
+        """轮询槽（主线程）：进度条 / 时间 / 播放暂停按钮 / 设备名。"""
+        if self._cast_session is None:
+            return  # 会话已收：晚到的排队信号整条丢弃
+        transport = str(state.get("state") or "")
+        try:
+            position = int(state.get("position") or 0)
+        except (TypeError, ValueError):
+            position = -1
+        try:
+            duration = int(state.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        if duration > 0:
+            self._cast_duration = duration
+        if position >= 0 and self._cast_duration > 0:
+            if not self.progress.isSliderDown():  # 用户正在拖 → 别抢他的手
+                self.progress.blockSignals(True)
+                self.progress.setValue(
+                    max(0, min(1000, int(position * 1000 / self._cast_duration))))
+                self.progress.blockSignals(False)
+            self.time_label.setText(
+                f"{_fmt_hms(position)} / {_fmt_hms(self._cast_duration)}")
+        if transport == "PLAYING":
+            self._cast_state = "playing"
+        elif transport == "PAUSED_PLAYBACK":
+            self._cast_state = "paused"
+        elif transport in ("STOPPED", "NO_MEDIA_PRESENT"):
+            self._cast_state = "stopped"
+        # TRANSITIONING（切集中）不改状态：启动期仍是 connecting（按钮禁用），
+        # 已投屏则维持原状态，避免切集瞬间把「停止投屏」入口关掉。
+        self._update_play_button()
+        device = self._cast_device
+        if self._cast_state == "playing":
+            self._set_cast_status(f"投屏中 - {device}" if device else "投屏中")
+        elif self._cast_state == "paused":
+            self._set_cast_status(f"已暂停 - {device}" if device else "已暂停")
+        elif self._cast_state == "stopped":
+            self._set_cast_status("电视已停止播放")
+        self._update_cast_button()
+
+    def _on_cast_poll_failed(self, msg: str) -> None:
+        """连续 3 次轮询失败：标记 error、停轮询并释放会话端点。"""
+        if self._cast_session is None:
+            return
+        self._stop_cast(error=str(msg) or "与电视失去连接")
+
+    def _set_cast_status(self, text: str) -> None:
+        """状态文案去抖（轮询每秒一次，同文案不重排 UI）。"""
+        if text == self._cast_status_text:
+            return
+        self._show_status(text)
+
+    # ---- cast_active 控制路由 ---- #
+    def _apply_cast_controls(self, on: bool) -> None:
+        """投屏中启用进度/时间/上下集并提示；恢复时回到外播禁用基线。"""
+        if not on:
+            self._disable_embedded_controls()
+            self.play_btn.setText("▶")
+            self.prev_btn.setToolTip("上一集")  # _disable_embedded_controls 不覆盖它
+            return
+        for w in (self.play_btn, self.prev_btn, self.next_btn,
+                  self.progress, self.time_label):
+            w.setEnabled(True)
+        self.progress.setToolTip("拖动进度 → 发送到电视")
+        self.time_label.setToolTip("电视端播放进度")
+        self.play_btn.setToolTip("播放 / 暂停（投屏）")
+        self.prev_btn.setToolTip("投屏上一集")
+        self.next_btn.setToolTip("投屏下一集")
+        # 音量只在设备真有 RenderingControl 时开放（无则控件无意义）
+        has_rc = bool(getattr(self._cast_renderer, "rendering_control_url", None))
+        tip = "投屏设备音量" if has_rc else "该投屏设备不支持音量控制"
+        self.vol_btn.setEnabled(has_rc)
+        self.vol_slider.setEnabled(has_rc)
+        self.vol_btn.setToolTip(tip)
+        self.vol_slider.setToolTip(tip)
+
+    def _update_play_button(self) -> None:
+        if not self._cast_active:
+            return  # 未投屏：播放键保持「打开本地播放器」语义
+        self.play_btn.setText("⏸" if self._cast_state == "playing" else "▶")
+
+    def _cast_toggle_play_pause(self) -> None:
+        session = self._cast_session
+        if session is None:
+            return
+        try:
+            if self._cast_state == "playing":
+                session.pause()
+                self._cast_state = "paused"
+            else:
+                session.play()
+                self._cast_state = "playing"
+        except Exception as exc:  # noqa: BLE001 —— 会话已断
+            self._set_cast_status(f"投屏控制失败：{exc}")
+            return
+        self._update_play_button()
+
+    def _on_cast_progress_released(self) -> None:
+        """进度条拖到电视上（未投屏/时长未知 → 空操作）。"""
+        if not self._cast_active or self._cast_session is None:
+            return
+        if self._cast_duration <= 0:
+            return
+        seconds = int(self.progress.value() * self._cast_duration / 1000)
+        try:
+            self._cast_session.seek(seconds)
+        except Exception as exc:  # noqa: BLE001
+            self._set_cast_status(f"投屏控制失败：{exc}")
+
+    def _cast_set_episode(self, idx: int) -> None:
+        if not (0 <= idx < len(self._episodes)) or idx == self._current_idx:
+            return
+        self._cast_resolve_stream(idx, "episode")
+
+    def _cast_apply_episode(self, idx: int, video: str) -> None:
+        """切集成功才改当前集；失败保留原集（CastSession 内部已回滚 URI）。"""
+        if not self._cast_active or self._cast_session is None:
+            return
+        if not (0 <= idx < len(self._episodes)):
+            return
+        ep = self._episodes[idx]
+        title = ep.title or f"第{idx + 1}集"
+        headers, ad_block, force_proxy = self._cast_media_args()
+        try:
+            self._cast_session.set_episode(idx, video, title, headers, ad_block,
+                                           force_proxy)
+        except Exception as exc:  # noqa: BLE001
+            self._set_cast_status(f"投屏切集失败：{exc}")
+            return
+        self._selection_mode = False
+        self._current_idx = idx
+        self._paint_card_selection()
+        self._refresh_ep_menu()
+        self.episode_changed.emit((self._detail, ep.title, ep.url))
+        self._cast_duration = 0  # 新一集时长未读到，等下一轮轮询回填
+
+    # ---- 本地播放器停止入口 + 会话清理 ---- #
+    def _on_cast_local_player_stop(self) -> None:
+        """CastSession 回调（轮询线程 emit）→ 主线程停本地播放器。"""
+        if self._cast_session is None:
+            return  # 会话已被收掉：不再停，避免误伤用户重新拉起的本地播放
+        self._stop_local_player()
+
+    def _stop_local_player(self) -> None:
+        """停止本地播放（外部 VLC / 内嵌播放器）。只停不重启。"""
+        if self._external_active:
+            try:
+                from framework.external_player import _terminate_previous
+
+                _terminate_previous()
+            except Exception:  # noqa: BLE001 —— 进程已退出：静默
+                log.warning("投屏时停止外部播放器失败", exc_info=True)
+        self._stop_player()
+
+    def _stop_cast(self, error: str = "") -> None:
+        """清理投屏：停轮询 → Stop/释放会话（含 LAN 端点/token）→ 复位 UI。
+
+        换作品 / 换源 / 关闭播放页 / App 退出 / 用户点停止 / 连续轮询失败
+        六条路径都收敛到这里。**不**重启本地播放器。
+        """
+        task = self._cast_poll_task
+        self._cast_poll_task = None
+        if task is not None:
+            task.stop()  # 线程自持引用，无需保活列表；下个 step 内自行退出
+        session = self._cast_session
+        self._cast_session = None
+        self._cast_renderer = None
+        self._cast_device = ""
+        self._cast_duration = 0
+        self._cast_active = False
+        self._cast_stream_pending = None
+        self._cast_stream_task = None
+        if session is not None:
+            try:
+                session.stop()  # Stop + 释放 DLNA 会话 + 关 LAN 端点
+            except Exception:  # noqa: BLE001 —— 网络已断也必须继续复位 UI
+                log.warning("停止投屏会话失败", exc_info=True)
+        self._cast_state = "error" if error else "idle"
+        self._cast_error = error
+        self._apply_cast_controls(False)
+        self._cast_status_text = ""  # 复位去抖基准，下一次状态必能显示
+        self._show_status(f"投屏失败：{error}" if error else "")
+        self._update_cast_button()
+
+    # ------------------------------------------------------------------ #
     def position_snapshot(self):
         """当前播放进度：(0~1 比例, None)。未播放/未就绪返回 0。"""
         if self._player is None:
@@ -1856,6 +2344,9 @@ class VideoView(QWidget):
         暂停/进度/音量由外部播放器自身接管（VLC 桌面版）；这里再次点击
         重新拉起播放器播放当前集（VLC 单实例会复用已有窗口播同 URL）。
         """
+        if self._cast_active:
+            self._cast_toggle_play_pause()
+            return
         if not self._current_play:
             if self._selection_mode and 0 <= self._current_idx < len(self._episodes):
                 self._load_episode(self._current_idx)
@@ -2138,3 +2629,9 @@ def _fmt_time(ms: int) -> str:
     ms = max(0, int(ms or 0))
     s = ms // 1000
     return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def _fmt_hms(seconds) -> str:
+    """秒 → hh:mm:ss（投屏进度标签：电视端给的是秒，且可能超过 1 小时）。"""
+    s = max(0, int(seconds or 0))
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
