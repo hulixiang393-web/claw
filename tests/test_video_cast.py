@@ -17,13 +17,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest                                                   # noqa: E402
-from PySide6.QtCore import QCoreApplication                     # noqa: E402
+from PySide6.QtCore import QCoreApplication, QThreadPool       # noqa: E402
 
 import framework.cast_session as cs                            # noqa: E402
 import framework.external_player as ep                         # noqa: E402
 import framework.media_proxy as mp                             # noqa: E402
 
 _VIEWS = []  # 本轮用例建过的视图：收尾时统一收掉后台轮询任务
+_CAST_WAIT = 15.0  # 后台 start/取流完成等待窗口（全量套件高负载下仍留足余量）
 
 
 def _drain() -> None:
@@ -110,17 +111,21 @@ class _FakeProxy:
 
 
 class _FakeSession:
-    """CastSession 替身：记录调用，可配置 start 失败与轮询结果。"""
+    """CastSession 替身：记录调用与 start 所在线程，可配置 start/轮询结果。"""
 
-    def __init__(self, start_error=None, poll_error=None):
+    def __init__(self, start_error=None, poll_error=None,
+                 poll_state_value="PLAYING"):
         self.calls = []
         self.start_error = start_error
         self.poll_error = poll_error
+        self.poll_state_value = poll_state_value
         self.current_episode_index = None
         self.on_local_player_stop = None
+        self.start_thread_id = None  # start() 在哪个线程执行（验证不占 GUI 线程）
 
     def start(self, renderer, episode_index, media_url, title, headers,
               ad_block, force_proxy):
+        self.start_thread_id = threading.get_ident()
         self.calls.append(("start", renderer, episode_index, media_url, title,
                            headers, ad_block, force_proxy))
         if self.start_error is not None:
@@ -148,7 +153,7 @@ class _FakeSession:
         self.calls.append(("poll_state",))
         if self.poll_error is not None:
             raise self.poll_error
-        return {"state": "PLAYING", "position": 60, "duration": 120,
+        return {"state": self.poll_state_value, "position": 60, "duration": 120,
                 "track": 1, "uri": "u"}
 
 
@@ -169,6 +174,31 @@ def _install_proxy(monkeypatch, proxy=None):
     proxy = proxy if proxy is not None else _FakeProxy()
     monkeypatch.setattr(mp.MediaProxy, "instance", staticmethod(lambda: proxy))
     return proxy
+
+
+class _LocalPool:
+    """把 video_view 模块内的 QThreadPool 名字替换为本用例专用池的外壳。
+
+    全量套件里全局线程池（16 槽）会被更早用例遗留的取流/封面下载任务占用，
+    本用例的取流任务排队即超出等待窗口 → `test_cast_fetches_stream_when_cache_misses`
+    约 2/3 概率超时（task-6 第一轮 flaky）。专用池消除跨用例全局状态依赖，
+    线程执行 + 跨线程信号排队的异步链路本身完全不变（不削弱被测行为）。
+    """
+
+    def __init__(self, pool):
+        self._pool = pool
+
+    def globalInstance(self):
+        return self._pool
+
+
+def _use_local_pool(monkeypatch):
+    """取流任务改走本用例专用 QThreadPool，返回该池（供诊断/清理）。"""
+    from gui.pages.reader import video_view as vv
+
+    pool = QThreadPool()
+    monkeypatch.setattr(vv, "QThreadPool", _LocalPool(pool))
+    return pool
 
 
 def _renderer(rendering_control_url="http://192.168.1.20:80/rc"):
@@ -250,7 +280,11 @@ def _view(detail, idx=0, content=None):
 
 def _start_cast(view, monkeypatch, session=None, renderer=None, accepted=True,
                 idx=None):
-    """走真实点击链路把投屏跑起来，返回 (session, captured, dialog_seen)。"""
+    """走真实点击链路把投屏跑起来，返回 (session, captured, dialog_seen)。
+
+    session.start() 在后台线程执行（spec §7），完成经信号回主线程装配——
+    这里等到「会话已装配或已进 error」再返回，调用方拿到的是启动已落定的状态。
+    """
     session = session if session is not None else _FakeSession()
     captured = _install_session(monkeypatch, session)
     _install_proxy(monkeypatch)
@@ -261,6 +295,9 @@ def _start_cast(view, monkeypatch, session=None, renderer=None, accepted=True,
     seen = _install_dialog(monkeypatch, accepted=accepted,
                            renderer=renderer if renderer is not None else _renderer())
     view._on_cast_clicked()
+    assert _wait_for(lambda: view._cast_session is not None
+                     or view._cast_state == "error",
+                     timeout=_CAST_WAIT), "投屏启动未在超时内落定"
     return session, captured, seen
 
 
@@ -328,6 +365,7 @@ def test_cast_uses_current_episode_index_and_stream_cache(_qapp, monkeypatch):
 
 
 def test_cast_fetches_stream_when_cache_misses(_qapp, monkeypatch):
+    pool = _use_local_pool(monkeypatch)  # 隔离全量套件的全局线程池占用
     view = _view(_video_detail(3), idx=1,
                  content=_FakeContent("https://cdn/fresh.m3u8"))
     session = _FakeSession()
@@ -339,9 +377,20 @@ def test_cast_fetches_stream_when_cache_misses(_qapp, monkeypatch):
     assert view._cast_state == "preparing_stream"        # 还在等后台取流
     assert seen["titles"] == []                          # 未开对话框（信号未落地）
 
-    assert _wait_for(lambda: bool(seen["titles"])), "取流任务未续接投屏流程"
+    if not _wait_for(lambda: bool(seen["titles"]), timeout=_CAST_WAIT):
+        pytest.fail(
+            "取流任务未在超时内完成（专用池已隔离全局池；诊断："
+            f"content.calls={view._content.calls}"
+            f" pending={view._cast_stream_pending}"
+            f" task={view._cast_stream_task}"
+            f" state={view._cast_state}"
+            f" local_pool_active={pool.activeThreadCount()}"
+            f" global_pool_active={QThreadPool.globalInstance().activeThreadCount()}）"
+        )
     assert view._content.calls == [("http://e/1", "best", True)]
     assert seen["titles"] == ["第2集 标题1"]
+    assert _wait_for(lambda: bool(session.calls),
+                     timeout=_CAST_WAIT), "后台 start 未提交"
     assert session.calls[0][0] == "start"
     assert session.calls[0][3] == "https://cdn/fresh.m3u8"
     assert view._stream_cache[("http://e/1", "best")] == (
@@ -387,7 +436,9 @@ def test_local_player_stopped_only_after_tv_reports_playing(_qapp, monkeypatch):
     terminated = []
     monkeypatch.setattr(ep, "_terminate_previous",
                         lambda: terminated.append(threading.get_ident()))
-    _session, captured, _seen = _start_cast(view, monkeypatch)
+    # 轮询恒报 STOPPED：后台轮询不会先触发本地停播，停播只走下面的手动回调
+    _session, captured, _seen = _start_cast(
+        view, monkeypatch, session=_FakeSession(poll_state_value="STOPPED"))
 
     assert terminated == []                              # start 之后本地仍在播
     callback = captured["on_local_player_stop"]
@@ -399,6 +450,118 @@ def test_local_player_stopped_only_after_tv_reports_playing(_qapp, monkeypatch):
     _drain()
     assert terminated == [threading.get_ident()]         # 回到主线程才执行
     assert view._external_active is False
+
+
+def test_cast_start_network_runs_in_background_thread(_qapp, monkeypatch):
+    """spec §7：session.start()（LAN+SetAVTransportURI+Play）不占 GUI 线程。"""
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession()
+    _start_cast(view, monkeypatch, session=session)
+
+    assert session.start_thread_id is not None
+    assert session.start_thread_id != threading.get_ident()  # 不在主线程执行
+
+
+def test_stop_cast_during_start_discards_late_result(_qapp, monkeypatch):
+    """启动在途时 _stop_cast（换源/关页）作废它：迟到结果只补 stop、不复活状态。"""
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession()
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    _install_dialog(monkeypatch, renderer=_renderer())
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    view._on_cast_clicked()                              # 提交后台 start（在途）
+    assert view._cast_state == "connecting"
+    view._stop_cast()                                    # 此刻作废在途启动
+    assert view._cast_state == "idle"
+    assert view._cast_session is None
+
+    assert _wait_for(lambda: ("stop",) in session.calls,
+                     timeout=_CAST_WAIT), "陈旧启动未补 stop"
+    assert view._cast_session is None                    # 迟到结果不复活会话
+    assert view._cast_active is False
+    assert view._cast_state == "idle"
+    assert view._cast_poll_task is None
+    assert view._cast_start_task is None
+
+
+# --------------------------------------------------------------------- #
+# 2b. 取流失败状态（T5-3）与代际守卫（T5-4）
+# --------------------------------------------------------------------- #
+def test_cast_stream_failure_marks_error_and_allows_retry(_qapp, monkeypatch):
+    """首次投屏取流失败 → error 态 + 原因可见 + 按钮可点重试（非静默 idle）。"""
+    _use_local_pool(monkeypatch)
+    view = _view(_video_detail(3), idx=0, content=_FakeContent(err="解析失败"))
+    session = _FakeSession()
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    _install_dialog(monkeypatch, renderer=_renderer())
+
+    view._on_cast_clicked()                              # 缓存未命中 → 取流失败
+    assert _wait_for(lambda: view._cast_state == "error",
+                     timeout=_CAST_WAIT), "取流失败未进 error 态"
+    assert view._cast_error == "解析失败"
+    assert view.cast_btn.isEnabled() is True             # 可重试
+    assert "投屏失败" in view.cast_btn.toolTip()
+    assert "解析失败" in view.cast_btn.toolTip()
+    assert session.calls == []                           # 未启动会话
+    assert view._cast_active is False
+
+
+def test_episode_switch_stream_failure_keeps_cast_state(_qapp, monkeypatch):
+    """投屏中切集取流失败（spec §6.5）：保留原集与当前播放状态，只提示错误。
+
+    失败分支若把 _cast_state 误置 idle，_cast_toggle_play_pause 会把
+    「应暂停」误判为「播放」（cast_state != "playing" → play()）。
+    """
+    view = _view(_video_detail(5), idx=1)
+    session = _FakeSession()
+    view._cast_session = session
+    view._cast_active = True
+    view._cast_state = "playing"
+    view._cast_stream_pending = (2, "episode")
+
+    view._on_cast_stream_ready("http://e/2", "", "", "取流挂了", "best",
+                               view._cast_gen)
+    assert view._cast_state == "playing"                 # 不被误置 idle
+    assert view._cast_active is True
+    assert ("stop",) not in session.calls                # 不自动关投屏
+    assert "取流挂了" in view.play_label.text()           # 错误可见
+    view._cast_toggle_play_pause()
+    assert ("pause",) in session.calls                   # 「应暂停」不误判成播放
+
+
+def test_stale_stream_result_never_consumes_new_pending(_qapp, monkeypatch):
+    """旧取流任务迟到：不得消费/覆盖新 pending，否则卡死 preparing_stream。"""
+    _use_local_pool(monkeypatch)
+    view = _view(_video_detail(3), idx=2)
+    _install_session(monkeypatch, _FakeSession())
+    _install_proxy(monkeypatch)
+    seen = _install_dialog(monkeypatch, renderer=_renderer())
+    view._cast_state = "preparing_stream"
+
+    view._cast_resolve_stream(1, "start")                # 第一次取流在途
+    gen1 = view._cast_gen
+    view._cast_resolve_stream(2, "start")                # 再次取流（pending 换新）
+    gen2 = view._cast_gen
+    assert gen2 != gen1
+    assert view._cast_stream_pending == (2, "start")
+
+    # 陈旧任务先回：代数不符 → 只进缓存，pending/任务引用原样保留
+    view._on_cast_stream_ready("http://e/1", "https://cdn/old.m3u8", "", None,
+                               "best", gen1)
+    assert view._cast_stream_pending == (2, "start")
+    assert view._cast_stream_task is not None
+    assert seen["titles"] == []
+
+    # 当代任务后回：正常消费 pending 并续接投屏流程
+    view._on_cast_stream_ready("http://e/2", "https://cdn/new.m3u8", "", None,
+                               "best", gen2)
+    assert view._cast_stream_pending is None
+    assert view._cast_stream_task is None
+    assert seen["titles"] == ["第3集 标题2"]
 
 
 # --------------------------------------------------------------------- #
@@ -462,16 +625,23 @@ def test_controls_keep_local_behaviour_when_not_casting(_qapp, monkeypatch):
     assert session.calls == []
 
 
-def test_volume_enabled_only_when_rendering_control_present(_qapp, monkeypatch):
+def test_volume_stays_disabled_during_cast(_qapp, monkeypatch):
+    """RenderingControl 音量链路无实现 → 投屏期间音量控件保持禁用（诚实于现状）。
+
+    有 RC 的设备启用一个拖动无效的死控件比禁用更糟（T5-5）：tooltip 说明
+    「暂未实现」；无 RC 设备提示「不支持」。补链路后可恢复按 RC 启用。
+    """
     view = _view(_video_detail(3), idx=0)
     _start_cast(view, monkeypatch, renderer=_renderer("http://rc"))
-    assert view.vol_slider.isEnabled() is True
-    assert view.vol_btn.isEnabled() is True
+    assert view.vol_slider.isEnabled() is False
+    assert view.vol_btn.isEnabled() is False
+    assert "未实现" in view.vol_slider.toolTip()
 
     view2 = _view(_video_detail(3), idx=0)
     _start_cast(view2, monkeypatch, renderer=_renderer(None))
     assert view2.vol_slider.isEnabled() is False
     assert view2.vol_btn.isEnabled() is False
+    assert "不支持" in view2.vol_slider.toolTip()
 
 
 # --------------------------------------------------------------------- #
@@ -576,6 +746,57 @@ def test_three_poll_failures_mark_error_and_cleanup_session(_qapp, monkeypatch):
     assert ("stop",) in session.calls
     assert "投屏失败" in view.play_label.text()
     assert "与电视失去连接" in view.cast_btn.toolTip()
+
+
+# --------------------------------------------------------------------- #
+# 4b. 8 秒 PLAYING 超时（spec 6.4 步骤 6，T5-I1）
+# --------------------------------------------------------------------- #
+def test_playing_timeout_stops_cast_keeps_local_and_allows_retry(_qapp, monkeypatch):
+    """启动后 8 秒电视仍未 PLAYING → 投屏失败：关会话/轮询、保留本地 VLC、可重试。"""
+    view = _view(_video_detail(3), idx=0)
+    view._external_active = True
+    terminated = []
+    monkeypatch.setattr(ep, "_terminate_previous",
+                        lambda: terminated.append(threading.get_ident()))
+    # 轮询恒报 STOPPED：电视接受 Play 但状态不进 PLAYING（3 次失败判据不触发）
+    session = _FakeSession(poll_state_value="STOPPED")
+    _start_cast(view, monkeypatch, session=session)
+    task = view._cast_poll_task
+    assert task is not None
+    assert view._cast_playing_timer.isActive() is True   # 启动即开始 8s 倒计时
+    assert view._cast_playing_timer.interval() == 8000
+
+    view._on_cast_playing_timeout()                      # 模拟 8 秒到期
+
+    assert view._cast_state == "error"
+    assert view._cast_error == "电视未在 8 秒内开始播放"
+    assert view._cast_active is False
+    assert view._cast_session is None
+    assert view._cast_poll_task is None
+    assert task.running is False
+    assert ("stop",) in session.calls                    # 会话/端点已收
+    assert terminated == []                              # 本地 VLC 保留
+    assert "投屏失败" in view.play_label.text()
+    assert "8 秒" in view.cast_btn.toolTip()
+    assert view.cast_btn.isEnabled() is True             # 可点重试
+    assert view._cast_playing_timer.isActive() is False
+
+
+def test_playing_timer_stops_once_tv_plays(_qapp, monkeypatch):
+    """电视进 PLAYING（或其后被暂停）即撤掉 8s 超时定时器，不再判失败。"""
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession(poll_state_value="STOPPED")
+    _start_cast(view, monkeypatch, session=session)
+    assert view._cast_playing_timer.isActive() is True
+
+    view._on_cast_state({"state": "PLAYING", "position": 0, "duration": 10,
+                         "track": 1, "uri": "u"})
+    assert view._cast_playing_timer.isActive() is False
+    assert view._cast_state == "playing"
+
+    view._on_cast_playing_timeout()                      # 迟到的超时触发必须无害
+    assert view._cast_session is not None                # 已 PLAYING 不判失败
+    assert view._cast_state == "playing"
 
 
 # --------------------------------------------------------------------- #
