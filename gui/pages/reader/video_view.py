@@ -144,8 +144,11 @@ class _FetchStreamTask(QRunnable):
 
 
 class _CastSignals(QObject):
-    state_changed = Signal(object)  # poll_state() 结果 dict（worker emit）
-    poll_failed = Signal(str)       # 连续失败达阈值（worker emit）
+    # 第二参是产生该信号的 _CastPollTask：停投+再投后旧任务的迟到信号在
+    # 槽内按身份比对丢弃（F5-1）。失败原因放**首参**，1 参的旁路槽
+    # （如测试里的 seen.append）经 Qt 丢尾参拿到的仍是原因而非任务对象。
+    state_changed = Signal(object, object)  # (poll_state() 结果, 任务实例)
+    poll_failed = Signal(str, object)       # (连续失败原因, 任务实例)
 
 
 class _CastPollTask:
@@ -186,24 +189,34 @@ class _CastPollTask:
         self._running = False
 
     def tick(self) -> bool:
-        """单轮轮询；返回 False 表示应停止轮询。"""
+        """单轮轮询；返回 False 表示应停止轮询。
+
+        poll_state() 是网络调用（单次最长 ~10s），期间可能被 stop()（停投）
+        甚至「停投 + 再投」——返回后必须复核 _running 才允许 emit，否则迟到
+        的 PLAYING 会撤掉**新**会话的 8s 超时表、迟到的失败会误杀新会话（F5-1）。
+        """
         if not self._running:
             return False
         try:
             state = self._session.poll_state()
         except Exception as exc:  # noqa: BLE001 —— 网络/SOAP 全部按轮询失败计
+            if not self._running:  # 停投后才到达的失败：不再上报
+                return False
             self.failures += 1
             if self.failures >= self._max_failures:
                 self._running = False
                 try:
-                    self.signals.poll_failed.emit(str(exc) or exc.__class__.__name__)
+                    self.signals.poll_failed.emit(
+                        str(exc) or exc.__class__.__name__, self)
                 except RuntimeError:
                     pass
                 return False
             return True
+        if not self._running:  # 网络调用期间被停：迟到结果不再 emit
+            return False
         self.failures = 0
         try:
-            self.signals.state_changed.emit(state)
+            self.signals.state_changed.emit(state, self)
         except RuntimeError:
             pass
         return True
@@ -2171,27 +2184,36 @@ class VideoView(QWidget):
         _on_cast_start_finished 装配状态。提交即自增代数：启动期间
         _stop_cast（换源/换作品/关页）会再自增使本次结果作废。
         """
-        from framework.cast_session import CastSession
-        from framework.dlna import DlnaClient
-        from framework.media_proxy import MediaProxy
-
         title = self._episodes[idx].title or f"第{idx + 1}集"
         headers, ad_block, force_proxy = self._cast_media_args()
         self._cast_state = "connecting"
         self._update_cast_button()
-        # 顺序保证：本地 VLC 的停止**只**挂在这条回调上，而它由
-        # poll_state() 在电视报 PLAYING 时才调用 → start 前后本地都在播。
-        session = CastSession(
-            MediaProxy.instance(),
-            lambda r: DlnaClient(r),
-            on_local_player_stop=lambda: self._cast_local_player_stop.emit(),
-        )
-        self._cast_gen += 1
-        task = _CastStartTask(session, renderer, idx, video, title, headers,
-                              ad_block, force_proxy, self._cast_gen)
-        task.signals.finished.connect(self._on_cast_start_finished)
-        self._cast_start_task = task
-        task.start()
+        # 构造会话 / 建线程 / 起线程都在 try 内：任何一步抛错都收敛到
+        # _cast_fail_start → _stop_cast(error)，否则异常冒到 Qt 槽只打印一行，
+        # 状态卡死在 connecting、按钮禁用、_cast_start_task 残留（F5-2）。
+        try:
+            from framework.cast_session import CastSession
+            from framework.dlna import DlnaClient
+            from framework.media_proxy import MediaProxy
+
+            # 顺序保证：本地 VLC 的停止**只**挂在这条回调上，而它由
+            # poll_state() 在电视报 PLAYING 时才调用 → start 前后本地都在播。
+            session = CastSession(
+                MediaProxy.instance(),
+                lambda r: DlnaClient(r),
+                on_local_player_stop=lambda: self._cast_local_player_stop.emit(),
+            )
+            self._cast_gen += 1
+            task = _CastStartTask(session, renderer, idx, video, title, headers,
+                                  ad_block, force_proxy, self._cast_gen)
+            task.signals.finished.connect(self._on_cast_start_finished)
+            self._cast_start_task = task
+            task.start()
+        except Exception as exc:  # noqa: BLE001 —— 构造/建线程失败也要退出 connecting
+            # 没有真正在途的任务：必须清掉引用，否则 _begin_cast 的串行守卫
+            # 会永久拦截「上一次投屏启动尚未结束」，用户再也无法重试。
+            self._cast_start_task = None
+            self._cast_fail_start(exc)
 
     def _on_cast_start_finished(self, gen: int, session, exc) -> None:
         """start 后台完成（主线程槽）：按代数分流——新鲜才装配，陈旧只收尾。"""
@@ -2254,13 +2276,19 @@ class VideoView(QWidget):
         task = _CastPollTask(session, interval=1.0, max_failures=3)
         task.signals.state_changed.connect(self._on_cast_state)
         task.signals.poll_failed.connect(self._on_cast_poll_failed)
-        self._cast_poll_task = task
+        self._cast_poll_task = task  # 先注册身份再起线程：槽内按它丢弃陈旧信号
         task.start()
 
-    def _on_cast_state(self, state: dict) -> None:
-        """轮询槽（主线程）：进度条 / 时间 / 播放暂停按钮 / 设备名。"""
-        if self._cast_session is None:
-            return  # 会话已收：晚到的排队信号整条丢弃
+    def _on_cast_state(self, state: dict, task) -> None:
+        """轮询槽（主线程）：进度条 / 时间 / 播放暂停按钮 / 设备名。
+
+        task 是产生该信号的 _CastPollTask：「停投 + 再投」后旧任务已经排队/
+        迟到的信号必须整条丢弃——否则它会撤掉新会话的 8s 超时表、改写状态
+        与进度（F5-1）。会话为 None 同样丢弃（会话已收，晚到信号无处落地）。
+        """
+        if (task is None or task is not self._cast_poll_task
+                or self._cast_session is None):
+            return
         transport = str(state.get("state") or "")
         try:
             position = int(state.get("position") or 0)
@@ -2301,9 +2329,14 @@ class VideoView(QWidget):
             self._set_cast_status("电视已停止播放")
         self._update_cast_button()
 
-    def _on_cast_poll_failed(self, msg: str) -> None:
-        """连续 3 次轮询失败：标记 error、停轮询并释放会话端点。"""
-        if self._cast_session is None:
+    def _on_cast_poll_failed(self, msg: str, task) -> None:
+        """连续 3 次轮询失败：标记 error、停轮询并释放会话端点。
+
+        按任务身份守卫：旧任务的迟到失败（停投+再投之后才落地）不得杀死
+        刚建好的新会话（F5-1）。
+        """
+        if (task is None or task is not self._cast_poll_task
+                or self._cast_session is None):
             return
         self._stop_cast(error=str(msg) or "与电视失去连接")
 

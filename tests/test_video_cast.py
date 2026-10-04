@@ -648,16 +648,18 @@ def test_volume_stays_disabled_during_cast(_qapp, monkeypatch):
 # 4. 后台轮询 → Qt signal → 主线程更新 UI
 # --------------------------------------------------------------------- #
 def test_poll_state_updates_progress_time_and_play_button(_qapp):
-    from gui.pages.reader.video_view import _fmt_hms
+    from gui.pages.reader.video_view import _CastPollTask, _fmt_hms
 
     view = _view(_video_detail(3), idx=0)
     view._cast_session = _FakeSession()
     view._cast_active = True
     view._cast_device = "客厅电视"
     view._cast_duration = 0
+    task = _CastPollTask(view._cast_session)   # 槽按任务身份守卫（F5-1）
+    view._cast_poll_task = task
 
     view._on_cast_state({"state": "PLAYING", "position": 60, "duration": 120,
-                         "track": 1, "uri": "u"})
+                         "track": 1, "uri": "u"}, task)
     assert view.progress.value() == 500
     assert view.time_label.text() == f"{_fmt_hms(60)} / {_fmt_hms(120)}"
     assert view.play_btn.text() == "⏸"
@@ -665,7 +667,7 @@ def test_poll_state_updates_progress_time_and_play_button(_qapp):
     assert "客厅电视" in view.cast_btn.toolTip()
 
     view._on_cast_state({"state": "PAUSED_PLAYBACK", "position": 60,
-                         "duration": 120, "track": 1, "uri": "u"})
+                         "duration": 120, "track": 1, "uri": "u"}, task)
     assert view.play_btn.text() == "▶"
     assert view._cast_state == "paused"
 
@@ -676,7 +678,8 @@ def test_poll_task_emits_then_fails_after_three_consecutive_errors(_qapp):
     session = _FakeSession(poll_error=OSError("network down"))
     task = _CastPollTask(session, max_failures=3)
     seen = []
-    task.signals.poll_failed.connect(seen.append)
+    # 信号第二参是任务身份（F5-1）：接收方按 2 参签名取失败原因
+    task.signals.poll_failed.connect(lambda msg, _task: seen.append(msg))
 
     assert task.tick() is True
     assert task.tick() is True
@@ -717,6 +720,7 @@ def test_poll_worker_only_emits_signal_and_never_touches_widgets(_qapp):
     view._cast_active = True
     view._cast_device = "客厅电视"
     task = _CastPollTask(view._cast_session, max_failures=3)
+    view._cast_poll_task = task                  # 槽按任务身份守卫（F5-1）
     task.signals.state_changed.connect(view._on_cast_state)
 
     worker = threading.Thread(target=task.tick)
@@ -739,7 +743,7 @@ def test_three_poll_failures_mark_error_and_cleanup_session(_qapp, monkeypatch):
     task = view._cast_poll_task
     assert task is not None
 
-    view._on_cast_poll_failed("与电视失去连接")
+    view._on_cast_poll_failed("与电视失去连接", view._cast_poll_task)
     assert view._cast_state == "error"
     assert view._cast_active is False
     assert view._cast_poll_task is None
@@ -790,7 +794,7 @@ def test_playing_timer_stops_once_tv_plays(_qapp, monkeypatch):
     assert view._cast_playing_timer.isActive() is True
 
     view._on_cast_state({"state": "PLAYING", "position": 0, "duration": 10,
-                         "track": 1, "uri": "u"})
+                         "track": 1, "uri": "u"}, view._cast_poll_task)
     assert view._cast_playing_timer.isActive() is False
     assert view._cast_state == "playing"
 
@@ -863,3 +867,190 @@ def test_stop_cast_is_idempotent(_qapp, monkeypatch):
     view._stop_cast()
     assert session.calls.count(("stop",)) == 1
     assert view._cast_session is None
+
+
+# --------------------------------------------------------------------- #
+# 6. 收口修复（final-fix-review：F5-1 / F5-2 / F5-3）
+# --------------------------------------------------------------------- #
+def test_late_poll_result_from_stopped_task_never_touches_new_session(
+        _qapp, monkeypatch):
+    """F5-1：慢网络下「停投 + 再投」，旧轮询的迟到 PLAYING 不得落在新会话上。
+
+    旧任务卡在 poll_state()（单次最长 ~10s）期间用户停投并重新投屏：stop()
+    只置标志，tick() 若在 poll_state() 返回后不复核 _running 就 emit，迟到的
+    state_changed(PLAYING) 会撤掉**新会话**的 8s 超时定时器（T5-I1 的保护失效）。
+    """
+    view = _view(_video_detail(3), idx=0)
+    entered = threading.Event()   # 旧任务已进入慢轮询
+    release = threading.Event()   # 放行信号：模拟网络此刻才返回
+
+    class _SlowSession(_FakeSession):
+        def poll_state(self):
+            entered.set()
+            release.wait(_CAST_WAIT)
+            return {"state": "PLAYING", "position": 60, "duration": 120,
+                    "track": 1, "uri": "u"}
+
+    _start_cast(view, monkeypatch, session=_SlowSession(poll_state_value="STOPPED"))
+    old_task = view._cast_poll_task
+    assert old_task is not None
+    assert entered.wait(_CAST_WAIT), "旧任务未进入慢轮询"
+
+    view._on_cast_clicked()                            # 停投（旧任务被 stop）
+    assert view._cast_poll_task is None
+
+    session2 = _FakeSession(poll_state_value="STOPPED")
+    _start_cast(view, monkeypatch, session=session2)   # 立即再投
+    assert view._cast_session is session2
+    assert view._cast_playing_timer.isActive() is True  # 新会话 8s 保护已启动
+
+    release.set()                                      # 旧任务的慢轮询此刻才返回
+    assert _wait_for(lambda: not old_task._thread.is_alive(),
+                     timeout=_CAST_WAIT), "旧任务未退出"
+    _wait_for(lambda: not view._cast_playing_timer.isActive(), timeout=1.0)
+
+    assert view._cast_playing_timer.isActive() is True  # 迟到 PLAYING 不得撤新会话的表
+    assert view._cast_session is session2
+    assert view._cast_state != "playing"
+    assert ("stop",) not in session2.calls               # 新会话没被误关
+
+
+def test_stale_poll_signals_dropped_by_task_identity(_qapp, monkeypatch):
+    """F5-1：轮询信号携带任务身份，陈旧任务的迟到信号在槽内比对不符即丢弃。"""
+    from gui.pages.reader.video_view import _CastPollTask
+
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession(poll_state_value="STOPPED")
+    _start_cast(view, monkeypatch, session=session)
+    assert view._cast_poll_task is not None
+    # 停投前的旧任务：其信号已连到视图槽，但当前 _cast_poll_task 指向新任务
+    stale = _CastPollTask(_FakeSession(), max_failures=3)
+
+    stale.signals.state_changed.emit(
+        {"state": "PLAYING", "position": 60, "duration": 120,
+         "track": 1, "uri": "u"}, stale)
+    stale.signals.poll_failed.emit("旧任务的连续三次失败", stale)
+    _drain()
+
+    assert view._cast_playing_timer.isActive() is True   # 撤表被丢弃
+    assert view._cast_state != "playing"
+    assert view._cast_state != "error"                   # 迟到失败不杀新会话
+    assert view._cast_session is session
+    assert ("stop",) not in session.calls
+
+
+def test_cast_session_construction_failure_recovers_to_error(_qapp, monkeypatch):
+    """F5-2：CastSession 构造抛错不得卡死 connecting——落到 error 且可重试。"""
+    view = _view(_video_detail(3), idx=0)
+    _install_proxy(monkeypatch)
+    _install_dialog(monkeypatch, renderer=_renderer())
+
+    def _boom(proxy, client_factory, on_local_player_stop=None):
+        raise RuntimeError("LAN 端点被占用")
+
+    monkeypatch.setattr(cs, "CastSession", _boom)
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    view._on_cast_clicked()
+
+    assert view._cast_state == "error"
+    assert view._cast_start_task is None      # 无在途任务：守卫不得永久拦截重试
+    assert view.cast_btn.isEnabled() is True
+    assert view._cast_active is False
+    assert "LAN 端点被占用" in view.cast_btn.toolTip()
+
+
+def test_cast_start_thread_failure_recovers_to_error(_qapp, monkeypatch):
+    """F5-2：task.start()（建线程）抛错同样要走 _cast_fail_start，而非冒泡卡 connecting。"""
+    from gui.pages.reader import video_view as vv
+
+    view = _view(_video_detail(3), idx=0)
+    _install_proxy(monkeypatch)
+    _install_dialog(monkeypatch, renderer=_renderer())
+
+    class _BrokenTask:
+        def __init__(self, *args, **kwargs):
+            self.signals = vv._CastStartSignals()
+
+        def start(self):
+            raise RuntimeError("无法创建投屏线程")
+
+    monkeypatch.setattr(vv, "_CastStartTask", _BrokenTask)
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    view._on_cast_clicked()
+
+    assert view._cast_state == "error"
+    assert view._cast_start_task is None
+    assert view.cast_btn.isEnabled() is True
+    assert "无法创建投屏线程" in view.cast_btn.toolTip()
+
+
+def test_begin_cast_waits_for_in_flight_start_before_retry(_qapp, monkeypatch):
+    """F5-3：_begin_cast 的 _cast_start_task 串行守卫——在途 start 期间重复点击不再发起取流。
+
+    该守卫是「陈旧 stop 与新 start 在 MediaProxy 单例端点上互斥」的发起侧保证，
+    此前只有 _stop_cast 侧被测（test_stop_cast_during_start_discards_late_result）。
+    """
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession()
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    seen = _install_dialog(monkeypatch, renderer=_renderer())
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    view._on_cast_clicked()                              # 提交后台 start（在途）
+    assert view._cast_state == "connecting"
+    view._stop_cast()                                    # 作废，但 _cast_start_task 仍在途
+    assert view._cast_start_task is not None
+    gen = view._cast_gen
+
+    view._on_cast_clicked()                              # 立即再投 → 守卫拦截
+    assert view._cast_gen == gen                         # 未再取流/未自增代数
+    assert view._cast_state == "idle"                    # 未进 preparing_stream
+    assert seen["titles"] == ["第1集 标题0"]              # 对话框只开过一次
+    assert "上一次投屏启动尚未结束" in view.play_label.text()
+
+    assert _wait_for(lambda: view._cast_start_task is None,
+                     timeout=_CAST_WAIT), "陈旧启动未收尾"
+    view._on_cast_clicked()                              # 收尾后才能再投
+    assert view._cast_gen > gen
+    assert view._cast_state == "connecting"
+    assert seen["titles"] == ["第1集 标题0", "第1集 标题0"]
+
+
+def test_cast_confirm_after_flow_invalidated_starts_nothing(_qapp, monkeypatch):
+    """F5-3：对话框模态期间流程被作废（换源/换作品/关页），确认设备也不得拉起会话。"""
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession()
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    module = types.ModuleType("gui.components.cast_dialog")
+
+    class _Dialog:
+        def __init__(self, title, parent=None):
+            pass
+
+        def exec(self):
+            view._stop_cast()          # 模态期间换源/换作品/关页作废流程
+            return True                # 但用户点了「确定」
+
+        def selected_device(self):
+            return _renderer()
+
+    module.CastDeviceDialog = _Dialog
+    monkeypatch.setitem(sys.modules, "gui.components.cast_dialog", module)
+
+    view._on_cast_clicked()
+
+    assert view._cast_state == "idle"                     # 复核不通过 → 不再拉起
+    assert view._cast_session is None
+    _wait_for(lambda: bool(session.calls), timeout=0.5)   # 给漏网的后台 start 冒头
+    assert session.calls == []
+    assert view._cast_active is False
