@@ -441,6 +441,18 @@ class _GridCard(QFrame):
         super().mouseReleaseEvent(event)
 
 
+def _cast_history_path():
+    """投屏历史文件路径：应用根目录 data/cast_history.json。
+
+    与 library.json / reading_progress.json 同一 data 目录约定；
+    复用 media_cache._base_dir（frozen 时为 exe 目录，开发时为项目根）。
+    测试经 monkeypatch 本函数隔离到临时目录。
+    """
+    from framework.media_cache import _base_dir
+
+    return _base_dir() / "data" / "cast_history.json"
+
+
 class VideoView(QWidget):
     """视频分集 + VLC 内嵌播放视图（现代化交互，支持多播放源换源）。"""
 
@@ -558,6 +570,10 @@ class VideoView(QWidget):
         # （迟到的取流/启动回调按代数整条丢弃，不许消费/覆盖新的 pending）
         self._cast_gen = 0
         self._cast_start_task = None    # _CastStartTask（防 GC + 陈旧启动守卫）
+        # 投屏设备历史（data/cast_history.json，惰性打开）：
+        # 有历史 → 取流完成直接重连上次设备；start 失败才回落选设备对话框
+        self._cast_history_store = None  # framework.cast_history.CastHistory
+        self._cast_direct = False        # 正在直投上次设备（失败需回落对话框）
         # spec 6.4 步骤 6：启动后 8 秒内电视未进 PLAYING → 判投屏失败
         self._cast_playing_timer = QTimer(self)
         self._cast_playing_timer.setSingleShot(True)
@@ -2069,6 +2085,7 @@ class VideoView(QWidget):
             return
         self._cast_state = "preparing_stream"
         self._cast_error = ""  # 重试入口：清掉上次失败，按钮文案回到「正在投屏...」
+        self._cast_direct = False  # 重新起投：由 _cast_pick_device 按历史重判
         self._update_cast_button()
         self._cast_resolve_stream(self._current_idx, "start")
 
@@ -2137,13 +2154,87 @@ class VideoView(QWidget):
     def _cast_stream_arrived(self, idx: int, kind: str, video: str) -> None:
         if kind == "start":
             if idx == self._current_idx and self._cast_state == "preparing_stream":
-                self._open_cast_dialog(idx, video)
+                self._cast_pick_device(idx, video)
             return
         if self._cast_active:
             self._cast_apply_episode(idx, video)
 
+    # ---- 设备历史：直投上次设备 / 失败回落选设备对话框 ---- #
+    def _cast_history(self):
+        """投屏历史存储（惰性打开 data/cast_history.json；不可用返回 None）。"""
+        store = self._cast_history_store
+        if store is None:
+            try:
+                from framework.cast_history import CastHistory
+
+                store = CastHistory(_cast_history_path())
+            except Exception:  # noqa: BLE001 —— 历史不可用不能挡住投屏本身
+                log.warning("投屏历史不可用", exc_info=True)
+                return None
+            self._cast_history_store = store
+        return store
+
+    def _cast_history_entries(self) -> list:
+        """历史条目（最近在前）；存储不可用返回空列表。"""
+        store = self._cast_history()
+        if store is None:
+            return []
+        try:
+            return store.entries()
+        except Exception:  # noqa: BLE001 —— 读失败按无历史处理
+            log.warning("读取投屏历史失败", exc_info=True)
+            return []
+
+    def _last_cast_renderer(self):
+        """上次投屏成功的设备（DlnaRenderer）；无历史/条目非法返回 None。"""
+        from framework.cast_history import renderer_from_entry
+
+        entries = self._cast_history_entries()
+        return renderer_from_entry(entries[0]) if entries else None
+
+    def _record_cast_history(self, renderer) -> None:
+        """投屏 start 成功即写历史（不等 PLAYING；写失败不影响投屏）。"""
+        store = self._cast_history()
+        if store is None or renderer is None:
+            return
+        try:
+            store.record(renderer)
+        except Exception:  # noqa: BLE001 —— 历史写失败只记日志
+            log.warning("写入投屏历史失败", exc_info=True)
+
+    def _on_cast_history_cleared(self) -> None:
+        """对话框「清除历史」信号：清掉存储（对话框本身不碰文件）。"""
+        store = self._cast_history()
+        if store is None:
+            return
+        try:
+            store.clear()
+        except Exception:  # noqa: BLE001
+            log.warning("清除投屏历史失败", exc_info=True)
+
+    def _cast_pick_device(self, idx: int, video: str) -> None:
+        """取流完成选目标设备：有历史直投上次设备，否则开选择对话框。
+
+        直投在 _start_cast 后台 start；连接失败（SOAP 超时等）由
+        _on_cast_start_finished 的回落分支打开对话框让用户换设备。
+        切集（kind == "episode"）走不到这里，不受直投影响。
+        """
+        renderer = self._last_cast_renderer()
+        if renderer is None:
+            self._open_cast_dialog(idx, video)
+            return
+        self._cast_direct = True
+        self._show_status(f"正在连接上次投屏设备：{renderer.friendly_name}...")
+        self._update_cast_button()
+        self._start_cast(idx, video, renderer)
+
     def _open_cast_dialog(self, idx: int, video: str) -> None:
-        """投屏第二步：选目标电视（用户取消 → 回到干净 idle）。"""
+        """投屏第二步：选目标电视（用户取消 → 回到干净 idle）。
+
+        历史设备随构造传入对话框：置顶分组 + 上次使用默认选中，后台 SSDP
+        扫描照常进行但不阻塞选择；对话框的「清除历史」经信号回到本视图清
+        存储（组件不直接碰 data/cast_history.json）。
+        """
         title = self._episodes[idx].title or f"第{idx + 1}集"
         try:
             from gui.components.cast_dialog import CastDeviceDialog
@@ -2152,9 +2243,12 @@ class VideoView(QWidget):
             self._show_status(f"投屏组件不可用：{exc}")
             self._update_cast_button()
             return
-        # 真实接口：CastDeviceDialog(current_episode_title, parent)，
+        # 真实接口：CastDeviceDialog(title, parent, history=None)，
         # 确认后经 selected_device() 取设备（未选中抛 RuntimeError）。
-        dialog = CastDeviceDialog(title, self)
+        dialog = CastDeviceDialog(title, self, history=self._cast_history_entries())
+        clear_signal = getattr(dialog, "clearHistoryRequested", None)
+        if clear_signal is not None:
+            clear_signal.connect(self._on_cast_history_cleared)
         if not dialog.exec():  # Accepted=1 真 / Rejected=0 假
             self._cast_state = "idle"
             self._show_status("")
@@ -2233,8 +2327,21 @@ class VideoView(QWidget):
             return
         self._cast_start_task = None
         if exc is not None:
+            if self._cast_direct:
+                # 直投上次设备失败（SOAP 超时/拒连等）→ 回落选设备对话框，
+                # 把失败原因带状态栏，让用户换一台电视继续，而不是报错死。
+                self._cast_direct = False
+                self._cast_state = "preparing_stream"  # 对话框确认后可续投
+                self._show_status(
+                    f"连接上次投屏设备失败：{str(exc) or exc.__class__.__name__}，"
+                    "请选择投屏设备"
+                )
+                self._update_cast_button()
+                self._open_cast_dialog(task.idx, task.video)
+                return
             self._cast_fail_start(exc)
             return
+        self._cast_direct = False
         self._cast_session = session
         self._cast_renderer = task.renderer
         self._cast_device = getattr(task.renderer, "friendly_name", "") or ""
@@ -2243,6 +2350,7 @@ class VideoView(QWidget):
         self._cast_error = ""
         self._cast_duration = 0
         self._cast_status_text = ""
+        self._record_cast_history(task.renderer)  # start 成功即记忆（非 PLAYING）
         self._apply_cast_controls(True)
         self._start_cast_poll(session)
         self._set_cast_status(f"正在连接电视 {self._cast_device}" if self._cast_device
@@ -2473,6 +2581,7 @@ class VideoView(QWidget):
         丢弃（启动已成功则在槽里补 stop），不再触碰复位后的状态。
         """
         self._cast_gen += 1  # 作废在途取流/启动任务
+        self._cast_direct = False  # 直投标志随流程作废（迟到失败不再回落开框）
         self._cast_playing_timer.stop()
         task = self._cast_poll_task
         self._cast_poll_task = None

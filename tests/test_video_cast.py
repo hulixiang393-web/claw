@@ -56,6 +56,30 @@ def _stop_cast_polls():
     _VIEWS.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cast_history(tmp_path, monkeypatch):
+    """投屏历史隔离：每例一个临时 cast_history.json。
+
+    历史一旦落在真实 data/ 下，跨用例（及下次运行）会把投屏链路切成
+    「直投上次设备」，绕开本文件大量依赖的对话框路径。
+    """
+    from gui.pages.reader import video_view as vv
+
+    path = tmp_path / "cast_history.json"
+    monkeypatch.setattr(vv, "_cast_history_path", lambda: path)
+    yield path
+
+
+def _seed_history(path, *renderers):
+    """往隔离的历史文件写入若干「上次投屏成功」的设备，返回存储对象。"""
+    from framework.cast_history import CastHistory
+
+    store = CastHistory(path)
+    for renderer in renderers:  # 后写的在前：最后一个 = 上次使用
+        store.record(renderer)
+    return store
+
+
 def _video_detail(n):
     from framework.content import Chapter, Detail
 
@@ -201,13 +225,15 @@ def _use_local_pool(monkeypatch):
     return pool
 
 
-def _renderer(rendering_control_url="http://192.168.1.20:80/rc"):
+def _renderer(rendering_control_url="http://192.168.1.20:80/rc", udn="uuid:tv-1",
+              name="客厅电视", ip="192.168.1.20"):
     from framework.dlna import DlnaRenderer
 
+    location = f"http://{ip}:80/root.xml"
     return DlnaRenderer(
-        udn="uuid:tv-1", friendly_name="客厅电视",
-        location="http://192.168.1.20:80/root.xml",
-        av_transport_control_url="http://192.168.1.20:80/avt",
+        udn=udn, friendly_name=name,
+        location=location,
+        av_transport_control_url=f"http://{ip}:80/avt",
         rendering_control_url=rendering_control_url,
         service_type="urn:schemas-upnp-org:service:AVTransport:1",
     )
@@ -216,16 +242,18 @@ def _renderer(rendering_control_url="http://192.168.1.20:80/rc"):
 def _install_dialog(monkeypatch, accepted=True, renderer=None):
     """注入假 gui.components.cast_dialog（Task 4 并行开发，测试不依赖它）。
 
-    替身必须复刻真实接口：CastDeviceDialog(title, parent) + exec() +
-    selected_device()（未选中抛 RuntimeError）。
+    替身必须复刻真实接口：CastDeviceDialog(title, parent, history=None) +
+    exec() + selected_device()（未选中抛 RuntimeError）+ 可选
+    clearHistoryRequested 信号。
     """
     module = types.ModuleType("gui.components.cast_dialog")
-    seen = {"titles": [], "parents": []}
+    seen = {"titles": [], "parents": [], "history": []}
 
     class _Dialog:
-        def __init__(self, title, parent=None):
+        def __init__(self, title, parent=None, history=None):
             seen["titles"].append(title)
             seen["parents"].append(parent)
+            seen["history"].append(history)
             self._renderer = renderer
 
         def exec(self):
@@ -253,12 +281,17 @@ def test_cast_dialog_contract_matches_real_component(_qapp):
     from gui.pages.reader.video_view import VideoView
 
     assert hasattr(cd, "CastDeviceDialog"), "video_view 依赖的对话框类名"
-    params = list(inspect.signature(cd.CastDeviceDialog.__init__).parameters)
+    sig = inspect.signature(cd.CastDeviceDialog.__init__)
+    params = list(sig.parameters)
     assert params[1:3] == ["current_episode_title", "parent"], "构造参数顺序"
+    assert params[3] == "history", "历史设备经可选参数 history 传入"
+    assert sig.parameters["history"].default is None  # 向后兼容默认 None
     assert hasattr(cd.CastDeviceDialog, "selected_device"), "选中设备访问器"
+    assert hasattr(cd.CastDeviceDialog, "clearHistoryRequested"), "清历史信号"
     src = inspect.getsource(VideoView._open_cast_dialog)
     assert "from gui.components.cast_dialog import CastDeviceDialog" in src
-    assert "CastDeviceDialog(title, self)" in src      # 参数顺序：标题在前
+    assert "CastDeviceDialog(title, self" in src      # 参数顺序：标题在前
+    assert "history=" in src                          # 历史随构造传入对话框
     assert "dialog.selected_device()" in src           # 访问器而非 .renderer 属性
     assert "dialog.renderer" not in src
 
@@ -638,6 +671,9 @@ def test_volume_stays_disabled_during_cast(_qapp, monkeypatch):
     assert "未实现" in view.vol_slider.toolTip()
 
     view2 = _view(_video_detail(3), idx=0)
+    # 上一次投屏已写历史：先清掉，否则 view2 直投上次设备、绕开对话框，
+    # 选不到下面这台「无 RenderingControl」的设备（历史记忆是被测外的行为）
+    view2._on_cast_history_cleared()
     _start_cast(view2, monkeypatch, renderer=_renderer(None))
     assert view2.vol_slider.isEnabled() is False
     assert view2.vol_btn.isEnabled() is False
@@ -1034,7 +1070,7 @@ def test_cast_confirm_after_flow_invalidated_starts_nothing(_qapp, monkeypatch):
     module = types.ModuleType("gui.components.cast_dialog")
 
     class _Dialog:
-        def __init__(self, title, parent=None):
+        def __init__(self, title, parent=None, history=None):
             pass
 
         def exec(self):
@@ -1053,4 +1089,174 @@ def test_cast_confirm_after_flow_invalidated_starts_nothing(_qapp, monkeypatch):
     assert view._cast_session is None
     _wait_for(lambda: bool(session.calls), timeout=0.5)   # 给漏网的后台 start 冒头
     assert session.calls == []
+    assert view._cast_active is False
+
+
+# --------------------------------------------------------------------- #
+# 7. 投屏设备历史记忆：直投上次设备 / 失败回落对话框 / 写历史 / 容错
+# --------------------------------------------------------------------- #
+def test_cast_with_history_reconnects_directly_without_dialog(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """有历史：取流完成直接用上次设备 start（不开对话框、不等扫描）。"""
+    _seed_history(_isolated_cast_history, _renderer(udn="uuid:tv-1"))
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession()
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    seen = _install_dialog(monkeypatch, renderer=_renderer(udn="uuid:tv-other"))
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    view._on_cast_clicked()
+
+    assert _wait_for(lambda: view._cast_session is not None,
+                     timeout=_CAST_WAIT), "直投上次设备未落定"
+    assert seen["titles"] == []                     # 没开设备选择对话框
+    start = session.calls[0]
+    assert start[0] == "start"
+    assert start[1].udn == "uuid:tv-1"              # 用的就是历史里那台
+    assert view._cast_active is True
+
+
+def test_cast_direct_failure_falls_back_to_device_dialog(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """直投上次设备失败（SOAP 超时等）→ 打开对话框换设备，错误带状态栏。"""
+    _seed_history(_isolated_cast_history, _renderer(udn="uuid:tv-1"))
+    view = _view(_video_detail(3), idx=0)
+
+    class _FailFirstSession(_FakeSession):
+        """第一次 start（历史设备）失败，之后的成功（对话框选的设备）。"""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.attempts = 0
+
+        def start(self, renderer, episode_index, media_url, title, headers,
+                  ad_block, force_proxy):
+            self.attempts += 1
+            if self.attempts == 1:
+                self.start_thread_id = threading.get_ident()
+                self.calls.append(("start", renderer, episode_index, media_url,
+                                   title, headers, ad_block, force_proxy))
+                raise OSError("connection timed out")
+            return super().start(renderer, episode_index, media_url, title,
+                                 headers, ad_block, force_proxy)
+
+    session = _FailFirstSession()
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    seen = _install_dialog(monkeypatch, renderer=_renderer(udn="uuid:tv-2"))
+    statuses = []
+    monkeypatch.setattr(view, "_show_status", lambda text: statuses.append(text))
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    view._on_cast_clicked()
+
+    assert _wait_for(lambda: bool(seen["titles"]),
+                     timeout=_CAST_WAIT), "直投失败未打开设备选择对话框"
+    # 对话框带上历史：置顶展示 + 上次使用默认选中
+    assert seen["history"] and seen["history"][0]
+    assert seen["history"][0][0]["udn"] == "uuid:tv-1"
+    assert any("连接上次投屏设备失败" in text for text in statuses)
+    assert _wait_for(lambda: view._cast_session is not None,
+                     timeout=_CAST_WAIT), "换设备后未完成投屏"
+    starts = [call for call in session.calls if call[0] == "start"]
+    assert [call[1].udn for call in starts] == ["uuid:tv-1", "uuid:tv-2"]
+    assert view._cast_active is True
+
+
+def test_cast_without_history_opens_dialog_with_empty_history(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """无历史（文件不存在）→ 照旧直接弹对话框，且拿到空历史列表。"""
+    view = _view(_video_detail(3), idx=0)
+    session, _captured, seen = _start_cast(view, monkeypatch)
+
+    assert seen["titles"] == ["第1集 标题0"]
+    assert seen["history"] == [[]]              # 空历史：对话框按原行为扫描
+    assert session.calls[0][0] == "start"
+    assert _isolated_cast_history.exists()  # start 成功后落盘历史
+    assert view._cast_active is True
+
+
+def test_cast_success_writes_history_entry(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """start 成功（非 PLAYING）即写入历史：6 字段 + 时间戳，UDN 去重置顶。"""
+    from framework.cast_history import CastHistory
+
+    view = _view(_video_detail(3), idx=0)
+    _start_cast(view, monkeypatch)  # 走对话框路径成功
+
+    entries = CastHistory(_isolated_cast_history).entries()
+    assert [entry["udn"] for entry in entries] == ["uuid:tv-1"]
+    entry = entries[0]
+    assert entry["friendly_name"] == "客厅电视"
+    assert entry["location"] == "http://192.168.1.20:80/root.xml"
+    assert entry["av_transport_control_url"] == "http://192.168.1.20:80/avt"
+    assert entry["service_type"] == "urn:schemas-upnp-org:service:AVTransport:1"
+    assert entry["last_used"] > 0
+
+
+def test_corrupted_history_file_falls_back_to_dialog(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """历史文件损坏 → 按无历史处理（开对话框），成功后重新写盘自愈。"""
+    from framework.cast_history import CastHistory
+
+    _isolated_cast_history.write_text("{ 这不是 JSON", encoding="utf-8")
+    view = _view(_video_detail(3), idx=0)
+    session, _captured, seen = _start_cast(view, monkeypatch)
+
+    assert seen["titles"] == ["第1集 标题0"]     # 没炸，按原路径弹框
+    assert session.calls[0][0] == "start"
+    assert view._cast_active is True
+    entries = CastHistory(_isolated_cast_history).entries()
+    assert [entry["udn"] for entry in entries] == ["uuid:tv-1"]  # 写入覆盖坏文件
+
+
+def test_dialog_clear_history_signal_clears_store(
+        _qapp, monkeypatch, _isolated_cast_history):
+    """对话框「清除历史」信号接到视图 → 清掉 CastHistory 存储（含文件）。"""
+    from PySide6.QtCore import QObject, Signal
+
+    from framework.cast_history import CastHistory
+
+    store = _seed_history(_isolated_cast_history, _renderer(udn="uuid:tv-1"))
+    assert store.entries()
+    view = _view(_video_detail(3), idx=0)
+    session = _FakeSession(start_error=OSError("connection timed out"))
+    _install_session(monkeypatch, session)
+    _install_proxy(monkeypatch)
+    ep0 = view._episodes[0]
+    view._stream_cache[(ep0.url, view._quality)] = ("https://cdn/e0.m3u8", "")
+
+    module = types.ModuleType("gui.components.cast_dialog")
+    holder = {}
+
+    class _Dialog(QObject):
+        clearHistoryRequested = Signal()
+
+        def __init__(self, title, parent=None, history=None):
+            super().__init__()
+            holder["dialog"] = self
+            holder["history"] = history
+
+        def exec(self):
+            return False  # 用户只清历史、取消投屏
+
+        def selected_device(self):
+            raise RuntimeError("未选中投屏设备")
+
+    module.CastDeviceDialog = _Dialog
+    monkeypatch.setitem(sys.modules, "gui.components.cast_dialog", module)
+
+    view._on_cast_clicked()                       # 直投失败 → 打开对话框
+    assert _wait_for(lambda: "dialog" in holder,
+                     timeout=_CAST_WAIT), "对话框未打开"
+    assert holder["history"][0]["udn"] == "uuid:tv-1"
+
+    holder["dialog"].clearHistoryRequested.emit()  # 用户点了「清除历史」
+
+    assert CastHistory(_isolated_cast_history).entries() == []  # 文件已清
+    assert view._cast_history().last() is None      # 视图侧存储同步清空
+    assert view._cast_state == "idle"               # 取消投屏：回到干净 idle
     assert view._cast_active is False

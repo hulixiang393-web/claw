@@ -10,11 +10,19 @@ deviceSelected 信号把 DlnaRenderer 交回调用方。
 - 关闭对话框时若扫描仍在进行，worker 脱离生命周期后台收尾，
   不阻塞 UI、不悬挂线程。
 
+历史设备（构造参数 history，来自 framework.cast_history.CastHistory）：
+- 分组置顶、首条标「上次使用」并在打开时默认选中，直接点确定即可投屏；
+- 后台 SSDP 扫描照常进行但不阻塞选择，扫描结果与历史按 UDN 合并去重
+  （历史保名称、新扫描更新 IP / 控制 URL）；
+- 「清除历史」经 clearHistoryRequested 信号通知调用方删存储，本组件
+  不直接碰文件。
+
 样式跟随 palette()，不写死色值，兼容主题切换。
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from urllib.parse import urlparse
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -32,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from framework import dlna
+from framework.cast_history import renderer_from_entry
 from framework.dlna import DlnaRenderer
 
 # 空列表提示（spec 6.2：同一局域网 / 防火墙）
@@ -83,10 +92,12 @@ class CastDeviceDialog(QDialog):
     """选择投屏设备：扫描 → 列表选择 → 确认返回 DlnaRenderer。"""
 
     deviceSelected = Signal(object)  # DlnaRenderer，确认选中时发出
+    clearHistoryRequested = Signal()  # 用户点「清除历史」（调用方负责删存储）
 
     SSDP_TIMEOUT = 2.0  # SSDP 扫描超时（秒）
 
-    def __init__(self, current_episode_title: str, parent=None):
+    def __init__(self, current_episode_title: str, parent=None,
+                 history: list[dict] | None = None):
         super().__init__(parent)
         self.setWindowTitle("选择投屏设备")
         self.setMinimumWidth(440)
@@ -94,6 +105,10 @@ class CastDeviceDialog(QDialog):
         self._devices: dict[str, DlnaRenderer] = {}  # UDN → 设备（去重）
         self._selected: DlnaRenderer | None = None
         self._worker: SsdpScanWorker | None = None
+        # 历史设备（最近在前）：置顶展示 + 首条「上次使用」默认选中
+        self._history_renderers: list[DlnaRenderer] = []
+        self._history_udns: set[str] = set()
+        self._last_used_udn = ""
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -125,6 +140,10 @@ class CastDeviceDialog(QDialog):
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.clicked.connect(self._on_refresh_clicked)
         status_row.addWidget(self.refresh_btn)
+        self.clear_history_btn = QPushButton("清除历史")
+        self.clear_history_btn.clicked.connect(self._on_clear_history_clicked)
+        self.clear_history_btn.setVisible(False)  # 无历史时隐藏
+        status_row.addWidget(self.clear_history_btn)
         layout.addLayout(status_row)
 
         # 设备列表（friendly name + IP）
@@ -162,6 +181,92 @@ class CastDeviceDialog(QDialog):
         self.select_btn.clicked.connect(self._on_accept)
         self.cancel_btn.clicked.connect(self.reject)
         layout.addWidget(buttons)
+
+        # 历史设备置顶 + 上次使用默认选中（放最后：依赖上面全部控件就位）
+        self._load_history(history)
+
+    # ------------------------------------------------------------------ #
+    # 历史设备
+    # ------------------------------------------------------------------ #
+    def _load_history(self, history: list[dict] | None) -> None:
+        """历史条目 → 列表置顶分组，首条标「上次使用」并默认选中。
+
+        打开对话框即可直接点确定投上次设备；SSDP 扫描仍由 showEvent 照常
+        在后台启动（不阻塞选择）。非法条目（非 dict / 字段不全）静默跳过。
+        """
+        for entry in history or []:
+            renderer = renderer_from_entry(entry)
+            if renderer is None or renderer.udn in self._history_udns:
+                continue
+            self._history_udns.add(renderer.udn)
+            self._history_renderers.append(renderer)
+        if not self._history_renderers:
+            return
+        self._last_used_udn = self._history_renderers[0].udn
+        for renderer in self._history_renderers:
+            self._append_item(renderer)
+        self.empty_hint.setVisible(False)
+        self.clear_history_btn.setVisible(True)
+        # 打开即选中上次使用：select_btn 随 selectionChanged 同步启用
+        self.device_list.setCurrentRow(0)
+
+    def _item_label(self, renderer: DlnaRenderer) -> str:
+        """列表项文本：名称 + IP；上次使用的设备追加「上次使用」标记。"""
+        label = format_device_label(renderer)
+        return f"{label} · 上次使用" if renderer.udn == self._last_used_udn else label
+
+    def _append_item(self, renderer: DlnaRenderer) -> QListWidgetItem:
+        """把设备加入列表与去重缓存，返回列表项。"""
+        self._devices[renderer.udn] = renderer
+        item = QListWidgetItem(self._item_label(renderer))
+        item.setData(Qt.UserRole, renderer.udn)
+        self.device_list.addItem(item)
+        return item
+
+    def _merge_scanned(self, existing: DlnaRenderer,
+                       scanned: DlnaRenderer) -> None:
+        """扫描到列表已有设备：历史保名称、新扫描更新 IP / 控制 URL。
+
+        非历史设备的重复应答维持原去重语义（保留首次结果）。
+        """
+        if existing.udn not in self._history_udns:
+            return
+        merged = replace(scanned, friendly_name=existing.friendly_name)
+        self._devices[merged.udn] = merged
+        if self._selected is not None and self._selected.udn == merged.udn:
+            self._selected = merged  # 已选中的历史项改用新扫描的连接地址
+        for row in range(self.device_list.count()):
+            item = self.device_list.item(row)
+            if item.data(Qt.UserRole) == merged.udn:
+                item.setText(self._item_label(merged))
+                break
+
+    def _on_clear_history_clicked(self) -> None:
+        """「清除历史」：通知调用方清存储，本地历史分组随之移除。
+
+        对话框不直接碰 JSON 文件（存储归调用方 CastHistory 管）；扫描到的
+        非历史设备保留，用户仍可正常选设备投屏。
+        """
+        self.clearHistoryRequested.emit()
+        history_udns = set(self._history_udns)
+        selected_udn = self._selected.udn if self._selected is not None else None
+        self._history_udns.clear()
+        self._history_renderers.clear()
+        self._last_used_udn = ""
+        self.clear_history_btn.setVisible(False)
+        for row in range(self.device_list.count() - 1, -1, -1):
+            if self.device_list.item(row).data(Qt.UserRole) in history_udns:
+                self.device_list.takeItem(row)
+        for udn in history_udns:
+            self._devices.pop(udn, None)
+        if selected_udn in history_udns:
+            # 选中项刚被移除：明确清掉选中（Qt 会把 current 挪到下一项，
+            # 不显式复位就会让「确定」静默投给另一台电视）
+            self.device_list.setCurrentRow(-1)
+            self._selected = None
+            self.select_btn.setEnabled(False)
+        if self._worker is None or not self._worker.isRunning():
+            self._finish_scan_ui()  # 状态行设备数按移除后的实际数量刷新
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -220,14 +325,13 @@ class CastDeviceDialog(QDialog):
             )
 
     def _on_scan_finished(self, renderers) -> None:
-        """扫描完成（主线程槽）：去重回填列表并更新状态。"""
+        """扫描完成（主线程槽）：与历史合并去重回填列表并更新状态。"""
         for renderer in renderers:
-            if renderer.udn in self._devices:
+            existing = self._devices.get(renderer.udn)
+            if existing is not None:
+                self._merge_scanned(existing, renderer)
                 continue
-            self._devices[renderer.udn] = renderer
-            item = QListWidgetItem(format_device_label(renderer))
-            item.setData(Qt.UserRole, renderer.udn)
-            self.device_list.addItem(item)
+            self._append_item(renderer)
         self._finish_scan_ui()
 
     def _on_scan_error(self, message: str) -> None:
@@ -253,11 +357,13 @@ class CastDeviceDialog(QDialog):
         self.empty_hint.setVisible(count == 0)
 
     def _on_refresh_clicked(self) -> None:
-        """刷新：清空列表与去重缓存，重新 SSDP 扫描。"""
+        """刷新：清空扫描结果与去重缓存后重新扫描（历史分组原样置顶保留）。"""
         self._devices.clear()
         self._selected = None
         self.device_list.clear()
         self.select_btn.setEnabled(False)
+        for renderer in self._history_renderers:
+            self._append_item(renderer)
         self._start_scan()
 
     # ------------------------------------------------------------------ #

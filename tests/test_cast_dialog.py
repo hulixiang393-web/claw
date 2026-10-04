@@ -22,6 +22,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog
 
 from framework.dlna import DlnaRenderer
@@ -43,6 +44,25 @@ def _renderer(
         rendering_control_url=f"{location}/ctl/RenderingControl",
         service_type="urn:schemas-upnp-org:service:AVTransport:1",
     )
+
+
+def _history_entry(
+    udn: str = "uuid:tv-1",
+    name: str = "客厅电视",
+    ip: str = "192.168.1.100",
+    last_used: float = 1730000000.0,
+) -> dict:
+    """历史条目 dict（CastHistory 序列化格式：6 字段 + 时间戳）。"""
+    location = f"http://{ip}:49152/description.xml"
+    return {
+        "udn": udn,
+        "friendly_name": name,
+        "location": location,
+        "av_transport_control_url": f"{location}/ctl/AVTransport",
+        "rendering_control_url": f"{location}/ctl/RenderingControl",
+        "service_type": "urn:schemas-upnp-org:service:AVTransport:1",
+        "last_used": last_used,
+    }
 
 
 def _drain(app, cond, timeout: float = 5.0) -> bool:
@@ -109,6 +129,7 @@ def test_dialog_basics(app):
     assert "同一局域网" in cd.EMPTY_HINT_TEXT
     assert "Windows 防火墙" in cd.EMPTY_HINT_TEXT
     assert dialog.error_label.isHidden()
+    assert dialog.clear_history_btn.isHidden()  # 无历史 → 不提供「清除历史」
 
 
 def test_selected_device_raises_without_selection(app):
@@ -297,3 +318,151 @@ def test_show_starts_scan_automatically(app):
 
     assert dialog._worker is None
     assert not _detached_running()
+
+
+# ---------------------------------------------------------------------- #
+# 历史设备：置顶分组 / 上次使用默认选中 / 扫描合并 / 清除历史
+# ---------------------------------------------------------------------- #
+def test_history_listed_first_with_last_used_label_and_preselected(app):
+    """历史设备置顶、首条标「上次使用」并打开即默认选中（可直接点确定）。"""
+    history = [
+        _history_entry("uuid:tv-last", "卧室电视"),
+        _history_entry("uuid:tv-old", "旧电视"),
+    ]
+    dialog = cd.CastDeviceDialog("第 1 集", history=history)
+
+    # 未扫描也立即可用：历史先出、上次使用已选中（扫描在 show 后台继续）
+    assert dialog.device_list.count() == 2
+    assert dialog._worker is None  # 此时还没发起扫描，不阻塞选择
+    first = dialog.device_list.item(0)
+    assert "卧室电视" in first.text()
+    assert "上次使用" in first.text()
+    second = dialog.device_list.item(1)
+    assert "旧电视" in second.text()
+    assert "上次使用" not in second.text()
+    assert dialog.device_list.currentRow() == 0
+    assert dialog.select_btn.isEnabled() is True
+    assert dialog.selected_device().udn == "uuid:tv-last"
+    assert dialog.empty_hint.isHidden()  # 有内容 → 空提示不显示
+    assert not dialog.clear_history_btn.isHidden()
+
+
+def test_no_history_hides_clear_button_and_keeps_empty_hint(app):
+    dialog = cd.CastDeviceDialog("第 1 集")
+    assert dialog.clear_history_btn.isHidden()
+    assert not dialog.empty_hint.isHidden()
+    assert dialog.device_list.count() == 0
+
+
+def test_invalid_history_entries_are_skipped(app):
+    """非 dict / 缺 udn / 缺字段的历史条目静默跳过，不炸对话框。"""
+    history = [
+        42,
+        {"friendly_name": "没有 udn"},
+        {"udn": ""},
+        {"udn": "uuid:tv-bad"},  # 缺控制 URL 等必需字段
+        _history_entry("uuid:tv-ok", "好电视"),
+    ]
+    dialog = cd.CastDeviceDialog("第 1 集", history=history)
+    assert dialog.device_list.count() == 1
+    assert dialog.selected_device().udn == "uuid:tv-ok"
+
+
+def test_scan_merges_history_udn_keeps_name_updates_ip(app):
+    """扫描命中历史设备：按 UDN 去重不重复入列，历史保名称、新扫描更新 IP。"""
+    history = [_history_entry("uuid:tv-1", "客厅电视", ip="192.168.1.100")]
+    dialog = cd.CastDeviceDialog("第 1 集", history=history)
+    scanned = _renderer(udn="uuid:tv-1", name="Living Room TV",
+                        ip="192.168.1.77")
+
+    with patch.object(cd.dlna, "discover_renderers", return_value=[scanned]):
+        dialog._start_scan()
+        assert _drain(app, lambda: "扫描完成" in dialog.status_label.text())
+        _wait_thread_idle(app, dialog._worker)
+
+    assert dialog.device_list.count() == 1
+    text = dialog.device_list.item(0).text()
+    assert "客厅电视" in text        # 历史保名称
+    assert "192.168.1.77" in text    # 新扫描更新 IP
+    assert "上次使用" in text         # 上次使用标记保留
+    device = dialog.selected_device()
+    assert device.friendly_name == "客厅电视"
+    assert device.location == scanned.location  # 连接用新扫描地址
+    assert device.av_transport_control_url == scanned.av_transport_control_url
+    assert dialog.select_btn.isEnabled() is True
+
+
+def test_scan_adds_new_devices_after_history_group(app):
+    """历史置顶，扫描到的新设备追加在其后（历史分组不被打散）。"""
+    history = [
+        _history_entry("uuid:tv-last", "卧室电视"),
+        _history_entry("uuid:tv-old", "旧电视"),
+    ]
+    dialog = cd.CastDeviceDialog("第 1 集", history=history)
+    with patch.object(
+        cd.dlna, "discover_renderers",
+        return_value=[_renderer(udn="uuid:tv-new", name="新电视",
+                                ip="192.168.1.50")],
+    ):
+        dialog._start_scan()
+        assert _drain(app, lambda: dialog.device_list.count() == 3)
+        _wait_thread_idle(app, dialog._worker)
+
+    udns = [dialog.device_list.item(i).data(Qt.UserRole)
+            for i in range(dialog.device_list.count())]
+    assert udns == ["uuid:tv-last", "uuid:tv-old", "uuid:tv-new"]
+    assert dialog.device_list.currentRow() == 0  # 默认选中不被扫描结果抢走
+
+
+def test_refresh_keeps_history_group_on_top(app):
+    """刷新清掉扫描结果，历史分组重新置顶（不被刷新误删）。"""
+    history = [_history_entry("uuid:tv-1", "客厅电视")]
+    dialog = cd.CastDeviceDialog("第 1 集", history=history)
+    with patch.object(
+        cd.dlna, "discover_renderers",
+        side_effect=[[_renderer(udn="uuid:tv-2", name="新电视")], []],
+    ):
+        dialog._start_scan()
+        assert _drain(app, lambda: dialog.device_list.count() == 2)
+        _wait_thread_idle(app, dialog._worker)
+
+        dialog.refresh_btn.click()
+        assert _drain(app, lambda: "扫描完成" in dialog.status_label.text())
+        _wait_thread_idle(app, dialog._worker)
+
+    assert dialog.device_list.count() == 1  # 历史保留、上次扫描结果被清掉
+    assert dialog.device_list.item(0).data(Qt.UserRole) == "uuid:tv-1"
+    assert not dialog.clear_history_btn.isHidden()
+
+
+def test_clear_history_emits_signal_and_drops_history_items(app):
+    """「清除历史」发信号给调用方（删存储），本地只移除历史分组。"""
+    history = [
+        _history_entry("uuid:tv-last", "卧室电视"),
+        _history_entry("uuid:tv-old", "旧电视"),
+    ]
+    dialog = cd.CastDeviceDialog("第 1 集", history=history)
+    with patch.object(
+        cd.dlna, "discover_renderers",
+        return_value=[_renderer(udn="uuid:tv-new", name="新电视")],
+    ):
+        dialog._start_scan()
+        assert _drain(app, lambda: dialog.device_list.count() == 3)
+        _wait_thread_idle(app, dialog._worker)
+
+    cleared = []
+    dialog.clearHistoryRequested.connect(lambda: cleared.append(True))
+    dialog.clear_history_btn.click()
+
+    assert cleared == [True]  # 只发一次，存储由调用方处理
+    udns = [dialog.device_list.item(i).data(Qt.UserRole)
+            for i in range(dialog.device_list.count())]
+    assert udns == ["uuid:tv-new"]  # 扫描到的设备保留，可继续投
+    assert dialog._history_udns == set()
+    assert dialog._history_renderers == []
+    assert dialog.clear_history_btn.isHidden()
+    assert "uuid:tv-last" not in dialog._devices
+    # 原选中（历史首项）被移除 → 取消选中，确定按钮回到禁用
+    assert dialog.device_list.currentItem() is None
+    assert dialog.select_btn.isEnabled() is False
+    assert "1" in dialog.status_label.text()  # 设备数按剩余数量刷新
