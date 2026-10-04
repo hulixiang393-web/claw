@@ -38,6 +38,9 @@ class FakeProxy:
         if self.events is not self.calls:
             self.events.append(("stop_lan_endpoint",))
 
+    def lan_endpoint_error(self):
+        return self._lan_error
+
 
 class FakeClient:
     def __init__(self, calls, states=None, positions=None, events=None):
@@ -278,8 +281,12 @@ def test_set_episode_recovers_old_uri_on_play_failure(monkeypatch, renderer):
 
     assert session.current_episode_index == 0
     assert session._current_url == old_url
-    assert ("set_av_transport_uri", old_url, "第一集", "video/mp4") in calls
+    # 恢复动作是最后一次 set_av_transport_uri，且用的是旧标题
+    assert calls[-2] == ("set_av_transport_uri", old_url, "第一集", "video/mp4")
     assert "new_token" in proxy.release_calls
+    # 旧 token 保留，LAN token 集合回到仅剩旧 token 的状态
+    assert old_url.rsplit("/", 1)[-1] not in proxy.release_calls
+    assert proxy.lan_tokens == {"token"}
 
 
 def test_set_episode_releases_old_token_on_success(monkeypatch, renderer):
@@ -296,6 +303,7 @@ def test_set_episode_releases_old_token_on_success(monkeypatch, renderer):
     session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
 
     assert old_token in proxy.release_calls
+    assert proxy.lan_tokens == {"new_token"}
 
 
 def test_stop_propagates_lan_endpoint_error(monkeypatch, renderer):
@@ -307,6 +315,8 @@ def test_stop_propagates_lan_endpoint_error(monkeypatch, renderer):
         proxy.calls.append(("stop_lan_endpoint",))
         if stop_attempts[0] == 1:
             proxy._lan_error = RuntimeError("endpoint cleanup failed")
+        else:
+            proxy._lan_error = None
 
     proxy.stop_lan_endpoint = failing_stop_lan_endpoint
     calls = []
@@ -319,8 +329,12 @@ def test_stop_propagates_lan_endpoint_error(monkeypatch, renderer):
     with pytest.raises(RuntimeError, match="endpoint cleanup failed"):
         session.stop()
 
+    # N-1：stop() 只读代理错误，不得清空失败生命周期标记（否则守卫被解除）
+    assert proxy._lan_error is not None
+
     session.stop()
     assert stop_attempts[0] == 2
+    assert proxy._lan_error is None
 
 
 def test_complete_startup_order_with_unified_events(monkeypatch, renderer):
@@ -342,6 +356,7 @@ def test_complete_startup_order_with_unified_events(monkeypatch, renderer):
 
     for i, expected in enumerate(expected_order):
         assert events[i] == expected, f"Event {i}: expected {expected}, got {events[i]}"
+    assert len(events) == len(expected_order)
 
 
 def test_set_episode_build_url_failure_does_not_affect_state(monkeypatch, renderer):
@@ -366,9 +381,11 @@ def test_set_episode_build_url_failure_does_not_affect_state(monkeypatch, render
 
     assert session.current_episode_index == old_index
     assert session._current_url == old_url
+    assert proxy.release_calls == []
+    assert proxy.lan_tokens == {"token"}
 
 
-def test_set_episode_uri_success_play_failure_full_recovery(monkeypatch, renderer):
+def test_set_episode_recovery_failure_wraps_error(monkeypatch, renderer):
     events = []
     proxy = FakeProxy(events=events)
     calls = []
@@ -377,11 +394,6 @@ def test_set_episode_uri_success_play_failure_full_recovery(monkeypatch, rendere
         def __init__(self, calls, events):
             super().__init__(calls, events=events)
             self.set_episode_started = False
-
-        def set_av_transport_uri(self, uri, title, mime):
-            super().set_av_transport_uri(uri, title, mime)
-            if self.set_episode_started:
-                pass
 
         def play(self):
             if self.set_episode_started:
@@ -402,10 +414,51 @@ def test_set_episode_uri_success_play_failure_full_recovery(monkeypatch, rendere
 
     client.set_episode_started = True
 
-    with pytest.raises(RuntimeError, match="play after new uri failed"):
+    with pytest.raises(RuntimeError,
+                        match="set_episode failed and recovery failed: play after new uri failed"):
         session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
 
+    # 恢复失败分支：会话保持 active，索引/URL 未被改写，仅新 token 被释放
+    assert session._active is True
     assert session.current_episode_index == old_index
     assert session._current_url == old_url
     assert "new_token" in proxy.release_calls
-    assert ("set_av_transport_uri", old_url, "第一集", "video/mp4") in calls
+    assert "token" not in proxy.release_calls
+    # 恢复时用的是会话持有的旧标题（最后一次 set_av_transport_uri）
+    assert calls[-2] == ("set_av_transport_uri", old_url, "第一集", "video/mp4")
+
+
+def test_set_episode_recovery_uses_session_owned_title(monkeypatch, renderer):
+    # N-2：类真实 DlnaClient（无 calls 属性），恢复标题必须来自会话自身状态
+    proxy = FakeProxy()
+    log = []
+
+    class NoCallsClient:
+        def set_av_transport_uri(self, uri, title, mime):
+            log.append(("set_av_transport_uri", uri, title, mime))
+
+        def play(self):
+            log.append(("play",))
+            if log.count(("play",)) == 2:
+                raise RuntimeError("play failed")
+
+        def stop(self):
+            log.append(("stop",))
+
+    client = NoCallsClient()
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/first.mp4", "第一集", {}, None, False)
+    old_url = session._current_url
+    proxy.next_url = "http://192.168.1.10:4321/s/new_token"
+
+    with pytest.raises(RuntimeError, match="play failed"):
+        session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
+
+    uri_calls = [entry for entry in log if entry[0] == "set_av_transport_uri"]
+    assert uri_calls[-1] == ("set_av_transport_uri", old_url, "第一集", "video/mp4")
+    assert session.current_episode_index == 0
+    assert session._current_url == old_url
+    assert "new_token" in proxy.release_calls
+    assert old_url.rsplit("/", 1)[-1] not in proxy.release_calls

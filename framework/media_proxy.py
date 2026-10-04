@@ -1318,11 +1318,22 @@ class MediaProxy:
                 self._tokens.pop(token, None)
             self._lan_tokens.clear()
 
+    def lan_endpoint_error(self) -> Exception | None:
+        """公开只读接口：返回最近一次 LAN 端点生命周期失败的错误。
+
+        只读、不清除——失败生命周期标记由代理自身在
+        start_lan_endpoint()/stop_lan_endpoint() 成功时复位。
+        调用方（如 CastSession）经此感知 stop_lan_endpoint() 的静默失败，
+        不得改写该标记，否则 Task 2 的 failed-lifecycle 守卫会被解除。
+        """
+        with self._lan_lock:
+            return self._lan_error
+
     def stop_lan_endpoint(self) -> None:
         """只停止 LAN server，并清理 LAN-owned tokens。
 
         失败时设置 _lan_error 但不抛异常（保持向后兼容）。
-        调用方可检查 _lan_error 来感知失败。
+        调用方可通过 lan_endpoint_error() 感知失败。
         """
         with self._lan_lock:
             server = self._lan_server

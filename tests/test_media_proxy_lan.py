@@ -514,3 +514,68 @@ def test_stop_lan_endpoint_is_idempotent_and_local_endpoint_survives(proxy_ctx):
     local_url = proxy_ctx.build_url("https://cdn.example/local.m3u8", {"Referer": "r"})
     assert local_url.startswith("http://127.0.0.1:")
     assert lan_base != local_url.rsplit("/s/", 1)[0]
+
+
+def test_release_token_removes_target_token_only(proxy_ctx):
+    local_url = proxy_ctx.build_url("https://cdn.example/local.m3u8", {"Referer": "r"})
+    lan_base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    lan_url = proxy_ctx.build_url(
+        "https://cdn.example/lan.m3u8", {"Referer": "r"}, public_base=lan_base
+    )
+
+    proxy_ctx.release_token(lan_url)
+    proxy_ctx.release_token(lan_url)  # 幂等
+
+    assert _token(lan_url) not in proxy_ctx._tokens
+    assert _token(lan_url) not in proxy_ctx._lan_tokens
+    assert _token(local_url) in proxy_ctx._tokens
+
+    proxy_ctx.release_token(local_url)
+
+    assert _token(local_url) not in proxy_ctx._tokens
+
+
+def test_cast_session_stop_failure_keeps_lan_guard(monkeypatch, proxy_ctx):
+    # N-1：stop() 只读代理公开错误通道，不得清空失败生命周期标记。
+    # LAN 停止失败 → stop() 抛错 → 该状态下 build_url/start_lan_endpoint 仍被拒绝。
+    from types import SimpleNamespace
+
+    from framework.cast_session import CastSession
+
+    class _CastClient:
+        def set_av_transport_uri(self, uri, title, mime):
+            pass
+
+        def play(self):
+            pass
+
+        def stop(self):
+            pass
+
+    base = proxy_ctx.start_lan_endpoint("127.0.0.1")
+    server = proxy_ctx._lan_server
+    original_close = server.server_close
+
+    def fail_close():
+        raise OSError("close failed")
+
+    monkeypatch.setattr(server, "server_close", fail_close)
+    monkeypatch.setattr(
+        "framework.cast_session._local_ip_for_renderer", lambda _: "127.0.0.1"
+    )
+    session = CastSession(proxy_ctx, lambda _: _CastClient())
+    renderer = SimpleNamespace(location="http://192.168.1.20:80/root.xml")
+    try:
+        session.start(
+            renderer, 0, "https://cdn.example/video.m3u8", "第一集", {}, None, False
+        )
+        with pytest.raises(OSError, match="close failed"):
+            session.stop()
+        with pytest.raises(OSError, match="failed lifecycle"):
+            proxy_ctx.build_url(
+                "https://cdn.example/video.m3u8", public_base=base
+            )
+        with pytest.raises(OSError, match="failed lifecycle"):
+            proxy_ctx.start_lan_endpoint("127.0.0.1")
+    finally:
+        monkeypatch.setattr(server, "server_close", original_close)
