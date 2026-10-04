@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import threading
 from urllib.parse import urlsplit
 
 
@@ -27,10 +28,15 @@ class CastSession:
         self.local_player_stopped = False
         self._active = False
         self._current_url = None
+        self._lock = threading.Lock()
+        self._lan_endpoint_error = None
 
     def start(self, renderer, episode_index: int, media_url: str,
               title: str, headers: dict, ad_block: dict | None,
               force_proxy: bool) -> None:
+        if self._active:
+            raise RuntimeError("cast session is already active; call stop() first")
+
         local_ip = _local_ip_for_renderer(renderer)
         try:
             lan_base = self.proxy.start_lan_endpoint(local_ip)
@@ -47,6 +53,7 @@ class CastSession:
                 pass
             self._clear_state()
             raise
+
         self.client = client
         self.renderer = renderer
         self.lan_base = lan_base
@@ -54,6 +61,7 @@ class CastSession:
         self.local_player_stopped = False
         self._active = True
         self._current_url = lan_url
+        self._lan_endpoint_error = None
 
     def stop(self) -> None:
         first_error = None
@@ -62,13 +70,21 @@ class CastSession:
                 self.client.stop()
         except Exception as exc:
             first_error = exc
+
         try:
             self.proxy.stop_lan_endpoint()
+            if self.proxy._lan_error is not None:
+                lan_error = self.proxy._lan_error
+                self.proxy._lan_error = None
+                if first_error is None:
+                    first_error = lan_error
         except Exception as exc:
+            self._lan_endpoint_error = exc
             if first_error is None:
                 first_error = exc
         finally:
             self._clear_state()
+
         if first_error is not None:
             raise first_error
 
@@ -84,24 +100,48 @@ class CastSession:
     def set_episode(self, episode_index: int, media_url: str, title: str,
                     headers: dict, ad_block: dict | None,
                     force_proxy: bool) -> None:
-        client = self._require_active()
-        old_index = self.current_episode_index
-        old_url = self._current_url
-        new_url = None
-        try:
-            new_url = self.proxy.build_url(
-                media_url, headers, ad_block, force_proxy, public_base=self.lan_base,
-            )
-            client.set_av_transport_uri(new_url, title, self._mime_type(media_url))
-            client.play()
-        except Exception:
-            if new_url is not None:
-                self._release_url(new_url)
-            self.current_episode_index = old_index
-            self._current_url = old_url
-            raise
-        self.current_episode_index = episode_index
-        self._current_url = new_url
+        with self._lock:
+            client = self._require_active()
+            old_index = self.current_episode_index
+            old_url = self._current_url
+            old_title = self._episode_title_from_calls(client)
+            new_url = None
+            uri_set = False
+
+            try:
+                new_url = self.proxy.build_url(
+                    media_url, headers, ad_block, force_proxy, public_base=self.lan_base,
+                )
+
+                client.set_av_transport_uri(new_url, title, self._mime_type(media_url))
+                uri_set = True
+
+                client.play()
+
+            except Exception:
+                if uri_set:
+                    try:
+                        client.set_av_transport_uri(old_url, old_title or "Unknown",
+                                                   self._mime_type(old_url))
+                        client.play()
+                    except Exception as recovery_error:
+                        if new_url is not None:
+                            self.proxy.release_token(new_url)
+                        raise RuntimeError(f"set_episode failed and recovery failed: {recovery_error}") from recovery_error
+
+                self.current_episode_index = old_index
+                self._current_url = old_url
+
+                if new_url is not None:
+                    self.proxy.release_token(new_url)
+
+                raise
+
+            self.current_episode_index = episode_index
+            self._current_url = new_url
+
+            if old_url is not None:
+                self.proxy.release_token(old_url)
 
     def poll_state(self) -> dict:
         client = self._require_active()
@@ -134,14 +174,13 @@ class CastSession:
             else "video/mp4"
         )
 
-    def _release_url(self, url: str) -> None:
-        token = url.rsplit("/", 1)[-1]
-        tokens = getattr(self.proxy, "_tokens", None)
-        lan_tokens = getattr(self.proxy, "_lan_tokens", None)
-        if tokens is not None:
-            tokens.pop(token, None)
-        if lan_tokens is not None:
-            lan_tokens.discard(token)
+    @staticmethod
+    def _episode_title_from_calls(client) -> str:
+        if hasattr(client, 'calls'):
+            for call in reversed(client.calls):
+                if isinstance(call, tuple) and len(call) >= 2 and call[0] == "set_av_transport_uri":
+                    return call[2] if len(call) > 2 else "Unknown"
+        return "Unknown"
 
     def _clear_state(self) -> None:
         self.client = None

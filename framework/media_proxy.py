@@ -1300,6 +1300,17 @@ class MediaProxy:
                 raise
             return base
 
+    def release_token(self, url: str) -> None:
+        """公开、线程安全的 token 释放接口。按 URL 从 _tokens 中移除。
+
+        如果 URL 对应的 token 是 LAN token，同时从 _lan_tokens 中移除。
+        该接口供外部（如 CastSession）调用，避免直接操作私有容器。
+        """
+        token = url.rsplit("/", 1)[-1]
+        with self._lock:
+            self._tokens.pop(token, None)
+            self._lan_tokens.discard(token)
+
     def release_lan_tokens(self) -> None:
         """只清理投屏端点生成的 tokens。"""
         with self._lock:
@@ -1308,7 +1319,11 @@ class MediaProxy:
             self._lan_tokens.clear()
 
     def stop_lan_endpoint(self) -> None:
-        """只停止 LAN server，并清理 LAN-owned tokens。"""
+        """只停止 LAN server，并清理 LAN-owned tokens。
+
+        失败时设置 _lan_error 但不抛异常（保持向后兼容）。
+        调用方可检查 _lan_error 来感知失败。
+        """
         with self._lan_lock:
             server = self._lan_server
             thread = self._lan_thread
