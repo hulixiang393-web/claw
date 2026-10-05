@@ -49,6 +49,9 @@ class CastSession:
         self._active = False
         self._current_url = None
         self._current_title = None
+        self._current_token_url = None
+        self._transcode_session = None
+        self._transcode_attempted = False
         self._lock = threading.RLock()
 
     def start(self, renderer, episode_index: int, media_url: str,
@@ -57,6 +60,7 @@ class CastSession:
         with self._lock:
             if self._active:
                 raise RuntimeError("cast session is already active; call stop() first")
+            self._transcode_attempted = False
 
             local_ip = _local_ip_for_renderer(renderer)
             try:
@@ -83,15 +87,100 @@ class CastSession:
             self._active = True
             self._current_url = lan_url
             self._current_title = title
+            self._current_token_url = lan_url
+
+    def start_transcoded(self, renderer, episode_index: int, playlist_url: str,
+                         title: str, transcode_session=None) -> None:
+        with self._lock:
+            if self._transcode_attempted:
+                raise RuntimeError("transcode fallback already attempted")
+            self._transcode_attempted = True
+            was_active = self._active
+            old_token_url = self._current_token_url
+            client = self.client
+            lan_base = self.lan_base
+            if not was_active:
+                local_ip = _local_ip_for_renderer(renderer)
+                try:
+                    lan_base = self.proxy.start_lan_endpoint(local_ip)
+                    client = self.client_factory(renderer)
+                except Exception:
+                    try:
+                        self.proxy.stop_lan_endpoint()
+                    except Exception:
+                        pass
+                    self._clear_state()
+                    raise
+
+            try:
+                client.set_av_transport_uri(
+                    playlist_url, title, self._mime_type(playlist_url),
+                )
+                client.play()
+            except Exception:
+                if transcode_session is not None:
+                    try:
+                        transcode_session.stop()
+                    except Exception:
+                        pass
+                if old_token_url is not None:
+                    try:
+                        self.proxy.release_token(old_token_url)
+                    except Exception:
+                        pass
+                try:
+                    if client is not None and was_active:
+                        client.stop()
+                except Exception:
+                    pass
+                try:
+                    self.proxy.stop_lan_endpoint()
+                except Exception:
+                    pass
+                self._clear_state()
+                raise
+
+            if old_token_url is not None and old_token_url != playlist_url:
+                self.proxy.release_token(old_token_url)
+            self.client = client
+            self.renderer = renderer if not was_active else self.renderer
+            self.lan_base = lan_base
+            self.current_episode_index = episode_index
+            self.local_player_stopped = False
+            self._active = True
+            self._current_url = playlist_url
+            self._current_title = title
+            self._current_token_url = None
+            self._transcode_session = transcode_session
+
+    def has_transcode_fallback(self) -> bool:
+        with self._lock:
+            return self._transcode_attempted
 
     def stop(self) -> None:
         with self._lock:
             first_error = None
+            transcode_session = self._transcode_session
+            token_url = self._current_token_url
             try:
                 if self._active and self.client is not None:
                     self.client.stop()
             except Exception as exc:
                 first_error = exc
+
+            if transcode_session is not None:
+                try:
+                    transcode_session.stop()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+
+            if token_url is not None:
+                try:
+                    self.proxy.release_token(token_url)
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
 
             try:
                 self.proxy.stop_lan_endpoint()
@@ -129,6 +218,7 @@ class CastSession:
             client = self._require_active()
             old_index = self.current_episode_index
             old_url = self._current_url
+            old_token_url = self._current_token_url
             old_title = self._current_title or "Unknown"
             new_url = None
             uri_set = False
@@ -168,9 +258,10 @@ class CastSession:
             self.current_episode_index = episode_index
             self._current_url = new_url
             self._current_title = title
+            self._current_token_url = new_url
 
-            if old_url is not None:
-                self.proxy.release_token(old_url)
+            if old_token_url is not None:
+                self.proxy.release_token(old_token_url)
 
     def poll_state(self) -> dict:
         with self._lock:
@@ -215,3 +306,5 @@ class CastSession:
         self._active = False
         self._current_url = None
         self._current_title = None
+        self._current_token_url = None
+        self._transcode_session = None

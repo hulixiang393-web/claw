@@ -526,3 +526,68 @@ def test_set_episode_recovery_uses_session_owned_title(monkeypatch, renderer):
     assert session._current_url == old_url
     assert "new_token" in proxy.release_calls
     assert old_url.rsplit("/", 1)[-1] not in proxy.release_calls
+
+
+def test_start_transcoded_reuses_active_renderer_client_and_hls_mime(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    stopped = []
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, stopped.append)
+
+    session.start(renderer, 0, "https://cdn.example/original.mp4", "第一集", {}, None, False)
+    session.start_transcoded(renderer, 0, "http://192.168.1.10:4321/transcode/index.m3u8", "第一集")
+
+    assert calls[-2:] == [
+        ("set_av_transport_uri", "http://192.168.1.10:4321/transcode/index.m3u8", "第一集", "application/vnd.apple.mpegurl"),
+        ("play",),
+    ]
+    assert calls.count(("set_av_transport_uri", "http://192.168.1.10:4321/transcode/index.m3u8", "第一集", "application/vnd.apple.mpegurl")) == 1
+    assert proxy.calls.count(("start_lan_endpoint", "192.168.1.5")) == 1
+    assert stopped == []
+
+
+def test_transcoded_fallback_is_one_shot_and_stop_cleans_session(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    transcode = SimpleNamespace(stop=lambda: calls.append(("transcode_stop",)))
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start_transcoded(
+        renderer, 1, "http://192.168.1.10:4321/transcode/index.m3u8", "第二集",
+        transcode_session=transcode,
+    )
+
+    with pytest.raises(RuntimeError, match="already attempted"):
+        session.start_transcoded(renderer, 1, "http://192.168.1.10:4321/transcode/again.m3u8", "第二集")
+
+    session.stop()
+
+    assert ("transcode_stop",) in calls
+    assert session.has_transcode_fallback() is True
+    assert session._active is False
+
+
+def test_transcoded_fallback_failure_does_not_stop_local_player(monkeypatch, renderer):
+    proxy = FakeProxy()
+    stopped = []
+
+    class FailingClient(FakeClient):
+        def set_av_transport_uri(self, uri, title, mime):
+            super().set_av_transport_uri(uri, title, mime)
+            if "transcode" in uri:
+                raise RuntimeError("transcoded uri rejected")
+
+    client = FailingClient([])
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, stopped.append)
+
+    with pytest.raises(RuntimeError, match="transcoded uri rejected"):
+        session.start_transcoded(renderer, 0, "http://192.168.1.10:4321/transcode/index.m3u8", "第一集")
+
+    assert stopped == []
+    assert session._active is False
+    assert session.has_transcode_fallback() is True
