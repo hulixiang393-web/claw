@@ -24,6 +24,7 @@ import threading
 import time
 import webbrowser
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from framework.content import Content, Detail
+from framework.transcode_session import TranscodeSession
 
 from gui.components.hover_title import HoverTitle
 
@@ -280,6 +282,58 @@ class _CastStartTask:
             exc = e
         try:
             self.signals.finished.emit(self.gen, self.session, exc)
+        except RuntimeError:
+            pass
+
+
+class _CastTranscodeSignals(QObject):
+    finished = Signal(int, object, object, object)
+
+
+class _CastTranscodeTask:
+    def __init__(self, session, proxy, renderer, idx, video, title, headers, gen):
+        self.signals = _CastTranscodeSignals()
+        self.session = session
+        self.proxy = proxy
+        self.renderer = renderer
+        self.idx = idx
+        self.video = video
+        self.title = title
+        self.headers = headers
+        self.gen = gen
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self.run, daemon=True,
+                                        name="cast-transcode")
+        self._thread.start()
+
+    def run(self):
+        transcode = None
+        exc = None
+        try:
+            from framework.cast_session import _local_ip_for_renderer
+
+            public_base = self.proxy.start_lan_endpoint(
+                _local_ip_for_renderer(self.renderer)
+            )
+            transcode = TranscodeSession(media_proxy=self.proxy)
+            playlist_url = transcode.start(self.video, self.headers, public_base)
+            self.session.start_transcoded(
+                self.renderer, self.idx, playlist_url, self.title,
+                transcode_session=transcode,
+            )
+        except Exception as error:  # noqa: BLE001
+            exc = error
+            if transcode is not None:
+                try:
+                    transcode.stop()
+                except Exception:
+                    pass
+        try:
+            self.signals.finished.emit(self.gen, self.session, transcode, exc)
         except RuntimeError:
             pass
 
@@ -570,6 +624,11 @@ class VideoView(QWidget):
         # （迟到的取流/启动回调按代数整条丢弃，不许消费/覆盖新的 pending）
         self._cast_gen = 0
         self._cast_start_task = None    # _CastStartTask（防 GC + 陈旧启动守卫）
+        self._cast_transcode_task = None
+        self._cast_transcoding = False
+        self._cast_transcode_attempted = False
+        self._cast_video = ""
+        self._cast_local_stop_pending = False
         # 投屏设备历史（data/cast_history.json，惰性打开）：
         # 有历史 → 取流完成直接重连上次设备；start 失败才回落选设备对话框
         self._cast_history_store = None  # framework.cast_history.CastHistory
@@ -2359,9 +2418,16 @@ class VideoView(QWidget):
         self._cast_start_task = None
         if exc is not None:
             if self._cast_direct:
-                # 直投上次设备失败（SOAP 超时/拒连等）→ 回落选设备对话框，
-                # 把失败原因带状态栏，让用户换一台电视继续，而不是报错死。
                 self._cast_direct_fallback(exc, task.idx, task.video)
+                return
+            if self._cast_can_transcode(task.video):
+                self._cast_session = session
+                self._cast_renderer = task.renderer
+                self._cast_device = getattr(task.renderer, "friendly_name", "") or ""
+                self._cast_active = True
+                self._start_cast_transcode_fallback(
+                    task.idx, task.video, task.renderer, exc,
+                )
                 return
             self._cast_fail_start(exc)
             return
@@ -2372,6 +2438,10 @@ class VideoView(QWidget):
         self._cast_active = True
         self._cast_state = "connecting"
         self._cast_error = ""
+        self._cast_video = task.video
+        self._cast_transcoding = False
+        self._cast_transcode_attempted = False
+        self._cast_local_stop_pending = False
         self._cast_duration = 0
         self._cast_status_text = ""
         self._record_cast_history(task.renderer)  # start 成功即记忆（非 PLAYING）
@@ -2385,8 +2455,73 @@ class VideoView(QWidget):
         self._update_cast_button()
 
     def _cast_fail_start(self, exc: BaseException) -> None:
-        """start 失败：保留本地播放器（绝不碰停止入口），只提示错误。"""
         self._stop_cast(error=str(exc) or exc.__class__.__name__)
+
+    @staticmethod
+    def _cast_can_transcode(video: str) -> bool:
+        path = urlsplit(video or "").path.lower()
+        return not path.endswith((".mp4", ".m4v", ".mov", ".webm", ".m3u8", ".m3u"))
+
+    def _start_cast_transcode_fallback(self, idx: int, video: str, renderer,
+                                       error: BaseException) -> None:
+        if self._cast_transcode_attempted or self._cast_transcode_task is not None:
+            return
+        session = self._cast_session
+        if session is None:
+            self._stop_cast(error=f"原始投屏失败：{error}")
+            return
+        self._cast_transcode_attempted = True
+        self._cast_transcoding = True
+        self._cast_video = video
+        self._cast_playing_timer.stop()
+        task = self._cast_poll_task
+        self._cast_poll_task = None
+        if task is not None:
+            task.stop()
+        self._cast_gen += 1
+        headers, _ad_block, _force_proxy = self._cast_media_args()
+        try:
+            from framework.media_proxy import MediaProxy
+
+            transcode_task = _CastTranscodeTask(
+                session, MediaProxy.instance(), renderer, idx,
+                video, self._episodes[idx].title or f"第{idx + 1}集",
+                headers, self._cast_gen,
+            )
+            transcode_task.signals.finished.connect(self._on_transcode_finished)
+            self._cast_transcode_task = transcode_task
+            self._cast_state = "connecting"
+            self._set_cast_status("正在转换为电视兼容格式")
+            self._update_cast_button()
+            transcode_task.start()
+        except Exception as exc:
+            self._stop_cast(error=f"转码启动失败：{exc}")
+
+    def _on_transcode_finished(self, gen: int, session, transcode, exc) -> None:
+        task = self._cast_transcode_task
+        if task is None or task.gen != gen or gen != self._cast_gen:
+            if transcode is not None:
+                try:
+                    transcode.stop()
+                except Exception:
+                    pass
+            try:
+                session.stop()
+            except Exception:
+                pass
+            return
+        self._cast_transcode_task = None
+        if exc is not None:
+            self._stop_cast(error=f"转码失败：{exc}")
+            return
+        self._cast_session = session
+        self._cast_active = True
+        self._cast_state = "connecting"
+        self._cast_error = ""
+        self._start_cast_poll(session)
+        self._cast_playing_timer.start()
+        self._set_cast_status("正在连接电视")
+        self._update_cast_button()
 
     def _cast_media_args(self):
         """当前源的请求头 / 广告过滤 / 强制代理（与本地播放同一套来源）。"""
@@ -2443,6 +2578,11 @@ class VideoView(QWidget):
         if transport == "PLAYING":
             self._cast_state = "playing"
             self._cast_playing_timer.stop()
+            if self._cast_transcoding:
+                self._cast_transcoding = False
+                if self._cast_local_stop_pending:
+                    self._cast_local_stop_pending = False
+                    self._stop_local_player()
         elif transport == "PAUSED_PLAYBACK":
             if not self._cast_playing_timer.isActive():
                 self._cast_state = "paused"
@@ -2481,8 +2621,17 @@ class VideoView(QWidget):
         if self._cast_session is None:
             return
         if self._cast_state in ("playing", "paused"):
-            return  # 定时器触发前已进 PLAYING（正常在进 PLAYING 时就已停表）
-        self._stop_cast(error="电视未在 8 秒内开始播放")
+            return
+        if (not self._cast_transcode_attempted
+                and self._cast_can_transcode(self._cast_video)):
+            self._start_cast_transcode_fallback(
+                self._current_idx, self._cast_video, self._cast_renderer,
+                RuntimeError("电视未在 8 秒内开始播放"),
+            )
+            return
+        self._stop_cast(error=("转码后电视未在 8 秒内开始播放"
+                               if self._cast_transcoding
+                               else "电视未在 8 秒内开始播放"))
 
     def _set_cast_status(self, text: str) -> None:
         """状态文案去抖（轮询每秒一次，同文案不重排 UI）。"""
@@ -2579,9 +2728,11 @@ class VideoView(QWidget):
 
     # ---- 本地播放器停止入口 + 会话清理 ---- #
     def _on_cast_local_player_stop(self) -> None:
-        """CastSession 回调（轮询线程 emit）→ 主线程停本地播放器。"""
         if self._cast_session is None:
-            return  # 会话已被收掉：不再停，避免误伤用户重新拉起的本地播放
+            return
+        if self._cast_transcoding and self._cast_state != "playing":
+            self._cast_local_stop_pending = True
+            return
         self._stop_local_player()
 
     def _stop_local_player(self) -> None:
@@ -2618,6 +2769,11 @@ class VideoView(QWidget):
         self._cast_active = False
         self._cast_stream_pending = None
         self._cast_stream_task = None
+        self._cast_transcode_task = None
+        self._cast_transcoding = False
+        self._cast_transcode_attempted = False
+        self._cast_video = ""
+        self._cast_local_stop_pending = False
         if session is not None:
             try:
                 session.stop()  # Stop + 释放 DLNA 会话 + 关 LAN 端点

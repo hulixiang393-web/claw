@@ -134,6 +134,23 @@ class _FakeProxy:
         pass
 
 
+class _FakeTranscodeSession:
+    def __init__(self, playlist_url="http://192.168.1.10:4321/t/transcoded/index.m3u8",
+                 error=None):
+        self.playlist_url = playlist_url
+        self.error = error
+        self.calls = []
+
+    def start(self, source_url, headers, public_base):
+        self.calls.append(("start", source_url, headers, public_base))
+        if self.error is not None:
+            raise self.error
+        return self.playlist_url
+
+    def stop(self):
+        self.calls.append(("stop",))
+
+
 class _FakeSession:
     """CastSession 替身：记录调用与 start 所在线程，可配置 start/轮询结果。"""
 
@@ -146,6 +163,7 @@ class _FakeSession:
         self.current_episode_index = None
         self.on_local_player_stop = None
         self.start_thread_id = None  # start() 在哪个线程执行（验证不占 GUI 线程）
+        self.transcode_session = None
 
     def start(self, renderer, episode_index, media_url, title, headers,
               ad_block, force_proxy):
@@ -158,6 +176,16 @@ class _FakeSession:
 
     def stop(self):
         self.calls.append(("stop",))
+
+    def start_transcoded(self, renderer, episode_index, playlist_url, title,
+                         transcode_session=None):
+        self.calls.append(("start_transcoded", renderer, episode_index,
+                           playlist_url, title))
+        self.transcode_session = transcode_session
+        self.current_episode_index = episode_index
+
+    def has_transcode_fallback(self):
+        return any(call[0] == "start_transcoded" for call in self.calls)
 
     def play(self):
         self.calls.append(("play",))
@@ -1408,12 +1436,109 @@ def test_broken_history_module_import_degrades_to_dialog(
 
     assert view._last_cast_renderer() is None      # 修复前：ImportError 在此冒泡
     view._on_cast_clicked()                        # 修复前：同样冒泡、状态卡死
-
     assert _wait_for(lambda: view._cast_session is not None,
                      timeout=_CAST_WAIT), "降级到对话框后未完成投屏"
-    assert seen["titles"] == ["第1集 标题0"]       # 走了对话框（而非卡死/直投）
-    assert seen["history"] == [[]]                 # 降级为「无历史」
+    assert seen["titles"] == ["第1集 标题0"]
+    assert seen["history"] == [[]]
     assert view._cast_direct is False
-    assert view._cast_start_task is None           # 串行守卫不被残留任务卡死
-    assert view._cast_state != "preparing_stream"  # 没卡在入口侧死路状态
+    assert view._cast_start_task is None
+    assert view._cast_state != "preparing_stream"
     assert view.cast_btn.isEnabled() is True
+
+
+def test_incompatible_cast_start_failure_falls_back_to_transcode(_qapp, monkeypatch):
+    from gui.pages.reader import video_view as vv
+
+    view = _view(_video_detail(1), idx=0)
+    view._external_active = True
+    stopped = []
+    monkeypatch.setattr(ep, "_terminate_previous", lambda: stopped.append(True))
+    session = _FakeSession(start_error=RuntimeError("电视不支持 HEVC"))
+    _install_session(monkeypatch, session)
+    proxy = _install_proxy(monkeypatch)
+    transcodes = []
+
+    def _factory(*args, **kwargs):
+        transcode = _FakeTranscodeSession()
+        transcodes.append(transcode)
+        return transcode
+
+    monkeypatch.setattr(vv, "TranscodeSession", _factory, raising=False)
+    view._stream_cache[("http://e/0", "best")] = ("https://cdn/video.mpd", "")
+    _install_dialog(monkeypatch, renderer=_renderer())
+    view._on_cast_clicked()
+
+    assert _wait_for(lambda: any(call[0] == "start_transcoded" for call in session.calls),
+                     timeout=_CAST_WAIT)
+    assert view._cast_state == "connecting"
+    assert view._cast_session is session
+    assert transcodes and transcodes[0].calls[0][1] == "https://cdn/video.mpd"
+    assert stopped == []
+    assert proxy.lan_started
+
+
+def test_transcode_playing_is_the_only_point_that_stops_local_player(_qapp, monkeypatch):
+    from gui.pages.reader import video_view as vv
+
+    view = _view(_video_detail(1), idx=0)
+    view._external_active = True
+    stopped = []
+    monkeypatch.setattr(ep, "_terminate_previous", lambda: stopped.append(True))
+    session = _FakeSession()
+    view._cast_session = session
+    view._cast_renderer = _renderer()
+    view._cast_active = True
+    view._cast_state = "connecting"
+    view._cast_transcoding = True
+    view._cast_poll_task = object()
+    view._on_cast_state({"state": "STOPPED", "position": 0, "duration": 0},
+                        view._cast_poll_task)
+    assert stopped == []
+
+    view._on_cast_state({"state": "PLAYING", "position": 0, "duration": 10},
+                        view._cast_poll_task)
+    view._on_cast_local_player_stop()
+    assert stopped == [True]
+
+
+def test_compatible_mp4_and_hls_never_start_transcode(_qapp, monkeypatch):
+    from gui.pages.reader import video_view as vv
+
+    view = _view(_video_detail(1), idx=0)
+    view._cast_session = _FakeSession()
+    view._cast_renderer = _renderer()
+    view._cast_active = True
+    view._cast_state = "connecting"
+    called = []
+    monkeypatch.setattr(view, "_start_cast_transcode_fallback",
+                        lambda *args: called.append(args))
+
+    for url in ("https://cdn/video.mp4?token=x", "https://cdn/video.m3u8?token=x"):
+        view._cast_video = url
+        view._on_cast_playing_timeout()
+        assert called == []
+        view._cast_state = "connecting"
+
+
+def test_transcode_failure_is_terminal_and_keeps_local_player(_qapp, monkeypatch):
+    from gui.pages.reader import video_view as vv
+
+    view = _view(_video_detail(1), idx=0)
+    view._external_active = True
+    stopped = []
+    monkeypatch.setattr(ep, "_terminate_previous", lambda: stopped.append(True))
+    session = _FakeSession()
+    view._cast_session = session
+    view._cast_renderer = _renderer()
+    view._cast_active = True
+    view._cast_state = "connecting"
+    transcode = _FakeTranscodeSession(error=RuntimeError("ffmpeg failed"))
+    monkeypatch.setattr(vv, "TranscodeSession", lambda *a, **k: transcode,
+                        raising=False)
+
+    view._start_cast_transcode_fallback(0, "https://cdn/video.mpd", view._cast_renderer,
+                                        RuntimeError("电视未播放"))
+    assert _wait_for(lambda: view._cast_state == "error", timeout=_CAST_WAIT)
+    assert stopped == []
+    assert "ffmpeg failed" in view._cast_error
+    assert sum(call[0] == "start" for call in transcode.calls) == 1
