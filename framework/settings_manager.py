@@ -84,8 +84,8 @@ DEFAULTS: dict = {
     },
     "reader": {
         "prefetch_enabled": True,
-        "prefetch_ahead": 3,
-        "prefetch_behind": 1,
+        "prefetch_ahead": 1,
+        "prefetch_behind": 0,
     },
     "discover": {
         "preload_pages": 5,
@@ -173,8 +173,8 @@ def reader_prefetch_settings(settings_manager) -> dict:
     g = settings_manager.get
     return {
         "enabled": bool(g("reader", "prefetch_enabled", True)),
-        "ahead": _clamp_int(g("reader", "prefetch_ahead", 3), 0, 20, 3),
-        "behind": _clamp_int(g("reader", "prefetch_behind", 1), 0, 10, 1),
+        "ahead": _clamp_int(g("reader", "prefetch_ahead", 1), 0, 1, 1),
+        "behind": 0,
     }
 
 

@@ -54,8 +54,15 @@ class NovelView(QWidget):
         self._auto_loading = False  # 翻页边界跳章锁，防重复触发
         self._auto_prev_loading = False  # 向上翻页边界跳章锁，防重复触发
         self._prefetch_idx = -2  # 正在后台预加载的章节 idx（<0 表示空闲）
-        self._prefetch_ahead = 3
-        self._prefetch_behind = 1
+        self._prefetch_ahead = 1
+        self._prefetch_behind = 0
+        self._load_generation = 0
+        self._toc_generation = 0
+        self._toc_next_index = 0
+        self._toc_batch_size = 200
+        self._toc_timer = QTimer(self)
+        self._toc_timer.setInterval(0)
+        self._toc_timer.timeout.connect(lambda: self._append_toc_batch(self._toc_generation))
         self._next_prefetch_queue = []
         self._prev_prefetch_queue = []  # 向前缓存队列（串行）
         self._prev_prefetch_idx = -2  # 正在向前预取的章节 idx（<0 表示空闲）
@@ -251,6 +258,7 @@ class NovelView(QWidget):
         self._detail = detail
         self._restore_generation += 1
         self._restore_cancel_token += 1
+        self._load_generation += 1
         self._chapters = detail.chapters
         # 换书：无条件清零续读位置——旧书若章节还在后台加载，本次 load() 的
         # 首章显示会消费到「上一本书残留的 _pending_restore」，把新书滚动条
@@ -258,6 +266,8 @@ class NovelView(QWidget):
         self._pending_restore = None
         self._prev_prefetch_queue = []  # 换书清空向前缓存队列（旧队列指向旧书章节）
         self._prev_prefetch_idx = -2
+        self._next_prefetch_queue = []
+        self._prefetch_idx = -2
         self._populate_toc()
         if restore_position is not None or restore_page is not None or restore_location:
             self._pending_restore = (
@@ -276,11 +286,30 @@ class NovelView(QWidget):
         self._load_chapter(idx)
 
     def _populate_toc(self) -> None:
+        self._toc_generation += 1
+        generation = self._toc_generation
+        self._toc_timer.stop()
         self.toc_list.clear()
-        for i, ch in enumerate(self._chapters):
+        self._toc_next_index = 0
+        self._append_toc_batch(generation)
+
+    def _append_toc_batch(self, generation: int) -> None:
+        if generation != self._toc_generation:
+            return
+        start = self._toc_next_index
+        end = min(start + self._toc_batch_size, len(self._chapters))
+        for i in range(start, end):
+            ch = self._chapters[i]
             item = QListWidgetItem(ch.title or f"第{i+1}章")
             item.setData(Qt.UserRole, i)
             self.toc_list.addItem(item)
+        self._toc_next_index = end
+        if end < len(self._chapters):
+            self._toc_timer.start()
+        else:
+            self._toc_timer.stop()
+            if 0 <= self._current_idx < self.toc_list.count():
+                self.toc_list.setCurrentRow(self._current_idx)
 
     def _load_chapter(self, idx: int, scroll_to_end: bool = False) -> None:
         """加载指定章节正文（后台线程）。
@@ -292,6 +321,8 @@ class NovelView(QWidget):
             return
         self._stop_auto_scroll()
         self._current_idx = idx
+        if idx < self.toc_list.count():
+            self.toc_list.setCurrentRow(idx)
         ch = self._chapters[idx]
 
         self._scroll_on_load = getattr(self, "_scroll_on_load", 0)  # 0=顶部; 1=底部
@@ -311,7 +342,10 @@ class NovelView(QWidget):
         from PySide6.QtCore import QThreadPool
 
         task = _LoadChapterTask(self._content, self._source, ch)
-        task.signals.finished.connect(self._on_chapter_loaded)
+        generation = self._load_generation
+        task.signals.finished.connect(
+            lambda loaded_ch, text, err, g=generation: self._on_chapter_loaded(loaded_ch, text, err, g)
+        )
         self._chapter_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
         self.chapter_changed.emit((self._detail, ch.title, ch.url))
@@ -462,7 +496,9 @@ class NovelView(QWidget):
         vbar.setValue(vbar.maximum())
         vbar.blockSignals(False)
 
-    def _on_chapter_loaded(self, ch, text, err) -> None:
+    def _on_chapter_loaded(self, ch, text, err, generation=None) -> None:
+        if generation is not None and generation != self._load_generation:
+            return
         if err:
             self._auto_loading = False  # 加载失败也要解锁，防死锁
             self._auto_prev_loading = False
@@ -788,13 +824,13 @@ class NovelView(QWidget):
         try:
             ahead = int(ahead)
         except (TypeError, ValueError):
-            ahead = 3
+            ahead = 1
         try:
             behind = int(behind)
         except (TypeError, ValueError):
-            behind = 1
-        self._prefetch_ahead = max(0, ahead)
-        self._prefetch_behind = max(0, behind)
+            behind = 0
+        self._prefetch_ahead = max(0, min(1, ahead))
+        self._prefetch_behind = 0
 
     @staticmethod
     def _prefetch_back_queue(total: int, idx: int, behind: int) -> list[int]:
@@ -829,12 +865,17 @@ class NovelView(QWidget):
             return
         self._prefetch_idx = k
         task = _LoadChapterTask(self._content, self._source, self._chapters[k])
-        task.signals.finished.connect(self._on_prefetch_done)
+        generation = self._load_generation
+        task.signals.finished.connect(
+            lambda ch, text, err, g=generation: self._on_prefetch_done(ch, text, err, g)
+        )
         self._prefetch_task = task
         QThreadPool.globalInstance().start(task)
 
-    def _on_prefetch_done(self, ch, text, err) -> None:
+    def _on_prefetch_done(self, ch, text, err, generation=None) -> None:
         """预取完成：写缓存并继续泵下一个，保持 -2 空闲哨兵。"""
+        if generation is not None and generation != self._load_generation:
+            return
         self._prefetch_idx = -2
         if not err and text:
             ch._cached_text = text
@@ -870,12 +911,17 @@ class NovelView(QWidget):
         from PySide6.QtCore import QThreadPool
 
         task = _LoadChapterTask(self._content, self._source, ch)
-        task.signals.finished.connect(self._on_prev_prefetch_done)
+        generation = self._load_generation
+        task.signals.finished.connect(
+            lambda loaded_ch, text, err, g=generation: self._on_prev_prefetch_done(loaded_ch, text, err, g)
+        )
         self._prev_prefetch_task = task  # 持引用防 GC
         QThreadPool.globalInstance().start(task)
 
-    def _on_prev_prefetch_done(self, ch, text, err) -> None:
+    def _on_prev_prefetch_done(self, ch, text, err, generation=None) -> None:
         """向前预取完成：写缓存，继续队列下一个；失败则终止本轮（随显示章再补）。"""
+        if generation is not None and generation != self._load_generation:
+            return
         self._prev_prefetch_idx = -2
         if err or not text:
             self._prev_prefetch_queue.clear()
