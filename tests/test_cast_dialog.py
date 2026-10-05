@@ -122,6 +122,7 @@ def test_dialog_basics(app):
     assert dialog.windowTitle() == "选择投屏设备"
     assert "第 12 集 · 告白" in dialog.episode_label.text()
     assert dialog.refresh_btn.text() == "刷新"
+    assert dialog.search_btn.text() == "搜索设备"
     assert dialog.cancel_btn.text() == "取消"
     assert not dialog.select_btn.isEnabled()  # 未选中前不可确定
     # 空列表提示：初始可见，含局域网 / 防火墙关键词
@@ -306,18 +307,50 @@ def test_cancel_rejects_and_detaches_running_worker(app):
     assert worker not in cd._DETACHED_WORKERS  # 结束后自动回收
 
 
-def test_show_starts_scan_automatically(app):
-    """show() 触发 showEvent 自动扫描；关闭后 worker 清理。"""
+def test_show_does_not_start_scan_automatically(app):
+    """show() 只显示对话框，不自动发起 SSDP 扫描。"""
     dialog = cd.CastDeviceDialog("第 10 集")
-    with patch.object(cd.dlna, "discover_renderers", return_value=[_renderer()]):
+    with patch.object(cd.dlna, "discover_renderers") as fake:
         dialog.show()
-        assert _drain(app, lambda: dialog.device_list.count() == 1)
-        _wait_thread_idle(app, dialog._worker)
+        app.processEvents()
+        assert fake.call_count == 0
+        assert dialog._worker is None
         dialog.close()
         app.processEvents()
 
     assert dialog._worker is None
     assert not _detached_running()
+
+
+def test_no_history_hint_prompts_search_and_search_button_starts_worker(app):
+    """无历史设备时提示点击搜索，搜索按钮启动 worker。"""
+    dialog = cd.CastDeviceDialog("第 11 集")
+    assert "点击搜索设备" in cd.EMPTY_HINT_TEXT
+    with patch.object(cd.dlna, "discover_renderers", return_value=[_renderer()]) as fake:
+        dialog.search_btn.click()
+        assert _drain(app, lambda: dialog.device_list.count() == 1)
+        _wait_thread_idle(app, dialog._worker)
+
+    fake.assert_called_once_with(dialog.SSDP_TIMEOUT)
+    assert dialog.device_list.item(0).text() == "客厅电视 (192.168.1.100)"
+
+
+def test_refresh_starts_worker_after_manual_search(app):
+    """刷新按钮保留并可再次启动扫描 worker。"""
+    dialog = cd.CastDeviceDialog("第 12 集")
+    with patch.object(
+        cd.dlna, "discover_renderers", side_effect=[[_renderer()], [_renderer(udn="uuid:tv-2")]]
+    ) as fake:
+        dialog.search_btn.click()
+        assert _drain(app, lambda: dialog.device_list.count() == 1)
+        _wait_thread_idle(app, dialog._worker)
+
+        dialog.refresh_btn.click()
+        assert _drain(app, lambda: dialog.device_list.count() == 1 and dialog.device_list.item(0).data(Qt.UserRole) == "uuid:tv-2")
+        _wait_thread_idle(app, dialog._worker)
+
+    assert fake.call_count == 2
+    assert dialog.refresh_btn.isEnabled()
 
 
 # ---------------------------------------------------------------------- #
@@ -331,7 +364,7 @@ def test_history_listed_first_with_last_used_label_and_preselected(app):
     ]
     dialog = cd.CastDeviceDialog("第 1 集", history=history)
 
-    # 未扫描也立即可用：历史先出、上次使用已选中（扫描在 show 后台继续）
+    # 未扫描也立即可用：历史先出、上次使用已选中
     assert dialog.device_list.count() == 2
     assert dialog._worker is None  # 此时还没发起扫描，不阻塞选择
     first = dialog.device_list.item(0)

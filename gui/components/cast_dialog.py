@@ -5,7 +5,7 @@ friendly name + IP，用户选中后经 selected_device() 访问器或
 deviceSelected 信号把 DlnaRenderer 交回调用方。
 
 - 扫描在后台 QThread 执行，UI 不阻塞；结果经 Qt signal 队列投递回主线程；
-- 「刷新」清空列表与去重缓存并重新扫描；
+- 「搜索设备」与「刷新」清空/更新扫描结果并启动 SSDP 搜索；
 - 设备列表为空时提示检查同一局域网 / Windows 防火墙；
 - 关闭对话框时若扫描仍在进行，worker 脱离生命周期后台收尾，
   不阻塞 UI、不悬挂线程。
@@ -47,7 +47,7 @@ from framework.dlna import DlnaRenderer
 EMPTY_HINT_TEXT = (
     "请确认电脑和电视处于同一局域网，并允许应用通过 Windows 防火墙。\n"
     "如网络配置无误，请检查电视已开机且 DLNA 功能已启用，"
-    "然后点击「刷新」重试。"
+    "然后点击搜索设备重试。"
 )
 
 # 已脱离对话框、仍在后台收尾的扫描线程（防止被 GC 后 QThread 悬挂）
@@ -137,6 +137,9 @@ class CastDeviceDialog(QDialog):
         self.progress.setFixedWidth(90)
         self.progress.setVisible(False)
         status_row.addWidget(self.progress)
+        self.search_btn = QPushButton("搜索设备")
+        self.search_btn.clicked.connect(self._on_search_clicked)
+        status_row.addWidget(self.search_btn)
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.clicked.connect(self._on_refresh_clicked)
         status_row.addWidget(self.refresh_btn)
@@ -191,8 +194,8 @@ class CastDeviceDialog(QDialog):
     def _load_history(self, history: list[dict] | None) -> None:
         """历史条目 → 列表置顶分组，首条标「上次使用」并默认选中。
 
-        打开对话框即可直接点确定投上次设备；SSDP 扫描仍由 showEvent 照常
-        在后台启动（不阻塞选择）。非法条目（非 dict / 字段不全）静默跳过。
+        打开对话框即可直接点确定投上次设备；SSDP 扫描由用户主动触发，
+        不阻塞选择。非法条目（非 dict / 字段不全）静默跳过。
         """
         for entry in history or []:
             renderer = renderer_from_entry(entry)
@@ -276,10 +279,8 @@ class CastDeviceDialog(QDialog):
     # 生命周期
     # ------------------------------------------------------------------ #
     def showEvent(self, event) -> None:
-        """显示即自动开始 SSDP 扫描。"""
+        """显示对话框，不自动开始 SSDP 扫描。"""
         super().showEvent(event)
-        if self._worker is None or not self._worker.isRunning():
-            self._start_scan()
 
     def done(self, result: int) -> None:
         """确认 / 取消 / 关闭均先回收扫描线程。"""
@@ -296,6 +297,7 @@ class CastDeviceDialog(QDialog):
         self._shutdown_worker()
 
         self.error_label.setVisible(False)
+        self.search_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
         self.progress.setRange(0, 0)  # 忙碌指示
         self.progress.setVisible(True)
@@ -345,6 +347,7 @@ class CastDeviceDialog(QDialog):
         self.status_label.setText("扫描出错，请重试")
         self.progress.setRange(0, 100)
         self.progress.setVisible(False)
+        self.search_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
         self.empty_hint.setVisible(self.device_list.count() == 0)
 
@@ -357,8 +360,13 @@ class CastDeviceDialog(QDialog):
             self.status_label.setText(f"扫描完成，找到 {count} 台设备")
         else:
             self.status_label.setText("未找到设备（请检查网络）")
+        self.search_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
         self.empty_hint.setVisible(count == 0)
+
+    def _on_search_clicked(self) -> None:
+        """点击「搜索设备」：主动发起 SSDP 扫描。"""
+        self._start_scan()
 
     def _on_refresh_clicked(self) -> None:
         """刷新：清空扫描结果与去重缓存后重新扫描（历史分组原样置顶保留）。"""
