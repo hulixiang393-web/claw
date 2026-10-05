@@ -88,8 +88,8 @@ DEFAULTS: dict = {
         "prefetch_behind": 0,
     },
     "discover": {
-        "preload_pages": 5,
-        "preload_concurrency": 3,
+        "preload_pages": 1,
+        "preload_concurrency": 2,
     },
     "shelf_cache": {
         "max_book_mb": 256,
@@ -181,8 +181,8 @@ def reader_prefetch_settings(settings_manager) -> dict:
 def discover_preload_settings(settings_manager) -> dict:
     g = settings_manager.get
     return {
-        "pages": _clamp_int(g("discover", "preload_pages", 5), 0, 10, 5),
-        "concurrency": _clamp_int(g("discover", "preload_concurrency", 3), 1, 5, 3),
+        "pages": _clamp_int(g("discover", "preload_pages", 1), 0, 2, 1),
+        "concurrency": _clamp_int(g("discover", "preload_concurrency", 2), 1, 2, 2),
     }
 
 

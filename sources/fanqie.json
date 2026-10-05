@@ -262,10 +262,10 @@
         },
 "render_config": {
           "wait_for": "a[href*='/page/']",
-          "wait_until": "networkidle",
+          "wait_until": "domcontentloaded",
           "timeout_ms": 30000,
-          "extra_delay_ms": 3000,
-          "response_pages": 3,
+          "extra_delay_ms": 0,
+          "response_pages": 1,
           "response_json_url": "/api/author/search/search_book/v1",
           "response_items": "data.search_book_data_list",
           "response_fields": {

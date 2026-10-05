@@ -103,8 +103,8 @@ class DiscoverPage(BasePage):
         self._current_cat_url = None
         self._work_count = 0
         self._source_epoch = 0  # 源切换序号，防止旧请求回调竞态
-        self._preload_ahead = 5
-        self._preload_concurrency = 3
+        self._preload_ahead = 1
+        self._preload_concurrency = 2
         if self.settings is not None:
             from framework.settings_manager import discover_preload_settings
 
@@ -572,8 +572,8 @@ class DiscoverPage(BasePage):
     # ------------------------------------------------------------------ #
     def apply_preload_settings(self, pages: int, concurrency: int) -> None:
         """设置预加载深度与在途上限。已派发的任务不受影响。"""
-        self._preload_ahead = max(0, int(pages))
-        self._preload_concurrency = max(1, int(concurrency))
+        self._preload_ahead = max(0, min(2, int(pages)))
+        self._preload_concurrency = max(1, min(2, int(concurrency)))
 
     def _pump_preload(self) -> None:
         while self._preload_pending:
