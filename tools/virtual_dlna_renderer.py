@@ -207,11 +207,15 @@ class VirtualRenderer:
         port: int = 0,
         ffmpeg_path: str | None = None,
         fetch_timeout: float = 10.0,
+        supported_video_codecs: set[str] | None = None,
+        supported_audio_codecs: set[str] | None = None,
     ):
         self.host = host
         self.port = port
         self.ffmpeg_path = ffmpeg_path
         self.fetch_timeout = fetch_timeout
+        self.supported_video_codecs = supported_video_codecs
+        self.supported_audio_codecs = supported_audio_codecs
         self._server: ThreadingHTTPServer | None = None
         self._thread: Thread | None = None
         self._lock = Lock()
@@ -321,6 +325,15 @@ class VirtualRenderer:
             uri = self._uri
         try:
             result = VirtualMediaFetcher(self.ffmpeg_path, self.fetch_timeout).decode(uri)
+            incompatible = (
+                self.supported_video_codecs is not None
+                and result.get("video_codec") not in self.supported_video_codecs
+            ) or (
+                self.supported_audio_codecs is not None
+                and result.get("audio_codec") not in self.supported_audio_codecs
+            )
+            if incompatible:
+                result = {**result, "decoded": False, "error": "unsupported renderer codec"}
         except Exception as exc:
             result = {"decoded": False, "error": type(exc).__name__}
         with self._lock:
