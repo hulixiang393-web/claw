@@ -33,11 +33,13 @@ import atexit
 import ipaddress
 import mimetypes
 from contextlib import nullcontext
+import posixpath
 import re
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urljoin, unquote, quote, urlparse
 
 import requests
@@ -744,6 +746,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 return
+            if path.startswith("/t/"):
+                proxy._serve_transcode(self, path, public_base)
+                return
             if path.startswith("/e/"):
                 try:
                     proxy._serve_series(self, path, public_base)
@@ -809,6 +814,8 @@ class MediaProxy:
         self._lan_thread: threading.Thread | None = None
         self._lan_base: str | None = None
         self._lan_tokens: set[str] = set()
+        self._transcode_dirs: dict[str, Path] = {}
+        self._lan_transcode_tokens: set[str] = set()
         self._lan_lock = threading.RLock()
         self._lan_error: Exception | None = None
         self._last_use = time.time()
@@ -1243,6 +1250,80 @@ class MediaProxy:
                 self._lan_tokens.add(token)
         return f"{base}/s/{token}"
 
+    def register_transcode_directory(self, directory: str | Path, public_base: str) -> str:
+        """注册一个由当前 LAN endpoint 提供的只读 HLS 目录。"""
+        base = self._base_url(public_base)
+        root = Path(directory).resolve()
+        if not root.is_dir():
+            raise ValueError("directory must be an existing directory")
+        token = uuid.uuid4().hex
+        with self._lan_lock:
+            if self._lan_base != base or self._lan_server is None:
+                raise ValueError("public_base must be the active LAN endpoint")
+            with self._lock:
+                self._transcode_dirs[token] = root
+            self._lan_transcode_tokens.add(token)
+        return f"{base}/t/{token}"
+
+    def unregister_transcode_directory(self, token: str) -> None:
+        """注销转码目录；token 或其公开 URL 均可传入，且操作幂等。"""
+        raw = str(token).rstrip("/")
+        if "/t/" in raw:
+            raw = raw.rsplit("/t/", 1)[1].split("/", 1)[0]
+        else:
+            raw = raw.rsplit("/", 1)[-1]
+        with self._lan_lock:
+            self._lan_transcode_tokens.discard(raw)
+            with self._lock:
+                self._transcode_dirs.pop(raw, None)
+
+    def _serve_transcode(self, handler, path: str,
+                         public_base: str | None = None) -> None:
+        if public_base is None:
+            handler.send_error(404, "LAN endpoint required")
+            return
+        parts = path[len("/t/"):].split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            handler.send_error(404, "bad transcode path")
+            return
+        token, relative = parts
+        with self._lan_lock:
+            active = token in self._lan_transcode_tokens and public_base == self._lan_base
+            with self._lock:
+                root = self._transcode_dirs.get(token)
+        if root is None or not active:
+            handler.send_error(404, "transcode directory not found")
+            return
+        if posixpath.normpath(relative) != relative or relative.startswith("../"):
+            handler.send_error(404, "invalid transcode path")
+            return
+        candidate = (root / Path(relative)).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            handler.send_error(404, "invalid transcode path")
+            return
+        if not candidate.is_file():
+            handler.send_error(404, "transcode file not found")
+            return
+        content_type = mimetypes.guess_type(candidate.name)[0]
+        if candidate.suffix.lower() == ".m3u8":
+            content_type = "application/vnd.apple.mpegurl"
+        elif candidate.suffix.lower() == ".ts":
+            content_type = "video/mp2t"
+        body_length = candidate.stat().st_size
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type or "application/octet-stream")
+        handler.send_header("Content-Length", str(body_length))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        with candidate.open("rb") as stream:
+            while True:
+                chunk = stream.read(_READ_CHUNK)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+
     def start_lan_endpoint(self, bind_host: str) -> str:
         """启动 LAN server，返回 http://<bind_host>:<port>。"""
         if not isinstance(bind_host, str) or not bind_host.strip():
@@ -1318,6 +1399,14 @@ class MediaProxy:
                 self._tokens.pop(token, None)
             self._lan_tokens.clear()
 
+    def _release_lan_transcode_directories(self) -> None:
+        with self._lan_lock:
+            tokens = tuple(self._lan_transcode_tokens)
+            self._lan_transcode_tokens.clear()
+        with self._lock:
+            for token in tokens:
+                self._transcode_dirs.pop(token, None)
+
     def lan_endpoint_error(self) -> Exception | None:
         """公开只读接口：返回最近一次 LAN 端点生命周期失败的错误。
 
@@ -1340,8 +1429,10 @@ class MediaProxy:
             thread = self._lan_thread
             if server is None:
                 self.release_lan_tokens()
+                self._release_lan_transcode_directories()
                 return
             self.release_lan_tokens()
+            self._release_lan_transcode_directories()
             try:
                 server.shutdown()
                 server.server_close()

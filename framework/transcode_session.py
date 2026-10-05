@@ -20,13 +20,17 @@ class TranscodeSession:
         ffmpeg_path: Optional[str] = None,
         temp_root: Optional[str | Path] = None,
         startup_timeout: float = 10.0,
+        media_proxy=None,
     ):
         self._ffmpeg_path = ffmpeg_path or "ffmpeg"
         self._temp_root = Path(temp_root) if temp_root is not None else None
         self._startup_timeout = startup_timeout
+        self._media_proxy = media_proxy
         self._process = None
         self._directory: Optional[Path] = None
         self._playlist_path: Optional[Path] = None
+        self._public_playlist_url: Optional[str] = None
+        self._registration_token: Optional[str] = None
         self._lock = threading.RLock()
         self._diagnostics = {
             "state": "idle",
@@ -115,6 +119,18 @@ class TranscodeSession:
             self._playlist_path = playlist_path
             self._diagnostics["state"] = "starting"
 
+        if self._media_proxy is not None:
+            try:
+                directory_url = self._media_proxy.register_transcode_directory(
+                    directory, public_base)
+                public_playlist_url = directory_url.rstrip("/") + "/index.m3u8"
+            except Exception as exc:
+                self.stop()
+                raise TranscodeError("failed to register transcode directory") from exc
+            with self._lock:
+                self._public_playlist_url = public_playlist_url
+                self._registration_token = self._registration_token_from_url(public_playlist_url)
+
         started_at = time.monotonic()
         try:
             while time.monotonic() - started_at < self._startup_timeout:
@@ -124,7 +140,7 @@ class TranscodeSession:
                     if ready:
                         self._diagnostics["state"] = "running"
                         self._diagnostics["startup_time"] = round(time.monotonic() - started_at, 3)
-                        return self._public_playlist_url(public_base)
+                        return self._public_playlist_url or self._playlist_url(public_base)
                     if process is None or process.poll() is not None:
                         raise TranscodeError("ffmpeg exited before HLS output was ready")
                 time.sleep(0.02)
@@ -140,13 +156,22 @@ class TranscodeSession:
         with self._lock:
             process = self._process
             directory = self._directory
-            if process is None and directory is None:
+            media_proxy = self._media_proxy
+            registration_token = self._registration_token
+            if process is None and directory is None and registration_token is None:
                 if self._diagnostics["state"] != "failed":
                     self._diagnostics["state"] = "stopped"
                 return
             self._process = None
             self._directory = None
             self._playlist_path = None
+            self._public_playlist_url = None
+            self._registration_token = None
+        if media_proxy is not None and registration_token is not None:
+            try:
+                media_proxy.unregister_transcode_directory(registration_token)
+            except Exception:
+                pass
         if process is not None and process.poll() is None:
             try:
                 process.terminate()
@@ -171,7 +196,12 @@ class TranscodeSession:
         return any(directory.glob("segment*.ts"))
 
     @staticmethod
-    def _public_playlist_url(public_base: str) -> str:
+    def _playlist_url(public_base: str) -> str:
         parts = urlsplit(public_base)
         path = parts.path.rstrip("/") + "/index.m3u8"
         return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+    @staticmethod
+    def _registration_token_from_url(public_url: str) -> str:
+        path = urlsplit(public_url).path.rstrip("/")
+        return path.split("/t/", 1)[1].split("/", 1)[0]
