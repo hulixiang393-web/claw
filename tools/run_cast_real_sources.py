@@ -170,6 +170,39 @@ def classify_failure(result: dict) -> str:
     return "protocol_error"
 
 
+def _transport_metrics_summary(metrics: list[dict]) -> dict:
+    kinds: dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    failures: dict[str, int] = {}
+    first_bytes = []
+    durations = []
+    total_bytes = 0
+    for metric in metrics:
+        kind = str(metric.get("kind") or "unknown")
+        kinds[kind] = kinds.get(kind, 0) + 1
+        status = metric.get("status")
+        status_key = str(status) if status is not None else "none"
+        statuses[status_key] = statuses.get(status_key, 0) + 1
+        failure = metric.get("failure_category")
+        if failure:
+            failures[str(failure)] = failures.get(str(failure), 0) + 1
+        if isinstance(metric.get("first_byte_ms"), (int, float)):
+            first_bytes.append(float(metric["first_byte_ms"]))
+        if isinstance(metric.get("duration_ms"), (int, float)):
+            durations.append(float(metric["duration_ms"]))
+        if isinstance(metric.get("bytes"), (int, float)):
+            total_bytes += int(metric["bytes"])
+    return {
+        "count": len(metrics),
+        "kinds": dict(sorted(kinds.items())),
+        "statuses": dict(sorted(statuses.items())),
+        "failure_categories": dict(sorted(failures.items())),
+        "bytes": total_bytes,
+        "first_byte_ms_avg": round(sum(first_bytes) / len(first_bytes), 2) if first_bytes else None,
+        "duration_ms_avg": round(sum(durations) / len(durations), 2) if durations else None,
+    }
+
+
 def _public_result(source: dict, **fields) -> dict:
     result = {
         "source_id": source.get("source_id", "unknown"),
@@ -186,6 +219,8 @@ def _public_result(source: dict, **fields) -> dict:
     if fields.get("protocol_error"):
         result["protocol_error"] = True
     result["decoded"] = bool(fields.get("decoded"))
+    if fields.get("transport_metrics") is not None:
+        result["transport_metrics"] = _transport_metrics_summary(fields["transport_metrics"])
     result["classification"] = classify_failure({**fields, **result})
     return result
 
@@ -237,6 +272,7 @@ def run_real_source_case(source: dict, ffmpeg_path: str | None = None) -> dict:
         diagnostics = renderer.diagnostics()
         state = session.poll_state()
         decoded = state.get("state") == "PLAYING" and diagnostics.get("decoded") is True
+        transport_metrics = proxy.transport_metrics()
         return _public_result(
             source,
             http_status=http_status,
@@ -245,11 +281,13 @@ def run_real_source_case(source: dict, ffmpeg_path: str | None = None) -> dict:
             decode=diagnostics.get("decode"),
             decoded=decoded,
             protocol_error=not decoded and not diagnostics.get("decode"),
+            transport_metrics=transport_metrics,
         )
     except FileNotFoundError as exc:
         return _public_result(source, error=exc, decode={"returncode": None})
     except Exception as exc:
         diagnostics = renderer.diagnostics()
+        transport_metrics = proxy.transport_metrics()
         message = _safe_text(exc)
         proxy_error = isinstance(exc, (ConnectionError, TimeoutError, OSError)) and not diagnostics
         return _public_result(
@@ -262,6 +300,7 @@ def run_real_source_case(source: dict, ffmpeg_path: str | None = None) -> dict:
             proxy_error=proxy_error,
             protocol_error=not proxy_error,
             error=message,
+            transport_metrics=transport_metrics,
         )
     finally:
         if session is not None:
@@ -300,6 +339,8 @@ def _render_report(results: list[dict]) -> str:
         lines.append(f"- 分类：`{result.get('classification')}`")
         lines.append(f"- probe：`{json.dumps(result.get('probe') or {}, ensure_ascii=False, sort_keys=True)}`")
         lines.append(f"- decode：`{json.dumps(result.get('decode') or {}, ensure_ascii=False, sort_keys=True)}`")
+        if result.get("transport_metrics"):
+            lines.append(f"- 代理传输：`{json.dumps(result['transport_metrics'], ensure_ascii=False, sort_keys=True)}`")
         if result.get("error"):
             lines.append(f"- 原因：{_safe_text(result['error'])}")
         lines.append("")
@@ -323,6 +364,14 @@ def main(argv: list[str] | None = None) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_render_report(results), encoding="utf-8")
     print(json.dumps(results, ensure_ascii=False, sort_keys=True))
+    print("transport metrics: " + json.dumps(
+        {
+            result.get("source_id", "unknown"): result.get("transport_metrics", {})
+            for result in results
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ))
     print(f"report: {output}")
     return 0
 

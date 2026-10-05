@@ -166,6 +166,7 @@ def _record_upstream_diagnostic(target: str, headers: dict, route: str,
         "status_code": status_code,
         "elapsed_ms": elapsed_ms,
         "first_byte_ms": None,
+        "bytes": 0,
         "throughput_bps": None,
         "cache_state": cache_state,
         "wait_ms": wait_ms,
@@ -221,6 +222,7 @@ def _update_upstream_diagnostic(response, size: int, finished: bool = False,
                 response._media_proxy_bytes = total
             except Exception:
                 pass
+            record["bytes"] = total
             elapsed = max(0.000001, now - first)
             record["throughput_bps"] = total * 8.0 / elapsed
         if failure_category is not None:
@@ -1155,6 +1157,28 @@ class MediaProxy:
 
     def _touch(self) -> None:
         self._last_use = time.time()
+
+    def transport_metrics(self) -> list[dict]:
+        """返回脱敏的上游传输指标快照。"""
+        with _UPSTREAM_DIAGNOSTICS_LOCK:
+            records = list(_UPSTREAM_DIAGNOSTICS)
+        metrics = []
+        for record in records:
+            metric = {
+                "kind": record.get("request_kind"),
+                "status": record.get("status_code"),
+                "first_byte_ms": record.get("first_byte_ms"),
+                "bytes": record.get("bytes", 0),
+                "duration_ms": record.get("elapsed_ms"),
+            }
+            if record.get("failure_category"):
+                metric["failure_category"] = record["failure_category"]
+            metrics.append(metric)
+        return metrics
+
+    def clear_transport_metrics(self) -> None:
+        """清空代理进程内的传输指标队列。"""
+        _reset_upstream_route_diagnostics()
 
     def _begin(self) -> None:
         with self._lock:
