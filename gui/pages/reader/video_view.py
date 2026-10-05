@@ -252,7 +252,7 @@ class _CastStartTask:
     """
 
     def __init__(self, session, renderer, idx, video, title, headers,
-                 ad_block, force_proxy, gen: int):
+                 ad_block, force_proxy, gen: int, cast_tuning=None):
         self.signals = _CastStartSignals()
         self.session = session
         self.renderer = renderer
@@ -263,6 +263,7 @@ class _CastStartTask:
         self.ad_block = ad_block
         self.force_proxy = force_proxy
         self.gen = gen
+        self.cast_tuning = cast_tuning or {}
         self._thread = None
 
     def start(self) -> None:
@@ -276,8 +277,12 @@ class _CastStartTask:
     def run(self) -> None:
         exc = None
         try:
-            self.session.start(self.renderer, self.idx, self.video, self.title,
-                               self.headers, self.ad_block, self.force_proxy)
+            args = (self.renderer, self.idx, self.video, self.title,
+                    self.headers, self.ad_block, self.force_proxy)
+            if self.cast_tuning:
+                self.session.start(*args, cast_tuning=self.cast_tuning)
+            else:
+                self.session.start(*args)
         except Exception as e:  # noqa: BLE001 —— 网络/SOAP/设备拒绝
             exc = e
         try:
@@ -533,7 +538,7 @@ class VideoView(QWidget):
     _cast_local_player_stop = Signal()
 
     # spec §6.4 步骤 6：投屏启动后轮询到电视 PLAYING 的超时（毫秒）
-    CAST_PLAYING_TIMEOUT_MS = 8000
+    CAST_PLAYING_TIMEOUT_MS = 60000
 
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
@@ -629,6 +634,7 @@ class VideoView(QWidget):
         self._cast_transcode_attempted = False
         self._cast_video = ""
         self._cast_local_stop_pending = False
+        self._cast_startup_retry_attempted = False
         # 投屏设备历史（data/cast_history.json，惰性打开）：
         # 有历史 → 取流完成直接重连上次设备；start 失败才回落选设备对话框
         self._cast_history_store = None  # framework.cast_history.CastHistory
@@ -1454,13 +1460,12 @@ class VideoView(QWidget):
             self._stream_task = task
             QThreadPool.globalInstance().start(task)
             return
-        if len(detail.chapters) >= 2:
-            # 多集源：停在选集态，不自动取流/播放，由用户点选集数
+        if detail.chapters:
+            # 有分集：统一停在选集态，由用户明确选择后播放，单集也不例外。
             self._selection_mode = True
-            self._paint_card_selection()  # 高亮当前应选中的集（默认第 0 或续读集）
+            self._paint_card_selection()
             self._show_status("请选择要播放的集数")
             return
-        self._load_episode(idx)
 
     def reload_detail(self, new_detail: Detail) -> None:
         """换源重载分集后调用：多集源停选集态等用户选择，单集/无分集自动取流播放。"""
@@ -1497,13 +1502,12 @@ class VideoView(QWidget):
             self._stream_task = task
             QThreadPool.globalInstance().start(task)
             return
-        if len(new_detail.chapters) >= 2:
-            # 多集源：停在选集态，不自动取流/播放，由用户点选集数
+        if new_detail.chapters:
+            # 有分集：统一停在选集态，由用户明确选择后播放，单集也不例外。
             self._selection_mode = True
-            self._paint_card_selection()  # 高亮当前应选中的集（默认第 0 集）
+            self._paint_card_selection()
             self._show_status("请选择要播放的集数")
             return
-        self._load_episode(0)
 
     def current_episode_no(self) -> int:
         """当前集序号（0 基）；未加载/无分集（season 页）返回 0。
@@ -1834,12 +1838,6 @@ class VideoView(QWidget):
         if callable(_rh):
             hdrs = _rh() or {}
         from framework.external_player import open_with_player
-        from framework.media_proxy import MediaProxy
-        from framework.media_tuner import classify
-        profile = classify(video)
-        MediaProxy.instance().configure_prefetch(
-            profile.kind == "hls", depth=30, workers=3
-        )
 
         # 源 ad_block 配置：播放代理转发 m3u8 时过滤广告段（下载已有过滤）
         ad_block = {}
@@ -1888,6 +1886,26 @@ class VideoView(QWidget):
         self._external_active = True  # 外播会话在 → App 内快捷键转发 VLC
         if msg:
             self._notify_last_episode()  # 末集/单集：提示不再有下一集
+
+    def _source_cast_tuning(self) -> dict:
+        try:
+            media = (getattr(self._source, "raw", None) or {}).get("media") or {}
+            tuning = media.get("cast") or {}
+            return dict(tuning) if isinstance(tuning, dict) else {}
+        except Exception:
+            return {}
+
+    def _configure_cast_tuning(self) -> None:
+        from framework.media_proxy import MediaProxy
+        configure = getattr(MediaProxy.instance(), "configure_prefetch", None)
+        if not callable(configure):
+            return
+        prefetch = self._source_cast_tuning().get("prefetch") or {}
+        configure(
+            bool(prefetch.get("enabled", False)),
+            depth=prefetch.get("depth", 4),
+            workers=prefetch.get("workers", 3),
+        )
 
     def _force_proxy_enabled(self) -> bool:
         """源 media.proxy_mode == force_proxy → 播放代理强制走系统代理。
@@ -2284,15 +2302,8 @@ class VideoView(QWidget):
         异常）由 _cast_direct_fallback 打开对话框让用户换设备。
         切集（kind == "episode"）走不到这里，不受直投影响。
         """
-        renderer = self._last_cast_renderer()
-        if renderer is None:
-            self._cast_direct = False  # 显式复位：不依赖 _begin_cast 的前置复位
-            self._open_cast_dialog(idx, video)
-            return
-        self._cast_direct = True
-        self._show_status(f"正在连接上次投屏设备：{renderer.friendly_name}...")
-        self._update_cast_button()
-        self._start_cast(idx, video, renderer)
+        self._cast_direct = False
+        self._open_cast_dialog(idx, video)
 
     def _open_cast_dialog(self, idx: int, video: str) -> None:
         """投屏第二步：选目标电视（用户取消 → 回到干净 idle）。
@@ -2346,6 +2357,8 @@ class VideoView(QWidget):
         """
         title = self._episodes[idx].title or f"第{idx + 1}集"
         headers, ad_block, force_proxy = self._cast_media_args()
+        cast_tuning = self._source_cast_tuning()
+        self._configure_cast_tuning()
         self._cast_state = "connecting"
         self._update_cast_button()
         # 构造会话 / 建线程 / 起线程都在 try 内：任何一步抛错都收敛到
@@ -2441,6 +2454,7 @@ class VideoView(QWidget):
         self._cast_video = task.video
         self._cast_transcoding = False
         self._cast_transcode_attempted = False
+        self._cast_startup_retry_attempted = False
         self._cast_local_stop_pending = False
         self._cast_duration = 0
         self._cast_status_text = ""
@@ -2587,7 +2601,10 @@ class VideoView(QWidget):
             if not self._cast_playing_timer.isActive():
                 self._cast_state = "paused"
         elif transport in ("STOPPED", "NO_MEDIA_PRESENT"):
-            self._cast_state = "stopped"
+            if self._cast_state == "connecting" and not self._cast_startup_retry_attempted:
+                self._retry_cast_start()
+            else:
+                self._cast_state = "stopped"
         # TRANSITIONING（切集中）不改状态：启动期仍是 connecting（按钮禁用），
         # 已投屏则维持原状态，避免切集瞬间把「停止投屏」入口关掉。
         self._update_play_button()
@@ -2610,6 +2627,16 @@ class VideoView(QWidget):
                 or self._cast_session is None):
             return
         self._stop_cast(error=str(msg) or "与电视失去连接")
+
+    def _retry_cast_start(self) -> None:
+        if self._cast_session is None or self._cast_state != "connecting":
+            return
+        self._cast_startup_retry_attempted = True
+        try:
+            self._cast_session.play()
+            self._set_cast_status("正在重新启动电视播放")
+        except Exception as exc:
+            self._stop_cast(error=f"电视播放启动失败：{exc}")
 
     def _on_cast_playing_timeout(self) -> None:
         """spec 6.4 步骤 6：启动后 8 秒电视仍未进 PLAYING → 判投屏失败。
@@ -2772,6 +2799,7 @@ class VideoView(QWidget):
         self._cast_transcode_task = None
         self._cast_transcoding = False
         self._cast_transcode_attempted = False
+        self._cast_startup_retry_attempted = False
         self._cast_video = ""
         self._cast_local_stop_pending = False
         if session is not None:
@@ -3064,6 +3092,7 @@ class VideoView(QWidget):
             caching_ms=self._source_network_caching_ms(),
         )
         self._show_status(msg)
+
         # 起播后与 _play 同规格地把 App 侧 UI 拉回「未播放」一致态（幂等同步：
         # 播放按钮文案、中央浮层、控制条）。两处保持一致，将来若让 control_bar
         # 真能被自动隐藏、或给 play_btn 换文案（⏸/▶），⚙ 不会静默与 _play 分叉。

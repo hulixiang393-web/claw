@@ -204,6 +204,14 @@
   },
   "media": {
     "format": "dash",
+    "cast": {
+      "network_caching_ms": 30000,
+      "prefetch": {
+        "enabled": false,
+        "depth": 4,
+        "workers": 2
+      }
+    },
     "select": {
       "video": {
         "quality": "best"
