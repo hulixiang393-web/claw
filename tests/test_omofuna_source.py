@@ -14,6 +14,8 @@ import json
 import os
 import sys
 import time
+
+import pytest
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -116,7 +118,9 @@ def test_omofuna_episode_and_player_rules():
     episode = src.raw["endpoints"]["content"]["episode"]
     assert "player_aaaa" in episode["source_switch"]["play_regex"]
     assert episode["list"]["fields"]["url"]["attr"] == "href"
-    assert src.raw["decryption"]["targets"]["video_url"]["strategy"] == "maccms_url"
+    decrypt = src.raw["decryption"]["targets"]["video_url"]
+    assert decrypt["strategy"] == "js_custom"
+    assert decrypt["script"] == "function decrypt(d) { return decodeURIComponent(d); }"
 
 
 def test_omofuna_maccms_url_decodes_public_player_value():
@@ -124,6 +128,27 @@ def test_omofuna_maccms_url_decodes_public_player_value():
     cipher = base64.b64encode(quote(url, safe="").encode("ascii")).decode("ascii")
     assert Decrypter(None)._maccms_url(cipher) == url
     assert Decrypter(None)._maccms_url(quote(url, safe="")) == url
+
+
+def test_omofuna_encrypt_one_uses_javascript_unescape():
+    from framework.content import Content
+
+    source_obj = source()
+    encoded = quote("https://vip.example/video/index.m3u8", safe="")
+    html = (
+        '<script>var player_aaaa={"encrypt":1,"url":"'
+        + encoded
+        + '"}</script>'
+    )
+    content = Content.__new__(Content)
+    content._decrypter = Decrypter(None)
+    result = Content._fetch_play_url_from_player(
+        content, html,
+        source_obj.raw["endpoints"]["content"]["episode"]["source_switch"],
+        "https://www.omofuna.com/anime/demo/play/3/1.html",
+        source=source_obj,
+    )
+    assert result == "https://vip.example/video/index.m3u8"
 
 
 def test_omofuna_episode_selector_parses_links():
@@ -252,6 +277,18 @@ _PLAY1_LIVE = (
     '"url":"https://live.example/xx.m3u8","from":"player","ps":0}'
     "</script></body></html>"
 )
+
+
+def test_omofuna_non_http_token_is_not_a_playable_stream(monkeypatch):
+    src = source()
+    cont = _content({})
+    monkeypatch.setattr(Content, "_fetch_play_url_once", lambda *args: "provider_token")
+    monkeypatch.setattr(Content, "_switch_candidate_episode_urls", lambda *args: [])
+    with pytest.raises(Exception, match="全部线路取流失败"):
+        cont.fetch_video_episode(
+            src,
+            "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3",
+        )
 
 
 def test_omofuna_dead_line_remembered_and_skipped(monkeypatch):

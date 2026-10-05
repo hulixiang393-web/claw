@@ -104,7 +104,16 @@
       }
     }
   },
-  "decryption": {"targets": {"video_url": {"strategy": "maccms_url"}}},
+  "decryption": {
+    "targets": {
+      "video_url": {
+        "strategy": "js_custom",
+        "entry": "decrypt",
+        "script": "function decrypt(d) { return decodeURIComponent(d); }",
+        "params": {}
+      }
+    }
+  },
   "media": {"format": "hls", "select": {"video": {"quality": "best"}}, "hls": {"workers": 4}},
   "ad_block": {"enabled": true},
   "constraints": {"search": {"max_pages": 10, "max_results": 300}, "detail": {"max_pages": 1}, "episode": {"max_pages": 1, "max_items": 1000}, "max_concurrency": 2},

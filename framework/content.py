@@ -2896,7 +2896,7 @@ class Content:
         不必等满 10s；慢 CDN 尽快失败换线路比白等更流畅）。
         """
         if not url or not url.startswith(("http://", "https://")):
-            return True
+            return False
         headers = dict(self._headers(source))
         timeout = max(3.0, min(float(self._timeout(source)) or 10.0, 5.0))
         try:
