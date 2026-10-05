@@ -14,7 +14,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -204,12 +204,11 @@ class _CentralArea(QWidget):
         size = self.size()
         if size.width() <= 0 or size.height() <= 0:
             return
-        from PySide6.QtCore import Qt
-
         scaled = self._bg_pixmap.scaled(
             size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
         )
         # 居中裁剪到窗口尺寸（超出部分去掉），避免 drawPixmap 用负坐标
+
         sx = max(0, (scaled.width() - size.width()) // 2)
         sy = max(0, (scaled.height() - size.height()) // 2)
         self._bg_scaled = scaled.copy(
@@ -385,7 +384,8 @@ class MainWindow(QMainWindow):
 
         # 主题
         self.theme_manager.on_theme_changed(self._apply_theme_qss)
-        self._apply_theme_qss(self.theme_manager.current_key())
+        self._initial_theme_pending = True
+        QTimer.singleShot(0, self._apply_initial_theme)
 
         # 全局快捷键
         self._install_shortcuts()
@@ -395,6 +395,12 @@ class MainWindow(QMainWindow):
 
         # 首次启动源选择引导（可跳过；未做过源选择时窗口显示后弹出）
         self._schedule_source_selection()
+
+    def _apply_initial_theme(self) -> None:
+        if not self._initial_theme_pending:
+            return
+        self._initial_theme_pending = False
+        self._apply_theme_qss(self.theme_manager.current_key())
 
     # ------------------------------------------------------------------ #
     def _build_pages(self) -> None:
@@ -1145,6 +1151,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _apply_theme_qss(self, theme: str) -> None:
         """应用主题 QSS 到全局 + 背景图合成 + 设置 Palette（兜底防黑色） + 广播事件。"""
+        self._initial_theme_pending = False
         from PySide6.QtGui import QColor, QPalette
 
         qss = self.theme_manager.generate_qss(theme)
