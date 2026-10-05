@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -44,6 +45,8 @@ from gui.pages.discover_page import DiscoverPage
 from gui.pages.reader_page import ReaderPage
 from gui.pages.search_page import SearchPage
 from gui.pages.download_page import DownloadPage
+
+log = logging.getLogger(__name__)
 
 # 导航栏顺序（对应 ui-index.md）
 TABS = [
@@ -265,6 +268,7 @@ class MainWindow(QMainWindow):
                 base_dir / "data" / "cache",
                 max_book_bytes=cfg["max_book_mb"] * 1024 * 1024,
                 max_total_bytes=cfg["max_total_mb"] * 1024 * 1024,
+                repair_index=False,
             )
         except Exception:
             self.shelf_cache_repository = None
@@ -1658,6 +1662,21 @@ def main() -> int:
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
+
+    def repair_shelf_cache_index() -> None:
+        repository = win.shelf_cache_repository
+        if repository is None:
+            return
+        try:
+            repository.repair_index()
+        except Exception:
+            log.exception("后台修复书架缓存索引失败")
+
+    threading.Thread(
+        target=repair_shelf_cache_index,
+        daemon=True,
+        name="shelf-cache-index-repair",
+    ).start()
     return app.exec()
 
 

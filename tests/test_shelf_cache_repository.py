@@ -17,6 +17,40 @@ def make_repo(tmp_path: Path, **kwargs) -> ShelfCacheRepository:
     )
 
 
+def test_repair_index_false_defers_full_repair_until_requested(tmp_path: Path):
+    root = tmp_path / "content"
+    root.mkdir()
+    orphan = root / "orphan.gz"
+    orphan.write_bytes(b"orphan")
+
+    repo = ShelfCacheRepository(
+        tmp_path / "shelf.sqlite3",
+        root,
+        repair_index=False,
+    )
+
+    assert orphan.exists()
+    repo.repair_index()
+    assert not orphan.exists()
+
+
+def test_repair_index_entry_point_repairs_stale_index(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    repo.upsert_book("book", "s", "u", "novel", {})
+    repo.put_content("book", "c1", "text/plain", "hello", {})
+    path = next((tmp_path / "content").rglob("*.gz"))
+    path.unlink()
+
+    deferred = ShelfCacheRepository(
+        tmp_path / "shelf.sqlite3",
+        tmp_path / "content",
+        repair_index=False,
+    )
+    assert deferred.get_book_snapshot("book")["content"]
+    deferred.repair_index()
+    assert deferred.get_book_snapshot("book")["content"] == []
+
+
 def test_schema_book_chapter_snapshot_and_restart(tmp_path: Path):
     db = tmp_path / "shelf.sqlite3"
     repo = ShelfCacheRepository(db, tmp_path / "content")

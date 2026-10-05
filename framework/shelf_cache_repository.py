@@ -21,6 +21,7 @@ class ShelfCacheRepository:
         clock: Callable[[], float] | None = None,
         max_book_bytes: int = 256 * 1024 * 1024,
         max_total_bytes: int = 8 * 1024 * 1024 * 1024,
+        repair_index: bool = True,
     ) -> None:
         self.path = Path(path)
         self.content_root = Path(content_root)
@@ -35,7 +36,8 @@ class ShelfCacheRepository:
         self._db.execute("PRAGMA foreign_keys = ON")
         self._init_schema()
         self._validate_schema_version()
-        self._repair_index()
+        if repair_index:
+            self.repair_index()
 
     def close(self) -> None:
         with self._lock:
@@ -85,7 +87,7 @@ class ShelfCacheRepository:
         if not row or row[0] != 1:
             raise RuntimeError(f"unsupported schema version: {row[0] if row else None}")
 
-    def _repair_index(self) -> None:
+    def repair_index(self) -> None:
         with self._lock, self._db:
             rows = self._db.execute("SELECT book_key, chapter_key, path FROM content").fetchall()
             indexed = set()
