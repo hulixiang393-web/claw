@@ -100,6 +100,10 @@
         ],
         "page": "{page}"
       },
+      "provider_fallback": {
+        "max_providers": 3,
+        "response_path": "list"
+      },
       "item_fields": {
         "title": "vod_name",
         "url": "/title/{vod_id}?title={vod_name}&source={source}",

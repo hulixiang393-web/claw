@@ -78,8 +78,8 @@ def _strip_signed_params(url: str) -> str:
 
 
 def key_of(url: str) -> str:
-    """缓存 key：sha1(去时效参数后的最终 URL)。"""
-    return hashlib.sha1(_strip_signed_params(url).encode("utf-8")).hexdigest()
+    """缓存 key：不暴露 URL 内容且区分不同签名回源目标。"""
+    return hashlib.sha256(url.encode("utf-8", "replace")).hexdigest()
 
 
 def _base_dir() -> Path:

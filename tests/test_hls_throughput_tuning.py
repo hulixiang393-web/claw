@@ -358,7 +358,7 @@ def test_prefetch_limits_are_hard_clamped():
         proxy.stop()
 
 
-def test_prefetch_dedupes_signed_variants(pf_proxy):
+def test_prefetch_keeps_distinct_signed_targets_separate(pf_proxy):
     proxy = pf_proxy({"enabled": True, "depth": 4, "workers": 2})
     cache = proxy._cache
     key = cache.key_of("http://cdn.test/index.m3u8")
@@ -373,7 +373,7 @@ def test_prefetch_dedupes_signed_variants(pf_proxy):
             "http://cdn.test/001.ts?token=b",
         ]
     proxy._maybe_prefetch(key, "http://cdn.test/000.ts")
-    assert len(proxy._pf_scheduled) == 1
+    assert len(proxy._pf_scheduled) == 2
     proxy._prefetch_drain()
 
 

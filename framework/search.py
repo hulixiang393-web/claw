@@ -14,9 +14,10 @@ import json
 import logging
 import re as _re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-from urllib.parse import quote, urlencode, urljoin
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from .config import SourceConfig
 from .discovery import Discovery
@@ -363,15 +364,23 @@ class Search:
                     body = {kw_param: keyword, page_param: page}
                     for k, v in extra.items():
                         body.setdefault(k, v)
-                    # 前置请求取动态 token（如 rrssk 的 _t）：pre_fetch.{url,regex,param}
                     pre = search_cfg.get("pre_fetch") or {}
-                    if pre.get("url") and pre.get("regex"):
+                    if pre.get("url"):
                         pre_text = self._http_get(
                             source, urljoin(source.base_url, pre["url"]), http=http
                         )
-                        m = _re.search(str(pre["regex"]), pre_text)
-                        if m:
-                            body.setdefault(pre.get("param") or "token", m.group(1))
+                        pre_fields = pre.get("fields") or {}
+                        if pre_fields and isinstance(pre_fields, dict):
+                            for param, pattern in pre_fields.items():
+                                match = _re.search(str(pattern), pre_text)
+                                if match:
+                                    body.setdefault(param, match.group(1))
+                        elif pre.get("regex"):
+                            match = _re.search(str(pre["regex"]), pre_text)
+                            if match:
+                                body.setdefault(
+                                    pre.get("param") or "token", match.group(1)
+                                )
                     text = self._http_post_form(source, abs_url, body, http=http)
                 else:
                     # GET / 分页模板：统一由 _build_page_url 构造第 page 页 URL
@@ -985,7 +994,7 @@ class Search:
                 else:
                     abs_url = f"{abs_url}?{qs}"
             else:
-                api_url2 = api_url.replace("{keyword}", quote(keyword)).replace("{page}", str(page))
+                api_url2 = api_url.replace("{keyword}", quote(keyword, safe="")).replace("{page}", str(page))
                 abs_url = urljoin(source.base_url, api_url2)
             if not is_sse and method != "POST":
                 resp = http.get_json(
@@ -1018,10 +1027,19 @@ class Search:
                 if not isinstance(it, dict):
                     continue
                 title = self._tpl(it, item_fields.get("title"))
-                url = self._tpl(it, item_fields.get("url"))
+                url = self._tpl_url(it, item_fields.get("url"))
                 if not title or not url:
                     continue
                 url = urljoin(source.base_url, url)
+                parts = urlsplit(url)
+                if parts.query:
+                    url = urlunsplit((
+                        parts.scheme,
+                        parts.netloc,
+                        parts.path,
+                        urlencode(parse_qsl(parts.query, keep_blank_values=True)),
+                        parts.fragment,
+                    ))
                 if url in seen_urls:
                     continue
                 seen_urls.add(url)
@@ -1037,7 +1055,123 @@ class Search:
                         update=str(self._tpl(it, item_fields.get("update")) or ""),
                     )
                 )
-        return results
+        return self._provider_fallback(source, keyword, results, http)
+
+    @staticmethod
+    def _normalize_provider_text(value: str) -> str:
+        value = unicodedata.normalize("NFKC", str(value or "")).lower()
+        return _re.sub(r"[\W_]+", "", value, flags=_re.UNICODE)
+
+    @staticmethod
+    def _provider_title_is_bad(title: str, keyword: str) -> bool:
+        if not title or "�" in title or "\\ufffd" in title:
+            return True
+        normalized_title = Search._normalize_provider_text(title)
+        normalized_keyword = Search._normalize_provider_text(keyword)
+        return bool(normalized_keyword and normalized_keyword not in normalized_title)
+
+    @staticmethod
+    def _provider_item_matches(item: dict, keyword: str) -> bool:
+        needle = Search._normalize_provider_text(keyword)
+        if not needle:
+            return False
+        for key in ("vod_name", "vod_sub", "vod_en"):
+            value = item.get(key)
+            normalized = Search._normalize_provider_text(value)
+            if normalized and (normalized == needle or needle in normalized):
+                return True
+        return False
+
+    def _provider_fallback(
+        self, source: SourceConfig, keyword: str, results: List[SearchResult], http: HttpClient
+    ) -> List[SearchResult]:
+        if source.source_id != "ikanpp":
+            return results
+        search_cfg = ((source.raw.get("api_endpoints") or {}).get("search") or {})
+        body = search_cfg.get("body") or {}
+        providers = body.get("sources") if isinstance(body, dict) else None
+        if not isinstance(providers, list) or not providers:
+            return results
+        bad = not results or any(self._provider_title_is_bad(r.title, keyword) for r in results)
+        matched = any(
+            self._normalize_provider_text(keyword)
+            and self._normalize_provider_text(keyword) in self._normalize_provider_text(r.title)
+            and "�" not in r.title
+            for r in results
+        )
+        if matched:
+            return results
+        fallback_cfg = search_cfg.get("provider_fallback") or {}
+        limit = 3
+        by_id = {
+            str(item.get("id")): item for item in providers
+            if isinstance(item, dict) and item.get("id") and item.get("enabled", True)
+        }
+        ordered = []
+        for result in results:
+            provider_id = str(result.url).split("source=", 1)[-1]
+            if provider_id in by_id and provider_id not in ordered:
+                ordered.append(provider_id)
+        for item in providers:
+            provider_id = str(item.get("id")) if isinstance(item, dict) else ""
+            if provider_id in by_id and provider_id not in ordered:
+                ordered.append(provider_id)
+        fallback_results = []
+        seen = set()
+        valid_results = [
+            result for result in results
+            if not self._provider_title_is_bad(result.title, keyword)
+        ]
+        for provider_id in ordered[:limit]:
+            provider = by_id[provider_id]
+            base_url = str(provider.get("baseUrl") or "").rstrip("/")
+            path = str(provider.get("searchPath") or "")
+            if not base_url or not path:
+                continue
+            sep = "&" if "?" in path else "?"
+            provider_url = f"{base_url}/{path.lstrip('/')}" + (
+                f"{sep}{urlencode({'ac': 'list', 'wd': keyword})}"
+            )
+            try:
+                payload = http.get_json(
+                    provider_url,
+                    headers=source.request_headers(),
+                    timeout=float(source.transports().get("timeout") or http.defaults.timeout),
+                    retries=0,
+                    interval_ms=int(source.transports().get("interval_ms") or http.defaults.interval_ms),
+                    proxy_pool=source.proxy_pool(),
+                )
+            except Exception as exc:
+                log.info("[%s] provider fallback %s failed: %s", source.source_id, provider_id, type(exc).__name__)
+                continue
+            items = payload
+            if isinstance(payload, dict):
+                path_cfg = fallback_cfg.get("response_path") or "list"
+                items = self._simple_getpath(payload, path_cfg)
+                if not isinstance(items, list):
+                    items = payload.get("data") if isinstance(payload.get("data"), list) else []
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or not self._provider_item_matches(item, keyword):
+                    continue
+                title = str(item.get("vod_name") or item.get("vod_sub") or item.get("vod_en") or "").strip()
+                item_id = item.get("vod_id")
+                if not title or item_id in seen:
+                    continue
+                seen.add(item_id)
+                fallback_results.append(SearchResult(
+                    title=self._clean_title(title),
+                    url=f"{source.base_url.rstrip('/')}/title/{quote(str(item_id), safe='')}?{urlencode({'title': title, 'source': provider_id})}",
+                    source_id=source.source_id,
+                    source_name=source.source_name,
+                    cover=self._clean_cover(str(item.get("vod_pic") or "")),
+                    author=str(item.get("vod_area") or ""),
+                    update=str(item.get("vod_remarks") or ""),
+                ))
+            if fallback_results:
+                return fallback_results
+        return valid_results if bad else results
 
     @staticmethod
     def merge_similar(results: "List[SearchResult]") -> "List[SearchResult]":
@@ -1181,6 +1315,16 @@ class Search:
     @staticmethod
     def _simple_getpath(data, path: str):
         return jsonpath(data, path)
+
+    @staticmethod
+    def _tpl_url(item: dict, spec):
+        if isinstance(spec, str) and "{" in spec:
+            return _re.sub(
+                r"\{(\w+)\}",
+                lambda match: quote(str(item.get(match.group(1), "") or ""), safe=""),
+                spec,
+            )
+        return Search._tpl(item, spec)
 
     @staticmethod
     def _tpl(item: dict, spec):

@@ -400,6 +400,7 @@ class SettingsPage(BasePage):
         self._reader_prefetch_behind = sec._spin(
             "向前预加载(章)", "prefetch_behind", 0, 10, " 章", "0=不向前缓存"
         )
+        self._reader_show_images = sec._check("显示正文图片", "show_images")
         self.tabs.addTab(sec, "阅读")
 
 
@@ -459,6 +460,7 @@ class SettingsPage(BasePage):
         )
         self._reader_prefetch_ahead.setValue(int(g("reader", "prefetch_ahead", 3)))
         self._reader_prefetch_behind.setValue(int(g("reader", "prefetch_behind", 1)))
+        self._reader_show_images.setChecked(bool(g("reader", "show_images", True)))
 
     def _on_apply(self) -> None:
 
@@ -501,6 +503,7 @@ class SettingsPage(BasePage):
         s.set("reader", "prefetch_enabled", self._reader_prefetch_enabled.isChecked())
         s.set("reader", "prefetch_ahead", self._reader_prefetch_ahead.value())
         s.set("reader", "prefetch_behind", self._reader_prefetch_behind.value())
+        s.set("reader", "show_images", self._reader_show_images.isChecked())
 
         s.save()
 

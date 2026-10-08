@@ -104,12 +104,55 @@ class TestM3u8StreamAds:
         assert "VWd1eJQz" not in out and "6UkoUQLF" not in out
         segs = [l for l in out.splitlines() if l and not l.startswith("#")]
         assert segs == ["/seg/001.ts", "/seg/002.ts", "/seg/003.ts"]
-        # AES 加密 KEY 保留、KEY:NONE 清理
         assert "#EXT-X-KEY:METHOD=AES-128" in out
-        assert "#EXT-X-KEY:METHOD=NONE" not in out
+        assert "#EXT-X-KEY:METHOD=NONE" in out
         # 列表合法：EXTINF 数与段数一致
         extinf = sum(1 for l in out.splitlines() if l.startswith("#EXTINF"))
         assert extinf == len(segs)
+
+    def test_same_url_different_byte_ranges_are_not_duplicates(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n"
+            "#EXT-X-BYTERANGE:100@0\n#EXTINF:10,\n/media.ts\n"
+            "#EXT-X-BYTERANGE:100@100\n#EXTINF:10,\n/media.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_same_normal_url_and_range_is_not_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-BYTERANGE:100@0\n#EXTINF:10,\n/media.ts\n"
+            "#EXT-X-DISCONTINUITY\n#EXT-X-BYTERANGE:100@0\n#EXTINF:10,\n/media.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_ts_binary_keyword_is_not_used_as_ad_signal(self):
+        eng = AdblockEngine()
+        m3u8 = "#EXTM3U\n#EXTINF:10,\n/seg/%E6%BE%B3%E9%97%A8.ts\n#EXT-X-ENDLIST\n"
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_normal_short_named_leading_block_is_kept(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5,\n/seg/000.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            + "".join(f"#EXTINF:10,\n/seg/{i:03d}.ts\n" for i in range(1, 8))
+            + "#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_normal_key_none_and_map_are_retained(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+            "#EXT-X-KEY:METHOD=NONE\n#EXTINF:10,\n/seg/a.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
 
     def test_normal_short_seg_after_discontinuity_kept(self):
         # DISCONTINUITY 后 2s 段是正片第一段（xuandm seg96），不能被旧规则误删
@@ -123,8 +166,7 @@ class TestM3u8StreamAds:
         )
         assert eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8") == m3u8
 
-    def test_isolated_short_block_removed(self):
-        # 被 DISCONTINUITY 包裹、块总时长 <3s → 广告（替代旧「单段 <3s」启发式）
+    def test_isolated_short_block_is_kept_without_reliable_ad_signal(self):
         eng = AdblockEngine()
         m3u8 = (
             "#EXTM3U\n"
@@ -133,7 +175,7 @@ class TestM3u8StreamAds:
             "#EXT-X-ENDLIST\n"
         )
         out = eng.filter_m3u8(m3u8, "https://cdn.example.com/play/list.m3u8")
-        assert "1003.ts" not in out and "1004.ts" in out
+        assert out == m3u8
 
 
 class TestBackwardCompat:
@@ -410,9 +452,7 @@ class TestM3u8PreRoll:
 
 
 class TestM3u8MidRoll:
-    def test_short_uniform_interior_block_removed(self):
-        # 注意：首尾两块段名必须不同（c1-c4 / c5-c8），否则同一 URL 在列表中
-        # 出现 ≥2 次会命中 R2 重复段规则，正片段被误判广告（R2 为锁定行为）。
+    def test_short_uniform_interior_block_kept_without_ad_signal(self):
         eng = AdblockEngine()
         content = "".join(f"#EXTINF:10.0,\n/seg/c{i}.ts\n" for i in range(1, 5))
         content2 = "".join(f"#EXTINF:10.0,\n/seg/c{i}.ts\n" for i in range(5, 9))
@@ -425,8 +465,7 @@ class TestM3u8MidRoll:
             + "#EXT-X-ENDLIST\n"
         )
         out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
-        assert "m1.ts" not in out and "m2.ts" not in out
-        assert "c1.ts" in out
+        assert out == m3u8
 
     def test_longer_varied_interior_block_kept(self):
         # 12s 内部块（8+4 非均匀），各块中位数 80s：12 < 80/3 成立但无均匀签名

@@ -21,6 +21,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from typing import Dict, List, Optional
 from urllib.parse import urlencode, urljoin
 
@@ -50,7 +51,7 @@ class Ytdlp:
         self._timeout = timeout
 
     # ------------------------------------------------------------------ #
-    def _run(self, args: List[str]) -> str:
+    def _run(self, args: List[str], timeout: float | None = None) -> str:
         """跑 yt-dlp，返回 stdout（utf-8）。失败抛 YtdlpError。
 
         用临时文件重定向 stdout/stderr 而非 capture_output：
@@ -85,7 +86,7 @@ class Ytdlp:
                     stderr=ef,
                     text=True,
                     errors="replace",
-                    timeout=self._timeout,
+                    timeout=self._timeout if timeout is None else timeout,
                     **no_window_kwargs(),  # Windows 静默，不弹控制台窗口
                 )
             try:
@@ -218,7 +219,7 @@ class Ytdlp:
         }
 
     # ------------------------------------------------------------------ #
-    def fetch_streams(self, url: str, fmt: str = "bestvideo+bestaudio/best") -> tuple:
+    def fetch_streams(self, url: str, fmt: str = "bestvideo+bestaudio/best", deadline=None) -> tuple:
         """高清双流（video_url, audio_url）。供播放器（VLC）播放 / ffmpeg 下载。"""
         # 拿 video 与 audio 两个 URL（有 audio 则分离）
         fmt_video, fmt_audio = None, None
@@ -227,19 +228,24 @@ class Ytdlp:
             fmt_video, fmt_audio = m.group("v"), m.group("a")
         else:
             fmt_video = fmt
-        v = self._fetch_one(url, fmt_video)
-        a = self._fetch_one(url, fmt_audio) if fmt_audio else ""
+        v = self._fetch_one(url, fmt_video, deadline=deadline)
+        a = self._fetch_one(url, fmt_audio, deadline=deadline) if fmt_audio else ""
         return v, a
 
-    def _fetch_one(self, url: str, fmt: str) -> str:
+    def _fetch_one(self, url: str, fmt: str, deadline=None) -> str:
         """拿单个 format 的 URL。用 --get-url。"""
+        timeout = None
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise YtdlpError("yt-dlp 超时")
         out = self._run([
             "-f", fmt, "--get-url", "--no-warnings",
             "--no-playlist",  # 取流只要单条：URL 带 list 参数时不整表解析，省签名等待
             "--socket-timeout", "10",
             "--extractor-args", "youtube:skip=sections",
             url,
-        ])
+        ], timeout=timeout)
         first = out.strip().splitlines()
         return first[0] if first else ""
 

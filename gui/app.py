@@ -14,7 +14,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QSignalBlocker, QTimer, Qt
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -379,7 +379,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tabs)
 
         self._build_pages()
-        # 切到书架 Tab 时刷新：阅读/下载后回来，续读记忆（读到第X章/看到第X集）实时更新
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # 主题
@@ -389,9 +388,6 @@ class MainWindow(QMainWindow):
 
         # 全局快捷键
         self._install_shortcuts()
-
-        # 启动自动诊断：后台对所有启用源跑一次 selfcheck，健康灯一开始就准确
-        self._schedule_startup_diag()
 
         # 首次启动源选择引导（可跳过；未做过源选择时窗口显示后弹出）
         self._schedule_source_selection()
@@ -405,36 +401,51 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _build_pages(self) -> None:
         """构建导航栏各 Tab。未实现界面在标签后标注「·开发中」。"""
-        self.reader = None  # 占位，_build_reader 时创建
+        self.reader = None
+        for attr in (
+            "discover_page", "search_page", "download_page", "library_page",
+            "source_page", "settings_page",
+        ):
+            setattr(self, attr, None)
+        self._lazy_tab_builders = {
+            "discover": self._build_discover,
+            "search": self._build_search,
+            "library": self._build_library,
+            "source": self._build_source,
+            "settings": self._build_settings,
+        }
         for label, key in TABS:
             if key == "home":
                 page = self._build_home()
-                tab_label = label
-            elif key == "discover":
-                page = self._build_discover()
-                tab_label = label
             elif key == "reader":
                 page = self._build_reader()
-                tab_label = label
-            elif key == "search":
-                page = self._build_search()
-                tab_label = label
             elif key == "download":
                 page = self._build_download()
-                tab_label = label
-            elif key == "library":
-                page = self._build_library()
-                tab_label = label
-            elif key == "source":
-                page = self._build_source()
-                tab_label = label
-            elif key == "settings":
-                page = self._build_settings()
-                tab_label = label
+            elif key in self._lazy_tab_builders:
+                page = self._build_placeholder(label)
             else:
                 page = self._build_placeholder(label)
-                tab_label = f"{label}·开发中"
-            self.tabs.addTab(page, tab_label)
+                label = f"{label}·开发中"
+            self.tabs.addTab(page, label)
+
+    def _ensure_tab_page(self, idx: int) -> QWidget:
+        key = TABS[idx][1]
+        builder = self._lazy_tab_builders.get(key)
+        if builder is None:
+            return self.tabs.widget(idx)
+        selected_idx = self.tabs.currentIndex()
+        page = builder()
+        self._lazy_tab_builders.pop(key, None)
+        old = self.tabs.widget(idx)
+        label = self.tabs.tabText(idx)
+        blocker = QSignalBlocker(self.tabs)
+        self.tabs.removeTab(idx)
+        if old is not None:
+            old.deleteLater()
+        self.tabs.insertTab(idx, page, label)
+        self.tabs.setCurrentIndex(selected_idx)
+        del blocker
+        return page
 
     def _build_reader(self) -> ReaderPage:
         from gui.pages.reader_page import ReaderPage
@@ -579,7 +590,7 @@ class MainWindow(QMainWindow):
         if prev == reader_idx and idx != reader_idx and self.reader is not None:
             self.reader.flush_progress()
         self._last_tab_idx = idx
-        page = self.tabs.widget(idx)
+        page = self._ensure_tab_page(idx)
         if page is getattr(self, "library_page", None) and hasattr(page, "refresh"):
             page.refresh()
 
@@ -722,7 +733,10 @@ class MainWindow(QMainWindow):
         page.open_requested.connect(self._open_from_search)
         page.add_to_shelf_requested.connect(self._on_batch_add_shelf)
         page.batch_download_requested.connect(self._on_batch_download)
+
+        self.search_page = page
         return page
+
 
     def _open_from_search(self, source_id: str, url: str, content_type: str) -> None:
         """搜索页点结果卡片 → 打开 reader 播放/阅读。"""

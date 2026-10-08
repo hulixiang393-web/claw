@@ -316,8 +316,12 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             否则直连。音频轨非空也走同一代理。tuple = (play_url, audio_url)。
             force_proxy 透传给代理：主 MRL/音频/episodes 每集都带。
             """
-            is_hls = target.split("?", 1)[0].lower().endswith(".m3u8")
-            if hdrs or is_hls:
+            is_hls = "m3u8" in target.lower()
+            needs_proxy_headers = any(
+                str(key).lower() in {"referer", "cookie"} and value
+                for key, value in hdrs.items()
+            )
+            if force_proxy or needs_proxy_headers or is_hls:
                 play_url = proxy_url_for(target, hdrs, ad_block=ad_block,
                                          force_proxy=force_proxy)
                 audio_url = (
@@ -460,7 +464,15 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             if truncated:
                 return f"已用外部播放器打开（列表已截断，共 {len(window)} 集）"
             return "已用外部播放器打开"
-    webbrowser.open(url)
+    hdrs = dict(headers or {})
+    if referer:
+        hdrs.setdefault("Referer", referer)
+    if user_agent:
+        hdrs.setdefault("User-Agent", user_agent)
+    target = url
+    if "m3u8" in url.lower():
+        target = proxy_url_for(url, hdrs, ad_block=ad_block, force_proxy=force_proxy)
+    webbrowser.open(target)
     return "已在浏览器中打开"
 
 

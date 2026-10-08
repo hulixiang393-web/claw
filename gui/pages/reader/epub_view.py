@@ -35,6 +35,7 @@ from framework.epub_reader import (
     FastEpub,
     MERGE_DOC_THRESHOLD,
     _html_to_text,
+    _ordered_parts,
     split_single_document,
 )
 
@@ -71,11 +72,13 @@ class _Chapter:
         src: str = "",
         text: str = "",
         img_srcs: list | None = None,
+        content_parts: list | None = None,
     ):
         self.title = title or "未命名章节"
         self.src = src
         self.text = text
         self.img_srcs = list(img_srcs or [])
+        self.content_parts = list(content_parts or [])
         self.is_comic = bool(self.img_srcs)
 
 
@@ -105,7 +108,7 @@ class _OpenTask(QRunnable):
 
 
 class _LoadSignals(QObject):
-    done = Signal(object, object, object, object)  # (idx, kind, text, imgs)
+    done = Signal(object, object, object, object, object)  # (idx, kind, text, imgs, parts)
 
 
 class _LoadChapterTask(QRunnable):
@@ -119,11 +122,24 @@ class _LoadChapterTask(QRunnable):
         self._epub = epub
 
     def run(self) -> None:
-        kind, text, imgs = "novel", "", []
-        with _READ_LOCK:  # zip 文件句柄跨线程读需串行
+        kind, text, imgs, parts = "novel", "", [], []
+        with _READ_LOCK:
             try:
-                if self._ch.text:
+                if self._ch.text and not self._ch.content_parts:
                     kind, text = "novel", self._ch.text
+                elif self._ch.content_parts:
+                    has_image = any(item[0] == "image" for item in self._ch.content_parts)
+                    has_text = any(item[0] == "text" for item in self._ch.content_parts)
+                    kind = "mixed" if has_image and has_text else "comic" if has_image else "novel"
+                    for part_kind, value in self._ch.content_parts:
+                        if part_kind == "text":
+                            parts.append(("text", value))
+                        else:
+                            raw = EpubView._read_bytes(self._epub, self._ch.src, value)
+                            if raw:
+                                imgs.append(raw)
+                                parts.append(("image", raw))
+                    text = "\n".join(value for part_kind, value in parts if part_kind == "text")
                 elif self._ch.img_srcs:
                     kind = "comic"
                     for ref in self._ch.img_srcs:
@@ -132,18 +148,23 @@ class _LoadChapterTask(QRunnable):
                             imgs.append(raw)
                 elif self._epub is not None:
                     html = EpubView._read_doc(self._epub, self._ch.src)
-                    if "<img" in (html or "").lower():
-                        kind = "comic"
-                        for ref in re.findall(r'src="([^"]+)"', html or "", flags=re.IGNORECASE):
-                            raw = EpubView._read_bytes(self._epub, self._ch.src, ref)
+                    parsed = _ordered_parts(html or "")
+                    has_image = any(part_kind == "image" for part_kind, _ in parsed)
+                    has_text = any(part_kind == "text" for part_kind, _ in parsed)
+                    kind = "mixed" if has_image and has_text else "comic" if has_image else "novel"
+                    for part_kind, value in parsed:
+                        if part_kind == "text":
+                            parts.append(("text", value))
+                        else:
+                            raw = EpubView._read_bytes(self._epub, self._ch.src, value)
                             if raw:
                                 imgs.append(raw)
-                    else:
-                        kind, text = "novel", _html_to_text(html or "")
-            except Exception:  # noqa: BLE001
-                kind, text = "novel", ""
+                                parts.append(("image", raw))
+                    text = "\n".join(value for part_kind, value in parts if part_kind == "text")
+            except Exception:
+                kind, text, imgs, parts = "novel", "", [], []
         try:
-            self.signals.done.emit(self._idx, kind, text, imgs)
+            self.signals.done.emit(self._idx, kind, text, imgs, parts)
         except RuntimeError:
             pass
 
@@ -359,11 +380,11 @@ class EpubView(QWidget):
         hrefs = epub.spine_hrefs
         if len(hrefs) == 1 and epub.file_size(hrefs[0]) > MERGE_DOC_THRESHOLD:
             html = EpubView._read_doc(epub, hrefs[0])
-            parts = split_single_document(html)
+            parts = split_single_document(html, include_parts=True)
             if len(parts) > 1:
                 chapters = [
-                    _Chapter(t, src=hrefs[0], text=txt, img_srcs=srcs)
-                    for t, txt, srcs in parts
+                    _Chapter(t, src=hrefs[0], text=txt, img_srcs=srcs, content_parts=content_parts)
+                    for t, txt, srcs, content_parts in parts
                 ]
                 _SPLIT_CACHE.clear()  # 只保留最近一本，避免多本拆分结果堆积内存
                 _SPLIT_CACHE[key] = chapters
@@ -450,12 +471,22 @@ class EpubView(QWidget):
         self.toc_list.clear()
         self.toc_list.setUpdatesEnabled(False)
         try:
-            self.toc_list.addItems([c.title or f"第{i+1}章" for i, c in enumerate(self._chapters)])
+            for i, chapter in enumerate(self._chapters):
+                item = QListWidgetItem(chapter.title or f"第{i+1}章")
+                item.setData(Qt.UserRole, i)
+                self.toc_list.addItem(item)
         finally:
             self.toc_list.setUpdatesEnabled(True)
 
     def _on_toc_clicked(self, item) -> None:
-        idx = item.data(Qt.UserRole)
+        if item is None:
+            return
+        try:
+            idx = item.data(Qt.UserRole)
+        except (AttributeError, TypeError):
+            return
+        if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < len(self._chapters):
+            return
         self._load_chapter(idx)
 
     def _toggle_toc(self) -> None:
@@ -480,13 +511,17 @@ class EpubView(QWidget):
         self._load_task = task  # 持有引用防 GC
         QThreadPool.globalInstance().start(task)
 
-    def _on_chapter_loaded(self, idx: int, kind: str, text: str, imgs: list) -> None:
+    def _on_chapter_loaded(self, idx: int, kind: str, text: str, imgs: list, parts: list | None = None) -> None:
         """章节内容就绪（主线程）。过期结果（已切章）丢弃。"""
         if idx != self._current_idx:
             return
         ch = self._chapters[idx]
         self._is_comic = kind == "comic"
-        if kind == "comic":
+        if kind == "mixed":
+            self._switch_gallery()
+            self._render_mixed_parts(parts or [])
+            self.scroll.verticalScrollBar().setValue(0)
+        elif kind == "comic":
             self._switch_gallery()
             self._render_comic_imgs(imgs)
             self.scroll.verticalScrollBar().setValue(0)
@@ -522,6 +557,42 @@ class EpubView(QWidget):
             self.position_changed.emit((self._path, round(ratio, 4)))
         except RuntimeError:
             pass
+
+    def _render_mixed_parts(self, parts: list) -> None:
+        self._comic_imgs = []
+        self._comic_gen += 1
+        gen = self._comic_gen
+        self._comic_tasks = []
+        self._comic_labels = []
+        while self._gallery_layout.count():
+            child = self._gallery_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        vp = self.scroll.viewport().width() or 600
+        target_w = vp
+        self._gallery_widget.setFixedWidth(vp)
+        for part_kind, value in parts:
+            if part_kind == "text":
+                label = QLabel(value)
+                label.setWordWrap(True)
+                label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+                label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                label.setStyleSheet(self._body_css())
+                self._gallery_layout.addWidget(label)
+                continue
+            if part_kind != "image" or not value:
+                continue
+            self._comic_imgs.append(value)
+            label = QLabel("加载中…")
+            label.setAlignment(Qt.AlignCenter)
+            label.setMinimumWidth(vp)
+            self._gallery_layout.addWidget(label)
+            self._comic_labels.append(label)
+        for idx, raw in enumerate(self._comic_imgs):
+            task = _ComicDecodeTask(gen, idx, raw, target_w)
+            task.signals.done.connect(self._on_comic_decoded)
+            QThreadPool.globalInstance().start(task)
+            self._comic_tasks.append(task)
 
     def _render_comic_imgs(self, imgs: list, preserve_ratio: bool = False) -> None:
         """漫画章：后台并发限宽解码 + 占位回填（首屏秒出，不冻结 UI）。

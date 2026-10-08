@@ -16,6 +16,7 @@
 import json
 import os
 import sys
+from urllib.parse import parse_qs, urlsplit
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -199,7 +200,7 @@ def test_discovery_browse_works():
     assert w.title == "生化危机：爆发夜"
     assert w.cover == "https://image.tmdb.org/t/p/w500/abc.jpg"
     # 详情 URL 携带 ?title=<精确标题>（detail POST 按 title 命中逻辑必需）
-    assert w.url == f"{_BASE}/title/ik020581?title=生化危机：爆发夜&source=bfzy"
+    assert w.url == f"{_BASE}/title/ik020581?title=%E7%94%9F%E5%8C%96%E5%8D%B1%E6%9C%BA%EF%BC%9A%E7%88%86%E5%8F%91%E5%A4%9C&source=bfzy"
 
 
 # --------------------------------------------------------------------------- #
@@ -218,7 +219,7 @@ def test_search_parallel_sse_aggregates_sources():
     assert "战狼2" in titles
     assert "战狼之父亲" in titles
     zl2 = next(r for r in res if r.title == "战狼2")
-    assert zl2.url == f"{_BASE}/title/20711?title=战狼2&source=jisu"
+    assert zl2.url == f"{_BASE}/title/20711?title=%E6%88%98%E7%8B%BC2&source=jisu"
     assert zl2.cover == "https://img.jisuimage.com/cover/48aedb.jpg"
     assert zl2.author == "中国大陆"
     assert zl2.update == "正片"
@@ -249,6 +250,111 @@ def test_search_parallel_sse_passes_charset_encoding():
     searcher.search_one(src, "战狼")
     assert http.last_post_kw is not None
     assert http.last_post_kw.get("encoding") == "utf-8"
+
+
+class _IkanppFallbackHttp(_FakeHttp):
+    def __init__(self):
+        super().__init__()
+        self.provider_calls = []
+
+    def post_text(self, url, json_body=None, **kw):
+        self.last_post_kw = dict(kw)
+        self.last_body = dict(json_body or {})
+        return 'data: {"type":"videos","source":"zuida","videos":[{"source":"zuida","vod_id":999,"vod_name":"���","vod_pic":"","vod_area":"","vod_remarks":""}]}\n\n'
+
+    def get_json(self, url, **kw):
+        self.provider_calls.append(url)
+        return {
+            "code": 1,
+            "list": [{
+                "vod_id": 123456,
+                "vod_name": "扑杀天使",
+                "vod_sub": "",
+                "vod_en": "Bokusatsu Tenshi",
+                "vod_pic": "https://img.zuidapi.example/push.jpg",
+                "vod_area": "日本",
+                "vod_remarks": "全1集",
+            }],
+        }
+
+
+def test_search_parallel_falls_back_to_matching_provider_for_garbled_title():
+    from framework.search import Search
+
+    http = _IkanppFallbackHttp()
+    src = _source()
+    searcher = Search(http, Parser())
+    res = searcher.search_one(src, "扑杀天使")
+    assert [(r.title, r.url) for r in res] == [
+        ("扑杀天使", f"{_BASE}/title/123456?title=%E6%89%91%E6%9D%80%E5%A4%A9%E4%BD%BF&source=zuida")
+    ]
+    assert len(http.provider_calls) == 1
+    assert "api.zuidapi.com/api.php/provide/vod" in http.provider_calls[0]
+    assert "wd=%E6%89%91%E6%9D%80%E5%A4%A9%E4%BD%BF" in http.provider_calls[0]
+
+
+def test_fallback_result_detail_keeps_provider_and_m3u8():
+    from framework.search import Search
+
+    http = _IkanppFallbackHttp()
+    src = _source()
+    result = Search(http, Parser()).search_one(src, "扑杀天使")[0]
+    content = Content(http, Parser(), _Checker())
+    detail = content.fetch_detail(src, result.url)
+    assert http.last_body["id"] == "123456"
+    assert http.last_body["source"] == "zuida"
+    assert detail.chapters[0].url == _M3U8
+
+
+class _NoMatchProviderHttp(_IkanppFallbackHttp):
+    def get_json(self, url, **kw):
+        self.provider_calls.append(url)
+        return {"code": 1, "list": []}
+
+
+class _MatchingProviderHttp(_IkanppFallbackHttp):
+    def post_text(self, url, json_body=None, **kw):
+        self.last_post_kw = dict(kw)
+        self.last_body = dict(json_body or {})
+        return 'data: {"type":"videos","source":"jisu","videos":[{"source":"jisu","vod_id":7,"vod_name":"战狼2","vod_pic":"","vod_area":"","vod_remarks":""}]}\n\n'
+
+
+def test_provider_fallback_config_above_cap_still_requests_only_three_providers():
+    from framework.search import Search
+
+    http = _NoMatchProviderHttp()
+    src = _source()
+    src.raw["api_endpoints"]["search"]["provider_fallback"]["max_providers"] = 10
+    Search(http, Parser()).search_one(src, "扑杀天使")
+    assert len(http.provider_calls) == 3
+
+
+def test_matching_normalized_title_does_not_trigger_provider_fallback():
+    from framework.search import Search
+
+    http = _MatchingProviderHttp()
+    src = _source()
+    results = Search(http, Parser()).search_one(src, "战狼")
+    assert [result.title for result in results] == ["战狼2"]
+    assert http.provider_calls == []
+
+
+def test_title_query_is_encoded_and_detail_decodes_special_characters():
+    from framework.search import Search
+
+    class SpecialTitleHttp(_FakeHttp):
+        def post_text(self, url, json_body=None, **kw):
+            self.last_body = dict(json_body or {})
+            return 'data: {"type":"videos","source":"jisu","videos":[{"source":"jisu","vod_id":8,"vod_name":"A&B/#?","vod_pic":"","vod_area":"","vod_remarks":""}]}\n\n'
+
+    http = SpecialTitleHttp()
+    src = _source()
+    result = Search(http, Parser()).search_one(src, "A&B/#?")[0]
+    query = parse_qs(urlsplit(result.url).query)
+    assert query["title"] == ["A&B/#?"]
+    assert query["source"] == ["jisu"]
+    Content(http, Parser(), _Checker()).fetch_detail(src, result.url)
+    assert http.last_body["title"] == "A&B/#?"
 
 
 # --------------------------------------------------------------------------- #

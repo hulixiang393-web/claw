@@ -754,7 +754,17 @@ class DownloadQueue:
         BATCH_SIZE = 12  # 每批渲染话数（控制 Chromium 峰值内存）
 
         # 收集待下载的章节索引
-        pending = [i for i in range(len(task.chapters)) if task.selected[i]]
+        with self._lock:
+            completed = {
+                index
+                for index in task.done_chapters
+                if 0 <= index < len(task.selected) and task.selected[index]
+            }
+            task.done = len(completed)
+        pending = [
+            i for i in range(len(task.chapters))
+            if task.selected[i] and i not in task.done_chapters
+        ]
         if not pending:
             with self._lock:
                 task.status = TaskStatus.DONE
@@ -791,6 +801,8 @@ class DownloadQueue:
                         for idx, nbytes in result.items():
                             task.done += 1
                             task.bytes_written += max(0, nbytes)
+                            if idx not in task.done_chapters:
+                                task.done_chapters.append(idx)
                     break
                 except Exception as exc:  # noqa: BLE001
                     last_err = str(exc)

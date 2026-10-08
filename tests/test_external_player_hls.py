@@ -28,6 +28,20 @@ def test_mp4_without_headers_direct(monkeypatch):
     assert calls == []
 
 
+def test_hls_parameter_wrapped_url_is_proxied(monkeypatch):
+    _, calls = _play(monkeypatch, "https://site/player?src=https%3A%2F%2Fcdn%2Findex.m3u8", {})
+    assert calls == ["https://site/player?src=https%3A%2F%2Fcdn%2Findex.m3u8"]
+
+
+def test_hls_without_vlc_uses_proxy_url(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: None)
+    monkeypatch.setattr(ep, "proxy_url_for", lambda u, *a, **k: calls.append(u) or "http://127.0.0.1/s/token")
+    monkeypatch.setattr(ep.webbrowser, "open", lambda u: calls.append(u))
+    ep.open_with_player("https://cdn.example.com/index.m3u8", headers={})
+    assert calls == ["https://cdn.example.com/index.m3u8", "http://127.0.0.1/s/token"]
+
+
 def test_hls_audio_slave_proxied(monkeypatch):
     calls = {}
 

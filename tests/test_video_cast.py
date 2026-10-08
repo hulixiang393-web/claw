@@ -893,6 +893,19 @@ def test_paused_playback_does_not_confirm_cast_start(_qapp):
 # --------------------------------------------------------------------- #
 # 5. 生命周期清理
 # --------------------------------------------------------------------- #
+def test_stop_cast_cancels_stream_task(_qapp):
+    view = _view(_video_detail(3), idx=0)
+    cancelled = []
+    view._cast_stream_task = types.SimpleNamespace(
+        cancel=lambda: cancelled.append(True)
+    )
+
+    view._stop_cast()
+
+    assert cancelled == [True]
+    assert view._cast_stream_task is None
+
+
 def test_stop_cast_cleans_session_poll_and_resets_button(_qapp, monkeypatch):
     view = _view(_video_detail(3), idx=0)
     session, _c, _s = _start_cast(view, monkeypatch)

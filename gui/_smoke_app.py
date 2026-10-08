@@ -26,7 +26,8 @@ def main():
     print("已实现 Tab:", IMPLEMENTED_TABS)
     print("占位 Tab:", [l for l, k in TABS if k not in IMPLEMENTED_TABS])
 
-    # 主题已应用
+    # 主题在事件循环空闲时应用
+    app.processEvents()
     qss = app.styleSheet()
     assert len(qss) > 100, "QSS 未应用"
     print("主题 QSS 已应用，长度 =", len(qss))

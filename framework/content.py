@@ -19,12 +19,14 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re as _re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
+from urllib.parse import urljoin, urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +43,7 @@ from .selfcheck import StructureChecker
 from . import utils
 from .chapter_sort import chapter_label, _extract_chapter_number, _sort_chapters
 from .health import report_bg_check
+from .stream_resolver import StreamBudget, StreamCancelledError
 
 
 def _strip_html_tags(text: str) -> str:
@@ -74,8 +77,16 @@ class Chapter:
     url: str
     source_id: str = ""  # 该集所属播放源标识（换源站：sid 值）；普通源空
     # 该集封面（如 hanime1 详情页侧边栏播放清單内每集缩略图）；
-    # 由 content.<type>.list.fields.cover 提取，空则该集界面回退作品封面
+    # 由 content.<type>.list.fields.cover 提取，空则章节界面回退作品封面
     cover: str = ""
+    depth: int = 0
+
+
+@dataclass
+class BookStackChapterResult:
+    body_html: str
+    text: str
+    image_urls: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -129,8 +140,6 @@ class Content:
         #   cover:{source_id}:{abs_url}  封面字节（永久，shelf 池）
         self._cache = cache
         self._repository = repository
-        # yt-dlp 流 URL 缓存（同视频短时复用，避免重复签名等待）
-        self._ytdlp_stream_cache: dict = {}
         self._ytdlp = None  # 懒加载单例，复用 yt-dlp 子进程
         # 视频详情页 HTML 复用缓存：single_chapter 源（missav/hanime1/18j/18mh-video
         # 等）取流 URL == 详情 URL，fetch_detail 已整页下载，取流时复用免二次下载
@@ -218,6 +227,19 @@ class Content:
 
     def _interval_ms(self, source: SourceConfig) -> int:
         return int(source.transports().get("interval_ms") or self._http.defaults.interval_ms)
+
+    @staticmethod
+    def _stream_context(context=None, deadline=None):
+        if context is not None:
+            return context
+        return StreamBudget(deadline) if deadline is not None else None
+
+    @staticmethod
+    def _check_stream_context(context=None, deadline=None):
+        if context is not None:
+            context.check()
+        elif deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("stream resolution deadline exhausted")
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         return utils.abs_url(source.base_url, url)
@@ -321,23 +343,44 @@ class Content:
             (".m3u8", ".mpd", ".mp4", ".m4v", ".flv", ".webm", ".mkv", ".mov", ".ts", ".m4a")
         )
 
-    def _get(self, source: SourceConfig, url: str, http=None) -> str:
+    def _get(self, source: SourceConfig, url: str, http=None, deadline=None, context=None) -> str:
         """抓取页面 HTML。http 可传独立 HttpClient（并行翻页时避免共享
         self._http 的 requests.Session 跨线程竞态）；缺省用共享实例。"""
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         client = http or self._http
         abs_url = self._abs_url(source, url)
-        return client.get_text(
+        timeout = self._timeout(source)
+        retries = self._retries(source)
+        interval_ms = self._interval_ms(source)
+        if context is not None:
+            remaining = context.remaining()
+            if remaining <= 0:
+                context.check()
+            timeout = min(timeout, remaining)
+            retries = 0
+            interval_ms = 0
+        elif deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("stream resolution deadline exhausted")
+            timeout = min(timeout, remaining)
+            retries = 0
+            interval_ms = 0
+        value = client.get_text(
             abs_url,
             headers=self._headers(source),
-            timeout=self._timeout(source),
-            retries=self._retries(source),
-            interval_ms=self._interval_ms(source),
+            timeout=timeout,
+            retries=retries,
+            interval_ms=interval_ms,
             encoding=source.transports().get("charset"),
             proxy_pool=source.proxy_pool(),
             direct=bool(source.transports().get("direct")),
         )
+        self._check_stream_context(context, deadline)
+        return value
 
-    def _get_detail_html(self, source: SourceConfig, url: str, abs_url: str) -> str:
+    def _get_detail_html(self, source: SourceConfig, url: str, abs_url: str, deadline=None, context=None) -> str:
         """详情页 HTML：短 TTL 缓存命中直接返回，否则抓取并缓存。
 
         重复打开同一本书（详情抽屉多次/刷新）免二次整页下载，慢站详情慢时
@@ -355,7 +398,7 @@ class Content:
             if cached is not None:
                 self._detail_html_cache[key] = (time.time() + self._detail_html_ttl, cached)
                 return cached
-        html = self._get(source, url)
+        html = self._get(source, url, deadline=deadline, context=context)
         self._detail_html_cache[key] = (time.time() + self._detail_html_ttl, html)
         if len(self._detail_html_cache) > self._detail_html_max:
             # dict 保持插入序：弹出最先插入的一条（近似 LRU）
@@ -395,6 +438,7 @@ class Content:
     # ------------------------------------------------------------------ #
     def refresh_detail(self, source: SourceConfig, url: str, current_chapter_url: str = "") -> Detail:
         """强制刷新详情和章节正文缓存，保留缓存优先的普通打开路径。"""
+        self.invalidate_video_stream_cache(source)
         abs_url = self._abs_url(source, url)
         detail_key = f"detail:{source.source_id}:{abs_url}"
         def _delete(key: str) -> None:
@@ -433,12 +477,14 @@ class Content:
                 self._repository.evict_book_content(book_key, keep)
         return detail
 
-    def fetch_detail(self, source: SourceConfig, url: str) -> Detail:
+    def fetch_detail(self, source: SourceConfig, url: str, deadline=None, context=None) -> Detail:
         """抓取详情页：元数据 + 章节列表。
 
         优先 api_endpoints.detail（JSON API，可选 sign 签名）；
         否则走 endpoints.detail HTML 解析。
         """
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         cache_key = f"detail:{source.source_id}:{self._abs_url(source, url)}"
         cached = self._cache_get_detail(cache_key)
         if cached is not None and not any(
@@ -450,9 +496,10 @@ class Content:
         detail_api = api.get("detail") or {}
         if detail_api:
             if detail_api.get("engine") == "ytdlp":
-                detail = self._fetch_detail_ytdlp(source, url, detail_api)
+                detail = self._fetch_detail_ytdlp(source, url, detail_api, context=context)
             else:
-                detail = self._fetch_detail_api(source, url, detail_api)
+                detail = self._fetch_detail_api(source, url, detail_api, context=context)
+            self._check_stream_context(context, deadline)
             self._cache_set_detail(cache_key, detail)
             return detail
 
@@ -472,7 +519,9 @@ class Content:
         if cached is not None:
             return cached
         self._bg_check(source, abs_url)
-        html = self._get_detail_html(source, url, abs_url)
+        html = self._get_detail_html(
+            source, url, abs_url, deadline=deadline, context=context
+        )
         if source.content_type == "video":
             # 缓存视频详情页 HTML：single_chapter 源取流 URL == 详情 URL，
             # fetch_video_episode 复用，避免二次整页下载（慢站省约一半等待）。
@@ -502,7 +551,7 @@ class Content:
         detail = Detail(
             source_id=source.source_id,
             content_type=source.content_type,
-            url=url,
+            url=abs_url,
             title=title,
             author=self._parser.extract_first(doc, fields.get("author")),
             cover=cover,
@@ -585,7 +634,7 @@ class Content:
             )
 
         # 播放源列表（换源站）：解析 source_switch 配置的可用源
-        detail.source_list = self._parse_source_list(source, html)
+        detail.source_list = self._parse_source_list(source, html, context=context)
 
         self._cache_set_detail(cache_key, detail)
         return detail
@@ -686,15 +735,20 @@ class Content:
             parts.setdefault(rpart, (r.title or "", r.url or ""))
         return parts
 
-    def _fetch_detail_ytdlp(self, source: SourceConfig, url: str, cfg: dict) -> Detail:
+    def _fetch_detail_ytdlp(self, source: SourceConfig, url: str, cfg: dict, context=None) -> Detail:
         """yt-dlp 引擎：详情元数据 + 章节列表。"""
+        self._check_stream_context(context)
         yt = self._get_ytdlp()
         try:
-            d = yt.fetch_detail(url)
+            d = self._call_with_remaining_timeout(
+                yt.fetch_detail, (url,), {},
+                context.deadline if context is not None else None,
+            )
         except Exception as exc:
             raise ContentMissingError(
                 f"yt-dlp 详情失败（{url}）：{exc}", source_id=source.source_id
             ) from exc
+        self._check_stream_context(context)
         detail = Detail(
             source_id=source.source_id,
             content_type=source.content_type,
@@ -716,7 +770,9 @@ class Content:
             related: List[dict] = []
             try:
                 html = self._get(source, url)
+
                 pat = str(
+
                     related_cfg.get("js_regex")
                     or r"relatedVideos\s*=\s*(\[.*?\]);"
                 )
@@ -750,7 +806,7 @@ class Content:
         return detail
 
     # ------------------------------------------------------------------ #
-    def _fetch_detail_api(self, source: SourceConfig, url: str, cfg: dict) -> Detail:
+    def _fetch_detail_api(self, source: SourceConfig, url: str, cfg: dict, context=None) -> Detail:
         """api_endpoints.detail：JSON API 取详情元数据 + 章节列表。
 
         支持 sign 签名。字段映射用 field_extractors（目标字段 → JSONPath）。
@@ -761,6 +817,7 @@ class Content:
         """
         from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
+        self._check_stream_context(context)
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
         filled = {}
@@ -792,10 +849,11 @@ class Content:
                 urljoin(source.base_url, api_url),
                 json_body=body_filled,
                 headers=self._endpoint_headers(source, cfg),
-                timeout=self._timeout(source),
-                retries=self._retries(source),
+                timeout=(min(self._timeout(source), context.remaining()) if context is not None else self._timeout(source)),
+                retries=(0 if context is not None else self._retries(source)),
                 proxy_pool=source.proxy_pool(),
             )
+            self._check_stream_context(context)
         else:
             # URL 路径占位符同样替换（同 episode 分支处理，avgood 类路径 {id} 原样发出会 404）
             api_url = str(cfg.get("url") or "")
@@ -822,10 +880,11 @@ class Content:
             resp = self._http.get_json(
                 abs_url,
                 headers=self._endpoint_headers(source, cfg),
-                timeout=self._timeout(source),
-                retries=self._retries(source),
+                timeout=(min(self._timeout(source), context.remaining()) if context is not None else self._timeout(source)),
+                retries=(0 if context is not None else self._retries(source)),
                 proxy_pool=source.proxy_pool(),
             )
+            self._check_stream_context(context)
         if not isinstance(resp, dict):
             return Detail(source_id=source.source_id, content_type=source.content_type, url=url)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
@@ -835,7 +894,7 @@ class Content:
         detail = Detail(
             source_id=source.source_id,
             content_type=source.content_type,
-            url=url,
+            url=self._abs_url(source, url),
             title=str(title),
             author=str(self._jsonpath(data, extractors.get("author")) or ""),
             cover=str(self._jsonpath(data, extractors.get("cover")) or ""),
@@ -1010,6 +1069,64 @@ class Content:
                 "[%s] current 页码补全失败，跳过：%s", source.source_id, exc
             )
 
+    def _fetch_bookstack_chapters(
+        self, source: SourceConfig, doc, block: dict, detail_url: str = ""
+    ) -> List[Chapter]:
+        list_cfg = block.get("list") or {}
+        root_selector = list_cfg.get("root_selector") or {"css": "ul.none-listyle"}
+        if detail_url:
+            match = _re.search(r"/books/([^/?#]+)", detail_url)
+            if match:
+                book_key = match.group(1)
+                reader_paths = (
+                    f"/read/{book_key}",
+                    f"/read/{book_key}/SUMMARY.md",
+                )
+                for reader_path in reader_paths:
+                    reader_url = self._abs_url(source, reader_path)
+                    try:
+                        reader_html = self._get_detail_html(source, reader_url, reader_url)
+                        reader_doc = self._parser.parse(reader_html)
+                        reader_roots = self._parser._query(
+                            reader_doc, ".article-menu-detail > ul", None
+                        )
+                        if reader_roots:
+                            doc = reader_doc
+                            root_selector = {"css": ".article-menu-detail > ul"}
+                            break
+                    except Exception:
+                        continue
+        roots = self._parser._query(
+            doc, root_selector.get("css"), root_selector.get("xpath")
+        )
+        chapters: List[Chapter] = []
+        seen = set()
+
+        def walk_li(child, depth):
+            link = child.xpath("./a[@href][1]")
+            if link:
+                href = (link[0].get("href") or "").strip()
+                title = link[0].text_content().strip()
+                absolute = self._abs_url(source, href)
+                key = absolute.rstrip("/").lower()
+                if href and title and key not in seen:
+                    seen.add(key)
+                    chapters.append(Chapter(title=title, url=absolute, depth=depth))
+            for nested in child.xpath("./ul | ./ol"):
+                walk_list(nested, depth + 1)
+
+        def walk_list(list_node, depth=0):
+            for child in list_node.xpath("./li"):
+                walk_li(child, depth)
+
+        for root in roots:
+            if getattr(root, "tag", "") == "li":
+                if root.getparent() is not None and root.getparent().get("class") == "none-listyle":
+                    walk_li(root, 0)
+            else:
+                walk_list(root)
+        return chapters
+
     # ------------------------------------------------------------------ #
     def _fetch_chapters(
         self,
@@ -1034,6 +1151,8 @@ class Content:
             block = content_cfg.get("page") or {}
         else:
             block = content_cfg.get("episode") or {}
+        if source.source_id == "bookstack":
+            return self._fetch_bookstack_chapters(source, doc, block, detail_url)
         # 换源站：分集从 source_switch.ep_list_selector 提取（按当前 sid）
         switch_cfg = block.get("source_switch") or {}
         if switch_cfg.get("ep_list_selector") and detail_url:
@@ -1397,8 +1516,8 @@ class Content:
             if not nxt:
                 break
             nxt_abs = self._abs_url(source, nxt)
-            cur_base = self._chapter_base(cur)
-            nxt_base = self._chapter_base(nxt_abs)
+            cur_base = self._chapter_base_for(source, cur)
+            nxt_base = self._chapter_base_for(source, nxt_abs)
             if cur_base == nxt_base and nxt_abs not in seen:
                 seen.add(nxt_abs)
                 cur = nxt_abs
@@ -1409,6 +1528,100 @@ class Content:
         if text and use_cache:
             self._cache_set(cache_key, text, ttl=7 * 86400)
         return text
+
+    def fetch_bookstack_chapter(
+        self, source: SourceConfig, url: str
+    ) -> BookStackChapterResult:
+        if source.source_id != "bookstack":
+            raise ValueError("fetch_bookstack_chapter requires source_id=bookstack")
+        self._bg_check(source, self._abs_url(source, url))
+        html = self._get(source, url)
+        doc = self._parser.parse(html)
+        block = (self._content_block(source).get("chapter") or {})
+        selector = (block.get("body") or {}).get("selector")
+        roots = self._image_selector_nodes(self._parser, doc, selector)
+        if not roots:
+            raise ContentMissingError("BookStack 正文选择器未命中", source_id=source.source_id)
+        from lxml.html import tostring
+
+        image_urls = []
+        seen = set()
+        parts = []
+        base_url = self._abs_url(source, url)
+        for root in roots:
+            for node in root.iter():
+                if node.tag == "img":
+                    image_value = ""
+                    for attr in ("data-original", "data-src", "data-lazy-src", "src"):
+                        candidate = (node.get(attr) or "").strip()
+                        if candidate and not candidate.startswith("data:"):
+                            image_value = candidate
+                            break
+                    if image_value:
+                        absolute = urljoin(base_url, image_value)
+                        node.set("src", absolute)
+                        if absolute not in seen:
+                            seen.add(absolute)
+                            image_urls.append(absolute)
+                    continue
+                for attr in ("href", "src"):
+                    value = (node.get(attr) or "").strip()
+                    if not value or value.startswith("data:"):
+                        continue
+                    node.set(attr, urljoin(base_url, value))
+            parts.append(tostring(root, encoding="unicode"))
+        body_html = "".join(parts)
+        return BookStackChapterResult(
+            body_html=body_html,
+            text=_strip_html_tags(body_html),
+            image_urls=image_urls,
+        )
+
+    def fetch_chapter_with_images(self, source: SourceConfig, url: str) -> tuple[str, list[str]]:
+        content_cfg = self._content_block(source)
+        if source.content_type == "novel":
+            block = content_cfg.get("chapter") or {}
+        elif source.content_type == "comic":
+            block = content_cfg.get("page") or {}
+        else:
+            block = content_cfg.get("episode") or {}
+        pag_cfg = block.get("pagination") or {}
+        pag_enabled = bool(pag_cfg.get("enabled", True))
+        max_pages = int(pag_cfg.get("max_pages") or 20)
+        pages, images, seen_pages, seen_images = [], [], set(), set()
+        cur = url
+        while cur and len(pages) < max_pages:
+            page_text, nxt, page_images = self._fetch_chapter_page(
+                source, cur, pag_enabled, include_images=True
+            )
+            if page_text:
+                pages.append(page_text)
+            for entry in page_images:
+                if not isinstance(entry, dict):
+                    if isinstance(entry, str) and entry and entry not in seen_images:
+                        seen_images.add(entry)
+                        images.append({"type": "image", "url": entry})
+                    continue
+                if entry.get("type") == "text":
+                    images.append({"type": "text", "text": str(entry.get("text") or "")})
+                    continue
+                image_url = entry.get("url")
+                if not isinstance(image_url, str) or not image_url:
+                    continue
+                image_url = self._abs_url(source, image_url)
+                if _AD_IMAGE_RE.search(image_url) or image_url in seen_images:
+                    continue
+                seen_images.add(image_url)
+                images.append({"type": "image", "url": image_url})
+            if not nxt:
+                break
+            nxt_abs = self._abs_url(source, nxt)
+            cur_abs = self._abs_url(source, cur)
+            if self._chapter_base_for(source, cur_abs) != self._chapter_base_for(source, nxt_abs) or nxt_abs in seen_pages:
+                break
+            seen_pages.add(nxt_abs)
+            cur = nxt_abs
+        return "\n".join(pages), images
 
     def precache_chapters(
         self,
@@ -1454,8 +1667,83 @@ class Content:
             if text and use_cache:
                 self._cache_set(key, text, ttl=7 * 86400)
 
+    @staticmethod
+    def _image_selector_nodes(parser, doc, selector):
+        if isinstance(selector, list):
+            for item in selector:
+                nodes = Content._image_selector_nodes(parser, doc, item)
+                if nodes:
+                    return nodes
+            return []
+        if isinstance(selector, dict) and "fallback" in selector:
+            return Content._image_selector_nodes(parser, doc, selector.get("fallback"))
+        if not isinstance(selector, dict):
+            return []
+        return parser._query(doc, selector.get("css"), selector.get("xpath"))
+
+    def _extract_body_fragments(self, source, url, doc, selector):
+        fragments = []
+        seen = set()
+
+        def add_text(value):
+            value = str(value or "")
+            if value:
+                if fragments and fragments[-1].get("type") == "text":
+                    fragments[-1]["text"] += value
+                else:
+                    fragments.append({"type": "text", "text": value})
+
+        def walk(node):
+            if node.tag == "img":
+                raw_url = ""
+                for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+                    candidate = (node.get(attr) or "").strip()
+                    if candidate and not candidate.startswith("data:"):
+                        raw_url = candidate
+                        break
+                if raw_url:
+                    image_url = urljoin(self._abs_url(source, url), raw_url)
+                    if image_url not in seen and not _AD_IMAGE_RE.search(image_url):
+                        seen.add(image_url)
+                        fragments.append({"type": "image", "url": image_url})
+                return
+            add_text(node.text)
+            for child in node:
+                walk(child)
+                add_text(child.tail)
+
+        for root in self._image_selector_nodes(self._parser, doc, selector):
+            walk(root)
+        return fragments
+
+    def _extract_body_images(self, source, url, doc, selector):
+        entries = []
+        for root in self._image_selector_nodes(self._parser, doc, selector):
+            text_offset = 0
+            for node in root.iter():
+                if node.tag == "img":
+                    raw_url = ""
+                    for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+                        candidate = (node.get(attr) or "").strip()
+                        if candidate and not candidate.startswith("data:"):
+                            raw_url = candidate
+                            break
+                    if not raw_url:
+                        continue
+                    image_url = urljoin(self._abs_url(source, url), raw_url)
+                    if _AD_IMAGE_RE.search(image_url):
+                        continue
+                    if image_url not in {entry["url"] for entry in entries}:
+                        entries.append({"url": image_url, "position": text_offset})
+                if node.text:
+                    text_offset += len(node.text)
+                if node.tail:
+                    text_offset += len(node.tail)
+        return entries
+
     def _fetch_chapter_page(
-        self, source: SourceConfig, url: str, pag_enabled: bool = True
+        self, source: SourceConfig, url: str, pag_enabled: bool = True,
+        include_images: bool = False,
     ) -> tuple:
         """抓取单页正文，返回 (plain_text, next_page_url 或 "")。
 
@@ -1492,10 +1780,12 @@ class Content:
             if nxt:
                 nxt = self._abs_url(source, nxt)
 
+        image_entries = self._extract_body_fragments(source, url, doc, selector) if include_images else []
+
         # Playwright 渲染正文（SPA 小说站，如 18mh）
         if body.get("render") == "playwright":
             rc = body.get("render_config") or {}
-            sel_css = (selector or {}).get("css") if isinstance(selector, dict) else selector
+            sel_css = (selector or {}).get("css") if isinstance(selector, dict) else ""
             from .playwright_helper import fetch_rendered_text_sync
 
             text = fetch_rendered_text_sync(
@@ -1515,7 +1805,7 @@ class Content:
                 text = self._normalize_para_indent(text)
                 if self._decrypter is not None:
                     text = self._decrypter.decrypt(source, text, "chapter")
-            return text, nxt
+            return (text, nxt, image_entries) if include_images else (text, nxt)
 
         if not selector:
             raise ContentMissingError("源未配置正文选择器", source_id=source.source_id)
@@ -1532,6 +1822,7 @@ class Content:
             # 字符映射解密（番茄小说字体混淆等）：decryption.targets.chapter.strategy=translit
             if self._decrypter is not None:
                 text = self._decrypter.decrypt(source, text, "chapter", html=html)
+        image_entries = image_entries if include_images else []
         # 正文广告行过滤（ad_block 引擎：剔除「广告/推广/点击领取」等特征行）
         try:
             from .adblock import adblock_for
@@ -1541,7 +1832,7 @@ class Content:
                 text = ad.filter_text(text)
         except Exception:
             pass  # 广告过滤是增强能力，失败不影响正文
-        return text, nxt
+        return (text, nxt, image_entries) if include_images else (text, nxt)
 
     @staticmethod
     def _normalize_para_indent(text: str) -> str:
@@ -1571,7 +1862,7 @@ class Content:
         3. 页面任意同基路径的 _<数字>.html 链接。
         返回原始 href（可能相对），无则空串。
         """
-        base = self._chapter_base(self._abs_url(source, url))
+        base = self._chapter_base_for(source, self._abs_url(source, url))
         url_abs = self._abs_url(source, url)
 
         # 页脚导航内同基路径链接（read-nav / pagenav 等）。
@@ -1586,19 +1877,39 @@ class Content:
                     if not href:
                         continue
                     href_abs = self._abs_url(source, href)
-                    if (self._chapter_base(href_abs) == base
-                            and href_abs != url_abs
-                            and "_" in href):  # 同基路径 + 带 _ 后缀 → 续页
+                    if (self._chapter_base_for(source, href_abs) == base
+                            and href_abs != url_abs):  # 同基路径 → 续页
                         match = href
                 if match:
                     return match
         # 兜底：页面任意同基路径的 _<数字>.html 链接
         for a in doc.xpath('//a[@href]'):
             href = a.get("href") or ""
-            if (href and self._chapter_base(self._abs_url(source, href)) == base
-                    and "_" in href):
+            if (href and self._chapter_base_for(source, self._abs_url(source, href)) == base):
                 return href
         return ""
+
+    def _chapter_base_for(self, source: SourceConfig, url: str) -> str:
+        """按源配置归一章节 URL，仅用于分页归属判断。"""
+        content_cfg = self._content_block(source)
+        if source.content_type == "novel":
+            block = content_cfg.get("chapter") or {}
+        elif source.content_type == "comic":
+            block = content_cfg.get("page") or {}
+        else:
+            block = content_cfg.get("episode") or {}
+        pagination = block.get("pagination") or {}
+        pattern = pagination.get("same_chapter_regex")
+        if pattern:
+            try:
+                replacement = pagination.get("same_chapter_replacement") or ""
+                return _re.sub(str(pattern), str(replacement), url)
+            except (TypeError, ValueError, _re.error):
+                log.warning(
+                    "[%s] same_chapter_regex 无效，回退默认章节分页规则",
+                    source.source_id,
+                )
+        return self._chapter_base(url)
 
     @staticmethod
     def _chapter_base(url: str) -> str:
@@ -2234,7 +2545,7 @@ class Content:
             except Exception as exc:
                 log.warning(
                     "[%s] 渲染提取 key 失败，回退接口 key：%s",
-                    source.source_id, exc,
+                    source.source_id, self._safe_exception_summary(exc),
                 )
         use_packer = bool(cfg.get("packer"))
         # 接口专用请求头（合并覆盖源头）——部分站点接口要求特定 Referer/Cookie
@@ -2481,7 +2792,76 @@ class Content:
         return {u: raw.get(a) for u, a in zip(chapter_urls, abs_urls)}
 
     def fetch_video_streams(self, source: SourceConfig, episode_url: str, quality: str = "",
-                            merged: bool = False) -> tuple:
+                            merged: bool = False, deadline=None, context=None,
+                            source_lock=False) -> tuple:
+        from .stream_resolver import StreamResolver
+
+        resolver = getattr(self, "_stream_resolver", None)
+        if resolver is None:
+            resolver = self._stream_resolver = StreamResolver(self)
+        return resolver.resolve(
+                source, episode_url, quality, merged, deadline=deadline, context=context,
+                source_lock=source_lock
+
+        )
+
+    def invalidate_video_stream_cache(
+        self, source: SourceConfig, episode_url: str | None = None,
+        quality: str | None = None, merged: bool | None = None,
+    ) -> None:
+        resolver = getattr(self, "_stream_resolver", None)
+        if resolver is not None:
+            resolver.invalidate(source, episode_url, quality, merged)
+        source_id = getattr(source, "source_id", "")
+        if episode_url is None:
+            self._video_html_cache = {
+                key: value for key, value in self._video_html_cache.items()
+                if key[0] != source_id
+            }
+            self._detail_html_cache = {
+                key: value for key, value in self._detail_html_cache.items()
+                if key[0] != source_id
+            }
+        else:
+            abs_url = self._abs_url(source, episode_url)
+            self._video_html_cache.pop((source_id, abs_url), None)
+            self._detail_html_cache.pop((source_id, abs_url), None)
+        cache = self._cache
+        if cache is None:
+            return
+        delete = getattr(cache, "delete", None)
+        if not callable(delete):
+            return
+        keys = []
+        if episode_url is None:
+            scan = getattr(cache, "scan", None)
+            if callable(scan):
+                keys.extend(scan(f"page:{source_id}:*"))
+        else:
+            keys.append(f"page:{source_id}:{self._abs_url(source, episode_url)}")
+        for key in keys:
+            delete(key)
+
+    def resolve_video_stream_candidates(self, source: SourceConfig, episode_url: str,
+                                         quality: str = "", merged: bool = False,
+                                         deadline=None, context=None,
+                                         source_lock=False) -> list:
+
+        context = self._stream_context(context, deadline)
+        return [
+            lambda context=None: self._fetch_video_streams_legacy(
+            source, episode_url, quality, merged, deadline=deadline, context=context,
+            source_lock=source_lock
+
+            )
+        ]
+
+    def _fetch_video_streams_legacy(self, source: SourceConfig, episode_url: str, quality: str = "",
+                                     merged: bool = False, deadline=None, context=None,
+                                     source_lock=False) -> tuple:
+
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         """视频：抓取单集 dash 音视频双流（播放/下载用）。
 
         返回 (video_url, audio_url)；非 dash/无音频时 audio_url 为 ""。
@@ -2505,11 +2885,13 @@ class Content:
             # yt-dlp 引擎（YouTube 高清双流，需签名）
             if episode_api.get("engine") == "ytdlp":
                 video, audio = self._fetch_streams_ytdlp(
-                    source, episode_url, episode_api, quality, merged=merged
+                    source, episode_url, episode_api, quality, merged=merged,
+                    deadline=deadline, context=context
                 )
             else:
                 streams = self._fetch_episode_api(
-                    source, episode_url, episode_api, want_streams=True, quality=quality
+                    source, episode_url, episode_api, want_streams=True, quality=quality,
+                    deadline=deadline, context=context,
                 )
                 if isinstance(streams, dict):
                     video, audio = streams.get("video", ""), streams.get("audio", "")
@@ -2517,7 +2899,10 @@ class Content:
                     video, audio = streams, ""
         else:
             # HTML 兜底：单 URL
-            video, audio = self.fetch_video_episode(source, episode_url), ""
+            video, audio = self.fetch_video_episode(
+                source, episode_url, deadline=deadline, context=context,
+                source_lock=source_lock
+            ), ""
         # 广告过滤（URL 命中 → 置空）
         if ad.enabled:
             if video and ad.is_ad_url(video):
@@ -2526,7 +2911,8 @@ class Content:
                 audio = ""
         return video, audio
 
-    def fetch_video_episode(self, source: SourceConfig, episode_url: str) -> str:
+    def fetch_video_episode(self, source: SourceConfig, episode_url: str, deadline=None,
+                            context=None, source_lock=False) -> str:
         """视频：抓取单集播放地址（解密后返回真实地址）。
 
         优先 api_endpoints.episode（JSON API，可选 sign 签名）；
@@ -2535,6 +2921,8 @@ class Content:
         （空 / ContentMissingError / 网络异常 / 播放 URL 403/404/超时）时
         自动尝试其他线路，全部失败才抛错。
         """
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         # 直链媒体 passthrough：分集 URL 已是可直接播放的媒体文件
         # （m3u8/mpd/mp4/flv/webm 等，如 ikanpp 详情 chapters url_template
         # 直接给出 CDN m3u8）。此时无需再走 episode API / HTML 播放页解析，
@@ -2548,9 +2936,14 @@ class Content:
         if episode_api:
             # yt-dlp 引擎：单流播放地址（合并单流，含音视频，VLC 可直接播）
             if episode_api.get("engine") == "ytdlp":
-                v, _ = self._fetch_streams_ytdlp(source, episode_url, episode_api, merged=True)
+                v, _ = self._fetch_streams_ytdlp(
+                    source, episode_url, episode_api, merged=True,
+                    deadline=deadline, context=context
+                )
                 return v
-            play = self._fetch_episode_api(source, episode_url, episode_api)
+            play = self._fetch_episode_api(
+                source, episode_url, episode_api, deadline=deadline, context=context
+            )
             if play:
                 return play
             if episode_api.get("url"):
@@ -2564,18 +2957,27 @@ class Content:
                 )
 
         # 换源站：默认线路失败 → 自动轮换其他线路
-        if self._get_source_switch_cfg(source):
-            return self._fetch_play_url_auto_switch(source, episode_url)
+        if self._get_source_switch_cfg(source) and not source_lock:
+            return self._fetch_play_url_auto_switch(
+                source, episode_url, deadline=deadline, context=context
+            )
 
-        return self._fetch_play_url_once(source, episode_url)
+        return self._call_with_context(
+            self._fetch_play_url_once, (source, episode_url), context, deadline
+        )
 
-    def _fetch_play_url_once(self, source: SourceConfig, episode_url: str) -> str:
+    def _fetch_play_url_once(
+        self, source: SourceConfig, episode_url: str, deadline=None, context=None
+    ) -> str:
         """按单条分集 URL 提取播放地址（fetch_video_episode 的 HTML 解析部分）。
 
         独立成方法供线路自动轮换按 URL 复用：每条线路各抓一次播放页再提取。
         """
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         abs_ep = self._abs_url(source, episode_url)
         self._bg_check(source, abs_ep)
+        self._check_stream_context(context, deadline)
 
         content_cfg = self._content_block(source)
         block = content_cfg.get("episode") or {}
@@ -2589,13 +2991,18 @@ class Content:
             rc = block.get("render_config") or {}
             from .playwright_helper import fetch_rendered_video_sync
 
+            timeout_ms = int(rc.get("timeout_ms") or 45000)
+            extra_delay_ms = int(rc.get("extra_delay_ms", 8000))
             vurl = fetch_rendered_video_sync(
                 abs_ep,
                 wait_until=rc.get("wait_until") or "networkidle",
-                timeout_ms=int(rc.get("timeout_ms") or 45000),
-                extra_delay_ms=int(rc.get("extra_delay_ms") or 8000),
+                timeout_ms=timeout_ms,
+                extra_delay_ms=extra_delay_ms,
                 proxy=source.transports().get("proxy"),
+                slow_fallback_rounds=int(rc.get("slow_fallback_rounds", 3)),
+                context=context,
             )
+            self._check_stream_context(context, deadline)
             if not vurl:
                 raise ContentMissingError(
                     f"渲染未获取到视频源（{episode_url}）", source_id=source.source_id
@@ -2607,7 +3014,7 @@ class Content:
         # 非单章源（episode URL 与详情不同）key 不命中 → 正常请求。
         html = self._video_html_cache.get((source.source_id, abs_ep))
         if html is None:
-            html = self._get(source, episode_url)
+            html = self._get(source, episode_url, deadline=deadline, context=context)
         doc = self._parser.parse(html)
 
         # 链式 HTTP 提取（play_url.http_chain）：多跳播放地址链，纯 HTTP 秒级完成、
@@ -2627,7 +3034,10 @@ class Content:
         #   - 最后一步提取出的串即播放地址（http 开头）
         chain_cfg = play_cfg.get("http_chain")
         if chain_cfg:
-            return self._fetch_http_chain(source, episode_url, html, chain_cfg)
+            return self._fetch_http_chain(
+                source, episode_url, html, chain_cfg,
+                deadline=deadline, context=context
+            )
 
         # 换源站：从 player_aaaa JS 配置提取真实播放地址（ps=0 直接用 / ps=1 走 parse 转码）。
         # 播放页无 player_aaaa（MacCMS 变体：var now 直链等）→ 回退下方 play_url.regex 规则
@@ -2638,6 +3048,12 @@ class Content:
                 )
             except ContentMissingError:
                 pass  # player_aaaa 缺失 → 走 play_url.regex
+
+        generic_candidates = self._extract_play_url_candidates(
+            html, source, switch_cfg, play_cfg, abs_ep, episode_url
+        )
+        if generic_candidates:
+            return generic_candidates[0]
 
         # 正则提取（JS 里的转义 URL，如 _detail_.url m3u8）
         play_regex = play_cfg.get("regex")
@@ -2650,9 +3066,8 @@ class Content:
                 # 相对地址绝对化（如 18mh /media/m3u8?url=... 是相对路径，
                 # 不补全 VLC/下载器拿不到完整 URL，表现为"无法爬取"）
                 if play and not play.startswith(("http://", "https://", "//", "data:", "javascript:")):
-                    from urllib.parse import urljoin
-
                     play = urljoin(abs_ep, play)
+
                 # 通用后缀：正则只提取到 CDN base 时补全（如 missav → /playlist.m3u8）
                 suffix = play_cfg.get("suffix", "")
                 if suffix:
@@ -2679,8 +3094,10 @@ class Content:
         return play
 
     # ------------------------------------------------------------------ #
-    def _fetch_http_chain(self, source: SourceConfig, episode_url: str,
-                          detail_html: str, chain: list) -> str:
+    def _fetch_http_chain(
+        self, source: SourceConfig, episode_url: str,
+        detail_html: str, chain: list, deadline=None, context=None
+    ) -> str:
         """链式 HTTP 取流：多跳播放地址链，逐步收敛到视频地址。
 
         每步从前一步响应文本（第 1 步从详情页 HTML）按 regex 提取，得到的串
@@ -2688,14 +3105,16 @@ class Content:
         referer 用于防盗链（"episode"/"detail" = 详情页 URL；上一步 name）。
         返回最终播放 URL；失败抛 ContentMissingError。
         """
-        from urllib.parse import urljoin
-
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         cur_text = detail_html  # 当前文本（初始为详情页 HTML）
+
         results: dict = {"detail": detail_html}
         cur_url = self._abs_url(source, episode_url)
         step_urls: dict = {"episode": cur_url, "detail": cur_url}
 
         for i, step in enumerate(chain):
+            self._check_stream_context(context, deadline)
             packer = step.get("packer")
             # url 模板：按 {前步name} 引用此前提取值、{t}=秒级时间戳 构造请求 URL
             url_tpl = step.get("url") or ""
@@ -2778,14 +3197,36 @@ class Content:
                                 if "mp4=" in abs_step_url
                                 else abs_step_url + ("&" if "?" in abs_step_url else "?") + "mp4=0")
             try:
+                timeout = self._timeout(source)
+                retries = self._retries(source)
+                interval_ms = self._interval_ms(source)
+                if context is not None:
+                    remaining = context.remaining()
+                    if remaining <= 0:
+                        context.check()
+                        raise StreamCancelledError("stream resolution deadline exhausted")
+                    timeout = min(timeout, remaining)
+                    retries = 0
+                    interval_ms = 0
+                elif deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("stream resolution deadline exhausted")
+                    timeout = min(timeout, remaining)
+                    retries = 0
+                    interval_ms = 0
                 cur_text = self._http.get_text(
                     abs_step_url, headers=headers,
-                    timeout=self._timeout(source), retries=self._retries(source),
-                    interval_ms=self._interval_ms(source),
+                    timeout=timeout, retries=retries,
+                    interval_ms=interval_ms,
                     encoding=source.transports().get("charset"),
                     proxy_pool=source.proxy_pool(),
                 )
+                self._check_stream_context(context, deadline)
+            except StreamCancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
+                self._check_stream_context(context, deadline)
                 raise ContentMissingError(
                     f"http_chain 第{i}步请求失败 {abs_step_url}: {exc}",
                     source_id=source.source_id,
@@ -2810,11 +3251,192 @@ class Content:
             )
         return final
 
+    def _extract_play_url_candidates(
+        self, html: str, source: SourceConfig, switch_cfg: dict,
+        play_cfg: dict, abs_ep: str, episode_url: str
+    ) -> list[str]:
+        import html as _html
+
+        values: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            value = _html.unescape(str(value or "")).strip()
+            value = value.replace("\\\\/", "/").replace("\\/", "/")
+            value = value.replace('\\"', '"')
+            if not value or value.startswith(("javascript:", "data:")):
+                return
+            if not value.startswith(("http://", "https://", "//")):
+                value = urljoin(abs_ep, value)
+            if value.startswith("//"):
+                value = "https:" + value
+            if value not in seen:
+                seen.add(value)
+                values.append(value)
+
+        player_regex = switch_cfg.get(
+            "play_regex", r'var\s+player_aaaa\s*=\s*(\{.*?\})(?:\s*</script>|;)'
+        )
+        for match in _re.finditer(player_regex, html, _re.S):
+            raw = match.group(1) if match.groups() else match.group(0)
+            raw = raw.replace("\\\\/", "/").replace("\\\\\"", '\"')
+            try:
+                player = json.loads(raw)
+            except Exception:
+                player = {}
+            raw_url = player.get(switch_cfg.get("play_url_path", "url"), "") if player else ""
+            if not raw_url:
+                url_match = _re.search(
+                    r'["\'](?:url|playurl|file)["\']\s*:\s*["\']([^"\']+)',
+                    raw,
+                    _re.I,
+                )
+                raw_url = url_match.group(1) if url_match else ""
+            if raw_url:
+                raw_url = str(raw_url).replace("\\\\/", "/").replace("\\/", "/")
+                ps = str(player.get("ps", "0") or "0") if player else "0"
+                parse_url = str(
+                    (player.get("parse") if player else "")
+                    or switch_cfg.get("default_parse")
+                    or ""
+                ).replace("\\/", "/")
+                if ps == "1" and parse_url:
+                    sep = "&" if "?" in parse_url else "?"
+                    add(f"{parse_url}{sep}url={raw_url}")
+                else:
+                    if self._decrypter is not None:
+                        try:
+                            add(self._decrypter.decrypt(source, raw_url, "video_url"))
+                        except StreamCancelledError:
+                            raise
+                        except TimeoutError:
+                            raise
+                        except Exception:
+                            pass
+                    else:
+                        add(raw_url)
+
+        for pattern in (
+            r'var\s+now\s*=\s*["\']([^"\']+)',
+            r'<(?:video|source)\b[^>]*\bsrc\s*=\s*["\']([^"\']+)',
+            r'(?<![A-Za-z0-9])((?:https?:)?\/\/[^"\'\s<>]+?\.m3u8(?:\?[^"\'\s<>]*)?)',
+        ):
+            for match in _re.finditer(pattern, html, _re.I | _re.S):
+                add(match.group(1))
+
+        normalized = html.replace("\\/", "/").replace('\\"', '"')
+        for match in _re.finditer(
+            r'((?:https?://|//)[^"\'\s<>]+?\.m3u8(?:\?[^"\'\s<>]*)?)',
+            normalized,
+            _re.I,
+        ):
+            add(match.group(1))
+        return values
+
+    def _fetch_play_url_candidates_once(
+        self, source: SourceConfig, episode_url: str, deadline=None, context=None
+    ) -> list[str]:
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
+        abs_ep = self._abs_url(source, episode_url)
+        self._bg_check(source, abs_ep)
+        content_cfg = self._content_block(source)
+        block = content_cfg.get("episode") or {}
+        play_cfg = block.get("play_url") or {}
+        switch_cfg = block.get("source_switch") or {}
+        if play_cfg.get("render") == "playwright" or play_cfg.get("http_chain"):
+            return [
+                self._call_with_context(
+                    self._fetch_play_url_once, (source, episode_url), context, deadline
+                )
+            ]
+        html = self._video_html_cache.get((source.source_id, abs_ep))
+        if html is None:
+            html = self._get(source, episode_url, deadline=deadline, context=context)
+        self._check_stream_context(context, deadline)
+        return self._extract_play_url_candidates(
+            html, source, switch_cfg, play_cfg, abs_ep, episode_url
+        )
+
+    @staticmethod
+    def _safe_url(url: str) -> str:
+        parts = urlsplit(str(url or ""))
+        return f"{parts.scheme}://{parts.netloc}{parts.path}" if parts.netloc else "<redacted>"
+
+    @staticmethod
+    def _safe_exception_summary(exc: Exception) -> str:
+        return type(exc).__name__
+
+    @staticmethod
+    def _call_with_remaining_timeout(func, args, kwargs, deadline):
+        if deadline is None:
+            return func(*args, **kwargs)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("stream resolution deadline exhausted")
+        try:
+            parameters = inspect.signature(func).parameters
+            supports_deadline = "deadline" in parameters
+            supports_timeout = (
+                "timeout" in parameters
+                or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in parameters.values()
+                )
+            )
+        except (TypeError, ValueError):
+            supports_deadline = False
+            supports_timeout = True
+        kwargs = dict(kwargs)
+        if supports_deadline:
+            kwargs["deadline"] = deadline
+        elif supports_timeout:
+            kwargs["timeout"] = remaining
+        return func(*args, **kwargs)
+
+    @staticmethod
+    def _call_with_context(func, args, context, deadline=None):
+        try:
+            parameters = inspect.signature(func).parameters
+            accepts_context = (
+                "context" in parameters
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            )
+            accepts_deadline = "deadline" in parameters
+        except (TypeError, ValueError):
+            accepts_context = False
+            accepts_deadline = False
+        kwargs = {}
+        if accepts_context:
+            kwargs["context"] = context
+        elif accepts_deadline:
+            kwargs["deadline"] = deadline
+        return func(*args, **kwargs)
+
+    @staticmethod
+    def _call_with_deadline(func, args, deadline):
+        if deadline is None:
+            return func(*args)
+        try:
+            parameters = inspect.signature(func).parameters
+            supports_deadline = (
+                "deadline" in parameters
+                or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in parameters.values()
+                )
+            )
+        except (TypeError, ValueError):
+            supports_deadline = True
+        if supports_deadline:
+            return func(*args, deadline=deadline)
+        return func(*args)
+
     # ------------------------------------------------------------------ #
     # 换源站线路自动轮换（source_switch）
     # ------------------------------------------------------------------ #
     def _fetch_play_url_auto_switch(
-        self, source: SourceConfig, episode_url: str
+        self, source: SourceConfig, episode_url: str, deadline=None, context=None
     ) -> str:
         """换源站取流：默认线路失败时自动尝试其他线路，全部失败才抛错。
 
@@ -2823,6 +3445,8 @@ class Content:
         分集 URL（如 play-{sid}-x.html）后重新取流。
         max_switch_attempts：最多尝试线路数（含默认线路），缺省 3，避免太慢。
         """
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         switch_cfg = self._get_source_switch_cfg(source)
         max_attempts = max(1, int(switch_cfg.get("max_switch_attempts") or 3))
         # 已知死线路黑名单：TTL 600s 惰性过期（站点修复后自动恢复尝试）。
@@ -2841,37 +3465,71 @@ class Content:
         current = episode_url
         last_err: Exception | None = None
         for _ in range(max_attempts):
+            self._check_stream_context(context, deadline)
             key = self._episode_key(current)
             if key in attempted:
                 break
             attempted.add(key)
+            line_index = len(attempted)
             if key in dead:
                 # probe 曾明确失败（403/404/空/超时）的线路：跳过抓取与 probe，
                 # 直接进入候选轮换（省一次播放页 HTTP + 一次死链 probe）。
-                log.info("[%s] 跳过已知失效线路：%s", source.source_id, current)
+                log.info(
+                    "[%s] 阶段=跳过，线路索引=%d，异常类型=KnownDeadLine",
+                    source.source_id,
+                    line_index,
+                )
             else:
                 try:
-                    play = self._fetch_play_url_once(source, current)
-                    if play and self._play_url_probe(source, play):
-                        return play
-                    if play:
-                        # 取流成功但 probe 判死 → 记入黑名单；提取失败（play 空，
-                        # 如渲染临时未出流）不记，保留下次重试。
+                    plays = self._call_with_context(
+                        self._fetch_play_url_candidates_once,
+                        (source, current), context, deadline
+                    )
+                    for play in plays:
+                        self._check_stream_context(context, deadline)
+                        usable = self._call_with_context(
+                            self._play_url_probe, (source, play), context, deadline
+                        )
+                        if usable:
+                            return play
+                    if plays:
                         dead[key] = now
                         self._dead_episode_lines[source.source_id] = dead
                     last_err = ContentMissingError(
-                        f"播放地址不可访问（{current} → {str(play)[:80]}），"
-                        f"已尝试 {len(attempted)} 条线路",
+                        f"播放地址不可访问（已尝试 {len(plays)} 个候选，"
+                        f"共 {len(attempted)} 条线路）",
                         source_id=source.source_id,
                     )
+                except StreamCancelledError:
+                    raise
                 except Exception as exc:  # noqa: BLE001
-                    last_err = exc
-                    log.info("[%s] 线路取流失败 %s：%s", source.source_id, current, exc)
+                    last_err = ContentMissingError(
+                        "线路取流失败",
+                        source_id=source.source_id,
+                    )
+                    log.info(
+                        "[%s] 阶段=取流，线路索引=%d，异常类型=%s",
+                        source.source_id,
+                        line_index,
+                        self._safe_exception_summary(exc),
+                    )
             if not candidates:
                 try:
-                    candidates = self._switch_candidate_episode_urls(source, current)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+                    candidates = self._call_with_context(
+                        self._switch_candidate_episode_urls,
+                        (source, current), context, deadline
+                    )
+                except StreamCancelledError:
+                    raise
                 except Exception as exc:  # noqa: BLE001
-                    log.info("[%s] 构造候选线路失败：%s", source.source_id, exc)
+                    log.info(
+                        "[%s] 阶段=换线，线路索引=%d，异常类型=%s",
+                        source.source_id,
+                        line_index,
+                        self._safe_exception_summary(exc),
+                    )
                     candidates = []
             if not candidates:
                 break
@@ -2879,11 +3537,11 @@ class Content:
         if last_err is None:
             last_err = ContentMissingError("未取到播放地址", source_id=source.source_id)
         raise ContentMissingError(
-            f"全部线路取流失败（{source.source_id}）：{last_err}",
+            f"全部线路取流失败（{source.source_id}）",
             source_id=source.source_id,
         )
 
-    def _play_url_probe(self, source: SourceConfig, url: str) -> bool:
+    def _play_url_probe(self, source: SourceConfig, url: str, deadline=None, context=None) -> bool:
         """轻量探测播放 URL 是否可访问：HTTP<400 且响应非空即视为可用。
 
         403/404/空内容/超时 → False（触发换线路）。非 http(s) URL（如 data:）
@@ -2895,22 +3553,47 @@ class Content:
         headers，与播放一致。超时取源配置但上限 5s（探测只是可达性判断，
         不必等满 10s；慢 CDN 尽快失败换线路比白等更流畅）。
         """
+        context = self._stream_context(context, deadline)
+        try:
+            self._check_stream_context(context, deadline)
+        except StreamCancelledError:
+            raise
         if not url or not url.startswith(("http://", "https://")):
             return False
         headers = dict(self._headers(source))
-        timeout = max(3.0, min(float(self._timeout(source)) or 10.0, 5.0))
+        configured_timeout = min(float(self._timeout(source)) or 10.0, 5.0)
+        if context is not None:
+            remaining = context.remaining()
+            if remaining <= 0:
+                context.check()
+                raise StreamCancelledError("stream resolution deadline exhausted")
+            timeout = min(configured_timeout, remaining)
+        elif deadline is None:
+            timeout = max(3.0, configured_timeout)
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            timeout = min(configured_timeout, remaining)
+            if timeout <= 0:
+                return False
         try:
             import requests as _req
 
             with _req.get(url, headers=headers, timeout=timeout, stream=True) as resp:
                 if resp.status_code >= 400:
                     return False
-                return bool(resp.raw.read(4096))
+                value = bool(resp.raw.read(4096))
+                self._check_stream_context(context, deadline)
+                return value
+        except StreamCancelledError:
+            raise
         except Exception:  # noqa: BLE001
+            self._check_stream_context(context, deadline)
             return False
 
     def _switch_candidate_episode_urls(
-        self, source: SourceConfig, episode_url: str
+        self, source: SourceConfig, episode_url: str, deadline=None, context=None
     ) -> list:
         """构造同集其他线路的分集 URL 列表（供失败自动换线路）。
 
@@ -2918,6 +3601,8 @@ class Content:
         从分集 URL 推导详情页 URL，再走 switch_source 取各线路分集列表，
         按当前集的位置/集数号匹配出同集在新线路上的 URL。
         """
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         switch = self._get_source_switch_cfg(source)
         detail_url = self._detail_url_from_episode(source, episode_url)
         if not detail_url:
@@ -2925,22 +3610,49 @@ class Content:
         m_sid = _re.search(r"sid=(\d+)", episode_url)
         cur_sid = m_sid.group(1) if m_sid else str(switch.get("default_sid") or "1")
         try:
-            base_detail, base_chs = self.switch_source(source, detail_url, cur_sid)
+            if deadline is None and context is None:
+                base_detail, base_chs = self.switch_source(source, detail_url, cur_sid)
+            else:
+                base_detail, base_chs = self.switch_source(
+                    source, detail_url, cur_sid, deadline=deadline, context=context
+                )
+            self._check_stream_context(context, deadline)
+        except StreamCancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001
-            log.info("[%s] 换源基线详情失败：%s", source.source_id, exc)
+            log.info(
+                "[%s] 阶段=换线，线路序号=0，异常类型=%s",
+                source.source_id,
+                self._safe_exception_summary(exc),
+            )
             return []
+
         # 当前集在新线路分集列表中的位置（精确 URL 匹配，回退 URL 末段集数号）
         idx = self._episode_index_in_chapters(episode_url, base_chs)
         out: list = []
         seen: set = set()
-        for line in base_detail.source_list or []:
+        for switch_index, line in enumerate(base_detail.source_list or [], 1):
             cand_sid = str(line.get("sid") or "")
             if not cand_sid or cand_sid == cur_sid:
                 continue
             try:
-                _, chs = self.switch_source(source, detail_url, cand_sid)
+                self._check_stream_context(context, deadline)
+                if deadline is None and context is None:
+                    _, chs = self.switch_source(source, detail_url, cand_sid)
+                else:
+                    _, chs = self.switch_source(
+                        source, detail_url, cand_sid, deadline=deadline, context=context
+                    )
+                self._check_stream_context(context, deadline)
+            except StreamCancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
-                log.info("[%s] 换源 sid=%s 失败：%s", source.source_id, cand_sid, exc)
+                log.info(
+                    "[%s] 阶段=换线，线路序号=%d，异常类型=%s",
+                    source.source_id,
+                    switch_index,
+                    self._safe_exception_summary(exc),
+                )
                 continue
             if not chs:
                 continue
@@ -2998,7 +3710,7 @@ class Content:
         return int(m.group(1)) if m else None
 
     def _fetch_streams_ytdlp(self, source: SourceConfig, episode_url: str, cfg: dict,
-                             quality: str = "", merged: bool = False) -> tuple:
+                             quality: str = "", merged: bool = False, deadline=None, context=None) -> tuple:
         """yt-dlp 引擎：拿高清双流（YouTube 需签名，委托 yt-dlp）。
 
         merged=True 时强制 `best` 合并单流（含音视频）：VLC input-slave
@@ -3007,29 +3719,44 @@ class Content:
 
         缓存：yt-dlp 取流 ~10s（签名+网络），同视频短时间复用，避免重复等待。
         """
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         yt = self._get_ytdlp()
 
         # 分集 URL 可能是相对路径（HTML 搜索结果未绝对化时）→ 补全，
         # yt-dlp 只认完整 URL
         episode_url = self._abs_url(source, episode_url)
 
-        key = (episode_url, quality, merged)
-        cached = self._ytdlp_stream_cache.get(key)
-        if cached is not None:
-            return cached
-
         fmt = "best" if merged else self._ytdlp_format(cfg, quality)
         try:
-            streams = yt.fetch_streams(episode_url, fmt=fmt)
+            streams = self._call_with_remaining_timeout(
+                yt.fetch_streams, (episode_url,), {"fmt": fmt},
+                context.deadline if context is not None else deadline
+            )
+            self._check_stream_context(context, deadline)
+        except StreamCancelledError:
+            raise
         except Exception as exc:
+            self._check_stream_context(context, deadline)
             # 高清失败回退单流
             try:
-                streams = (yt.fetch_streams(episode_url, fmt="best")[0], "")
+                streams = (
+                    self._call_with_remaining_timeout(
+                        yt.fetch_streams, (episode_url,), {"fmt": "best"},
+                        context.deadline if context is not None else deadline
+                    )[0],
+                    "",
+                )
+                self._check_stream_context(context, deadline)
+            except StreamCancelledError:
+                raise
             except Exception:
+                self._check_stream_context(context, deadline)
                 raise ContentMissingError(
-                    f"yt-dlp 取流失败（{episode_url}）：{exc}", source_id=source.source_id
-                ) from exc
-        self._ytdlp_stream_cache[key] = streams
+                    "yt-dlp 取流失败",
+                    source_id=source.source_id,
+                ) from None
+        self._check_stream_context(context, deadline)
         return streams
 
     def _get_ytdlp(self):
@@ -3049,7 +3776,7 @@ class Content:
         block = content_cfg.get("episode") or {}
         return block.get("source_switch") or {}
 
-    def _parse_source_list(self, source: SourceConfig, html: str) -> List[dict]:
+    def _parse_source_list(self, source: SourceConfig, html: str, context=None) -> List[dict]:
         """从详情页 HTML 提取所有可用播放源。
 
         source_switch 配置：
@@ -3119,8 +3846,12 @@ class Content:
         pc_url = switch.get("playerconfig_url")
         if pc_url and out:
             try:
-                pc_html = self._get(source, self._abs_url(source, pc_url))
+                self._check_stream_context(context)
+                pc_html = self._get(source, self._abs_url(source, pc_url), context=context)
+                self._check_stream_context(context)
                 self._merge_parse_config(out, pc_html)
+            except StreamCancelledError:
+                raise
             except Exception:
                 pass  # playerconfig 加载失败 → 所有源 ps=0 直接用 url
         return out
@@ -3246,20 +3977,25 @@ class Content:
         return deduped
 
     def switch_source(
-        self, source: SourceConfig, detail_url: str, new_sid: str
+        self, source: SourceConfig, detail_url: str, new_sid: str, deadline=None, context=None
     ) -> tuple:
         """切换播放源：重新抓取该源详情页，返回 (更新后的 Detail, 新分集列表)。
 
         detail_url：当前详情 URL（含当前 sid）；new_sid：目标播放源 sid。
         返回的 Detail 保留元数据，chapters 换成新源分集，source_list 保留。
         """
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         # 构造新 URL（换 sid 参数）
         new_url = _re.sub(r"sid=\d+", f"sid={new_sid}", detail_url)
         if f"sid={new_sid}" not in new_url:
             sep = "&" if "?" in new_url else "?"
             new_url = f"{new_url}{sep}sid={new_sid}"
         # 重新抓详情（fetch_detail 内部会按新 sid 用 _fetch_chapters 提取新分集）
-        detail = self.fetch_detail(source, new_url)
+        if deadline is None:
+            detail = self.fetch_detail(source, new_url)
+        else:
+            detail = self.fetch_detail(source, new_url, deadline=deadline, context=context)
         return detail, detail.chapters
 
     @staticmethod
@@ -3279,7 +4015,7 @@ class Content:
             return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
         return fmt
 
-    def _fetch_episode_api(self, source: SourceConfig, episode_url: str, cfg: dict, want_streams: bool = False, quality: str = "") -> str | dict:
+    def _fetch_episode_api(self, source: SourceConfig, episode_url: str, cfg: dict, want_streams: bool = False, quality: str = "", deadline=None, context=None) -> str | dict:
         """api_endpoints.episode：JSON API 取播放地址（支持 sign 签名）。
 
         want_streams=True 时返回 {"video": ..., "audio": ...}（dash 音视频分离）。
@@ -3288,6 +4024,8 @@ class Content:
         """
         from urllib.parse import urlencode, urljoin
 
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
         # 画质映射：{quality} 占位 → 具体请求参数值（如 B 站 qn）
@@ -3343,13 +4081,20 @@ class Content:
             abs_url = f"{abs_url}&{qs}"
         else:
             abs_url = f"{abs_url}?{qs}"
+        timeout = self._timeout(source)
+        retries = self._retries(source)
+        if context is not None:
+            timeout = min(timeout, context.remaining())
+            retries = 0
+            self._check_stream_context(context)
         resp = self._http.get_json(
             abs_url,
             headers=self._endpoint_headers(source, cfg),
-            timeout=self._timeout(source),
-            retries=self._retries(source),
+            timeout=timeout,
+            retries=retries,
             proxy_pool=source.proxy_pool(),
         )
+        self._check_stream_context(context, deadline)
         rpath = cfg.get("response_path") or ""
         node = resp
         if rpath:

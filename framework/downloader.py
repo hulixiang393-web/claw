@@ -88,6 +88,33 @@ class Downloader:
         """续传：漫画话目录已存在且含文件 → 跳过。"""
         return self.skip_existing() and path.is_dir() and any(path.iterdir())
 
+    def _store_epub_chapter(self, task, index: int, title: str, payload) -> None:
+        missing = index + 1 - len(task.epub_chapters)
+        if missing > 0:
+            task.epub_chapters.extend([None] * missing)
+        task.epub_chapters[index] = (title, payload)
+
+    def _ordered_epub_chapters(self, task) -> list[tuple[str, object]]:
+        chapters = list(getattr(task, "epub_chapters", []) or [])
+        if not chapters:
+            return []
+        selected = list(getattr(task, "selected", []) or [])
+        done = set(getattr(task, "done_chapters", []) or [])
+        if done:
+            return [
+                item
+                for index, item in enumerate(chapters)
+                if item is not None and index in done
+            ]
+        if not any(item is None for item in chapters):
+            return [item for item in chapters if item is not None]
+        return [
+            item
+            for index, item in enumerate(chapters)
+            if item is not None
+            and (not selected or (index < len(selected) and selected[index]))
+        ]
+
     # ------------------------------------------------------------------ #
     def download_chapter(self, source, task, chapter, index: int) -> int:
         """下载单章，返回写入字节数（0 = 跳过/已存在）。失败抛异常由队列层重试。"""
@@ -102,7 +129,7 @@ class Downloader:
         # 只产出 epub：抓正文累积到 task.epub_chapters，全书写完统一合成
         text = self._content.fetch_chapter(source, chapter.url)
         raw = (text or "").encode("utf-8")
-        task.epub_chapters.append((chapter.title or f"第{index+1}章", text or ""))
+        self._store_epub_chapter(task, index, chapter.title or f"第{index+1}章", text or "")
         return len(raw)
 
     def _download_comic(self, source, task, chapter, index: int) -> int:
@@ -131,7 +158,7 @@ class Downloader:
                 if progress_cb is not None:
                     progress_cb(len(b))
         img_bytes = [img_map[i] for i in sorted(img_map)]
-        task.epub_chapters.append((chapter.title or f"第{index+1}话", img_bytes))
+        self._store_epub_chapter(task, index, chapter.title or f"第{index+1}话", img_bytes)
         return sum(len(b) for b in img_bytes)
 
     def _download_video(self, source, task, chapter, index: int) -> int:
@@ -821,7 +848,7 @@ class Downloader:
         # 整批全部成功，一次性累积
         out: dict[int, int] = {}
         for idx, ch, img_bytes in collected:
-            task.epub_chapters.append((ch.title or f"第{idx+1}话", img_bytes))
+            self._store_epub_chapter(task, idx, ch.title or f"第{idx+1}话", img_bytes)
             out[idx] = sum(len(b) for b in img_bytes)
         # 未处理的话标记 0
         for idx in indices:
@@ -862,7 +889,8 @@ class Downloader:
         """
         from .epub_builder import build_comic_epub, build_novel_epub
 
-        if not task.epub_chapters:
+        chapters = self._ordered_epub_chapters(task)
+        if not chapters:
             raise RuntimeError("无章节内容，无法合成 epub")
         book_dir = self.book_dir(task)
         book_dir.mkdir(parents=True, exist_ok=True)
@@ -873,7 +901,7 @@ class Downloader:
         title = task.title or "untitled"
         merge = bool(self._settings.get("download", "merge_chapters_into_one_file", False))
         if ctype == "comic":
-            build_comic_epub(title, out, task.epub_chapters, merge=merge)
+            build_comic_epub(title, out, chapters, merge=merge)
         else:
-            build_novel_epub(title, out, task.epub_chapters, merge=merge)
+            build_novel_epub(title, out, chapters, merge=merge)
         return out

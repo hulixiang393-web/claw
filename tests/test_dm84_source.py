@@ -206,7 +206,29 @@ def test_dm84_render_delay_bounded():
     """播放页渲染的固定等待必须有界：hhplayer 实测 delay=0/1000/2000 均可稳定
     出流（video src 为 artplayer 直填），7000ms 死等纯属浪费（11.2s → ~4s）。"""
     rc = source().raw["endpoints"]["content"]["episode"]["render_config"]
-    assert rc["extra_delay_ms"] <= 2500
+    assert rc["extra_delay_ms"] <= 1000
+    assert rc["slow_fallback_rounds"] == 0
+
+
+def test_render_budget_does_not_preallocate_navigation_timeout(monkeypatch):
+    import time
+    from framework.stream_resolver import StreamBudget
+
+    src = source()
+    src.raw.setdefault("diagnostics", {})["selfcheck"] = {"strategy": "off"}
+    cont = Content(_FakeHttp(), Parser(), _Checker())
+    calls = []
+    monkeypatch.setattr("framework.playwright_helper.fetch_rendered_video_sync",
+                        lambda *args, **kwargs: calls.append(kwargs) or "https://cdn/v.m3u8")
+    deadline = time.monotonic() + 3
+    budget = StreamBudget(deadline)
+    assert cont._fetch_play_url_once(src, "/p/4183-1-1.html", deadline=deadline, context=budget)
+    assert calls[0]["extra_delay_ms"] == 500
+    assert calls[0]["context"] is budget
+    rc = src.raw["endpoints"]["content"]["episode"]["render_config"]
+    rc["extra_delay_ms"] = 0
+    cont.fetch_video_episode(src, "/p/4183-1-1.html", context=budget)
+    assert calls[1]["extra_delay_ms"] == 0
 
 
 def test_dm84_render_branch_skips_plain_http_fetch(monkeypatch):
@@ -231,3 +253,5 @@ def test_dm84_render_branch_skips_plain_http_fetch(monkeypatch):
         url = cont.fetch_video_episode(src, "/p/4183-1-1.html")
     assert url == "https://cdn.example.com/v.m3u8"
     assert mocked.call_count == 1
+    assert mocked.call_args.kwargs["extra_delay_ms"] == 500
+    assert mocked.call_args.kwargs["slow_fallback_rounds"] == 0

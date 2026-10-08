@@ -24,10 +24,10 @@ def main():
     page.show()
     app.processEvents()
 
-    # 分区 Tab 数（网络/UI/下载/书架/诊断/广告 = 6）
+    # 分区 Tab 数（网络/UI/下载/书架/诊断/广告/内容/阅读 = 8）
     tabs = [page.tabs.tabText(i) for i in range(page.tabs.count())]
     print("分区:", tabs)
-    assert tabs == ["网络", "UI", "下载", "书架", "诊断", "广告规则"], tabs
+    assert tabs == ["网络", "UI", "下载", "书架", "诊断", "广告规则", "内容", "阅读"], tabs
 
     # 字段载入（默认值）
     assert page._dl_concurrent.value() == 6, page._dl_concurrent.value()

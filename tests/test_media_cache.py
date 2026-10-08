@@ -236,14 +236,15 @@ def _wait_until(pred, timeout=5.0):
 
 
 # --------------------------------------------------------------------- #
-# MediaCache：签名参数 key 稳定
+# MediaCache：签名目标安全区分
 # --------------------------------------------------------------------- #
-def test_key_stable_under_signed_params():
+def test_key_uses_safe_fingerprint_without_signed_target_collision():
     a = MediaCache.key_of("https://cdn/a/b.ts?token=abc&expires=999")
     b = MediaCache.key_of("https://cdn/a/b.ts?token=xyz&expires=1000")
     c = MediaCache.key_of("https://cdn/a/b.ts?hd=1")
-    assert a == b
+    assert a != b
     assert a != c
+    assert len(a) == 64
 
 
 # --------------------------------------------------------------------- #
@@ -347,7 +348,7 @@ def test_upstream_416_preserves_range_semantics_through_c(source, proxy_ctx):
         timeout=10,
     )
     cache_url = re.findall(
-        r"http://127\.0\.0\.1:\d+/c/[0-9a-f]{40}/[^\"\n]+",
+        r"http://127\.0\.0\.1:\d+/c/[0-9a-f]{64}/[^\"\n]+",
         manifest.text,
     )[0]
     response = requests.get(cache_url, headers={"Range": "bytes=999999-"}, timeout=10)
@@ -533,7 +534,7 @@ def test_hls_cache_hit_emits_one_cache_diagnostic_without_upstream_call(source, 
     manifest = requests.get(manifest_url, timeout=10)
     assert manifest.status_code == 200
     local = re.findall(
-        r"http://127\.0\.0\.1:\d+/c/[0-9a-f]{40}/[^\"\n]+",
+        r"http://127\.0\.0\.1:\d+/c/[0-9a-f]{64}/[^\"\n]+",
         manifest.text,
     )[0]
     target = _url(source, "/hls/seg0.ts")
@@ -567,7 +568,7 @@ def test_hls_segments_cached(source, proxy_ctx):
     # KEY 走 /s/（签名时效资源不落盘），分片走 /c/
     key_uri = re.search(r'URI="(http://127\.0\.0\.1:\d+/s/[0-9a-f]+)"', text)
     assert key_uri is not None
-    c_urls = re.findall(r"(http://127\.0\.0\.1:\d+/c/[0-9a-f]{40}/[^\"\n]+)", text)
+    c_urls = re.findall(r"(http://127\.0\.0\.1:\d+/c/[0-9a-f]{64}/[^\"\n]+)", text)
     assert len(c_urls) == 4
 
     # 拉取全部 /c/ 分片（首播：经上游 + tee 落盘）
@@ -590,7 +591,7 @@ def test_hls_segments_cached(source, proxy_ctx):
     c_hits = {f"/hls/seg{i}.ts": _FakeSource.hits.get(f"/hls/seg{i}.ts", 0)
               for i in range(4)}
     _ = requests.get(local, timeout=10)
-    r2_c_urls = re.findall(r"(/c/[0-9a-f]{40}/[^\"\n]+)", requests.get(local, timeout=10).text)
+    r2_c_urls = re.findall(r"(/c/[0-9a-f]{64}/[^\"\n]+)", requests.get(local, timeout=10).text)
     for cu in r2_c_urls:
         requests.get(_abs(source, cu), timeout=10)
     for i in range(4):

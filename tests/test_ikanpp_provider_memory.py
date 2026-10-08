@@ -37,7 +37,7 @@ def test_ikanpp_search_reorders_only_configured_provider_body_and_preserves_urls
     assert [item["id"] for item in http.last_body["sources"]][:2] == ["jisu", "guangsu"]
     assert all("source=" in result.url for result in results)
     assert next(result for result in results if result.title == "战狼2").url.endswith(
-        "?title=战狼2&source=jisu"
+        "?title=%E6%88%98%E7%8B%BC2&source=jisu"
     )
 
 

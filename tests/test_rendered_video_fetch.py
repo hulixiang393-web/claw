@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """fetch_rendered_video_sync：extra_delay 死等 → 轮询提前返回（只快不慢）。"""
+import threading
+import time
+
+import pytest
+
 import framework.playwright_helper as pw
+from framework.stream_resolver import StreamBudget, StreamCancelledError
 
 
 class _FakeSource:
@@ -69,7 +75,7 @@ class _FakePage:
                 self.frames[0]._videos[0]._src = src
 
 
-def _run(page, extra_delay_ms=2500):
+def _run(page, extra_delay_ms=2500, slow_fallback_rounds=3, context=None):
     import contextlib
 
     @contextlib.contextmanager
@@ -87,7 +93,8 @@ def _run(page, extra_delay_ms=2500):
     try:
         return pw.fetch_rendered_video_sync(
             "http://x/play", wait_until="domcontentloaded",
-            timeout_ms=5000, extra_delay_ms=extra_delay_ms)
+            timeout_ms=5000, extra_delay_ms=extra_delay_ms,
+            slow_fallback_rounds=slow_fallback_rounds, context=context)
     finally:
         pw._sync_browser = pw_orig
         pw._sync_page = pg_orig
@@ -128,8 +135,119 @@ def test_media_hit_request_returned_when_video_src_stays_blob():
     assert page.waited == 750        # 第 3 次 wait 后命中
 
 
+def test_can_disable_slow_fallback_for_fast_sources():
+    page = _FakePage(videos=[_FakeVideo("")])
+    assert _run(page, extra_delay_ms=0, slow_fallback_rounds=0) == ""
+    assert page.waited == 0
+
+
 def test_returns_empty_when_nothing_found():
     """全程无源 → ""（与旧实现一致；总等待 = extra_delay + 3 轮重试）。"""
     page = _FakePage(videos=[_FakeVideo("")])
     assert _run(page, extra_delay_ms=500) == ""
     assert page.waited >= 500 + 12000
+
+
+def _clocked_page(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(pw.time, "monotonic", lambda: now[0])
+    page = _FakePage(videos=[_FakeVideo("")])
+    wait = page.wait_for_timeout
+
+    def advance(ms):
+        now[0] += ms / 1000
+        wait(ms)
+
+    page.wait_for_timeout = advance
+    return now, page
+
+
+@pytest.mark.parametrize("media", [False, True])
+def test_slow_player_returns_during_fallback_within_budget(monkeypatch, media):
+    now, page = _clocked_page(monkeypatch)
+    if media:
+        page._hits_after = [(8, "https://cdn/slow.m3u8")]
+    else:
+        page._src_after = [(8, "https://cdn/slow.m3u8")]
+    assert _run(page, extra_delay_ms=500, context=StreamBudget(now[0] + 5)) == "https://cdn/slow.m3u8"
+    assert page.waited == 2000
+
+
+def test_navigation_consumes_actual_budget_before_slow_wait(monkeypatch):
+    now, page = _clocked_page(monkeypatch)
+    navigation = []
+
+    def goto(url, timeout=None, wait_until=None):
+        navigation.append(timeout)
+        now[0] += 0.2
+
+    page.goto = goto
+    with pytest.raises(StreamCancelledError):
+        _run(page, extra_delay_ms=0, context=StreamBudget(now[0] + 0.6))
+    assert navigation == [pytest.approx(600)]
+    assert page.waited == pytest.approx(400)
+
+
+def test_cancel_during_wait_does_not_enter_another_fallback(monkeypatch):
+    now, page = _clocked_page(monkeypatch)
+    context = StreamBudget(now[0] + 30)
+    wait = page.wait_for_timeout
+
+    def cancel(ms):
+        wait(ms)
+        context.cancel()
+
+    page.wait_for_timeout = cancel
+    with pytest.raises(StreamCancelledError):
+        _run(page, extra_delay_ms=0, context=context)
+    assert page._n_wait == 1
+    assert page.waited <= 250
+
+
+def test_expired_queued_job_never_runs():
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    owner = threading.Thread(target=lambda: pw.run_on_render_thread(
+        lambda: started.set() or release.wait(2)
+    ))
+    owner.start()
+    try:
+        assert started.wait(1)
+        with pytest.raises(StreamCancelledError):
+            pw.run_on_render_thread(lambda: calls.append("expired"), context=StreamBudget(time.monotonic() + 0.03))
+    finally:
+        release.set()
+        owner.join(2)
+    pw.run_on_render_thread(lambda: None)
+    assert calls == []
+
+
+def test_expired_video_never_opens_browser(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pw, "_sync_browser", lambda *args: calls.append("browser"))
+    with pytest.raises(StreamCancelledError):
+        pw.fetch_rendered_video_sync.__wrapped__("http://x/play", context=StreamBudget(time.monotonic() - 1))
+    assert calls == []
+
+
+def test_failure_log_uses_stage_and_exception_type_only(monkeypatch, caplog):
+    import contextlib
+
+    @contextlib.contextmanager
+    def broken_browser(proxy=None):
+        raise RuntimeError("signed-url-secret")
+        yield None, None
+
+    monkeypatch.setattr(pw, "_sync_browser", broken_browser)
+    with caplog.at_level("WARNING", logger="framework.playwright_helper"):
+        assert pw.fetch_rendered_video_sync(
+            "https://video.example/watch?token=secret", extra_delay_ms=0,
+            slow_fallback_rounds=0
+        ) == ""
+
+    message = " ".join(record.getMessage() for record in caplog.records)
+    assert "阶段=视频渲染" in message
+    assert "异常类型=RuntimeError" in message
+    assert "video.example" not in message
+    assert "signed-url-secret" not in message

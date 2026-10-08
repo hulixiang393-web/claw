@@ -10,7 +10,9 @@ fixture 取自站点真实 DOM（2026-10-02/03 抓取）：
 - 分类分页 /type/2.html → /type/2-2.html；list_url 用 /type/1.html（/show/ 路径被验证页拦截）
 """
 import base64
+import inspect
 import json
+import logging
 import os
 import sys
 import time
@@ -22,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from framework.config import SourceConfig  # noqa: E402
 from framework.content import Content  # noqa: E402
+from framework.stream_resolver import StreamBudget, StreamCancelledError  # noqa: E402
 from framework.decrypter import Decrypter  # noqa: E402
 from framework.discovery import Discovery  # noqa: E402
 from framework.parser import Parser  # noqa: E402
@@ -291,6 +294,291 @@ def test_omofuna_non_http_token_is_not_a_playable_stream(monkeypatch):
         )
 
 
+def test_safe_url_redacts_url_without_secondary_name_error():
+    assert Content._safe_url("https://cdn.example/live.m3u8?token=secret") == (
+        "https://cdn.example/live.m3u8"
+    )
+
+
+def test_fetch_video_streams_passes_deadline_and_context_to_resolver():
+    src = source()
+    cont = _content({})
+    calls = []
+
+    class _Resolver:
+        def resolve(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "video", "audio"
+
+    cont._stream_resolver = _Resolver()
+    deadline = 123.45
+    context = StreamBudget()
+
+    assert cont.fetch_video_streams(src, "episode", "720p", True, deadline=deadline, context=context) == (
+        "video",
+        "audio",
+    )
+    assert calls == [((src, "episode", "720p", True), {"deadline": deadline, "context": context})]
+
+
+def test_fetch_video_streams_keeps_legacy_four_argument_call_compatible():
+    src = source()
+    cont = _content({})
+    cont._stream_resolver = type(
+        "Resolver", (), {"resolve": lambda self, *args, **kwargs: (args, kwargs)}
+    )()
+
+    args, kwargs = cont.fetch_video_streams(src, "episode", "720p", True)
+
+    assert args == (src, "episode", "720p", True)
+    assert kwargs == {"deadline": None, "context": None}
+
+
+def test_player_aaaa_cancelled_decryption_is_not_fallback(monkeypatch):
+    src = source()
+    cont = _content({})
+    cont._decrypter = type(
+        "Decrypter", (), {"decrypt": lambda *args: (_ for _ in ()).throw(StreamCancelledError("cancelled"))}
+    )()
+
+    with pytest.raises(StreamCancelledError):
+        cont._extract_play_url_candidates(
+            '<script>var player_aaaa={"url":"encrypted"};</script>'
+            '<video><source src="https://fallback.example/live.m3u8"></video>',
+            src,
+            {},
+            {},
+            "https://video.example/episode.html",
+            "episode",
+        )
+
+
+def test_player_aaaa_deadline_error_is_not_fallback():
+    src = source()
+    cont = _content({})
+    cont._decrypter = type(
+        "Decrypter", (), {"decrypt": lambda *args: (_ for _ in ()).throw(TimeoutError("expired"))}
+    )()
+
+    with pytest.raises(TimeoutError):
+        cont._extract_play_url_candidates(
+            '<script>var player_aaaa={"url":"encrypted"};</script>'
+            '<video><source src="https://fallback.example/live.m3u8"></video>',
+            src,
+            {},
+            {},
+            "https://video.example/episode.html",
+            "episode",
+        )
+
+
+def test_player_aaaa_ordinary_decryption_error_uses_fallback():
+    src = source()
+    cont = _content({})
+    cont._decrypter = type(
+        "Decrypter", (), {"decrypt": lambda *args: (_ for _ in ()).throw(ValueError("bad input"))}
+    )()
+
+    assert cont._extract_play_url_candidates(
+        '<script>var player_aaaa={"url":"encrypted"};</script>'
+        '<video><source src="https://fallback.example/live.m3u8"></video>',
+        src,
+        {},
+        {},
+        "https://video.example/episode.html",
+        "episode",
+    ) == ["https://fallback.example/live.m3u8"]
+
+
+def test_source_switch_logs_only_fixed_fields(caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    src = source()
+    cont = _content({})
+    episode_url = "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3&token=secret"
+    key = cont._episode_key(episode_url)
+    cont._dead_episode_lines[src.source_id] = {key: time.monotonic()}
+    monkeypatch.setattr(Content, "_switch_candidate_episode_urls", lambda *args: [])
+
+    with pytest.raises(Exception, match="全部线路取流失败"):
+        cont._fetch_play_url_auto_switch(src, episode_url)
+
+    assert episode_url not in caplog.text
+    assert "www.omofuna.com" not in caplog.text
+    assert "token=secret" not in caplog.text
+    assert "线路索引=1" in caplog.text
+    assert "异常类型=KnownDeadLine" in caplog.text
+    assert "阶段=跳过" in caplog.text
+
+
+def test_source_switch_exception_log_has_no_url_or_exception_text(caplog, monkeypatch):
+    src = source()
+    cont = _content({})
+    secret = "https://cdn.example/live.m3u8?token=secret-signature"
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"request failed for {secret}; Cookie: secret-cookie")
+
+    monkeypatch.setattr(Content, "_fetch_play_url_candidates_once", fail)
+    monkeypatch.setattr(Content, "_switch_candidate_episode_urls", lambda *args: [])
+    with caplog.at_level(logging.INFO, logger="framework.content"):
+        with pytest.raises(Exception, match="全部线路取流失败"):
+            cont._fetch_play_url_auto_switch(
+                src, "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
+            )
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "RuntimeError" in messages
+    assert secret not in messages
+    assert "secret-cookie" not in messages
+    assert "阶段=取流" in messages
+    assert "线路索引=1" in messages
+    assert "www.omofuna.com" not in messages
+
+
+def test_public_video_streams_pass_deadline_to_ytdlp_and_use_remaining_timeout(monkeypatch):
+    src = source()
+    src.raw["api_endpoints"] = {"episode": {"engine": "ytdlp"}}
+    cont = _content({})
+    calls = []
+
+    class _Ytdlp:
+        def fetch_streams(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "video", "audio"
+
+    cont._ytdlp = _Ytdlp()
+    deadline = time.monotonic() + 4
+    cont._stream_resolver = type(
+        "Resolver", (), {"resolve": lambda self, *args, **kwargs: cont._fetch_video_streams_legacy(
+            *args, deadline=kwargs["deadline"]
+        )}
+    )()
+
+    assert cont.fetch_video_streams(src, "https://video.example/watch/1", deadline=deadline) == (
+        "video", "audio"
+    )
+    assert calls and calls[0][1]["timeout"] <= 4
+
+
+def test_public_video_streams_pass_deadline_to_api_and_html(monkeypatch):
+    src = source()
+    src.raw["api_endpoints"] = {"episode": {"url": "/api/{id}", "response_path": "data"}}
+    cont = _content({})
+    api_calls = []
+
+    def get_json(*args, **kwargs):
+        api_calls.append(kwargs)
+        return {"data": "https://live.example/video.m3u8"}
+
+    cont._http.get_json = get_json
+    deadline = time.monotonic() + 4
+    cont._stream_resolver = type(
+        "Resolver", (), {"resolve": lambda self, *args, **kwargs: cont._fetch_video_streams_legacy(
+            *args, deadline=kwargs["deadline"]
+        )}
+    )()
+    assert cont.fetch_video_streams(src, "https://video.example/watch/1", deadline=deadline) == (
+        "https://live.example/video.m3u8", ""
+    )
+    assert api_calls and api_calls[0]["timeout"] <= 4
+    assert api_calls[0]["retries"] == 0
+
+    src.raw["api_endpoints"] = {}
+    src.raw["endpoints"]["content"]["episode"]["source_switch"] = {}
+    html_calls = []
+    monkeypatch.setattr(
+        Content,
+        "_fetch_play_url_once",
+        lambda self, source, url, deadline=None: html_calls.append(deadline) or "https://live.example/html.m3u8",
+    )
+    assert cont.fetch_video_streams(src, "https://video.example/watch/1", deadline=deadline) == (
+        "https://live.example/html.m3u8", ""
+    )
+    assert html_calls == [deadline]
+
+
+def test_play_url_probe_respects_short_remaining_deadline(monkeypatch):
+    import requests
+
+    src = source()
+    cont = _content({})
+    calls = []
+
+    class _Response:
+        status_code = 200
+
+        class _Raw:
+            @staticmethod
+            def read(size):
+                return b"stream"
+
+        raw = _Raw()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def get(*args, **kwargs):
+        calls.append(kwargs)
+        return _Response()
+
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(Content, "_timeout", lambda self, source: 0.1)
+    now = [10.0]
+    monkeypatch.setattr("framework.content.time.monotonic", lambda: now[0])
+
+    assert cont._play_url_probe(src, "https://cdn.example/live.m3u8", deadline=10.2)
+    assert calls[0]["timeout"] == 0.1
+
+    calls.clear()
+    with pytest.raises(TimeoutError):
+        cont._play_url_probe(src, "https://cdn.example/live.m3u8", deadline=10.0)
+    assert calls == []
+
+
+def test_source_switch_stops_after_resolver_deadline(monkeypatch):
+    from framework.stream_resolver import StreamResolver
+
+    src = source()
+    cont = _content({})
+    next_line_calls = []
+    candidate_deadlines = []
+    candidate_finished = __import__("threading").Event()
+
+    def fetch_candidates(self, source, episode_url, deadline=None):
+        candidate_deadlines.append(deadline)
+        time.sleep(0.05)
+        candidate_finished.set()
+        return ["https://dead.example/live.m3u8"]
+
+    monkeypatch.setattr(Content, "_fetch_play_url_candidates_once", fetch_candidates)
+    monkeypatch.setattr(
+        Content,
+        "_switch_candidate_episode_urls",
+        lambda *args, **kwargs: next_line_calls.append(True) or [
+            "https://next.example/episode"
+        ],
+    )
+    cont.resolve_video_stream_candidates = (
+        lambda source, episode_url, quality, merged, deadline=None: [
+            lambda: cont._fetch_play_url_auto_switch(source, episode_url, deadline=deadline)
+        ]
+    )
+    cont._stream_resolver = StreamResolver(cont, total_budget=0.05)
+
+    try:
+        result = cont.fetch_video_streams(
+            src, "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
+        )
+    except TimeoutError:
+        result = ("", "")
+    assert result == ("", "")
+    assert candidate_finished.wait(1)
+    assert candidate_deadlines and candidate_deadlines[0] is not None
+    assert next_line_calls == []
+
+
 def test_omofuna_dead_line_remembered_and_skipped(monkeypatch):
     """probe 失败的线路记入 TTL 黑名单：复播同集不再重抓死线路播放页、
     不再打已知死链 probe（死线路串行轮换是取流 8.9s 的最大耗时段）。"""
@@ -328,3 +616,487 @@ def test_omofuna_dead_line_remembered_and_skipped(monkeypatch):
     assert sum(1 for u in calls if "/play/3/" in u) == 1
     # 已知死链不再重复 probe
     assert sum(1 for u in probes if "dead.example" in u) == 1
+
+
+def test_omofuna_stream_candidates_fall_back_within_one_line(monkeypatch):
+    src = source()
+    ep = "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
+    html = (
+        '<script>var player_aaaa={"url":"https://dead.example/one.m3u8",'
+        '"ps":0}</script>'
+        '<video><source src="https://live.example/two.m3u8"></video>'
+    )
+    cont = _content({"play/3/1.html": html})
+    probes = []
+
+    def probe(self, source, url):
+        probes.append(url)
+        return "dead" not in url
+
+    monkeypatch.setattr(Content, "_play_url_probe", probe)
+    monkeypatch.setattr(Content, "_switch_candidate_episode_urls", lambda *args: [])
+
+    assert cont.fetch_video_streams(src, ep)[0] == "https://live.example/two.m3u8"
+    assert probes == [
+        "https://dead.example/one.m3u8",
+        "https://live.example/two.m3u8",
+    ]
+
+
+def test_stream_candidate_relative_url_is_absolutized():
+    src = source()
+    ep = "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
+    html = '<video><source src="/media/live.m3u8"></video>'
+    cont = _content({"play/3/1.html": html})
+
+    assert cont._fetch_play_url_candidates_once(src, ep) == [
+        "https://www.omofuna.com/media/live.m3u8"
+    ]
+    assert cont._fetch_play_url_once(src, ep) == "https://www.omofuna.com/media/live.m3u8"
+
+
+def test_stream_candidates_support_var_now_and_video_source_deduplication():
+    src = source()
+    ep = "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
+    html = (
+        '<script>var now = "/media/live.m3u8";</script>'
+        '<video><source src="/media/live.m3u8"></video>'
+    )
+    cont = _content({"play/3/1.html": html})
+
+    assert cont._fetch_play_url_candidates_once(src, ep) == [
+        "https://www.omofuna.com/media/live.m3u8"
+    ]
+
+
+def test_stream_candidates_support_escaped_json_m3u8():
+    src = source()
+    ep = "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
+    html = (
+        '<script>var player_aaaa={\\"url\\":\\"https:\\/\\/live.example\\/x.m3u8\\"};'
+        "</script>"
+    )
+    cont = _content({"play/3/1.html": html})
+
+    assert cont._fetch_play_url_candidates_once(src, ep) == [
+        "https://live.example/x.m3u8"
+    ]
+
+
+def test_stream_fallback_error_does_not_include_signed_candidate():
+    src = source()
+    ep = "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
+    secret = "https://dead.example/live.m3u8?token=secret-signature"
+    cont = _content({"play/3/1.html": f'<video><source src="{secret}"></video>'})
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(Content, "_play_url_probe", lambda *args: False)
+    monkeypatch.setattr(Content, "_switch_candidate_episode_urls", lambda *args: [])
+    try:
+        with pytest.raises(Exception) as exc_info:
+            cont.fetch_video_episode(src, ep)
+    finally:
+        monkeypatch.undo()
+    assert "secret-signature" not in str(exc_info.value)
+
+
+def test_source_switch_passes_deadline_into_rendered_play_url(monkeypatch):
+    src = source()
+    episode = src.raw["endpoints"]["content"]["episode"]
+    episode["play_url"] = {"render": "playwright"}
+    cont = _content({})
+    seen = []
+
+    def fetch_once(self, source, episode_url, deadline=None):
+        seen.append(deadline)
+        return "https://live.example/video.m3u8"
+
+    monkeypatch.setattr(Content, "_fetch_play_url_once", fetch_once)
+    deadline = time.monotonic() + 1
+    assert cont._fetch_play_url_candidates_once(src, "https://www.omofuna.com/play/1.html", deadline) == [
+        "https://live.example/video.m3u8"
+    ]
+    assert seen == [deadline]
+
+
+def test_source_switch_exception_log_is_redacted(monkeypatch, caplog):
+    src = source()
+    cont = _content({})
+    secret = "https://cdn.example/live.m3u8?token=secret-signature"
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"request failed for {secret}; Cookie: session=secret-cookie")
+
+    monkeypatch.setattr(Content, "_switch_candidate_episode_urls", fail)
+    with caplog.at_level("INFO", logger="framework.content"):
+        with pytest.raises(Exception, match="全部线路取流失败"):
+            cont._fetch_play_url_auto_switch(
+                src, "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
+            )
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "RuntimeError" in messages
+    assert secret not in messages
+    assert "secret-cookie" not in messages
+
+
+def test_stream_budget_cancellation_is_checked_before_api_stage():
+    src = source()
+    cont = _content({})
+    calls = []
+    cont._http.get_json = lambda *args, **kwargs: calls.append(kwargs) or {}
+    context = type(
+        "ExpiredContext",
+        (),
+        {
+            "deadline": time.monotonic() - 1,
+            "check": lambda self: (_ for _ in ()).throw(TimeoutError("expired")),
+            "remaining": lambda self: 0.0,
+        },
+    )()
+
+    with pytest.raises(TimeoutError):
+        cont._fetch_episode_api(
+            src, "https://video.example/watch/1", {"url": "/api/{id}"}, context=context
+        )
+
+    assert calls == []
+
+
+def test_html_stream_request_uses_context_remaining_timeout(monkeypatch):
+    src = source()
+    cont = _content({"play/3/1.html": '<video><source src="https://live.example/x.m3u8"></video>'})
+    calls = []
+
+    def get_text(*args, **kwargs):
+        calls.append(kwargs)
+        return '<video><source src="https://live.example/x.m3u8"></video>'
+
+    cont._http.get_text = get_text
+    context = StreamBudget(time.monotonic() + 0.2)
+    remaining_before = context.remaining()
+    assert cont._fetch_play_url_candidates_once(
+        src, "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3", context=context
+    ) == ["https://live.example/x.m3u8"]
+    assert calls and calls[0]["timeout"] <= remaining_before
+    assert calls[0]["retries"] == 0
+
+
+def test_http_chain_uses_context_remaining_timeout_without_deadline():
+    src = source()
+    cont = _content({})
+    calls = []
+    cont._http.get_text = lambda *args, **kwargs: calls.append(kwargs) or "https://cdn.example/live.m3u8"
+    context = type(
+        "BudgetContext",
+        (),
+        {
+            "deadline": None,
+            "check": lambda self: self,
+            "remaining": lambda self: 0.2,
+        },
+    )()
+    chain = [
+        {"regex": r"(https://cdn.example/player)", "name": "next", "fetch": True},
+        {"regex": r"(https://cdn.example/live.m3u8)"},
+    ]
+
+
+    result = cont._fetch_http_chain(
+        src,
+        "https://www.omofuna.com/play/1.html",
+        '<div>https://cdn.example/player</div>',
+        chain,
+        context=context,
+    )
+
+    assert result == "https://cdn.example/live.m3u8"
+    assert calls[0]["timeout"] <= 0.2
+    assert calls[0]["retries"] == 0
+
+
+def test_http_chain_does_not_request_with_exhausted_context():
+    src = source()
+    cont = _content({})
+    calls = []
+    cont._http.get_text = lambda *args, **kwargs: calls.append(kwargs)
+    context = type(
+        "ExpiredContext",
+        (),
+        {
+            "deadline": None,
+            "check": lambda self: self,
+            "remaining": lambda self: 0.0,
+        },
+    )()
+
+    with pytest.raises(TimeoutError):
+        cont._fetch_http_chain(
+            src,
+            "https://www.omofuna.com/play/1.html",
+            '<div>https://cdn.example/player</div>',
+            [{"regex": r"(https://cdn.example/player)", "fetch": True}],
+            context=context,
+        )
+    assert calls == []
+
+
+def test_play_url_probe_uses_context_remaining_without_deadline(monkeypatch):
+    import requests
+
+    src = source()
+    cont = _content({})
+    calls = []
+
+    class _Response:
+        status_code = 200
+
+        class _Raw:
+            @staticmethod
+            def read(size):
+                return b"stream"
+
+        raw = _Raw()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: calls.append(kwargs) or _Response())
+    monkeypatch.setattr(Content, "_timeout", lambda self, source: 10.0)
+    context = type(
+        "BudgetContext",
+        (),
+        {
+            "deadline": None,
+            "check": lambda self: self,
+            "remaining": lambda self: 0.25,
+        },
+    )()
+
+    assert cont._play_url_probe(src, "https://cdn.example/live.m3u8", context=context)
+    assert calls[0]["timeout"] <= 0.25
+
+
+def test_play_url_probe_does_not_request_with_exhausted_context(monkeypatch):
+    import requests
+    from framework.stream_resolver import StreamCancelledError
+
+    src = source()
+    cont = _content({})
+    calls = []
+    context = type(
+        "ExpiredContext",
+        (),
+        {
+            "deadline": None,
+            "check": lambda self: (_ for _ in ()).throw(StreamCancelledError("expired")),
+            "remaining": lambda self: 0.0,
+        },
+    )()
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: calls.append(kwargs))
+
+    with pytest.raises(StreamCancelledError):
+        cont._play_url_probe(src, "https://cdn.example/live.m3u8", context=context)
+    assert calls == []
+
+
+def test_playerconfig_cancellation_is_not_swallowed():
+    from framework.stream_resolver import StreamCancelledError
+
+    src = source()
+    src.raw["endpoints"]["content"]["episode"]["source_switch"]["playerconfig_url"] = "/player.js"
+    cont = _content({})
+    context = StreamBudget()
+    context.cancel()
+
+    with pytest.raises(StreamCancelledError):
+        cont._parse_source_list(src, _DETAIL_HTML, context=context)
+
+
+def test_source_switch_cancellation_stops_before_next_probe(monkeypatch):
+    from framework.stream_resolver import StreamCancelledError
+
+    src = source()
+    cont = _content({})
+    context = StreamBudget()
+    probes = []
+
+    monkeypatch.setattr(
+        Content,
+        "_fetch_play_url_candidates_once",
+        lambda self, source, url, context=None: [
+            "https://cdn.example/one.m3u8", "https://cdn.example/two.m3u8"
+        ],
+    )
+
+    def probe(self, source, url, context=None):
+        probes.append(url)
+        context.cancel()
+        return False
+
+    monkeypatch.setattr(Content, "_play_url_probe", probe)
+    with pytest.raises(StreamCancelledError):
+        cont._fetch_play_url_auto_switch(
+            src, "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3", context=context
+        )
+    assert probes == ["https://cdn.example/one.m3u8"]
+
+
+def test_source_switch_cancellation_from_line_builder_is_not_swallowed(monkeypatch):
+    from framework.stream_resolver import StreamCancelledError
+
+    src = source()
+    cont = _content({})
+    context = StreamBudget()
+    monkeypatch.setattr(
+        Content,
+        "_fetch_play_url_candidates_once",
+        lambda self, source, url, context=None: [],
+    )
+    monkeypatch.setattr(
+        Content,
+        "_switch_candidate_episode_urls",
+        lambda *args, **kwargs: (_ for _ in ()).throw(StreamCancelledError("cancelled")),
+    )
+
+    with pytest.raises(StreamCancelledError):
+        cont._fetch_play_url_auto_switch(
+            src, "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3", context=context
+        )
+
+
+def test_play_url_probe_reraises_cancellation_after_http_response(monkeypatch):
+    from framework.stream_resolver import StreamCancelledError
+
+    src = source()
+    cont = _content({})
+    context = StreamBudget()
+
+    class _Raw:
+        def read(self, size):
+            context.cancel()
+            return b"stream"
+
+    class _Response:
+        status_code = 200
+        raw = _Raw()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
+    with pytest.raises(StreamCancelledError):
+        cont._play_url_probe(src, "https://cdn.example/live.m3u8", context=context)
+
+
+def test_ytdlp_cancellation_does_not_start_single_stream_fallback(monkeypatch):
+    from framework.stream_resolver import StreamCancelledError
+
+    src = source()
+    cont = _content({})
+    calls = []
+
+    class _Ytdlp:
+        def fetch_streams(self, *args, **kwargs):
+            calls.append(kwargs.get("fmt"))
+            raise StreamCancelledError("cancelled")
+
+    cont._ytdlp = _Ytdlp()
+    with pytest.raises(StreamCancelledError):
+        cont._fetch_streams_ytdlp(src, "https://video.example/watch/1", {}, context=StreamBudget())
+    assert calls == ["best"]
+
+
+def test_http_chain_cancellation_is_not_wrapped_as_candidate_failure(monkeypatch):
+    from framework.stream_resolver import StreamCancelledError
+
+    src = source()
+    cont = _content({})
+    context = StreamBudget()
+    monkeypatch.setattr(
+        cont._http,
+        "get_text",
+        lambda *args, **kwargs: context.cancel() or "next",
+    )
+    with pytest.raises(StreamCancelledError):
+        cont._fetch_http_chain(
+            src,
+            "https://www.omofuna.com/play/1.html",
+            '<div>https://cdn.example/player</div>',
+            [{"regex": r"(https://cdn\.example/player)", "name": "next", "fetch": True}],
+            context=context,
+        )
+
+
+@pytest.mark.parametrize("cancel_sid", [None, "1", "2"])
+def test_switch_builder_preserves_context_and_stops_after_cancel(monkeypatch, cancel_sid):
+    from types import SimpleNamespace
+
+    cont = _content({})
+    budget = StreamBudget()
+    calls = []
+    monkeypatch.setattr(cont, "_detail_url_from_episode", lambda *args: "detail")
+    monkeypatch.setattr(cont, "_episode_index_in_chapters", lambda *args: 0)
+
+    def switch(source, url, sid, **kwargs):
+        calls.append((sid, kwargs.get("context")))
+        if sid == cancel_sid:
+            budget.cancel()
+        return SimpleNamespace(source_list=[{"sid": "2"}, {"sid": "3"}]), [SimpleNamespace(url=sid)]
+
+    monkeypatch.setattr(cont, "switch_source", switch)
+    if cancel_sid:
+        with pytest.raises(StreamCancelledError):
+            cont._switch_candidate_episode_urls(source(), "episode?sid=1", context=budget)
+    else:
+        assert cont._switch_candidate_episode_urls(source(), "episode?sid=1", context=budget) == ["2", "3"]
+    expected = {None: ["1", "2", "3"], "1": ["1"], "2": ["1", "2"]}[cancel_sid]
+    assert calls == [(sid, budget) for sid in expected]
+
+
+def test_stream_context_reaches_all_video_stage_boundaries():
+    expected = {
+        "switch_source": Content.switch_source,
+        "_fetch_play_url_once": Content._fetch_play_url_once,
+        "_fetch_http_chain": Content._fetch_http_chain,
+        "_fetch_episode_api": Content._fetch_episode_api,
+        "_fetch_streams_ytdlp": Content._fetch_streams_ytdlp,
+        "_fetch_play_url_auto_switch": Content._fetch_play_url_auto_switch,
+    }
+    for name, method in expected.items():
+        assert "context" in inspect.signature(method).parameters, name
+
+
+def test_slow_playwright_result_is_discarded_after_budget_expires(monkeypatch):
+    src = source()
+    src.raw["endpoints"]["content"]["episode"]["play_url"] = {"render": "playwright"}
+    cont = _content({})
+    seen = []
+
+    def slow_render(*args, context=None, **kwargs):
+        seen.append(context)
+        time.sleep(0.05)
+        return "https://live.example/late.m3u8"
+
+    import framework.playwright_helper as helper
+
+    monkeypatch.setattr(helper, "fetch_rendered_video_sync", slow_render)
+    context = StreamBudget(time.monotonic() + 0.01)
+    with pytest.raises(TimeoutError):
+        cont._fetch_play_url_once(src, "https://video.example/watch/1", context=context)
+
+    assert seen == [context]
+
+
+def test_expired_detail_context_does_not_write_detail_cache():
+    src = source()
+    src.raw["api_endpoints"] = {"detail": {"url": "/api/{id}"}}
+    cont = _content({})
+    context = StreamBudget(time.monotonic() - 1)
+    with pytest.raises(TimeoutError):
+        cont.fetch_detail(src, "https://video.example/watch/1", context=context)
+    assert cont._cache_get_detail("detail:omofuna:https://video.example/watch/1") is None

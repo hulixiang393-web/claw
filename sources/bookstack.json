@@ -1,0 +1,143 @@
+{
+  "$schema_version": 2,
+  "$id": "bookstack",
+  "$type": "novel",
+  "$name": "BookStack",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.bookstack.cn",
+    "description": "BookStack 中文公开文档书籍源。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["小说", "文档"]
+  },
+  "transports": {
+    "base_url": "https://www.bookstack.cn",
+    "timeout": 20,
+    "retries": 1,
+    "interval_ms": 1200
+  },
+  "endpoints": {
+      "discovery": {
+        "list_url": "/explore?tab=latest&lang=",
+        "list_paginator": {
+          "type": "increment",
+          "first_page_without_param": true
+        },
+
+      "works_list_item": {
+        "root_selector": {
+          "css": "dl.manual-item-standard"
+        },
+        "fields": {
+          "title": {
+            "css": "dd a.name"
+          },
+          "url": {
+            "css": "dd a.name",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "dt a img",
+            "attr": "src"
+          },
+          "author": {
+            "css": "dd.manual-item-author"
+          },
+          "update": {
+            "css": "dd.manual-item-meta"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/result",
+      "method": "GET",
+      "keyword_param": "wd",
+      "extra_params": {
+        "tab": "book"
+      },
+      "paginator": {
+        "url_template": "/search/result?wd={keyword}&tab=book&page={page}"
+      },
+      "item": {
+        "root_selector": {
+            "css": ".result-list li.clearfix"
+
+        },
+        "fields": {
+          "title": {
+            "css": "h4"
+          },
+          "url": {
+            "xpath": ".//h4/parent::a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          },
+          "author": {
+            "css": ".author"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/books/",
+      "fields": {
+        "title": {
+          "css": "h1.book-title"
+        },
+        "author": {
+          "css": ".book-meta .author"
+        },
+        "cover": {
+          "css": ".book-cover img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": ".book-description"
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "list": {
+          "root_selector": {
+              "css": "div.wd-tab-content ul.none-listyle > li"
+          },
+          "fields": {
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": "article.article-body.markdown-body"
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 20,
+      "max_results": 0
+    },
+    "chapter": {
+      "max_pages": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

@@ -30,6 +30,7 @@ VLC 3.0.23 无效（恒发 VLC 默认 UA，多数 CDN 拒绝）。本模块起�
 from __future__ import annotations
 
 import atexit
+import hashlib
 import ipaddress
 import mimetypes
 from contextlib import nullcontext
@@ -316,6 +317,45 @@ def _strip_stale_headers(headers: dict) -> dict:
     out = dict(headers)
     out.pop("Range", None)
     return out
+
+
+def _clean_context_headers(headers: dict) -> dict:
+    return _strip_stale_headers(headers)
+
+
+def _context_target(target: str) -> str:
+    return target
+
+
+def _context_fingerprint(target: str, headers: dict | None = None) -> str:
+    values = [_context_target(target)]
+    values.extend(
+        f"{key.lower()}={value}"
+        for key, value in sorted(_clean_context_headers(headers or {}).items())
+    )
+    return hashlib.sha256("\n".join(values).encode("utf-8", "replace")).hexdigest()
+
+
+def _clean_detection_context(context: dict | None) -> dict | None:
+    if not isinstance(context, dict):
+        return None
+    allowed = {"template_hashes", "keyword_region_score", "stable_block", "protocol_ad"}
+    return {key: value for key, value in context.items() if key in allowed}
+
+
+def _manifest_contains_query(text: str, base_url: str) -> bool:
+    for line in text.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        if value.startswith("#"):
+            match = re.search(r'URI="([^"]+)"', value)
+            if match is None:
+                continue
+            value = match.group(1)
+        if urlparse(urljoin(base_url, value)).query:
+            return True
+    return False
 
 
 def _proxy_get(target: str, headers: dict, timeout=30):
@@ -1234,7 +1274,8 @@ class MediaProxy:
                             ad_block: dict | None,
                             force_proxy: bool = False) -> None:
         with self._lock:
-            self._cache_ctx[key] = (target, _strip_stale_headers(headers),
+            self._cache_ctx[key] = (_context_target(target),
+                                    _clean_context_headers(headers),
                                     ad_block, force_proxy)
 
     # ------------------------------------------------------------------ #
@@ -1766,13 +1807,13 @@ class MediaProxy:
         # 播放路径广告过滤：HLS 一律走本地代理/过滤，剔除 m3u8 广告段再
         # 重写（不要求源配 ad_block；ad_block 显式 enabled:false 才关闭，
         # 判定与下载路径 filter_m3u8 一致）
-        if ad_block is not None:
-            text = self._filter_ad_segments(text, target, ad_block)
+        text = self._filter_ad_segments(text, target, ad_block)
         key = None
         if cache_on:
             try:
                 key = cache.key_of(target)
-                cache.playlist_write(key, text.encode("utf-8", "replace"))
+                if not _manifest_contains_query(text, target):
+                    cache.playlist_write(key, text.encode("utf-8", "replace"))
                 self._register_cache_ctx(key, target, req_headers, ad_block,
                                          force_proxy)
             except Exception:  # noqa: BLE001 —— 缓存写失败不阻断播放
@@ -1805,7 +1846,7 @@ class MediaProxy:
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
         # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
         # 默认直连优先，失败后回退系统代理。
-        manifest_key = target + "|" + repr(sorted((req_headers or {}).items()))
+        manifest_key = _context_fingerprint(target, req_headers)
         cached_manifest = self._manifest_cache.get(manifest_key)
         now = time.monotonic()
         if cached_manifest and now - cached_manifest[0] < _MANIFEST_CACHE_TTL:
@@ -1832,7 +1873,8 @@ class MediaProxy:
                 self._send_body(handler, resp, body)
                 return
             text = body.decode("utf-8", "replace")
-            self._manifest_cache[manifest_key] = (time.monotonic(), text)
+            if not _manifest_contains_query(text, target):
+                self._manifest_cache[manifest_key] = (time.monotonic(), text)
             self._serve_m3u8_text(handler, text, target, req_headers, ad_block,
                                   force_proxy, public_base)
         finally:
@@ -2388,6 +2430,7 @@ def proxy_url_for(url: str, headers: dict | None = None,
     force_proxy：True 时该 URL 的所有上游转发一律走系统代理会话（跳过
     直连探测）；默认策略为直连优先、失败回退代理。
     """
-    if not headers:
+    is_hls = "m3u8" in url.lower()
+    if not headers and not is_hls:
         return url
-    return MediaProxy.instance().build_url(url, headers, ad_block, force_proxy)
+    return MediaProxy.instance().build_url(url, headers or {}, ad_block, force_proxy)

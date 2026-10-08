@@ -25,7 +25,7 @@ DEFAULTS: dict = {
     "network": {
         "default_user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 SpiderFramework/1.0"
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         ),
         "default_timeout": 10,
         "default_retries": 3,
@@ -33,6 +33,10 @@ DEFAULTS: dict = {
         "proxy": None,
         "concurrent_search_sources": 4,
         "max_bytes_per_image": 5242880,
+        "impersonate": "chrome",
+        "user_agents": [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ],
     },
     "ui": {
         "theme": "sakura",
@@ -70,6 +74,15 @@ DEFAULTS: dict = {
         "max_videos": 5,
         "max_bytes_mb": 8192,
     },
+    "media": {
+        "source_probe": {
+            "enabled": True,
+            "max_sources": 5,
+            "concurrency": 1,
+            "timeout_ms": 30000,
+        },
+    },
+
     "hls_prefetch": {
         # 有界 HLS 预取：按消费位置前瞻 depth 片、并发 workers 路拉取落盘。
         # 实测部分 CDN 按连接限速，4 并发总带宽可达单连接的 2.1x。
@@ -86,6 +99,7 @@ DEFAULTS: dict = {
         "prefetch_enabled": True,
         "prefetch_ahead": 1,
         "prefetch_behind": 0,
+        "show_images": True,
     },
     "discover": {
         "preload_pages": 1,
@@ -167,6 +181,20 @@ def _clamp_int(value, lo: int, hi: int, fallback: int) -> int:
     except (TypeError, ValueError):
         return fallback
     return max(lo, min(hi, n))
+
+
+def media_source_probe_settings(settings_manager) -> dict:
+    probe = settings_manager.get("media", "source_probe", {})
+    if not isinstance(probe, dict):
+        probe = {}
+    return {
+        "enabled": bool(probe.get("enabled", True)),
+        "max_sources": _clamp_int(probe.get("max_sources", 5), 1, 5, 5),
+        "concurrency": 1,
+        "timeout_ms": _clamp_int(
+            probe.get("timeout_ms", 30000), 1000, 2_147_483_647, 30000
+        ),
+    }
 
 
 def reader_prefetch_settings(settings_manager) -> dict:

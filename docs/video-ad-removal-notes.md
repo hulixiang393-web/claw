@@ -77,3 +77,9 @@
   内置规则（`enabled:false` 关闭）。VLC 播放不再插播广告分片。
 
 实现：commit `a390588`（下载默认启用）、`3855d42`（播放默认启用）。
+
+## 画面检测与播放代理边界
+
+`frame_ad_detection` 在 `SettingsManager` 中默认 `enabled: false`，不会修改用户的 `app_config.json`。需要启用时，在用户配置的 `media.frame_ad_detection` 中显式设置 `enabled: true`；可选 `sync_budget_ms` 为首个清单允许等待检测的最大毫秒数，默认 `0`，首播不阻塞。通用 API 调用方也可向 `MediaProxy(..., frame_ad_detection={"enabled": True, ...})` 传入配置；后台检测完成后，结果只以脱敏指纹写入进程内缓存，后续同一清单请求才会按高置信度结果过滤。
+
+检测器没有 OCR 或模板时，只能依据 HLS 协议标记、URL 特征和用户提供的模板/上下文进行判断，不能保证识别画面中烧录的中文广告；未知、解码失败、超时或依赖缺失均保留分片，不宣称已过滤。

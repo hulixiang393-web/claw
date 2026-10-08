@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,10 +25,39 @@ class _FakeShelf:
         return []
 
 
+class _FakeSource:
+    source_id = "avgood"
+    content_type = "video"
+
+
+class _FakeSourceManager:
+    def get(self, source_id):
+        return _FakeSource()
+
+
+class _FakeContent:
+    def fetch_detail(self, source, url):
+        return object()
+
+
 def _page():
     from gui.pages.library_page import LibraryPage
 
-    return LibraryPage(shelf_service=_FakeShelf())
+    return LibraryPage(
+        shelf_service=_FakeShelf(),
+        source_manager=_FakeSourceManager(),
+        content=_FakeContent(),
+    )
+
+
+def _wait_for(predicate):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if predicate():
+            return
+        time.sleep(0.01)
+    assert predicate()
 
 
 def _fav(title, url, sid="avgood", ctype="video"):
@@ -59,7 +89,8 @@ def test_single_card_click_emits_open_online(monkeypatch):
     assert len(cards) == 1
     got = []
     page.open_online_requested.connect(got.append)
-    cards[0].clicked.emit(cards[0].rec)  # 同 mousePressEvent 的发信号路径
+    cards[0].clicked.emit(cards[0].rec)
+    _wait_for(lambda: bool(got))
     assert got == [("avgood", "u1", "video")]
 
 

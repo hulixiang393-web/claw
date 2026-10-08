@@ -64,7 +64,7 @@ def main():
 
     data = json.loads(p.read_text(encoding="utf-8"))
     assert len(data["favorites"]) == 4, data["favorites"]
-    assert "玄幻" in data["folders"]
+    assert any(folder.get("name") == "玄幻" for folder in data["folders"]), data["folders"]
     print("导出 OK:", p.name, "含收藏", len(data["favorites"]), "个")
 
     # 导出按钮存在于库页

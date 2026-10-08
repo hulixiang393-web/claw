@@ -49,6 +49,7 @@ _DEFAULT_URL_AD_RE = re.compile(
     r"/advert(?:/|-|\.)|/advertis|/adverts/|"  # advertise/advertising
     r"/adserver|/adframe|/adclick|/adview|/adrotate|/adserve|/adtag|/adunit|"
     r"/banner|/promo(?:/|_)|_promo\.|/promotion/|/guanggao/|/tuiguang/|"
+    r"/(?:ad|ads|advert|advertising|promo)(?:\d+|[-_./])|/admaterial/|"
     r"/gg/|/gg_|/ggad|/adv/"
     r")",
     re.IGNORECASE,
@@ -445,20 +446,29 @@ class AdblockEngine:
         n = len(lines)
 
         # ---- 第一遍：解析段信息 + 统计段 URL 出现次数（重复段检测） ----
-        seg_infos: List[tuple] = []  # (joined_url, dur)
+        seg_infos: List[tuple] = []  # (joined_url, dur, byte_range)
         url_counter: dict = {}
         pending_dur: Optional[float] = None
+        pending_range: Optional[str] = None
         for line in lines:
             m = re.match(r"#EXTINF:\s*([\d.]+)", line)
             if m:
                 pending_dur = float(m.group(1))
                 continue
+            if line.startswith("#EXT-X-BYTERANGE:"):
+                pending_range = line.split(":", 1)[1].strip()
+                continue
             if line.strip() and not line.startswith("#"):
                 joined = urljoin(base_url, line) if base_url else line
-                seg_infos.append((joined, pending_dur))
-                url_counter[joined] = url_counter.get(joined, 0) + 1
+                seg_infos.append((joined, pending_dur, pending_range))
+                duplicate_key = (joined, pending_range)
+                url_counter[duplicate_key] = url_counter.get(duplicate_key, 0) + 1
                 pending_dur = None
-        dup_urls = {u for u, c in url_counter.items() if c >= 2}
+                pending_range = None
+        dup_urls = {
+            key for key, count in url_counter.items()
+            if count >= 2 and self.is_ad_url(key[0])
+        }
 
         # ---- 第二遍：按 DISCONTINUITY 划分块 + 跟踪协议级广告标签区间 ----
         # 块 = 一段连续段序列；块前紧邻 DISCONTINUITY 视为「独立块」。
@@ -517,18 +527,20 @@ class AdblockEngine:
             blocks.append(cur)
         short_block_segs: set = set()
         for b in blocks:
-            if b["independent"] and b["dur"] < 3.0:
+            if b["independent"] and b["dur"] < 3.0 and any(
+                self.is_ad_url(seg_infos[index][0]) for index in b["seg"]
+            ):
                 short_block_segs.update(b["seg"])
 
         # ---- 第三遍：重写输出，剔除广告段 ----
         ad_set: set = set()
         # R1: URL 广告特征
-        for i0, (joined, _dur) in enumerate(seg_infos):
+        for i0, (joined, _dur, _byte_range) in enumerate(seg_infos):
             if self.is_ad_url(joined):
                 ad_set.add(i0)
-        # R2: 重复段（同一 URL ≥2 次）
-        for i0, (joined, _dur) in enumerate(seg_infos):
-            if joined in dup_urls:
+        # R2: 重复段（同一 URL + BYTERANGE ≥2 次）
+        for i0, (joined, _dur, byte_range) in enumerate(seg_infos):
+            if (joined, byte_range) in dup_urls:
                 ad_set.add(i0)
         # R3: DISCONTINUITY 分隔的孤立短块
         ad_set |= short_block_segs
@@ -536,7 +548,7 @@ class AdblockEngine:
         ad_set |= seg_cue
 
         # ---- R5：片头/片尾预滚（双信号：块占整体 <25% + 短 或 块内时长全一致） ----
-        total_dur = sum(d for _joined, d in seg_infos if d is not None)
+        total_dur = sum(d for _joined, d, _byte_range in seg_infos if d is not None)
 
         def _uniform(b: dict) -> bool:
             durs = b["durs"]
@@ -548,8 +560,18 @@ class AdblockEngine:
                 continue
             _is_first = bi == 0
             _is_last = bi == len(blocks) - 1
+            _has_ad_name = any(
+                self.is_ad_url(seg_infos[index][0])
+                or bool(re.search(
+                    r"/(?:ad|ads|advert|advertising|promo)[^/]*$",
+                    urlparse(seg_infos[index][0]).path,
+                    re.IGNORECASE,
+                ))
+                for index in _segs
+            )
             if (
                 (_is_first or _is_last)
+                and _has_ad_name
                 and total_dur >= 60.0
                 and _b["dur"] < 0.25 * total_dur
                 and (_b["dur"] <= 30.0 or _uniform(_b))
@@ -572,10 +594,11 @@ class AdblockEngine:
             if not _segs:
                 continue
             if (
-                0 < bi < len(blocks) - 1  # 非首非尾（前后都有 DISCONTINUITY）
+                0 < bi < len(blocks) - 1
                 and median_dur > 0.0
                 and _b["dur"] < median_dur / 3.0
                 and (_uniform(_b) or _b["dur"] < 10.0)
+                and any(self.is_ad_url(seg_infos[index][0]) for index in _segs)
             ):
                 ad_set.update(_segs)
 
@@ -589,6 +612,14 @@ class AdblockEngine:
             m = re.match(r"#EXTINF:\s*([\d.]+)", line)
             if m:
                 pending_dur = float(m.group(1))
+            if ad_set and (
+                line.startswith("#EXT-X-CUE-OUT")
+                or line.startswith("#EXT-X-CUE-IN")
+                or line.startswith("#EXT-X-SCTE35")
+                or line.startswith("#EXT-X-DATERANGE:")
+            ):
+                i += 1
+                continue
             if line.strip() and not line.startswith("#"):
                 seg_idx += 1
                 pending_dur = None  # 消费：EXTINF 时长只属于紧随的段
@@ -604,7 +635,6 @@ class AdblockEngine:
                         out[-1].startswith("#EXTINF")
                         or out[-1].startswith("#EXT-X-DISCONTINUITY")
                         or out[-1].startswith("#EXT-X-BYTERANGE")
-                        or out[-1].startswith("#EXT-X-KEY:METHOD=NONE")
                     ):
                         out.pop()
                     # 跳过本段及后续紧邻的 DISCONTINUITY

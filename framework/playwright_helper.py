@@ -105,21 +105,38 @@ def _ensure_render_thread() -> None:
             _RENDER_THREAD.start()
 
 
-def run_on_render_thread(fn: Callable[[], object]) -> object:
+def run_on_render_thread(fn: Callable[[], object], context=None) -> object:
     """把 fn 投递到专用渲染线程执行并阻塞等待结果（异常跨线程复抛）。
 
     若渲染线程异常退出，等待方最多 1s 内抛出 RuntimeError，不会永久挂死。
     """
+    if context is not None:
+        context.check()
+
+    def execute():
+        if context is not None:
+            context.check()
+        result = fn()
+        if context is not None:
+            context.check()
+        return result
+
     _ensure_render_thread()
     holder = {"done": threading.Event(), "result": None, "error": None}
-    _RENDER_QUEUE.put((fn, holder))
+    _RENDER_QUEUE.put((execute, holder))
     while True:
-        holder["done"].wait(timeout=1.0)
+        wait_for = 1.0
+        if context is not None:
+            context.check()
+            wait_for = min(0.25, context.remaining())
+        holder["done"].wait(timeout=wait_for)
         if holder["done"].is_set():
             break
         thread = _RENDER_THREAD
         if thread is None or not thread.is_alive():
             raise RuntimeError("Playwright 渲染线程异常退出，任务未完成")
+    if context is not None:
+        context.check()
     if holder["error"] is not None:
         raise holder["error"]  # 异常对象跨线程复抛，保留原 traceback
     return holder["result"]
@@ -129,7 +146,8 @@ def _on_render_thread(fn: Callable) -> Callable:
     """装饰器：把 `*_sync` 函数整体放到专用渲染线程中执行。"""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        return run_on_render_thread(lambda: fn(*args, **kwargs))
+        context = kwargs.get("context")
+        return run_on_render_thread(lambda: fn(*args, **kwargs), context=context)
     return wrapper
 
 
@@ -759,9 +777,9 @@ async def fetch_rendered_images(
 
     used_proxy = _pick_proxy(proxy)
     if used_proxy:
-        log.info("[playwright] 使用代理 %s", used_proxy)
+        log.info("[playwright] 阶段=代理，状态=已启用")
     else:
-        log.info("[playwright] 未发现代理，直连（若连不上请配置 Clash 代理）")
+        log.info("[playwright] 阶段=代理，状态=直连")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -809,8 +827,11 @@ async def fetch_rendered_images(
                 if click_selector:
                     try:
                         await page.click(click_selector, timeout=5000)
-                    except Exception:
-                        log.warning("[playwright] 点击 %s 失败（忽略）", click_selector)
+                    except Exception as exc:
+                        log.warning(
+                            "[playwright] 阶段=点击，异常类型=%s",
+                            type(exc).__name__,
+                        )
                 # 可选动作：滚动到页底，触发滚动懒加载。
                 # 注意：此类漫画站（comicbox）的 canvas 是"视口内复用"的——
                 # 滚出视口即被 JS 移除回收。因此必须**边滚边收集**：
@@ -1276,7 +1297,10 @@ async def _fetch_pages_batch(
                         # 记录是否成功（失败以 None 标记由调用方决定）
                         results[url] = imgs if imgs else None
                     except Exception as exc:  # noqa: BLE001
-                        log.warning("[playwright] 批量渲染失败 %s: %s", url, exc)
+                        log.warning(
+                            "[playwright] 阶段=批量渲染，异常类型=%s",
+                            type(exc).__name__,
+                        )
                         results[url] = None
             finally:
                 await page.close()
@@ -1706,15 +1730,35 @@ def fetch_rendered_video_sync(
     timeout_ms: int = 45000,
     extra_delay_ms: int = 8000,
     proxy: Optional[str] = None,
+    slow_fallback_rounds: int = 3,
+    context=None,
 ) -> str:
     """渲染播放页，等 iframe 解析站执行后，提取真实视频源（video src）。
 
     适用：播放页用 iframe 嵌套第三方解析站（如 agedm），解析站 JS
     解密后填充真实视频 URL 到 iframe 的 <video>。返回 video src；失败 ""。
     """
+    from .stream_resolver import StreamCancelledError
+
+    def check():
+        if context is not None:
+            context.check()
+
+    def bounded_ms(milliseconds):
+        check()
+        if context is not None:
+            remaining = context.remaining()
+            if remaining <= 0:
+                raise StreamCancelledError("stream resolution deadline exhausted")
+            milliseconds = min(milliseconds, remaining * 1000)
+        return milliseconds
+
     try:
+        check()
         with _sync_browser(proxy) as (p, browser):
+            check()
             with _sync_page(browser) as page:
+                check()
                 # 捕获网络层真实媒体请求（blob/MSE 播放器的 m3u8/mp4 直链）。
                 # 部分解析站（voe.sx/eugenemakedraw 等 JWPlayer）会把 HLS 源塞进
                 # blob: URL，video src 拿不到 http 直链，但播放器会向 CDN 请求
@@ -1731,7 +1775,8 @@ def fetch_rendered_video_sync(
                         pass
 
                 page.on("request", _on_request)
-                page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+                page.goto(url, timeout=bounded_ms(timeout_ms), wait_until=wait_until)
+                check()
 
                 def _scan() -> str:
                     """扫全部 frame（含 iframe 解析站）找 video src / 媒体请求。
@@ -1769,24 +1814,28 @@ def fetch_rendered_video_sync(
                 # src/媒体请求就绪即返回——dm84 页面加载完即直填 src（delay=0
                 # 实测可播），原 2.5s 死等里通常前几百毫秒就绪，省 ~1-2s；
                 # 慢注入站（agedm 类 8s）扫不到就等满，最坏耗时与旧实现相同。
-                deadline = time.monotonic() + max(extra_delay_ms, 0) / 1000.0
-                while True:
-                    found = _scan()
-                    if found:
-                        return found
-                    if time.monotonic() >= deadline:
-                        break
-                    page.wait_for_timeout(250)
-                # 等满 extra_delay 仍无 → 慢注入站多轮渲染窗口（原 3 轮语义：
-                # 每轮扫描 + 轮间 4000ms），最后一次仍不中返回媒体请求兜底。
-                for _ in range(3):
-                    found = _scan()
-                    if found:
-                        return found
-                    page.wait_for_timeout(4000)
+                windows = [max(extra_delay_ms, 0)] + [4000] * max(0, int(slow_fallback_rounds))
+                for window_ms in windows:
+                    deadline = time.monotonic() + window_ms / 1000.0
+                    while True:
+                        check()
+                        found = _scan()
+                        check()
+                        if found:
+                            return found
+                        remaining_ms = (deadline - time.monotonic()) * 1000
+                        if remaining_ms <= 0:
+                            break
+                        page.wait_for_timeout(bounded_ms(min(250, remaining_ms)))
                 return ""
+    except StreamCancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001
         # 内部异常（greenlet.error / TimeoutError / playwright 错误）归一化为
         # 无视频源（""），不把内部异常抛给上层 fetch_video_episode。
-        log.warning("[playwright] 渲染播放页失败 %s: %s", url, exc)
+        check()
+        log.warning(
+            "[playwright] 阶段=视频渲染，异常类型=%s",
+            type(exc).__name__,
+        )
         return ""

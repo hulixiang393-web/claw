@@ -646,7 +646,7 @@ class Discovery:
             if not isinstance(it, dict):
                 continue
             title = self._template_value(it, item_fields.get("title"))
-            url_v = self._template_value(it, item_fields.get("url"))
+            url_v = self._template_url_value(it, item_fields.get("url"))
             if not title or not url_v:
                 continue
             url_v = self._resolve_tpl(source.base_url, url_v)
@@ -709,6 +709,19 @@ class Discovery:
         return utils.jsonpath(data, path)
 
     @staticmethod
+    def _template_url_value(item: dict, field_spec):
+        if isinstance(field_spec, str) and "{" in field_spec:
+            from urllib.parse import quote
+            import re
+
+            return re.sub(
+                r"\{(\w+)\}",
+                lambda match: quote(str(item.get(match.group(1), "") or ""), safe=""),
+                field_spec,
+            )
+        return Discovery._template_value(item, field_spec)
+
+    @staticmethod
     def _template_value(item: dict, field_spec):
         """字段值：若是模板（含 {}）则填充，否则直接取值。"""
         if field_spec is None:
@@ -734,11 +747,14 @@ class Discovery:
 
     @staticmethod
     def _resolve_tpl(base, url):
-        from urllib.parse import urljoin
+        from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-        if url.startswith("http"):
-            return url
-        return urljoin(base, url)
+        resolved = url if url.startswith("http") else urljoin(base, url)
+        parts = urlsplit(resolved)
+        if not parts.query:
+            return resolved
+        query = urlencode(parse_qsl(parts.query, keep_blank_values=True))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
     def _build_page_url(self, source: SourceConfig, url: str, page: int) -> str:
         """按源配置 paginator 构造第 page 页的 URL。"""
@@ -749,7 +765,13 @@ class Discovery:
         ptype = paginator.get("type") or "increment"
 
         if ptype == "increment":
-            # 1) {page} 占位替换
+            if page <= 1 and paginator.get("first_page_without_param"):
+                return url
+            # 1) 自定义分页模板（如 /list-8-{page}/）
+            page_template = paginator.get("page_url_template")
+            if page_template and page > 1:
+                return str(page_template).replace("{page}", str(page))
+            # 2) {page} 占位替换
             if "{page}" in url:
                 return url.replace("{page}", str(page))
             # 2) page_placeholder 正则：替换 URL 中页码位。

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -27,10 +28,39 @@ class _FakeShelf:
         return []
 
 
+class _FakeSource:
+    source_id = "avgood"
+    content_type = "video"
+
+
+class _FakeSourceManager:
+    def get(self, source_id):
+        return _FakeSource()
+
+
+class _FakeContent:
+    def fetch_detail(self, source, url):
+        return object()
+
+
 def _page():
     from gui.pages.library_page import LibraryPage
 
-    return LibraryPage(shelf_service=_FakeShelf())
+    return LibraryPage(
+        shelf_service=_FakeShelf(),
+        source_manager=_FakeSourceManager(),
+        content=_FakeContent(),
+    )
+
+
+def _wait_for(predicate):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if predicate():
+            return
+        time.sleep(0.01)
+    assert predicate()
 
 
 def _fav(title, url, sid="avgood", ctype="video"):
@@ -108,6 +138,7 @@ def test_open_rec_opens_online_series_member():
     got = []
     page.open_online_requested.connect(got.append)
     page._open_rec(_fav("背徳の少女-第2話", "u2"))
+    _wait_for(lambda: bool(got))
     assert got == [("avgood", "u2", "video")]
 
 

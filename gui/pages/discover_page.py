@@ -1164,13 +1164,16 @@ class DiscoverPage(BasePage):
 
     def _on_detail_loaded(self, detail, err) -> None:
         if err or detail is None:
+            source_name = getattr(self._current_source, "source_name", "")
+            prefix = f"{source_name} " if source_name else ""
             if self._is_challenge_blocked(err):
                 # 站点反爬挑战拦截（如 linovelib 个别书被 Cloudflare WAF 403 硬拦）
                 self.status_label.setText(
-                    "该作品被站点反爬拦截（Cloudflare 验证），请稍后再试或换源阅读。"
+                    f"{prefix}请求失败：站点反爬拦截（Cloudflare 验证），"
+                    "请完成站点验证后重试或换源阅读。"
                 )
             else:
-                self.status_label.setText(f"详情加载失败：{err}")
+                self.status_label.setText(f"{prefix}请求失败：{err}")
             return
         self.read_requested.emit(detail)
         self.status_label.setText("")

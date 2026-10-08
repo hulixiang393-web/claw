@@ -549,6 +549,114 @@ def test_force_proxy_default_false(monkeypatch):
     assert seen == [False]
 
 
+def test_user_agent_only_media_stays_direct(monkeypatch):
+    seen = []
+    procs = _install(monkeypatch, proxy=lambda u, *a, **k: (
+        seen.append(u) or "P:" + u))
+    ep.open_with_player(
+        "https://video.googlevideo.com/videoplayback?id=test&sig=test",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    assert seen == []
+    assert procs[0].args[-1] == (
+        "https://video.googlevideo.com/videoplayback?id=test&sig=test"
+    )
+
+
+def test_referer_or_cookie_media_uses_proxy(monkeypatch):
+    for header in ({"Referer": "https://www.youtube.com/"},
+                   {"Cookie": "session=test"}):
+        seen = []
+        _install(monkeypatch, proxy=lambda u, *a, **k: (
+            seen.append(u) or "P:" + u))
+        ep.open_with_player("https://cdn.example.com/video.mp4",
+                            headers=header)
+        assert seen == ["https://cdn.example.com/video.mp4"]
+
+
+def test_force_proxy_without_headers_uses_proxy(monkeypatch):
+    seen = []
+    procs = _install(monkeypatch, proxy=lambda u, *a, **k: (
+        seen.append((u, k.get("force_proxy"))) or "P:" + u))
+    video = "https://cdn.example.com/video.mp4"
+    audio = "https://cdn.example.com/audio.m4a"
+    ep.open_with_player(video, audio=audio, force_proxy=True)
+    assert seen == [(video, True), (audio, True)]
+    assert procs[0].args[-2:] == ["P:" + video, ":input-slave=P:" + audio]
+
+
+def test_lowercase_user_agent_keeps_video_and_audio_direct(monkeypatch):
+    seen = []
+    procs = _install(monkeypatch, proxy=lambda u, *a, **k: (
+        seen.append(u) or "P:" + u))
+    video = "https://video.googlevideo.com/videoplayback?id=video&sig=test"
+    audio = "https://audio.googlevideo.com/videoplayback?id=audio&sig=test"
+    ep.open_with_player(video, audio=audio,
+                        headers={"user-agent": "Mozilla/5.0"})
+    assert seen == []
+    assert procs[0].args[-2:] == [video, ":input-slave=" + audio]
+
+
+def test_user_agent_parameter_keeps_series_direct(monkeypatch):
+    seen = []
+    procs = _install(monkeypatch, proxy=lambda u, *a, **k: (
+        seen.append(u) or "P:" + u))
+    episodes = [("https://cdn.example.com/one.mp4", "", "One"),
+                ("https://cdn.example.com/two.mp4", "", "Two")]
+    ep.open_with_player(episodes[1][0], episodes=episodes, start_idx=1,
+                        user_agent="Mozilla/5.0")
+    assert seen == []
+    assert procs[0].args[-2:] == [episodes[0][0] + "#One",
+                                 episodes[1][0] + "#Two"]
+    assert "--no-playlist-autostart" in procs[0].args
+
+
+def test_lowercase_protected_headers_preserved_for_video_and_audio(monkeypatch):
+    for name in ("referer", "cookie"):
+        seen = []
+        procs = _install(monkeypatch, proxy=lambda u, headers, **kw: (
+            seen.append((u, dict(headers), kw)) or "P:" + u))
+        headers = {name: "test-value", "User-Agent": "Mozilla/5.0"}
+        video = "https://cdn.example.com/video.mp4"
+        audio = "https://cdn.example.com/audio.m4a"
+        ep.open_with_player(video, audio=audio, headers=headers)
+        assert seen == [(u, headers, {"ad_block": None, "force_proxy": False})
+                        for u in (video, audio)]
+        assert procs[0].args[-2:] == ["P:" + video, ":input-slave=P:" + audio]
+
+
+def test_user_agent_only_hls_preserves_ad_filter_and_lease(monkeypatch):
+    events = []
+    procs = _install(monkeypatch)
+    monkeypatch.setattr(ep, "_acquire_proxy_lease",
+                        lambda: events.append("lease") or "HLS")
+    monkeypatch.setattr(ep, "proxy_url_for", lambda u, headers, **kw: (
+        events.append((u, dict(headers), kw)) or "P:" + u))
+    video = "https://cdn.example.com/index.m3u8?token=test"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    ad_block = {"enabled": True, "url_patterns": ["/ads/"]}
+    ep.open_with_player(video, headers=headers, ad_block=ad_block)
+    assert events == ["lease", (video, headers,
+                               {"ad_block": ad_block, "force_proxy": False})]
+    assert procs[0].args[-1] == "P:" + video
+    assert ep._lease_id == "HLS"
+
+
+def test_force_proxy_with_user_agent_preserved_for_every_series_item(monkeypatch):
+    seen = []
+    procs = _install(monkeypatch, proxy=lambda u, headers, **kw: (
+        seen.append((u, dict(headers), kw["force_proxy"])) or "P:" + u))
+    episodes = [("https://cdn.example.com/one.mp4", "", "One"),
+                ("https://cdn.example.com/two.mp4", "", "Two")]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    ep.open_with_player(episodes[0][0], episodes=episodes, headers=headers,
+                        force_proxy=True)
+    assert seen == [(u, headers, True)
+                    for u in (episodes[0][0], episodes[0][0], episodes[1][0])]
+    assert procs[0].args[-2:] == ["P:" + episodes[0][0] + "#One",
+                                 "P:" + episodes[1][0] + "#Two"]
+
+
 # ---------------------------------------------------------------------- #
 # 启动握手：playlist.json → {集下标: vlc_id} + 非首集 pl_play 定位
 # ---------------------------------------------------------------------- #
@@ -889,7 +997,7 @@ def test_open_releases_lease_when_popen_fails(monkeypatch):
                             OSError("popen failed")))
     msg = ep.open_with_player("https://cdn.example.com/hls/a.m3u8")
     assert msg == "已在浏览器中打开"
-    assert opened == ["https://cdn.example.com/hls/a.m3u8"]
+    assert opened == ["P:https://cdn.example.com/hls/a.m3u8"]
     assert watched == []          # 没有进程 → 不起看守线程
     assert released == ["LF"]     # 但租约必须已释放
     assert ep._lease_id == ""

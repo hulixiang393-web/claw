@@ -10,22 +10,29 @@
 
 from __future__ import annotations
 
+from html import escape
 import hashlib
 import re
 import time
+import webbrowser
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject, QUrl
+from PySide6.QtGui import QKeySequence, QShortcut, QTextDocument
 from PySide6.QtWidgets import (
     QHBoxLayout,
+    QVBoxLayout,
     QLabel,
+    QTextBrowser,
     QListWidget,
     QListWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QSizePolicy,
     QPushButton,
     QScrollArea,
     QSlider,
     QToolButton,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -57,9 +64,16 @@ class NovelView(QWidget):
         self._prefetch_ahead = 1
         self._prefetch_behind = 0
         self._load_generation = 0
+        self._image_generation = 0
+        self._show_images = True
+        self._cached_image_urls = []
+        self._bookstack_image_pixmaps = {}
+        self._current_chapter_url = ""
         self._toc_generation = 0
         self._toc_next_index = 0
         self._toc_batch_size = 200
+        self._toc_stack = []
+        self._toc_items = []
         self._toc_timer = QTimer(self)
         self._toc_timer.setInterval(0)
         self._toc_timer.timeout.connect(lambda: self._append_toc_batch(self._toc_generation))
@@ -152,6 +166,16 @@ class NovelView(QWidget):
         self.toc_list.setVisible(False)
         body.addWidget(self.toc_list)
 
+        self.toc_tree = QTreeWidget()
+        self.toc_tree.setHeaderHidden(True)
+        self.toc_tree.setWordWrap(True)
+        self.toc_tree.setMinimumWidth(240)
+        self.toc_tree.setMaximumWidth(280)
+        self.toc_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.toc_tree.itemClicked.connect(self._on_toc_clicked)
+        self.toc_tree.setVisible(False)
+        body.addWidget(self.toc_tree)
+
         # 正文区：滚动模式 + 翻页模式，用 QStackedWidget 切换
         from PySide6.QtWidgets import QStackedWidget, QTextEdit
 
@@ -161,12 +185,32 @@ class NovelView(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_body = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_body)
+        self.scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_layout.setSpacing(8)
         self.text = QLabel()
         self.text.setObjectName("readerBody")
         self.text.setWordWrap(True)
         self.text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.scroll.setWidget(self.text)
+        self._rich_body = QTextBrowser()
+        self._rich_body.setObjectName("bookstackBody")
+        self._rich_body.setMinimumWidth(0)
+        self._rich_body.setMaximumWidth(960)
+        self._rich_body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self._rich_body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._rich_body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._rich_body.setOpenExternalLinks(False)
+        self._rich_body.setOpenLinks(False)
+        self._rich_body.anchorClicked.connect(self._on_rich_anchor_clicked)
+        self._rich_body.setReadOnly(True)
+        self._rich_body.setVisible(False)
+        self.scroll_layout.addWidget(self.text)
+        self.scroll_layout.addWidget(self._rich_body)
+        self.scroll_layout.setAlignment(self._rich_body, Qt.AlignHCenter)
+        self.scroll_layout.addStretch(1)
+        self.scroll.setWidget(self.scroll_body)
         self.body_stack.addWidget(self.scroll)
 
         # -- 翻页模式 --
@@ -290,7 +334,12 @@ class NovelView(QWidget):
         generation = self._toc_generation
         self._toc_timer.stop()
         self.toc_list.clear()
+        self.toc_tree.clear()
+        self._toc_stack = []
+        self._toc_items = []
         self._toc_next_index = 0
+        self.toc_list.setVisible(False)
+        self.toc_tree.setVisible(False)
         self._append_toc_batch(generation)
 
     def _append_toc_batch(self, generation: int) -> None:
@@ -298,17 +347,37 @@ class NovelView(QWidget):
             return
         start = self._toc_next_index
         end = min(start + self._toc_batch_size, len(self._chapters))
+        is_bookstack = getattr(self._source, "source_id", "") == "bookstack"
         for i in range(start, end):
             ch = self._chapters[i]
-            item = QListWidgetItem(ch.title or f"第{i+1}章")
-            item.setData(Qt.UserRole, i)
-            self.toc_list.addItem(item)
+            depth = max(0, int(getattr(ch, "depth", 0) or 0))
+            title = ch.title or f"第{i+1}章"
+            if is_bookstack:
+                while len(self._toc_stack) > depth:
+                    self._toc_stack.pop()
+                parent = self._toc_stack[-1] if self._toc_stack and depth else None
+                item = QTreeWidgetItem([title])
+                item.setData(0, Qt.UserRole, i)
+                if parent is None:
+                    self.toc_tree.addTopLevelItem(item)
+                else:
+                    parent.addChild(item)
+                self._toc_stack.append(item)
+                self._toc_items.append(item)
+            else:
+                item = QListWidgetItem(title)
+                item.setData(Qt.UserRole, i)
+                item.setData(Qt.UserRole + 1, depth)
+                self.toc_list.addItem(item)
         self._toc_next_index = end
         if end < len(self._chapters):
             self._toc_timer.start()
         else:
             self._toc_timer.stop()
-            if 0 <= self._current_idx < self.toc_list.count():
+            if getattr(self._source, "source_id", "") == "bookstack":
+                if 0 <= self._current_idx < len(self._toc_items):
+                    self.toc_tree.setCurrentItem(self._toc_items[self._current_idx])
+            elif 0 <= self._current_idx < self.toc_list.count():
                 self.toc_list.setCurrentRow(self._current_idx)
 
     def _load_chapter(self, idx: int, scroll_to_end: bool = False) -> None:
@@ -320,8 +389,13 @@ class NovelView(QWidget):
         if self._source is None or not (0 <= idx < len(self._chapters)):
             return
         self._stop_auto_scroll()
+        self._image_generation += 1
+        self._clear_images()
         self._current_idx = idx
-        if idx < self.toc_list.count():
+        if getattr(self._source, "source_id", "") == "bookstack":
+            if 0 <= idx < len(self._toc_items):
+                self.toc_tree.setCurrentItem(self._toc_items[idx])
+        elif idx < self.toc_list.count():
             self.toc_list.setCurrentRow(idx)
         ch = self._chapters[idx]
 
@@ -330,18 +404,21 @@ class NovelView(QWidget):
 
         # 已缓存 → 直接显示
         if hasattr(ch, "_cached_text") and ch._cached_text:
-            self._auto_loading = False  # 缓存命中也要解除翻页边界跳章锁
-            self._auto_prev_loading = False
-            self._display_chapter(ch, ch._cached_text, scroll_to_end)
-            self._update_progress()
-            self.chapter_changed.emit((self._detail, ch.title, ch.url))
-            return
+            if self._show_images and not getattr(ch, "_images_attempted", False):
+                self.text.setText("正在加载...")
+            else:
+                self._auto_loading = False
+                self._auto_prev_loading = False
+                self._display_chapter(ch, ch._cached_text, scroll_to_end)
+                self._update_progress()
+                self.chapter_changed.emit((self._detail, ch.title, ch.url))
+                return
 
         self.text.setText("正在加载...")
         # 后台加载（信号跨线程安全）
         from PySide6.QtCore import QThreadPool
 
-        task = _LoadChapterTask(self._content, self._source, ch)
+        task = _LoadChapterTask(self._content, self._source, ch, load_images=self._show_images)
         generation = self._load_generation
         task.signals.finished.connect(
             lambda loaded_ch, text, err, g=generation: self._on_chapter_loaded(loaded_ch, text, err, g)
@@ -355,9 +432,60 @@ class NovelView(QWidget):
         from framework.content import chapter_label
         label = chapter_label(ch.title) or f"第{self._current_idx + 1}章"
         full = f"【{label}】\n\n{text}"
-        self.text.setText(full)
+        self._current_chapter_url = ch.url
+        rich = getattr(ch, "_cached_rich_content", None)
+        self._clear_images()
+        self._bookstack_image_pixmaps.clear()
+        if getattr(self._source, "source_id", "") == "bookstack":
+            self._rich_body.setMaximumWidth(960)
+        else:
+            self.scroll_body.setStyleSheet("")
+            self._rich_body.setStyleSheet("")
+            self._rich_body.setMinimumHeight(0)
+            self._rich_body.setMaximumWidth(16777215)
+        if rich is not None and getattr(self._source, "source_id", "") == "bookstack":
+            render_generation = self._load_generation
+            self.text.setText("正在渲染正文...")
+            self.text.setVisible(True)
+            self._rich_body.setVisible(False)
+            QTimer.singleShot(
+                0,
+                lambda c=ch, l=label, r=rich, g=render_generation: self._render_bookstack_body(c, l, r, g),
+            )
+        else:
+            self.text.setText(full)
+            self.text.setMinimumHeight(self.text.sizeHint().height())
+            self._rich_body.setVisible(False)
+        entries = getattr(ch, "_cached_image_urls", []) or []
+        if rich is not None:
+            entries = [{"type": "image", "url": url} for url in getattr(rich, "image_urls", [])]
+        fragments = []
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("type") in ("text", "image"):
+                fragments.append(entry)
+            elif isinstance(entry, dict) and isinstance(entry.get("url"), str):
+                fragments.append({"type": "image", "url": entry["url"]})
+            elif isinstance(entry, str) and entry:
+                fragments.append({"type": "image", "url": entry})
+        if self._mode == "scroll" and self._show_images and fragments:
+            self.text.setVisible(False)
+            generation = self._image_generation
+            for fragment in fragments:
+                if fragment.get("type") == "text":
+                    segment = QLabel(str(fragment.get("text") or ""))
+                    segment.setObjectName("readerBody")
+                    segment.setWordWrap(True)
+                    segment.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                    self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, segment)
+                else:
+                    image_url = fragment.get("url")
+                    if isinstance(image_url, str) and image_url:
+                        self._load_image(image_url, generation, self._load_generation)
+        else:
+            self.text.setVisible(True)
         # 翻页视图同步（分页结果按章缓存，避免反复全量切分长文）
         self._paged_full_text = full
+        self.scroll_body.adjustSize()
         self._repaginate()
         if scroll_to_end:
             self._pager_show_page(self._page_count - 1)  # 定位到本章最后一页
@@ -375,10 +503,9 @@ class NovelView(QWidget):
             vbar.blockSignals(True)
             vbar.setValue(0)
             vbar.blockSignals(False)
-        # 后台预加载下一章：翻章时命中缓存秒开，不用现场等网络
-        self._prefetch_next(self._current_idx)
-        # 向前缓存：预取本章之前 3 章，向上翻章命中缓存秒开
-        self._prefetch_prev(self._current_idx)
+        if getattr(self._source, "source_id", "") != "bookstack":
+            self._prefetch_next(self._current_idx)
+            self._prefetch_prev(self._current_idx)
         # 续读定位：首章显示后恢复到上次的章内位置（页索引/滚动比例）
         if self._pending_restore is not None:
             pending = self._pending_restore
@@ -397,6 +524,118 @@ class NovelView(QWidget):
             QTimer.singleShot(0, self._emit_position)
         # 更新自动滚动滑块状态（根据模式和滚动范围）
         QTimer.singleShot(0, self._update_auto_scroll_slider_state)
+
+    def _render_bookstack_body(self, chapter, label, rich, generation) -> None:
+        if (
+            generation != self._load_generation
+            or not (0 <= self._current_idx < len(self._chapters))
+            or chapter is not self._chapters[self._current_idx]
+            or getattr(self._source, "source_id", "") != "bookstack"
+        ):
+            return
+        self._rich_body.setUpdatesEnabled(False)
+        try:
+            self._rich_body.setHtml(self._bookstack_html(label, rich.body_html))
+            self._apply_bookstack_style()
+        finally:
+            self._rich_body.setUpdatesEnabled(True)
+        self.text.setVisible(False)
+        self._rich_body.setVisible(True)
+        self._resize_bookstack_body()
+        self.scroll_body.adjustSize()
+
+    def _bookstack_html(self, label: str, body_html: str) -> str:
+        source_name = escape(str(getattr(self._source, "source_name", "BookStack") or "BookStack"))
+        detail_title = escape(str(getattr(self._detail, "title", "") or "当前文档"))
+        chapter_title = escape(str(label or "当前章节"))
+        return (
+            '<div class="bookstack-reader">'
+            f'<div class="bookstack-title">{chapter_title}</div>'
+            f'<div class="bookstack-meta">来源：{source_name}&nbsp;&middot;&nbsp;{detail_title}</div>'
+            f'<div class="markdown-body">{body_html}</div>'
+            '</div>'
+        )
+
+    def _bookstack_css(self) -> str:
+        size = self._clamp_font(self._base_font + self._font_delta)
+        return f"""
+            body {{ margin: 0; background: transparent; color: #222222; }}
+            .bookstack-reader {{ color: #222222; font-family: \"Segoe UI\", \"Microsoft YaHei\", sans-serif; }}
+            .bookstack-title {{ margin: 0 0 18px; color: #262626; font-size: 30px; font-weight: 700; line-height: 1.35; text-align: center; }}
+            .bookstack-meta {{ margin: 0 0 28px; padding: 0 0 14px; border-bottom: 1px dashed #d7d7d7; color: #666666; font-size: 12px; line-height: 1.5; text-align: center; }}
+            .markdown-body {{ color: #222222; font-size: {size}px; line-height: 1.8; }}
+            .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {{ color: #1f1f1f; font-weight: 700; line-height: 1.4; }}
+            .markdown-body h1 {{ margin: 30px 0 18px; font-size: 26px; }}
+            .markdown-body h2 {{ margin: 28px 0 16px; font-size: 22px; }}
+            .markdown-body h3 {{ margin: 24px 0 12px; font-size: 19px; }}
+            .markdown-body h4 {{ margin: 20px 0 10px; font-size: 17px; }}
+            .markdown-body p {{ margin: 0 0 16px; color: #222222; text-align: justify; }}
+            .markdown-body li {{ margin: 0 0 7px; color: #222222; }}
+            .markdown-body a {{ color: #315f9b; text-decoration: underline; }}
+            .markdown-body blockquote {{ margin: 18px 0; padding: 10px 16px; border-left: 4px solid #b8c2d1; background: #f6f7f8; color: #3b3b3b; }}
+            .markdown-body pre {{ margin: 18px 0; padding: 14px 16px; background: #f3f4f5; color: #202020; white-space: pre-wrap; }}
+            .markdown-body code {{ color: #242424; background: #f1f2f3; }}
+            .markdown-body table {{ border-collapse: collapse; margin: 18px 0; }}
+            .markdown-body th, .markdown-body td {{ padding: 8px 10px; border: 1px solid #d8d8d8; color: #222222; }}
+            .markdown-body img {{ display: block; max-width: 100%; height: auto; margin: 20px auto; border-radius: 4px; }}
+        """
+
+    def _apply_bookstack_style(self) -> None:
+        if getattr(self._source, "source_id", "") != "bookstack":
+            return
+        width = self._rich_body.width()
+        side_padding = 50 if width >= 760 else 28 if width >= 560 else 16
+        outer_bg = self._reading_bg or "#f4f5f7"
+        self.scroll_body.setStyleSheet(f"background-color: {outer_bg};")
+        self._rich_body.setStyleSheet(
+            "QTextBrowser#bookstackBody {"
+            "background-color: #ffffff;"
+            "color: #222222;"
+            "border: 1px solid #e4e4e4;"
+            "border-radius: 8px;"
+            f"padding: 30px {side_padding}px;"
+            "}"
+        )
+        document = self._rich_body.document()
+        document.setDefaultStyleSheet(self._bookstack_css())
+        document.setDocumentMargin(0)
+        document.adjustSize()
+
+    def _resize_bookstack_body(self) -> None:
+        if getattr(self._source, "source_id", "") != "bookstack":
+            return
+        document = self._rich_body.document()
+        document.adjustSize()
+        height = max(120, int(document.size().height()) + 60)
+        self._rich_body.setMinimumHeight(height)
+        self._rich_body.updateGeometry()
+
+    def _bookstack_image_width(self) -> int:
+        width = self._rich_body.width()
+        side_padding = 50 if width >= 760 else 28 if width >= 560 else 16
+        return max(120, width - side_padding * 2 - 2)
+
+    def _apply_bookstack_image_resources(self) -> None:
+        if getattr(self._source, "source_id", "") != "bookstack":
+            return
+        width = self._bookstack_image_width()
+        document = self._rich_body.document()
+        for url, pixmap in self._bookstack_image_pixmaps.items():
+            scaled = pixmap
+            if pixmap.width() > width:
+                scaled = pixmap.scaledToWidth(width, Qt.SmoothTransformation)
+            document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(url), scaled)
+        if self._bookstack_image_pixmaps:
+            document.markContentsDirty(0, document.characterCount())
+            document.adjustSize()
+            self._resize_bookstack_body()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if getattr(self._source, "source_id", "") == "bookstack" and self._rich_body.isVisible():
+            QTimer.singleShot(0, self._apply_bookstack_style)
+            QTimer.singleShot(0, self._apply_bookstack_image_resources)
+            QTimer.singleShot(0, self._resize_bookstack_body)
 
     @staticmethod
     def _normalize_anchor_text(text: str) -> str:
@@ -496,6 +735,89 @@ class NovelView(QWidget):
         vbar.setValue(vbar.maximum())
         vbar.blockSignals(False)
 
+    def _clear_images(self) -> None:
+        self._bookstack_image_pixmaps.clear()
+        keep = {self.text, self._rich_body}
+        while self.scroll_layout.count() > 1:
+            item = self.scroll_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None and widget not in keep:
+                widget.deleteLater()
+        if self.scroll_layout.indexOf(self.text) < 0:
+            self.scroll_layout.insertWidget(0, self.text)
+        if self.scroll_layout.indexOf(self._rich_body) < 0:
+            self.scroll_layout.insertWidget(1, self._rich_body)
+        self.text.setVisible(True)
+        self._rich_body.setVisible(False)
+
+    def set_show_images(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._show_images:
+            return
+        self._show_images = enabled
+        self._image_generation += 1
+        if getattr(self._source, "source_id", "") == "bookstack":
+            self._bookstack_image_pixmaps.clear()
+            chapter = self._chapters[self._current_idx] if 0 <= self._current_idx < len(self._chapters) else None
+            has_rich_body = chapter is not None and getattr(chapter, "_cached_rich_content", None) is not None
+            self._rich_body.setVisible(has_rich_body)
+            self.text.setVisible(not has_rich_body)
+            if not enabled:
+                return
+        else:
+            self._clear_images()
+        if self._mode == "scroll" and 0 <= self._current_idx < len(self._chapters):
+            ch = self._chapters[self._current_idx]
+            entries = getattr(ch, "_cached_image_urls", []) or []
+            for entry in entries:
+                image_url = entry.get("url", "") if isinstance(entry, dict) else entry
+                if image_url:
+                    self._load_image(image_url, self._image_generation, self._load_generation)
+
+    def _load_image(self, image_url, image_generation, load_generation):
+        if not self._show_images or image_generation != self._image_generation or load_generation != self._load_generation:
+            return False
+        from gui.components.cover_loader import CoverLoader
+        if getattr(self._source, "source_id", "") != "bookstack" and not self._rich_body.isVisible():
+            label = QLabel("加载中...")
+            label.setAlignment(Qt.AlignCenter)
+            label.setProperty("image_url", image_url)
+            self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, label)
+        CoverLoader.instance().load(
+            image_url,
+            lambda pixmap, url=image_url, ig=image_generation, lg=load_generation: self._on_image_loaded(url, ig, lg, pixmap),
+            referer=self._current_chapter_url or None,
+            cache=False,
+            persist=False,
+            source_id=getattr(self._source, "source_id", ""),
+            source=self._source,
+        )
+        return True
+
+    def _on_image_loaded(self, image_url, image_generation, load_generation, pixmap=None):
+        if not self._show_images or image_generation != self._image_generation or load_generation != self._load_generation:
+            return False
+        if pixmap is None:
+            for i in range(self.scroll_layout.count()):
+                widget = self.scroll_layout.itemAt(i).widget()
+                if widget is not None and widget.property("image_url") == image_url:
+                    widget.deleteLater()
+                    self.scroll_layout.takeAt(i)
+                    break
+            return False
+        if getattr(self._source, "source_id", "") == "bookstack":
+            self._bookstack_image_pixmaps[image_url] = pixmap
+            self._apply_bookstack_image_resources()
+            self._rich_body.updateGeometry()
+            self.scroll_body.adjustSize()
+            return True
+        for i in range(self.scroll_layout.count()):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if widget is not None and widget.property("image_url") == image_url:
+                widget.setPixmap(pixmap.scaledToWidth(max(100, self.scroll.width() - 20), Qt.SmoothTransformation))
+                return True
+        return False
+
     def _on_chapter_loaded(self, ch, text, err, generation=None) -> None:
         if generation is not None and generation != self._load_generation:
             return
@@ -505,6 +827,9 @@ class NovelView(QWidget):
             self.text.setText(f"加载失败：{err}")
             return
         ch._cached_text = text
+        if not hasattr(ch, "_cached_image_urls"):
+            ch._cached_image_urls = []
+        ch._images_attempted = True
         self._auto_loading = False  # 翻页边界跳章完成，解除锁定
         self._auto_prev_loading = False
         if self._current_idx >= 0 and ch.url == self._chapters[self._current_idx].url:
@@ -514,11 +839,59 @@ class NovelView(QWidget):
 
     # ------------------------------------------------------------------ #
     def _toggle_toc(self) -> None:
-        self.toc_list.setVisible(not self.toc_list.isVisible())
+        toc = self.toc_tree if getattr(self._source, "source_id", "") == "bookstack" else self.toc_list
+        toc.setVisible(not toc.isVisible())
 
-    def _on_toc_clicked(self, item) -> None:
-        idx = item.data(Qt.UserRole)
-        self._load_chapter(idx)
+    def _find_chapter_index(self, url: str) -> int:
+        target = str(url or "")
+        base_url = ""
+        if 0 <= self._current_idx < len(self._chapters):
+            base_url = str(getattr(self._chapters[self._current_idx], "url", "") or "")
+        if not base_url:
+            base_url = str(getattr(self._source, "base_url", "") or "")
+        if base_url:
+            target = urljoin(base_url, target)
+        target_parts = urlsplit(target)
+        target = urlunsplit((target_parts.scheme, target_parts.netloc, target_parts.path, target_parts.query, "")).rstrip("/")
+        for index, chapter in enumerate(self._chapters):
+            chapter_url = str(getattr(chapter, "url", "") or "")
+            parts = urlsplit(chapter_url)
+            chapter_url = urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, "")).rstrip("/")
+            if chapter_url == target:
+                return index
+        return -1
+
+    def _on_rich_anchor_clicked(self, url: QUrl) -> None:
+        target = url.toString()
+        if target.startswith("#"):
+            self._rich_body.scrollToAnchor(target[1:])
+            return
+        target_url = target
+        if getattr(self._source, "source_id", "") == "bookstack":
+            index = self._find_chapter_index(target)
+            if index >= 0:
+                self._load_chapter(index)
+                return
+            base_url = ""
+            if 0 <= self._current_idx < len(self._chapters):
+                base_url = str(getattr(self._chapters[self._current_idx], "url", "") or "")
+            if not base_url:
+                base_url = str(getattr(self._source, "base_url", "") or "")
+            if base_url:
+                target_url = urljoin(base_url, target)
+        scheme = urlsplit(target_url).scheme.lower()
+        if scheme not in {"http", "https"}:
+            return
+        webbrowser.open(target_url)
+
+    def _on_toc_clicked(self, item, column=0) -> None:
+        if isinstance(item, QTreeWidgetItem):
+            if item.childCount() > 0:
+                return
+            role = item.data(0, Qt.UserRole)
+        else:
+            role = item.data(Qt.UserRole)
+        self._load_chapter(int(role))
 
     def _jump_relative(self, delta: int) -> None:
         nxt = self._current_idx + delta
@@ -637,11 +1010,14 @@ class NovelView(QWidget):
         bg_css = f" background-color: {bg};" if bg else " background: transparent;"
         fg_css = f" color: {self._reading_fg};" if self._reading_fg else ""
         self.text.setStyleSheet(
-            f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;{bg_css}{fg_css}"
+            f"font-size: {size}px; line-height: 1.55; padding: 6px 10px;{bg_css}{fg_css}"
         )
         self.paged_label.setStyleSheet(
             f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;{bg_css}{fg_css}"
         )
+        if getattr(self._source, "source_id", "") == "bookstack":
+            self._apply_bookstack_style()
+            self._resize_bookstack_body()
         self._repaginate()
         self._pager_show_page(self._current_page)
 
@@ -864,7 +1240,7 @@ class NovelView(QWidget):
         if not (0 <= k < len(self._chapters)):
             return
         self._prefetch_idx = k
-        task = _LoadChapterTask(self._content, self._source, self._chapters[k])
+        task = _LoadChapterTask(self._content, self._source, self._chapters[k], load_images=self._show_images)
         generation = self._load_generation
         task.signals.finished.connect(
             lambda ch, text, err, g=generation: self._on_prefetch_done(ch, text, err, g)
@@ -910,7 +1286,7 @@ class NovelView(QWidget):
         ch = self._chapters[k]
         from PySide6.QtCore import QThreadPool
 
-        task = _LoadChapterTask(self._content, self._source, ch)
+        task = _LoadChapterTask(self._content, self._source, ch, load_images=self._show_images)
         generation = self._load_generation
         task.signals.finished.connect(
             lambda loaded_ch, text, err, g=generation: self._on_prev_prefetch_done(loaded_ch, text, err, g)
@@ -939,17 +1315,40 @@ class _LoadChapterSignals(QObject):
 class _LoadChapterTask(QRunnable):
     """后台加载章节正文（信号跨线程安全）。"""
 
-    def __init__(self, content, source, chapter):
+    def __init__(self, content, source, chapter, load_images=False):
         super().__init__()
         self.signals = _LoadChapterSignals()
         self._content = content
         self._source = source
         self._chapter = chapter
+        self._load_images = bool(load_images)
 
     def run(self) -> None:
         text, err = "", None
         try:
-            text = self._content.fetch_chapter(self._source, self._chapter.url)
+            if (
+                getattr(self._source, "source_id", "") == "bookstack"
+                and hasattr(self._content, "fetch_bookstack_chapter")
+            ):
+                rich = self._content.fetch_bookstack_chapter(self._source, self._chapter.url)
+                self._chapter._cached_rich_content = rich
+                self._chapter._cached_image_urls = [
+                    {"type": "image", "url": url} for url in rich.image_urls
+                ]
+                text = rich.text
+                self._chapter._cached_text = text
+                self._chapter._images_attempted = True
+            elif self._load_images and hasattr(self._content, "fetch_chapter_with_images"):
+                try:
+                    text, self._chapter._cached_image_urls = self._content.fetch_chapter_with_images(
+                        self._source, self._chapter.url
+                    )
+                    self._chapter._images_attempted = True
+                except (AttributeError, NotImplementedError, TypeError):
+                    text = self._content.fetch_chapter(self._source, self._chapter.url)
+                    self._chapter._images_attempted = True
+            else:
+                text = self._content.fetch_chapter(self._source, self._chapter.url)
         except Exception as exc:
             err = str(exc)
         try:

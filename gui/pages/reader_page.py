@@ -154,6 +154,8 @@ class ReaderPage(BasePage):
         # ---- 四视图切换 ----
         self.stack = QStackedWidget()
         self.novel_view = NovelView(content, font_scale=self._font_scale)
+        if settings is not None:
+            self.novel_view.set_show_images(bool(settings.get("reader", "show_images", True)))
         self.comic_view = ComicView(content)
         self.comic_view.set_cache_policy(lambda: self._comic_cache_allowed())
         self.video_view = VideoView(content, search=self._search)
@@ -476,6 +478,9 @@ class ReaderPage(BasePage):
             setter = getattr(view, "set_prefetch_config", None)
             if setter is not None:
                 setter(cfg["enabled"], cfg["ahead"], cfg["behind"])
+            if content_type == "novel":
+                self.novel_view.set_show_images(bool(self.settings.get("reader", "show_images", True)))
+
         # 后台预加载当前章+后 3 章正文到 Redis 缓存（小说/漫画，视频除外）。
         # 不阻塞渲染：ReaderPage 已离开_LoadDetailTask 后台线程，此处起独立 QRunnable。
         if content_type in ("novel", "comic"):

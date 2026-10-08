@@ -43,6 +43,34 @@ class _ScanSignals(QObject):
     done = Signal(object)  # list[dict]（ShelfItem.to_rec）
 
 
+class _DetailLoadSignals(QObject):
+    finished = Signal(object, object, object, object)
+
+
+class _DetailLoadTask(QRunnable):
+    def __init__(self, content, source, request_key, generation):
+        super().__init__()
+        self.signals = _DetailLoadSignals()
+        self._content = content
+        self._source = source
+        self._request_key = request_key
+        self._generation = generation
+
+    def run(self) -> None:
+        detail = None
+        error = None
+        try:
+            detail = self._content.fetch_detail(self._source, self._request_key[1])
+        except Exception as exc:
+            error = exc
+        try:
+            self.signals.finished.emit(
+                self._request_key, detail, error, self._generation
+            )
+        except RuntimeError:
+            pass
+
+
 class _ScanTask(QRunnable):
     """后台书架扫描：目录遍历 + 类型检测 + 合并去重全部在 worker 线程。"""
 
@@ -331,6 +359,8 @@ class LibraryPage(BasePage):
         self._reading_progress = reading_progress
         self._shelf_cache_repository = shelf_cache_repository
         self._precache_jobs: dict[str, object] = {}
+        self._detail_inflight: dict[tuple[str, str], object] = {}
+        self._detail_generation = 0
         self._cards_by_key: dict[str, _ShelfCard] = {}
         self._batch_selected: dict[str, dict] = {}
         self._unlocked: set[str] = set()
@@ -1539,12 +1569,45 @@ class LibraryPage(BasePage):
                 self.open_epub_requested.emit(rec["path"])
         elif rec.get("url"):
             content_type = rec.get("content_type", "") or ""
+            source_id = rec.get("source_id", "")
             if not content_type and self._source_manager is not None:
-                source = self._source_manager.get(rec.get("source_id", ""))
+                try:
+                    source = self._source_manager.get(source_id)
+                except Exception:
+                    return
                 content_type = getattr(source, "content_type", "") if source else ""
-            self.open_online_requested.emit(
-                (rec.get("source_id", ""), rec.get("url", ""), content_type)
+            self._load_online_detail(source_id, rec.get("url", ""), content_type)
+
+    def _load_online_detail(self, source_id: str, url: str, content_type: str) -> None:
+        try:
+            source = self._source_manager.get(source_id) if self._source_manager else None
+        except Exception:
+            return
+        if self._content is None or source is None:
+            return
+        request_key = (source_id, url)
+        if request_key in self._detail_inflight:
+            return
+        self._detail_generation += 1
+        generation = self._detail_generation
+        task = _DetailLoadTask(self._content, source, request_key, generation)
+        task.signals.finished.connect(
+            lambda key, detail, error, gen: self._on_detail_loaded(
+                key, detail, error, gen, content_type
             )
+        )
+        self._detail_inflight[request_key] = task
+        QThreadPool.globalInstance().start(task)
+
+    def _on_detail_loaded(
+        self, request_key, detail, error, generation, content_type: str
+    ) -> None:
+        self._detail_inflight.pop(request_key, None)
+        if error is not None or detail is None or generation != self._detail_generation:
+            return
+        self.open_online_requested.emit(
+            (request_key[0], request_key[1], content_type)
+        )
 
     def _pick_epub(self, rec: dict) -> None:
         """多本 epub：弹下拉框选一本读（同视频选集模式）。"""

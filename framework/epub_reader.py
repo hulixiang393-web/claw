@@ -42,35 +42,52 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
-def split_single_document(html: str) -> list[tuple[str, str, list]]:
-    """把合并单文档按 `<h1>标题</h1>` 拆成 [(title, text, img_srcs), ...]。
+def _ordered_parts(html: str) -> list[tuple[str, str]]:
+    parts: list[tuple[str, str]] = []
+    for block in re.split(r"(<img\b[^>]*>)", html or "", flags=re.IGNORECASE):
+        if re.match(r"<img\b", block or "", flags=re.IGNORECASE):
+            src = re.search(r"\bsrc=[\"']([^\"']+)", block, flags=re.IGNORECASE)
+            if src and src.group(1):
+                parts.append(("image", src.group(1)))
+            continue
+        text = _html_to_text(block)
+        if text:
+            for segment in text.split("\n"):
+                if segment.strip():
+                    parts.append(("text", segment.strip()))
+    return parts
 
-    每段：漫画（含 <img>）→ img_srcs 记录图片 zip 名（字节渲染时懒读）；
-    否则 text = 该段纯文本。首个 h1 之前的内容（前言/简介）并入首段。
-    """
-    # 找所有 <h1 ...>标题</h1>，记录标题与内容起点
+
+def split_single_document(html: str, include_parts: bool = False) -> list[tuple]:
+    """把合并单文档按 `<h1>标题</h1>` 拆成章节。"""
+    # 找所有 <h1 ...>标题</h1>，记录标题结束位置与下一标题起点
     marks: list[tuple[int, int, str]] = []  # (content_start, next_start, title)
-    for m in re.finditer(r"<h1[^>]*>(.*?)</h1>", html or "", flags=re.IGNORECASE | re.DOTALL):
-        title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
-        marks.append((m.end(), -1, title))
-    for i in range(len(marks)):
-        nxt = marks[i + 1][0] if i + 1 < len(marks) else len(html)
-        marks[i] = (marks[i][0], nxt, marks[i][2])
+    headings = list(re.finditer(r"<h1[^>]*>(.*?)</h1>", html or "", flags=re.IGNORECASE | re.DOTALL))
+    for i, match in enumerate(headings):
+        title = re.sub(r"<[^>]+>", "", match.group(1)).strip()
+        next_start = headings[i + 1].start() if i + 1 < len(headings) else len(html)
+        marks.append((match.end(), next_start, title))
     if not marks:
         return []  # 无 h1 → 非分章文档，由调用方按整章处理
     # 首个 h1 前的内容（前言）并入第一段
     first = marks[0]
-    prefix = html[: first[0]]
+    first_h1 = headings[0] if headings else None
+    prefix = html[: first_h1.start()] if first_h1 else ""
     marks[0] = (0, first[1], first[2]) if prefix.strip() else first
 
-    out: list[tuple[str, str, list]] = []
-    for start, end, title in marks:
-        frag = html[start:end]
-        if re.search(r"<img\b", frag, flags=re.IGNORECASE):
-            srcs = [s for s in re.findall(r'src="([^"]+)"', frag, flags=re.IGNORECASE) if s]
-            out.append((title or f"第{len(out)+1}话", "", srcs))
+    out: list[tuple] = []
+    for index, (start, end, title) in enumerate(marks):
+        if index == 0 and prefix.strip() and first_h1 is not None:
+            frag = prefix + html[first_h1.end():end]
         else:
-            out.append((title or f"第{len(out)+1}章", _html_to_text(frag), []))
+            frag = html[start:end]
+        parts = _ordered_parts(frag)
+        srcs = [value for kind, value in parts if kind == "image"]
+        text = "\n".join(value for kind, value in parts if kind == "text")
+        if srcs and not include_parts:
+            text = ""
+        item = (title or f"第{len(out)+1}话", text, srcs)
+        out.append(item + (parts,) if include_parts else item)
     return out
 
 

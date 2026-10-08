@@ -19,7 +19,9 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
+import re
 import threading
 import time
 import webbrowser
@@ -45,11 +47,22 @@ from PySide6.QtWidgets import (
 )
 
 from framework.content import Content, Detail
+from framework.stream_resolver import StreamBudget, StreamCancelledError
 from framework.transcode_session import TranscodeSession
 
 from gui.components.hover_title import HoverTitle
 
 log = logging.getLogger(__name__)
+
+
+def _safe_error_text(exc) -> str:
+    text = str(exc) if exc is not None else ""
+    text = re.sub(r"https?://[^\s)]+", "播放地址", text)
+    text = re.sub(r"([?&])[^\s=]+=[^\s&)]*", "", text)
+    lowered = text.lower()
+    if "deadline" in lowered or "timeout" in lowered or "超时" in text:
+        return "取流超时"
+    return text or (exc.__class__.__name__ if exc is not None else "取流失败")
 
 
 class _PlayPanel(QWidget):
@@ -117,7 +130,8 @@ class _VideoSignals(QObject):
 class _FetchStreamTask(QRunnable):
     """后台获取播放流（fetch_video_streams，覆盖 HLS/MP4/DASH 双流）。"""
 
-    def __init__(self, content, source, ep_url, quality="best", gen=None):
+    def __init__(self, content, source, ep_url, quality="best", gen=None,
+                 source_lock=False):
         super().__init__()
         self.signals = _VideoSignals()
         self._content = content
@@ -125,22 +139,155 @@ class _FetchStreamTask(QRunnable):
         self._url = ep_url
         self._quality = quality
         self._gen = gen
+        self._source_lock = source_lock
+        self._cancelled = threading.Event()
+        self._context = StreamBudget()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        self._context.cancel()
+        invalidate = getattr(self._content, "invalidate_video_stream_cache", None)
+        if callable(invalidate):
+            try:
+                invalidate(self._source, self._url, self._quality, True)
+            except Exception:
+                pass
 
     def run(self) -> None:
         video, audio, err = "", "", None
         try:
-            # merged=True：取合并单流（含音视频）供 VLC 直接播——
-            # 双流 input-slave 对 DASH/fMP4 不可靠（黑屏），单流最稳
+            if self._cancelled.is_set():
+                return
+            kwargs = {"quality": self._quality, "merged": True}
+            try:
+                parameters = inspect.signature(
+                    self._content.fetch_video_streams
+                ).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            accepts_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if "context" in parameters or accepts_kwargs:
+                kwargs["context"] = self._context
+            if "source_lock" in parameters or accepts_kwargs:
+                kwargs["source_lock"] = self._source_lock
             video, audio = self._content.fetch_video_streams(
-                self._source, self._url, quality=self._quality, merged=True
+                self._source, self._url, **kwargs
             )
         except Exception as exc:  # noqa: BLE001
-            err = str(exc)
+            err = _safe_error_text(exc)
+        if self._cancelled.is_set():
+            return
         try:
-            # quality 随任务回传：切画质后旧任务缓存 key 用发起时画质，
-            # 不与当前画质错位（B3）
             self.signals.finished.emit(self._url, video, audio, err,
                                         self._quality, self._gen)
+        except RuntimeError:
+            pass
+
+
+class _ProbeSignals(QObject):
+    progress = Signal(int, int, str, object)
+    finished = Signal(object, int, object)
+
+
+class _ProbeSourcesTask(QRunnable):
+    def __init__(self, content, candidates, generation, max_sources=5,
+                 timeout_ms=30000, quality="best"):
+        super().__init__()
+        self.signals = _ProbeSignals()
+        self._content = content
+        limit = max(1, min(5, int(max_sources)))
+        self._candidates = []
+        seen = set()
+        for candidate in candidates:
+            source_id = str(candidate.get("source_id") or candidate.get("sid") or "")
+            if not source_id or source_id in seen:
+                continue
+            seen.add(source_id)
+            self._candidates.append(candidate)
+            if len(self._candidates) >= limit:
+                break
+        self._generation = generation
+        self._timeout_ms = max(1, int(timeout_ms))
+        self._quality = quality
+        self._cancelled = threading.Event()
+        self._context = None
+        self._context_lock = threading.Lock()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._context_lock:
+            context = self._context
+        if context is not None:
+            context.cancel()
+
+    def _fetch(self, source, url, context):
+        kwargs = {"quality": self._quality, "merged": True}
+        try:
+            parameters = inspect.signature(self._content.fetch_video_streams).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "context" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            kwargs["context"] = context
+        return self._content.fetch_video_streams(source, url, **kwargs)
+
+    def run(self) -> None:
+        results = {}
+        total = len(self._candidates)
+        for number, candidate in enumerate(self._candidates, 1):
+            if self._cancelled.is_set():
+                return
+            source_id = str(candidate.get("source_id") or candidate.get("sid") or "")
+            try:
+                self.signals.progress.emit(number, total, source_id, self)
+            except RuntimeError:
+                return
+            source = candidate.get("source")
+            url = candidate.get("url") or candidate.get("episode_url") or ""
+            context = StreamBudget(time.monotonic() + self._timeout_ms / 1000.0)
+            with self._context_lock:
+                self._context = context
+            done = threading.Event()
+            value = []
+            error = []
+
+            def fetch():
+                try:
+                    value.append(self._fetch(source, url, context))
+                except Exception as exc:
+                    error.append(exc)
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=fetch, daemon=True)
+            thread.start()
+            timed_out = not done.wait(self._timeout_ms / 1000.0)
+            if timed_out:
+                context.cancel()
+                done.wait()
+            with self._context_lock:
+                self._context = None
+            if self._cancelled.is_set():
+                return
+            if timed_out:
+                results[source_id] = "timeout"
+                continue
+            if error:
+                if isinstance(error[0], StreamCancelledError):
+                    return
+                results[source_id] = "failed"
+                continue
+            pair = value[0] if value else ("", "")
+            video = pair[0] if isinstance(pair, (tuple, list)) and pair else pair
+            audio = pair[1] if isinstance(pair, (tuple, list)) and len(pair) > 1 else ""
+            results[source_id] = "ok" if video or audio else "failed"
+        try:
+            self.signals.finished.emit(results, self._generation, self)
         except RuntimeError:
             pass
 
@@ -576,8 +723,17 @@ class VideoView(QWidget):
         self._current_title = ""  # 当前集标题（重开播放器/浮层提示）
         self._source_list = []  # [{sid, name, ...}]（同站多线路）
         self._current_sid = ""
+        self._locked_source_id = ""
         self._switching = False
-        self._stream_cache: dict = {}  # {(ep_url, quality): (video, audio)} 播放用
+        self._stream_cache: dict = {}
+        self._stream_cache_ttl = 30.0
+        self._stream_task = None
+        self._probe_task = None
+        self._probe_generation = 0
+        self._source_probe_settings = None
+        self._probe_results = {}
+        self._probe_names = {}
+        self._prefetch_task = None
         self._prefetch_idx = -2  # 正在预拉下一集（<0 空闲）
         self._quality = "best"
         self._quality_options: list = []
@@ -602,6 +758,7 @@ class VideoView(QWidget):
         # 播放代数：每次「换作品/换源/新起一次外播」自增。已注册系列的回调
         # 都带着注册时的代数回来，对不上即陈旧 → 整条丢弃（见 _build_series_playlist）
         self._play_gen = 0
+        self._stream_gen = 0
         self._external_now_playing.connect(self._on_external_now_playing)
         self._vlc_playlist_ready.connect(self._on_vlc_playlist_ready)
         self._last_ep_toast_ts = 0.0  # 「已是最后一集」提示去抖时间戳
@@ -663,9 +820,15 @@ class VideoView(QWidget):
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._on_source_switch)
         source_row.addWidget(self.source_combo, stretch=1)
+        self.probe_btn = QPushButton("检测播放源")
+        self.probe_btn.setFixedWidth(96)
+        self.probe_btn.clicked.connect(self._probe_sources)
+        source_row.addWidget(self.probe_btn)
         layout.addLayout(source_row)
         self.source_label.setVisible(False)
         self.source_combo.setVisible(False)
+        self.probe_btn.setVisible(False)
+        self.probe_btn.setEnabled(False)
 
         # ---- 主体：播放面板在上，分集/推荐卡片网格在下 ----
         body = QVBoxLayout()
@@ -1041,7 +1204,7 @@ class VideoView(QWidget):
         self._source_actions = []
         for i, item in enumerate(self._source_list):
             name = item.get("name") if isinstance(item, dict) else str(item)
-            sid = item.get("sid") if isinstance(item, dict) else str(item)
+            sid = (item.get("source_id") or item.get("sid")) if isinstance(item, dict) else str(item)
             act = self.source_menu.addAction(str(name))
             act.setCheckable(True)
             act.setChecked(str(sid) == self._current_sid)
@@ -1057,7 +1220,7 @@ class VideoView(QWidget):
         """播放器内换源：同步顶部下拉框触发换源流程。"""
         if not (0 <= idx < self.source_combo.count()):
             return
-            self.source_combo.setCurrentIndex(idx)  # → currentIndexChanged → _on_source_switch
+        self.source_combo.setCurrentIndex(idx)
 
     # ------------------------------------------------------------------ #
     # 控制条自动隐藏
@@ -1413,9 +1576,149 @@ class VideoView(QWidget):
         ctype = getattr(self._detail, "content_type", "video") or "video"
         self.recommend_open_requested.emit((sid, url, ctype))
 
+    def _probe_config(self) -> dict:
+        if isinstance(self._source_probe_settings, dict):
+            return self._source_probe_settings
+        settings = getattr(self._content, "_settings", None)
+        if settings is not None:
+            try:
+                from framework.settings_manager import media_source_probe_settings
+
+                return media_source_probe_settings(settings)
+            except Exception:
+                pass
+        return {
+            "enabled": True,
+            "max_sources": 5,
+            "concurrency": 1,
+            "timeout_ms": 30000,
+        }
+
+    def _update_probe_button(self) -> None:
+        enabled = bool(self._probe_config().get("enabled", True))
+        available = bool(self._detail is not None and self._source_list)
+        running = self._probe_task is not None
+        self.probe_btn.setVisible(available)
+        self.probe_btn.setEnabled(enabled and available and not running)
+
+    def _probe_sources(self) -> None:
+        config = self._probe_config()
+        if not config.get("enabled", True) or self._detail is None:
+            self._update_probe_button()
+            return
+        episode_url = getattr(self._detail, "url", "") or ""
+        if 0 <= self._current_idx < len(self._episodes):
+            episode_url = getattr(self._episodes[self._current_idx], "url", "") or episode_url
+        candidates = []
+        seen = set()
+        for item in getattr(self._detail, "source_list", None) or []:
+            source_id = str(
+                (item.get("source_id") or item.get("sid"))
+                if isinstance(item, dict) else getattr(item, "source_id", "")
+            )
+            if not source_id or source_id in seen:
+                continue
+            seen.add(source_id)
+            source = item.get("source", self._source) if isinstance(item, dict) else self._source
+            url = ""
+            if isinstance(item, dict):
+                url = item.get("url") or item.get("episode_url") or ""
+            if not url:
+                url = re.sub(r"([?&]sid=)[^&#]+", rf"\g<1>{source_id}", episode_url)
+                if url == episode_url and source_id:
+                    url = f"{episode_url}{'&' if '?' in episode_url else '?'}sid={source_id}"
+            candidates.append({"source_id": source_id, "source": source, "url": url})
+        if not candidates:
+            self._update_probe_button()
+            return
+        self._cancel_probe_task()
+        self._probe_candidates = candidates
+        self._probe_task = object()
+        self._update_probe_button()
+        self._start_probe_task(config, self._probe_generation)
+
+    def _start_probe_task(self, config=None, generation=None) -> None:
+        config = config or self._probe_config()
+        generation = self._probe_generation if generation is None else generation
+        task = _ProbeSourcesTask(
+            self._content,
+            getattr(self, "_probe_candidates", []),
+            generation,
+            max_sources=config.get("max_sources", 5),
+            timeout_ms=config.get("timeout_ms", 30000),
+            quality=self._quality,
+        )
+        task.signals.progress.connect(self._on_probe_progress)
+        task.signals.finished.connect(self._on_sources_probed)
+        self._probe_task = task
+        QThreadPool.globalInstance().start(task)
+
+    def _restore_probe_names(self) -> None:
+        for i, item in enumerate(self._source_list):
+            sid = str(item.get("source_id") or item.get("sid") or "")
+            name = self._probe_names.get(sid, str(item.get("name") or f"源{sid}"))
+            if i < self.source_combo.count():
+                self.source_combo.setItemText(i, name)
+            if i < len(self._source_actions):
+                self._source_actions[i].setText(name)
+
+    def _clear_probe_state(self) -> None:
+        self._probe_results = {}
+        self.probe_btn.setText("检测播放源")
+        self._restore_probe_names()
+
+    def _on_probe_progress(self, number, total, source_id, task) -> None:
+        if task is not self._probe_task:
+            return
+        name = self._probe_names.get(str(source_id), str(source_id))
+        self.probe_btn.setText(f"第 {number}/{total}，当前源：{name}")
+
+    def _on_sources_probed(self, results, generation, task) -> None:
+        if task is None or task is not self._probe_task:
+            return
+        if generation != self._probe_generation:
+            self._probe_task = None
+            self._clear_probe_state()
+            self.probe_btn.setText("检测播放源")
+            self._update_probe_button()
+            return
+        self._probe_results = dict(results or {})
+        self._probe_task = None
+        self.probe_btn.setText("检测播放源")
+        for i, item in enumerate(self._source_list):
+            sid = str(item.get("source_id") or item.get("sid") or "")
+            status = self._probe_results.get(sid)
+            base = self._probe_names.get(sid, str(item.get("name") or f"源{sid}"))
+            if status == "ok":
+                text = f"{base}（可播放）"
+            elif status == "timeout":
+                text = f"{base}（超时）"
+            else:
+                text = base
+            if i < self.source_combo.count():
+                self.source_combo.setItemText(i, text)
+            if i < len(self._source_actions):
+                self._source_actions[i].setText(text)
+        self._update_probe_button()
+
+    def _cancel_probe_task(self) -> None:
+        self._probe_generation += 1
+        task = self._probe_task
+        self._probe_task = None
+        if task is not None and hasattr(task, "cancel"):
+            task.cancel()
+        self._update_probe_button()
+
     def load(self, source, detail: Detail, start_ep_url: str = "", restore_position: float | None = None) -> None:
+        self._cancel_probe_task()
+        self._clear_probe_state()
+        self._cancel_stream_tasks()
+        self._invalidate_stream_cache()
+        self._stop_cast()
+        self._stream_gen += 1
         self._source = source
         self._detail = detail
+        self._locked_source_id = ""
         self._pending_play = None  # 换书清掉旧暂存播放
         # 换作品：代数自增，旧系列（若有）的回调全部作废
         self._play_gen += 1
@@ -1429,7 +1732,6 @@ class VideoView(QWidget):
         if restore_position is not None:
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用）。
-        self._stop_cast()  # 换作品 → 投屏会话/轮询/代理 LAN 端点一并收掉
         self._stop_player()
         self._invalidate_current_stream()  # 与 reload_detail 同一不变量，防两处分叉
         self._episodes = detail.chapters
@@ -1455,7 +1757,8 @@ class VideoView(QWidget):
             self._show_status("正在获取播放流...")
             self._current_idx = -1
             self._detail_url_for_play = detail.url
-            task = _FetchStreamTask(self._content, self._source, detail.url, self._quality)
+            task = _FetchStreamTask(self._content, self._source, detail.url, self._quality,
+                                    gen=self._stream_gen)
             task.signals.finished.connect(self._on_stream_loaded)
             self._stream_task = task
             QThreadPool.globalInstance().start(task)
@@ -1469,13 +1772,19 @@ class VideoView(QWidget):
 
     def reload_detail(self, new_detail: Detail) -> None:
         """换源重载分集后调用：多集源停选集态等用户选择，单集/无分集自动取流播放。"""
+        self._cancel_probe_task()
+        self._clear_probe_state()
+        self._cancel_stream_tasks()
+        self._invalidate_stream_cache()
         self._stop_cast()    # 换源 → 投屏会话一并收掉（旧源的流不能再推电视）
         self._stop_player()  # 换源先停旧播放流
+        self._stream_gen += 1
         # 换源：代数自增。关键——多集源分支**不调用 _play**，若不在此自增，
         # 旧系列的 on_play 会带着仍然有效的代数回来，把旧源流写进新源的
         # _stream_cache（_load_episode 命中缓存不复验 → 持久播错集）。
         self._play_gen += 1
         self._detail = new_detail
+        self._populate_source_combo(new_detail)
         self._episodes = new_detail.chapters
         self._stream_cache.clear()
         self._prefetch_idx = -2
@@ -1497,7 +1806,8 @@ class VideoView(QWidget):
             # 无分集（season 页）→ 直接取详情页播放地址自动播放
             self._detail_url_for_play = new_detail.url
             self._show_status("正在获取播放流...")
-            task = _FetchStreamTask(self._content, self._source, new_detail.url, self._quality)
+            task = _FetchStreamTask(self._content, self._source, new_detail.url, self._quality,
+                                    gen=self._stream_gen)
             task.signals.finished.connect(self._on_stream_loaded)
             self._stream_task = task
             QThreadPool.globalInstance().start(task)
@@ -1596,6 +1906,12 @@ class VideoView(QWidget):
         """
         if self._fs_win is not None:
             self._exit_fullscreen()
+        self._play_gen += 1
+        self._cancel_probe_task()
+        self._clear_probe_state()
+        self._cancel_stream_tasks()
+        self._stream_gen += 1
+        self._invalidate_stream_cache()
         self._stop_cast()  # 离开视频页 → 投屏会话清理（会话回调不会再来停本地播放）
         self._stop_player()
         self._current_play = ""
@@ -1640,6 +1956,12 @@ class VideoView(QWidget):
 
     def _populate_source_combo(self, detail: Detail) -> None:
         self._source_list = detail.source_list or []
+        self._probe_names = {
+            str(item.get("source_id") or item.get("sid") or ""): str(
+                item.get("name") or f"源{item.get('source_id') or item.get('sid')}"
+            )
+            for item in self._source_list
+        }
         self._switching = False
         try:
             self.source_combo.currentIndexChanged.disconnect(self._on_source_switch)
@@ -1647,16 +1969,18 @@ class VideoView(QWidget):
             pass
         self.source_combo.clear()
         for s in self._source_list:
-            name = s.get("name") or f"源{s.get('sid')}"
-            self.source_combo.addItem(name, s.get("sid"))
+            sid = s.get("source_id") or s.get("sid")
+            name = self._probe_names.get(str(sid), f"源{sid}")
+            self.source_combo.addItem(name, sid)
         has = bool(self._source_list)
         self.source_label.setVisible(has)
         self.source_combo.setVisible(has)
+        self._update_probe_button()
         if has:
             cur_sid = self._current_sid
             idx = 0
             for i, s in enumerate(self._source_list):
-                if s.get("sid") == cur_sid:
+                if str(s.get("source_id") or s.get("sid")) == str(cur_sid):
                     idx = i
                     break
             self.source_combo.setCurrentIndex(idx)
@@ -1680,19 +2004,120 @@ class VideoView(QWidget):
         if not sid or sid == self._current_sid:
             return
         self._current_sid = str(sid)
+        self._locked_source_id = str(sid)
         self._switching = True
+        self._play_gen += 1
+        self._clear_probe_state()
+        self._cancel_probe_task()
+        self._populate_source_combo(self._detail)
         self.source_changed.emit((self._detail, str(sid)))
         self._video_frame.setFocus()  # 换源后快捷键继续可用
+
+    def _stream_cache_key(self, ep_url: str, quality: str):
+        source_id = getattr(self._source, "source_id", "")
+        if not source_id:
+            return (ep_url, quality)
+        return (source_id, ep_url, quality, True)
+
+    def _stream_cache_get(self, key):
+        value = self._stream_cache.get(key)
+        if value is None and len(key) == 4:
+            value = self._stream_cache.get((key[1], key[2]))
+        if value is None:
+            return None
+        if len(value) == 2:
+            video, audio = value
+            expires_at = time.monotonic() + self._stream_cache_ttl
+        else:
+            expires_at, video, audio = value
+        if expires_at <= time.monotonic():
+            self._stream_cache.pop(key, None)
+            return None
+        try:
+            from framework.stream_resolver import StreamResolver
+
+            if StreamResolver.cache_ttl_for_result(
+                (video, audio), self._stream_cache_ttl
+            ) <= 0:
+                self._stream_cache.pop(key, None)
+                return None
+            resolver = getattr(self._content, "_stream_resolver", None)
+            if resolver is not None and self._source is not None:
+                ep_url = key[1] if len(key) == 4 else key[0]
+                quality = key[2] if len(key) == 4 else key[1]
+                if resolver.get_cached(self._source, ep_url, quality, True) != (video, audio):
+                    self._stream_cache.pop(key, None)
+                    return None
+        except Exception:
+            self._stream_cache.pop(key, None)
+            return None
+        return video, audio
+
+    def _stream_cache_set(self, key, video, audio):
+        try:
+            from framework.stream_resolver import StreamResolver
+
+            ttl = StreamResolver.cache_ttl_for_result(
+                (video, audio), self._stream_cache_ttl
+            )
+        except Exception:
+            ttl = 0.0
+        if ttl <= 0:
+            self._stream_cache.pop(key, None)
+            return
+        resolver = getattr(self._content, "_stream_resolver", None)
+        if resolver is None:
+            self._stream_cache[key] = (video, audio)
+            return
+        if len(key) >= 2 and self._source is not None:
+            ep_url = key[1] if len(key) == 4 else key[0]
+            quality = key[2] if len(key) == 4 else key[1]
+            if resolver.get_cached(self._source, ep_url, quality, True) != (video, audio):
+                self._stream_cache.pop(key, None)
+                return
+        self._stream_cache[key] = (
+            time.monotonic() + ttl, video, audio
+        )
+
+    def _cancel_stream_tasks(self) -> None:
+        for name in ("_stream_task", "_prefetch_task"):
+            task = getattr(self, name, None)
+            if task is not None:
+                cancel = getattr(task, "cancel", None)
+                if callable(cancel):
+                    cancel()
+                setattr(self, name, None)
+        self._prefetch_idx = -2
+
+    def _invalidate_stream_cache(self, ep_url=None, quality=None) -> None:
+        source = self._source
+        if source is not None:
+            invalidate = getattr(self._content, "invalidate_video_stream_cache", None)
+            if callable(invalidate):
+                invalidate(source, ep_url, quality, True)
+        if ep_url is None and quality is None:
+            self._stream_cache.clear()
+            return
+        for key in list(self._stream_cache):
+            key_url = key[1] if len(key) == 4 else key[0]
+            key_quality = key[2] if len(key) == 4 else key[1]
+            if ep_url is not None and key_url != ep_url:
+                continue
+            if quality is not None and key_quality != quality:
+                continue
+            self._stream_cache.pop(key, None)
 
     def _on_quality_changed(self, text: str) -> None:
         if not text or text == self._quality or self._current_idx < 0:
             self._quality = text or "best"
             return
+        old_quality = self._quality
         self._quality = text
         # 清当前集播放缓存 → 新画质重拉
         ep = self._episodes[self._current_idx]
-        key = (ep.url, text)
-        self._stream_cache.pop(key, None)
+        self._cancel_stream_tasks()
+        self._invalidate_stream_cache(ep.url, old_quality)
+        self._invalidate_stream_cache(ep.url, text)
         for act in self._quality_actions:
             act.setChecked(act.text() == text)
         self._load_episode(self._current_idx)
@@ -1702,13 +2127,15 @@ class VideoView(QWidget):
         if self._source is None or not (0 <= idx < len(self._episodes)):
             return
         self._selection_mode = False  # 真实选集 → 退出选集态
+        if self._current_sid:
+            self._locked_source_id = self._current_sid
         self._current_idx = idx
         self._paint_card_selection()  # 当前集卡片选中态跟随
         self._refresh_ep_menu()  # 选集菜单当前集打勾跟随
         ep = self._episodes[idx]
         self.episode_changed.emit((self._detail, ep.title, ep.url))  # 进度记忆
-        key = (ep.url, self._quality)
-        cached = self._stream_cache.get(key)
+        key = self._stream_cache_key(ep.url, self._quality)
+        cached = self._stream_cache_get(key)
         if cached:
             video, audio = cached
             self._current_play = video
@@ -1717,7 +2144,10 @@ class VideoView(QWidget):
             return
         self._show_status(f"正在获取播放流：{ep.title}...")
         self._current_play = ""
-        task = _FetchStreamTask(self._content, self._source, ep.url, self._quality)
+        task = _FetchStreamTask(
+            self._content, self._source, ep.url, self._quality,
+            gen=self._stream_gen, source_lock=bool(self._locked_source_id),
+        )
         task.signals.finished.connect(self._on_stream_loaded)
         self._stream_task = task  # 防 GC
         QThreadPool.globalInstance().start(task)
@@ -1773,23 +2203,25 @@ class VideoView(QWidget):
             )
         return False
 
-    def _on_stream_loaded(self, ep_url, video, audio, err, quality) -> None:
+    def _on_stream_loaded(self, ep_url, video, audio, err, quality, gen=None) -> None:
         """取流完成：写缓存 →（仍为当前集/画质则）播放 → 预拉下一集。
 
         旧任务后到（ep_url/quality 已非当前）：只写缓存，不覆盖播放。
         缓存 key 用发起时 quality，避免切画质后 key 错位（B3）。
         """
-        if self._source is None:
+        if self._source is None or (gen is not None and gen != self._stream_gen):
             return
+        if self._stream_task is not None:
+            self._stream_task = None
         if err or not video:
             if self._is_current_stream(ep_url, quality):
-                self._show_status(f"获取播放流失败：{err or '无播放地址'}")
-                # 自动降级换源（多源站）
-                nxt = self._next_available_sid()
-                if nxt:
-                    self.source_changed.emit((self._detail, nxt))
+                self._show_status(f"获取播放流失败：{_safe_error_text(err) if err else '无播放地址'}")
+                if not self._locked_source_id:
+                    nxt = self._next_available_sid()
+                    if nxt:
+                        self.source_changed.emit((self._detail, nxt))
             return
-        self._stream_cache[(ep_url, quality)] = (video, audio)
+        self._stream_cache_set(self._stream_cache_key(ep_url, quality), video, audio)
         if not self._is_current_stream(ep_url, quality):
             return  # 旧任务/旧画质后到：不覆盖当前播放（B2）
         self._current_play = video
@@ -1838,6 +2270,7 @@ class VideoView(QWidget):
         if callable(_rh):
             hdrs = _rh() or {}
         from framework.external_player import open_with_player
+        from framework.media_proxy import MediaProxy
 
         # 源 ad_block 配置：播放代理转发 m3u8 时过滤广告段（下载已有过滤）
         ad_block = {}
@@ -1953,7 +2386,7 @@ class VideoView(QWidget):
             return  # 越界（陈旧/异常集位）：不改状态，避免把 _current_idx 带歪
         self._current_idx = idx
         ep = self._episodes[idx]
-        self._stream_cache[(ep.url, self._quality)] = (video, audio)
+        self._stream_cache_set(self._stream_cache_key(ep.url, self._quality), video, audio)
         self._current_play = video
         self._current_audio = audio
         self._current_title = ep.title or ""
@@ -2095,10 +2528,10 @@ class VideoView(QWidget):
         """
         if self._source is None:
             return
+        self._cancel_stream_tasks()
         if 0 <= self._current_idx < len(self._episodes):
             ep = self._episodes[self._current_idx]
-            key = (ep.url, self._quality)
-            self._stream_cache.pop(key, None)
+            self._invalidate_stream_cache(ep.url, self._quality)
             self._current_play = ""
             self._show_status(f"正在重新获取播放流：{ep.title}...")
             self._load_episode(self._current_idx)
@@ -2107,7 +2540,8 @@ class VideoView(QWidget):
             self._current_play = ""
             self._show_status("正在重新获取播放流...")
             task = _FetchStreamTask(
-                self._content, self._source, self._detail_url_for_play, self._quality
+                self._content, self._source, self._detail_url_for_play, self._quality,
+                gen=self._stream_gen,
             )
             task.signals.finished.connect(self._on_stream_loaded)
             self._stream_task = task
@@ -2176,8 +2610,8 @@ class VideoView(QWidget):
         self._cast_gen += 1
         gen = self._cast_gen
         ep = self._episodes[idx]
-        key = (ep.url, self._quality)
-        cached = self._stream_cache.get(key)
+        key = self._stream_cache_key(ep.url, self._quality)
+        cached = self._stream_cache_get(key)
         if cached:
             self._cast_stream_arrived(idx, kind, cached[0])
             return
@@ -2200,8 +2634,6 @@ class VideoView(QWidget):
         （pending 属于当代任务；被旧任务吞掉即永久丢失）。
         """
         if gen != self._cast_gen:
-            if not err and video:
-                self._stream_cache[(ep_url, quality)] = (video, audio)
             log.debug("丢弃陈旧投屏取流结果：代数 %s ≠ 当前 %s", gen, self._cast_gen)
             return
         pending, self._cast_stream_pending = self._cast_stream_pending, None
@@ -2210,12 +2642,12 @@ class VideoView(QWidget):
             return  # 已被清理（换作品/换源/停投屏）
         idx, kind = pending
         if err or not video:
-            reason = err or "无播放地址"
+            reason = _safe_error_text(err) if err else "无播放地址"
             if kind == "episode" and self._cast_active:
                 # 投屏中切集取流失败（spec §6.5：保留原集、不自动关投屏）：
                 # 当前播放状态保持不动——误置 idle 会让 _cast_toggle_play_pause
                 # 把「应暂停」误判为「播放」（cast_state != "playing" → play()）。
-                self._set_cast_status(f"获取播放流失败：{reason}")
+                self._set_cast_status(f"获取播放流失败：{_safe_error_text(reason)}")
                 return
             # 首次投屏取流失败：进 error 态并记原因，按钮可点重试
             self._cast_state = "error"
@@ -2223,7 +2655,7 @@ class VideoView(QWidget):
             self._show_status(f"获取播放流失败：{reason}")
             self._update_cast_button()
             return
-        self._stream_cache[(ep_url, quality)] = (video, audio)
+        self._stream_cache_set(self._stream_cache_key(ep_url, quality), video, audio)
         if not (0 <= idx < len(self._episodes)) or self._episodes[idx].url != ep_url:
             return  # 集已切换：陈旧结果只进缓存
         self._cast_stream_arrived(idx, kind, video)
@@ -2784,6 +3216,12 @@ class VideoView(QWidget):
         self._cast_gen += 1  # 作废在途取流/启动任务
         self._cast_direct = False  # 直投标志随流程作废（迟到失败不再回落开框）
         self._cast_playing_timer.stop()
+        stream_task = self._cast_stream_task
+        self._cast_stream_task = None
+        if stream_task is not None:
+            cancel = getattr(stream_task, "cancel", None)
+            if callable(cancel):
+                cancel()
         task = self._cast_poll_task
         self._cast_poll_task = None
         if task is not None:
@@ -2976,23 +3414,26 @@ class VideoView(QWidget):
         if not (0 <= idx < len(self._episodes)):
             return
         ep = self._episodes[idx]
-        key = (ep.url, self._quality)
-        if key in self._stream_cache:
+        key = self._stream_cache_key(ep.url, self._quality)
+        if self._stream_cache_get(key) is not None:
             return
         if self._prefetch_idx >= 0:
             return  # 已有其他集在预拉（串行）
         self._prefetch_idx = idx
-        task = _FetchStreamTask(self._content, self._source, ep.url, self._quality)
+        task = _FetchStreamTask(self._content, self._source, ep.url, self._quality,
+                                gen=self._stream_gen)
         task.signals.finished.connect(self._on_prefetch_done)
         self._prefetch_task = task
         QThreadPool.globalInstance().start(task)
 
-    def _on_prefetch_done(self, ep_url, video, audio, err, quality) -> None:
+    def _on_prefetch_done(self, ep_url, video, audio, err, quality, gen=None) -> None:
         self._prefetch_idx = -2
+        if gen is not None and gen != self._stream_gen:
+            return
         if err or not video:
             return
         # 预拉缓存 key 用发起时 quality（与任务一致，防切画质错位）
-        self._stream_cache[(ep_url, quality)] = (video, audio)
+        self._stream_cache_set(self._stream_cache_key(ep_url, quality), video, audio)
 
     def _next_available_sid(self) -> str:
         """返回当前源之后的第一个可用源 sid（无则空）。"""
@@ -3039,7 +3480,8 @@ class VideoView(QWidget):
             hdrs = _rh() or {}
         from framework.external_player import _locate_vlc, open_with_player
 
-        if not _locate_vlc():
+        is_hls = "m3u8" in self._current_play.lower()
+        if not _locate_vlc() and not is_hls:
             # 无 VLC：Referer 保护的媒体直链改开集页面（浏览器播放绕防盗链）
             page_url = ""
             if 0 <= self._current_idx < len(self._episodes):
