@@ -145,7 +145,7 @@ def test_hls_default_workers_4_when_unconfigured(tmp_path, monkeypatch):
 def test_hls_skip_ad_segments(tmp_path, monkeypatch):
     """广告段不下载、不进 get_bytes。"""
     http, size, out = _run(tmp_path, n_segs=8, workers=4, ads=(2, 4), monkeypatch=monkeypatch)
-    assert len(http.seg_calls) == 6  # 8 - 2 个广告段
+    assert len(http.seg_calls) == 6
     assert all("/ads/" not in url for url in http.seg_calls)
     assert size > 0
 
@@ -181,6 +181,18 @@ def test_variant_master_playlist_still_works(tmp_path, monkeypatch):
     assert http.max_active <= 3
     assert len(http.seg_calls) == 5
     assert size > 0
+
+
+def test_failed_segment_raises_without_placeholder(tmp_path, monkeypatch):
+    out = tmp_path / "out.mp4"
+    d = _downloader(_FakeHlsHttp(_m3u8(1)))
+    monkeypatch.setattr(d, "_http", type("Http", (), {
+        "get_bytes": lambda self, *args, **kwargs: b"",
+    })())
+    with pytest.raises(RuntimeError):
+        d._download_seg_retry("http://cdn/seg.ts", {}, tmp_path / "seg.ts", None, None, retries=1)
+    assert not (tmp_path / "seg.ts").exists()
+    assert b"\x47\x1f\xff\x10" not in out.read_bytes() if out.exists() else True
 
 
 if __name__ == "__main__":

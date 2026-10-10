@@ -399,7 +399,7 @@ class _CastStartTask:
     """
 
     def __init__(self, session, renderer, idx, video, title, headers,
-                 ad_block, force_proxy, gen: int, cast_tuning=None):
+                  ad_block, force_proxy, gen: int, cast_tuning=None):
         self.signals = _CastStartSignals()
         self.session = session
         self.renderer = renderer
@@ -1185,9 +1185,13 @@ class VideoView(QWidget):
         if item_id is None:
             return False
         try:
-            from framework.external_player import player_goto
+            from framework.external_player import player_goto, player_session
 
-            if not player_goto(item_id):
+            session = getattr(self, "_external_session", None)
+            if hasattr(self, "_external_session") and session is not player_session():
+                return False
+            moved = player_goto(item_id, expected_state=session) if session is not None else player_goto(item_id)
+            if not moved:
                 return False
         except Exception:  # noqa: BLE001 —— 无控制会话/网络失败：回落重开
             return False
@@ -1709,7 +1713,7 @@ class VideoView(QWidget):
             task.cancel()
         self._update_probe_button()
 
-    def load(self, source, detail: Detail, start_ep_url: str = "", restore_position: float | None = None) -> None:
+    def load(self, source, detail: Detail, start_ep_url: str = "", restore_position: float | None = None, restore_location: dict | None = None) -> None:
         self._cancel_probe_task()
         self._clear_probe_state()
         self._cancel_stream_tasks()
@@ -1729,6 +1733,8 @@ class VideoView(QWidget):
         # 首个选集/播放回调消费，把新书错 seek 到旧书位置）——与 novel/comic
         # 同模式修复跨书串位置 bug。
         self._pending_position = None
+        self._pending_location = dict(restore_location or {})
+        self._restore_episode_url = start_ep_url or detail.url
         if restore_position is not None:
             self._pending_position = restore_position
         # 换视频先停旧播放（不堆积缓存/后台占用）。
@@ -1763,6 +1769,9 @@ class VideoView(QWidget):
             self._stream_task = task
             QThreadPool.globalInstance().start(task)
             return
+        if detail.chapters and restore_location and detail.chapters[idx].url == start_ep_url:
+            self._load_episode(idx)
+            return
         if detail.chapters:
             # 有分集：统一停在选集态，由用户明确选择后播放，单集也不例外。
             self._selection_mode = True
@@ -1784,6 +1793,9 @@ class VideoView(QWidget):
         # _stream_cache（_load_episode 命中缓存不复验 → 持久播错集）。
         self._play_gen += 1
         self._detail = new_detail
+        self._pending_position = None
+        self._pending_location = None
+        self._restore_episode_url = ""
         self._populate_source_combo(new_detail)
         self._episodes = new_detail.chapters
         self._stream_cache.clear()
@@ -2216,10 +2228,6 @@ class VideoView(QWidget):
         if err or not video:
             if self._is_current_stream(ep_url, quality):
                 self._show_status(f"获取播放流失败：{_safe_error_text(err) if err else '无播放地址'}")
-                if not self._locked_source_id:
-                    nxt = self._next_available_sid()
-                    if nxt:
-                        self.source_changed.emit((self._detail, nxt))
             return
         self._stream_cache_set(self._stream_cache_key(ep_url, quality), video, audio)
         if not self._is_current_stream(ep_url, quality):
@@ -2255,7 +2263,7 @@ class VideoView(QWidget):
         """播放 = 调用外部播放器（VLC 桌面版优先，浏览器兜底）。
 
         外接方案：播放逻辑不再内嵌 libvlc（内嵌受 Qt 主线程/软解影响易卡），
-        交给独立播放器进程渲染；续读由 VLC 桌面版自带"恢复播放位置"接管，
+        交给独立播放器进程渲染。
         分集/换源/画质/下载仍在 App 内操作，取流完成后打开播放器即播。
         """
         self._has_played = True
@@ -2270,16 +2278,13 @@ class VideoView(QWidget):
         if callable(_rh):
             hdrs = _rh() or {}
         from framework.external_player import open_with_player
-        from framework.media_proxy import MediaProxy
-
+        from framework.media_proxy import MediaProxy, trusted_media_context
         # 源 ad_block 配置：播放代理转发 m3u8 时过滤广告段（下载已有过滤）
         ad_block = {}
         try:
-            ad_block = (self._source.raw or {}).get("ad_block") or {}
+            ad_block = dict((self._source.raw or {}).get("ad_block") or {})
         except Exception:  # noqa: BLE001
             pass
-        # 组装全集惰性播放列表（VLC 内可任意点集、App 内切集不重开）：
-        # 每集一个 /e/ 惰性 URL，流地址播到时才取；不足 2 集 → None 退回单集。
         series = self._build_series_playlist(
             video, audio, hdrs, ad_block, self._force_proxy_enabled())
         # 开播 MRL 取**返回列表**里当前集那一项（与交给 VLC 的列表同源，
@@ -2294,24 +2299,33 @@ class VideoView(QWidget):
             # warm 纯优化无副作用：失败/未命中时 VLC 请求照常回落 resolver。
             if video:
                 MediaProxy.instance().warm_series_episode(
-                    self._series_key, self._current_idx,
-                    video, audio, hdrs, ad_block)
+                     self._series_key, self._current_idx,
+                     video, audio, hdrs, ad_block,
+                     source_id=trusted_media_context(getattr(self._source, "source_id", "")))
+
         else:
             # 无系列，或当前集是「无 ep.url」的坏集（入列 URL 为空）→ 单集
             series, start_url, real_url = None, video, video
         msg = open_with_player(
             start_url, audio=audio,
             referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
-            headers=hdrs, ad_block=ad_block, force_proxy=self._force_proxy_enabled(),
-            episodes=series,
-            classify_url=real_url,
-            start_idx=self._current_idx,
+             headers=hdrs, ad_block=ad_block,
+             force_proxy=self._force_proxy_enabled(),
+              source_id=trusted_media_context(getattr(self._source, "source_id", "")),
+              episodes=series,
+
+             classify_url=real_url,
+              start_idx=self._current_idx,
+
             # 握手在**后台线程**回调：交信号 emit 而不是裸槽，Qt 自动投递到
             # 主线程执行（裸槽会在后台线程改视图状态 = 线程归属违规）。
             # 代数随映射一起带过去，槽才知道这是不是陈旧会话的握手结果。
             on_playlist_ready=lambda m: self._vlc_playlist_ready.emit(gen, m),
             caching_ms=self._source_network_caching_ms(),
+            **self._progress_options(),
         )
+        from framework.external_player import player_session
+        self._external_session = player_session()
         self._show_status(f"{msg}：{title or video}")
         self.play_btn.setText("▶")
         self._sync_overlay_state(playing=False)
@@ -2329,7 +2343,7 @@ class VideoView(QWidget):
             return {}
 
     def _configure_cast_tuning(self) -> None:
-        from framework.media_proxy import MediaProxy
+        from framework.media_proxy import MediaProxy, trusted_media_context
         configure = getattr(MediaProxy.instance(), "configure_prefetch", None)
         if not callable(configure):
             return
@@ -2436,14 +2450,15 @@ class VideoView(QWidget):
         self._vlc_item_ids = {}
         self._vlc_ids_gen = -1
         try:
-            from framework.media_proxy import MediaProxy
+            from framework.media_proxy import MediaProxy, trusted_media_context
 
             MediaProxy.instance().unregister_series(key)
         except Exception:  # noqa: BLE001 —— 代理不可用：本地状态已清
             log.debug("惰性系列 %s 注销失败（代理不可用）", key, exc_info=True)
 
     def _build_series_playlist(self, video: str, audio: str, hdrs: dict,
-                               ad_block: dict, force_proxy: bool) -> list | None:
+                                 ad_block: dict, force_proxy: bool) -> list | None:
+
         """注册惰性系列，返回**全集严格 0..N-1 顺序**的 episodes 列表。
 
         每集只给一个惰性 URL（http://127.0.0.1:PORT/e/<key>/<idx>）与标题，
@@ -2462,7 +2477,7 @@ class VideoView(QWidget):
         if len(self._episodes) < 2:
             return None
         self._unregister_series()   # 新系列注册前先注销旧系列
-        from framework.media_proxy import MediaProxy
+        from framework.media_proxy import MediaProxy, trusted_media_context
 
         try:
             proxy = MediaProxy.instance()
@@ -2495,8 +2510,12 @@ class VideoView(QWidget):
 
         try:
             key = proxy.register_series(_resolve, _on_play,
-                                        count=len(episodes),
-                                        force_proxy=force_proxy)
+                                          count=len(episodes),
+                                           force_proxy=force_proxy,
+                                           source_id=trusted_media_context(getattr(source, "source_id", "")))
+
+
+
             # 立即记账：此后任何异常（含下面建 URL 失败）都能被 _unregister_series
             # 找到并回收；否则注册表里就留下一条持视图强引用、谁也注销不掉的孤儿
             self._series_key = key
@@ -2800,7 +2819,7 @@ class VideoView(QWidget):
         try:
             from framework.cast_session import CastSession
             from framework.dlna import DlnaClient
-            from framework.media_proxy import MediaProxy
+            from framework.media_proxy import MediaProxy, trusted_media_context
 
             # 顺序保证：本地 VLC 的停止**只**挂在这条回调上，而它由
             # poll_state() 在电视报 PLAYING 时才调用 → start 前后本地都在播。
@@ -2927,7 +2946,7 @@ class VideoView(QWidget):
         self._cast_gen += 1
         headers, _ad_block, _force_proxy = self._cast_media_args()
         try:
-            from framework.media_proxy import MediaProxy
+            from framework.media_proxy import MediaProxy, trusted_media_context
 
             transcode_task = _CastTranscodeTask(
                 session, MediaProxy.instance(), renderer, idx,
@@ -2979,7 +2998,7 @@ class VideoView(QWidget):
             except Exception:  # noqa: BLE001
                 headers = {}
         try:
-            ad_block = (getattr(self._source, "raw", None) or {}).get("ad_block") or {}
+            ad_block = dict((getattr(self._source, "raw", None) or {}).get("ad_block") or {})
         except Exception:  # noqa: BLE001
             ad_block = {}
         return headers, ad_block, self._force_proxy_enabled()
@@ -3253,11 +3272,67 @@ class VideoView(QWidget):
         self._update_cast_button()
 
     # ------------------------------------------------------------------ #
+    def _progress_options(self):
+        from framework.external_player import flush_player_progress
+
+        flush_player_progress()
+        detail = self._detail
+        library_url = getattr(self, "library_url", "") or detail.url
+        episodes = tuple(self._episodes)
+        index = max(0, self._current_idx)
+        chapter_url = episodes[index].url if episodes else detail.url
+        location = {}
+        lookup = getattr(self, "progress_lookup", None)
+        record = lookup(library_url) if lookup else None
+        if record and record.get("chapter_url") == chapter_url:
+            location = dict(record.get("location") or {})
+            if "seconds" not in location and record.get("position") is not None:
+                location["position"] = record["position"]
+        elif getattr(self, "_restore_episode_url", "") == chapter_url:
+            location = dict(getattr(self, "_pending_location", None) or {})
+            if "seconds" not in location and self._pending_position is not None:
+                location["position"] = self._pending_position
+        self._pending_position = None
+        self._pending_location = None
+        allowed = getattr(self, "progress_allowed", None)
+        if allowed is not None and not allowed(library_url):
+            location = {}
+
+        def changed(idx, position):
+            if episodes:
+                if not 0 <= idx < len(episodes):
+                    return
+                episode = episodes[idx]
+                title = getattr(episode, "title", "") or f"第{idx + 1}集"
+                url = episode.url
+            else:
+                title, url = getattr(detail, "title", ""), detail.url
+            position = {**position, "chapter_url": url}
+            position["library_url"] = library_url
+            payload = (detail, title, url, position["seconds"] / position["duration"], None, position)
+            writer = getattr(self, "progress_writer", None)
+            if writer is not None:
+                writer(payload)
+            else:
+                try:
+                    self.position_changed.emit(payload)
+                except RuntimeError:
+                    pass
+
+        handoff_writer = getattr(self, "handoff_writer", None)
+        if episodes:
+            title = getattr(episodes[index], "title", "") or f"第{index + 1}集"
+        else:
+            title = getattr(detail, "title", "")
+
+        def handed_off():
+            if handoff_writer is not None:
+                handoff_writer(detail, library_url, title, chapter_url)
+
+        return {"on_progress": changed, "resume_positions": {index: location}, "on_handoff": handed_off}
+
     def position_snapshot(self):
-        """当前播放进度：(0~1 比例, None)。未播放/未就绪返回 0。"""
-        if self._player is None:
-            return 0.0, None
-        return max(0.0, self._player.get_position()), None
+        return None, None
 
     def current_context(self):
         """当前播放上下文 (detail, 集标题, 集URL)；未打开/未开始播放则 None。"""
@@ -3278,6 +3353,8 @@ class VideoView(QWidget):
         if ctx is None:
             return
         pos, _ = self.position_snapshot()
+        if pos is None:
+            return
         try:
             self.position_changed.emit((ctx[0], ctx[1], ctx[2], pos, None))
         except RuntimeError:
@@ -3479,6 +3556,7 @@ class VideoView(QWidget):
         if callable(_rh):
             hdrs = _rh() or {}
         from framework.external_player import _locate_vlc, open_with_player
+        from framework.media_proxy import trusted_media_context
 
         is_hls = "m3u8" in self._current_play.lower()
         if not _locate_vlc() and not is_hls:
@@ -3491,7 +3569,8 @@ class VideoView(QWidget):
             if page_url and self._media_needs_referer():
                 from urllib.parse import urljoin
 
-                webbrowser.open(urljoin(self._source.base_url, page_url))
+                if webbrowser.open(urljoin(self._source.base_url, page_url)):
+                    self._progress_options()["on_handoff"]()
                 return
         # 新起一次外播 = 新代数：上一次会话的回调就此作废（与 _play 同理。
         # 必须**在装配系列之前**自增，新注册才捕获得到新代数，在途的旧回调
@@ -3500,7 +3579,7 @@ class VideoView(QWidget):
         gen = self._play_gen
         ad_block = {}
         try:
-            ad_block = (self._source.raw or {}).get("ad_block") or {}
+            ad_block = dict((self._source.raw or {}).get("ad_block") or {})
         except Exception:  # noqa: BLE001
             pass
         force_proxy = self._force_proxy_enabled()
@@ -3510,7 +3589,8 @@ class VideoView(QWidget):
         # 旧分集条目则确实失效。旧窗口把「点集」报给 App 时，App 已用新系列重开
         # 播放，源相同，落在同一集上无感。
         series = self._build_series_playlist(
-            self._current_play, audio, hdrs, ad_block, force_proxy)
+             self._current_play, audio, hdrs, ad_block, force_proxy)
+
         # 开播 MRL 取**返回列表**里当前集那一项（不回头读 self._series_urls ——
         # 两处下标必须恒等；且无 ep.url 的坏集该项为 ""，读 _series_urls 会误取 /e/）
         start_ep_url = series[self._current_idx][0] if series else ""
@@ -3523,7 +3603,11 @@ class VideoView(QWidget):
         msg = open_with_player(
             start_url, audio=audio,
             referer=hdrs.get("Referer", ""), user_agent=hdrs.get("User-Agent", ""),
-            headers=hdrs, ad_block=ad_block, force_proxy=force_proxy,
+             headers=hdrs, ad_block=ad_block,
+             force_proxy=force_proxy,
+              source_id=trusted_media_context(getattr(self._source, "source_id", "")),
+
+
             episodes=series,
             classify_url=real_url,
             start_idx=self._current_idx,
@@ -3532,7 +3616,10 @@ class VideoView(QWidget):
             # 代数随映射一起带过去，槽才知道这是不是陈旧会话的握手结果。
             on_playlist_ready=lambda m: self._vlc_playlist_ready.emit(gen, m),
             caching_ms=self._source_network_caching_ms(),
+            **self._progress_options(),
         )
+        from framework.external_player import player_session
+        self._external_session = player_session()
         self._show_status(msg)
 
         # 起播后与 _play 同规格地把 App 侧 UI 拉回「未播放」一致态（幂等同步：

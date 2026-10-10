@@ -227,7 +227,7 @@ class SettingsPage(BasePage):
             "留空 = 跟随主题（如 #FDF6EC 或 #FFFFFF）",
         )
         self._ui_reading_font = sec._spin(
-            "阅读字号", "reading_font_size", 0, 36, " px", "0 = 跟随全局"
+            "阅读字号", "reading_font_size", 0, 48, " px", "0 = 跟随全局"
         )
         # 缓存清除行
         row = QHBoxLayout()

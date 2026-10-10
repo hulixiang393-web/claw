@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 from pathlib import Path
@@ -248,7 +249,7 @@ class MainWindow(QMainWindow):
 
         self.cookie_manager = CookieManager(base_dir / "data")
         self.source_manager.set_cookie_provider(self.cookie_manager.to_cookie_header)
-        self.search_history = SearchHistory(base_dir / "data" / "search_history.json")
+        self.search_history = SearchHistory(base_dir / "data" / "search_history.json", privacy=self._ensure_library_store())
         from framework.shelf_cache_repository import ShelfCacheRepository
         from framework.library_store import LibraryStore
         from framework.shelf_service import ShelfService
@@ -464,6 +465,9 @@ class MainWindow(QMainWindow):
         self.reader.download_requested.connect(self._download_from_reader)
         # 收藏判断回调：LibraryStore.has(url)（书架库未构建时先构建）
         self.reader.set_favorite_checker(self._favorite_has)
+        store = self._ensure_library_store()
+        if store is not None:
+            self.reader.set_reading_status_checker(store.reading_status)
         # 阅读器全屏：隐藏/恢复 Tab 栏（沉浸阅读，退出全屏还原）
         self.reader.fullscreen_changed.connect(self._on_reader_fullscreen)
         # 启动即应用阅读区独立背景/字号（ui-reader #12）
@@ -731,12 +735,16 @@ class MainWindow(QMainWindow):
             shelf_folder_provider=self._available_shelf_folders,
         )
         page.open_requested.connect(self._open_from_search)
+        page.search_clicked.connect(self._record_search)
         page.add_to_shelf_requested.connect(self._on_batch_add_shelf)
         page.batch_download_requested.connect(self._on_batch_download)
 
         self.search_page = page
         return page
 
+
+    def _record_search(self, keyword: str, context_url: str = "", folder: str = "") -> None:
+        self.search_history.push(keyword, context_url=context_url, folder=folder)
 
     def _open_from_search(self, source_id: str, url: str, content_type: str) -> None:
         """搜索页点结果卡片 → 打开 reader 播放/阅读。"""
@@ -869,6 +877,10 @@ class MainWindow(QMainWindow):
         ))
         QThreadPool.globalInstance().start(self._cover_backfill_tasks[-1])
 
+    def _local_progress_allowed(self, library_url: str) -> bool:
+        store = getattr(self, "library_store", None)
+        return store is None or store.reading_status(library_url) != "completed"
+
     def _play_local_video(self, rec: dict) -> None:
         """播本地视频：记住上次看到哪集（下次默认定位该集）；单集直接播，多集弹选择。"""
         paths = list(rec.get("episode_paths") or [])
@@ -877,20 +889,19 @@ class MainWindow(QMainWindow):
         # 记忆 key：本地视频书 key=目录路径（与 shelf_service 一致，已归一为绝对路径）
         key = rec.get("key") or rec.get("path") or ""
         prev_title = ""
-        if key and self.reading_progress is not None:
+        can_resume = MainWindow._local_progress_allowed(self, rec.get("url") or "")
+        if key and self.reading_progress is not None and can_resume:
             recp = self.reading_progress.resume(key)
             prev_title = (recp or {}).get("chapter_title", "")
         if not prev_title:
             # 本地无进度 → 回退线上收藏进度（同书线上看到哪集，本地也定位到那集）
             url = rec.get("url") or ""
-            if url and self.reading_progress is not None:
+            if url and self.reading_progress is not None and can_resume:
                 recp = self.reading_progress.resume(url)
                 prev_title = (recp or {}).get("chapter_title", "")
 
         target = paths[0]
         if len(paths) > 1:
-            from pathlib import Path
-
             names = [Path(p).name for p in paths]
 
             # 文件名模糊匹配：线上集标题（如"第5集"）未必等于文件名（如"第5集.mp4"）
@@ -926,19 +937,53 @@ class MainWindow(QMainWindow):
             if dlg.exec() != QDialog.Accepted:
                 return
             target = paths[combo.currentIndex()]
-        # 记录"看到第 N 集"（外部播放器无法回传秒数，至少记住集数续播）
-        if key and self.reading_progress is not None:
-            try:
-                from pathlib import Path as _P
+        from framework.external_player import open_with_player, flush_player_progress
 
+        flush_player_progress()
+        key = key or str(Path(target).resolve())
+        can_resume = MainWindow._local_progress_allowed(self, rec.get("url") or "")
+        resume = self.reading_progress.resume(key) if self.reading_progress is not None and can_resume else None
+        location = (resume.get("location") or {}) if resume and resume.get("chapter_url") == target else {}
+        metadata = {
+            "key": key, "chapter_url": target, "chapter_title": Path(target).name,
+            "title": rec.get("title") or Path(key).name,
+            "library_url": rec.get("url") or "", "folder": rec.get("folder") or "",
+        }
+
+        def changed(idx, position):
+            self._on_local_progress({**metadata, "location": position})
+
+        def handed_off():
+            if self.reading_progress is not None and MainWindow._local_progress_allowed(self, metadata["library_url"]):
                 self.reading_progress.save(
-                    "", key, "video", target, _P(target).name or ""
+                    "", key, "video", target, metadata["chapter_title"],
+                    title=metadata["title"], library_url=metadata["library_url"],
+                    folder=metadata["folder"], detail_url=target,
                 )
-            except Exception:  # noqa: BLE001 —— 记忆失败不影响播放
-                pass
-        from framework.external_player import open_with_player
 
-        open_with_player(target)
+        open_with_player(target, on_progress=changed, resume_positions={0: location}, on_handoff=handed_off)
+
+    def _on_local_progress(self, payload):
+        from framework.external_player import player_session
+
+        if not MainWindow._local_progress_allowed(self, payload.get("library_url") or ""):
+            return
+        location = payload.get("location") or {}
+        session = player_session()
+        if self.reading_progress is None or session is None or location.get("session_id") != id(session):
+            return
+        seconds, duration = location.get("seconds"), location.get("duration")
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (seconds, duration)):
+            return
+        if not 0 < seconds <= duration:
+            return
+        self.reading_progress.save(
+            "", payload["key"], "video", payload["chapter_url"], payload["chapter_title"],
+            position=seconds / duration,
+            location={"seconds": seconds, "duration": duration, "chapter_url": payload["chapter_url"]},
+            title=payload["title"], library_url=payload["library_url"], folder=payload["folder"],
+            detail_url=payload["chapter_url"],
+        )
 
     def _open_online_from_shelf(self, payload) -> None:
         """书架点收藏在线书 → 打开在线阅读器。payload=(source_id, url, content_type)。
@@ -1128,7 +1173,10 @@ class MainWindow(QMainWindow):
             settings=self.settings,
             history=self.search_history,
             bulk_fetch=self.bulk_fetch,
+            reading_progress=self.reading_progress,
+            privacy=self._ensure_library_store(),
         )
+        page.playback_requested.connect(self._resume_playback)
         # 首页内部导航联动主窗口 Tab
         page.add_source_requested.connect(
             lambda: self.tabs.setCurrentIndex(self._tab_index["source"])
@@ -1139,8 +1187,30 @@ class MainWindow(QMainWindow):
         page.search_requested.connect(self._jump_to_search)
         return page
 
+    def _resume_playback(self, record: dict) -> None:
+        from framework.reading_progress import history_active
+
+        progress = getattr(self, "reading_progress", None)
+        if progress is not None:
+            record = progress.all().get(record.get("book_url"))
+        if not record or not history_active(record):
+            return
+        store = self._ensure_library_store()
+        if store is None or store.playback_history_hidden(record):
+            return
+        if record.get("source_id"):
+            self._open_online_from_shelf((record["source_id"], record.get("library_url") or record["book_url"], "video"))
+        elif Path(record.get("chapter_url", "")).is_file():
+            self._play_local_video({
+                "key": record["book_url"], "episode_paths": [record["chapter_url"]],
+                "url": record.get("library_url", ""), "folder": record.get("folder", ""),
+                "title": record.get("title", ""),
+            })
+
     def _jump_to_search(self, keyword: str) -> None:
         """跳转搜索 Tab + 预填关键词并自动搜索（ui-home #3 最近搜索一键重搜）。"""
+        if self.search_history.hidden(keyword):
+            return
         self.tabs.setCurrentIndex(self._tab_index["search"])
         page = self.tabs.widget(self._tab_index["search"])
         if page is not None and hasattr(page, "fill_keyword"):

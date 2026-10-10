@@ -503,6 +503,22 @@ def test_stop_preserves_blocked_owner_until_fetch_finishes(blocking_source, prox
     assert not list(cache.root.glob("*.part"))
 
 
+@pytest.mark.parametrize("total, body", [(None, b"abc"), (4, b"abc"), (2, b"abc")])
+def test_file_tee_rejects_unverified_length(tmp_path, total, body):
+    cache = MediaCache(root=tmp_path / "vc")
+    key = "a" * 40
+    part = cache.hls_segment_part(key, "seg.ts")
+    final = cache.hls_segment_final(key, "seg.ts")
+    tee = _FileTee(cache, key, part, final, total, is_mp4=False)
+    assert tee.start()
+    tee.write(body)
+    tee.finish()
+    assert tee.aborted
+    assert not part.exists()
+    assert not final.exists()
+    assert key not in cache._inflight
+
+
 def test_file_tee_failure_cleans_part_and_inflight(tmp_path, monkeypatch):
     cache = MediaCache(root=tmp_path / "vc")
     key = "a" * 40

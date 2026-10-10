@@ -1732,6 +1732,7 @@ def fetch_rendered_video_sync(
     proxy: Optional[str] = None,
     slow_fallback_rounds: int = 3,
     context=None,
+    recover_navigation_timeout: bool = False,
 ) -> str:
     """渲染播放页，等 iframe 解析站执行后，提取真实视频源（video src）。
 
@@ -1774,8 +1775,35 @@ def fetch_rendered_video_sync(
                     except Exception:
                         pass
 
+                from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+                navigation = {"committed": False, "status": None}
+
+                def _on_response(response):
+                    request = response.request
+                    if request.is_navigation_request() and request.frame == page.main_frame:
+                        navigation["status"] = response.status
+                        navigation["committed"] = False
+
+                def _on_frame_navigated(frame):
+                    if frame == page.main_frame and frame.url.startswith(("http://", "https://")):
+                        navigation["committed"] = True
+
                 page.on("request", _on_request)
-                page.goto(url, timeout=bounded_ms(timeout_ms), wait_until=wait_until)
+                if recover_navigation_timeout:
+                    page.on("response", _on_response)
+                    page.on("framenavigated", _on_frame_navigated)
+                try:
+                    response = page.goto(url, timeout=bounded_ms(timeout_ms), wait_until=wait_until)
+                except PlaywrightTimeoutError:
+                    check()
+                    status = navigation["status"]
+                    if (not recover_navigation_timeout or not navigation["committed"]
+                            or status is None or not 200 <= status < 400):
+                        raise
+                else:
+                    if response is not None and response.status >= 400:
+                        return ""
                 check()
 
                 def _scan() -> str:

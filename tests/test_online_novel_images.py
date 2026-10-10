@@ -13,6 +13,7 @@ from framework.config import SourceConfig
 from framework.content import Content
 from framework.parser import Parser
 from framework.settings_manager import DEFAULTS, SettingsManager
+from PySide6.QtWidgets import QLabel
 from gui.pages.reader.novel_view import NovelView, _LoadChapterTask
 
 
@@ -232,6 +233,31 @@ def test_novel_view_places_ordered_images_between_paragraphs(_qapp, monkeypatch)
     view._current_idx = 0
     view._display_chapter(chapter, "p1\\np2\\np3")
     assert [item[0] for item in calls] == ["img-1", "img-2"]
+
+
+def test_novel_mixed_text_segments_follow_font_style(_qapp, monkeypatch):
+    view = NovelView(object())
+    view._source = SimpleNamespace(source_id="sid")
+    view._show_images = True
+    monkeypatch.setattr(view, "_load_image", lambda *args: None)
+    chapter = SimpleNamespace(
+        title="第一章",
+        url="chapter",
+        _cached_image_urls=[{"type": "text", "text": "正文"}],
+    )
+    view._chapters = [chapter]
+    view._current_idx = 0
+    view._display_chapter(chapter, "正文")
+    segment = view.scroll_body.findChildren(QLabel, "readerBody")[0]
+    initial_style = segment.styleSheet()
+    assert "font-family: Georgia" in initial_style
+    assert "font-size: 17px" in initial_style
+    assert "text-indent: 2em" in initial_style
+    assert "margin-bottom: 0.9em" in initial_style
+    assert segment.maximumWidth() == 960
+    view._adjust_font(3)
+    assert "font-size: 20px" in segment.styleSheet()
+    view.deleteLater()
 
 
 def test_novel_view_removes_failed_image_placeholder(_qapp):

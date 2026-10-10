@@ -17,15 +17,92 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import tempfile
 import time
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # 记忆有效期（秒）：超时未加入书架则清理
 MEMORY_TTL_SECONDS = 24 * 3600
+HISTORY_TTL_SECONDS = 604800
+
+
+def history_active(record, now=None):
+    now = time.time() if now is None else now
+    value = record.get("history_timestamp", record.get("updated_at"))
+    if isinstance(value, str):
+        try:
+            value = time.mktime(time.strptime(value, "%Y-%m-%dT%H:%M:%S"))
+        except (ValueError, OverflowError, OSError):
+            return False
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value) and 0 <= now - value < HISTORY_TTL_SECONDS)
+
+
+def video_resume_record(record):
+    result = {key: copy.deepcopy(record[key]) for key in (
+        "source_id", "book_url", "content_type", "chapter_url", "position",
+        "page", "library_url", "detail_url", "folder",
+    ) if key in record}
+    location = record.get("location")
+    result["location"] = ({key: copy.deepcopy(location[key]) for key in
+                           ("seconds", "duration", "position") if key in location}
+                          if isinstance(location, dict) else None)
+    return result
+
+
+def _sanitized_video_history(records):
+    return {key: video_resume_record(record)
+            if record.get("content_type") == "video" and not history_active(record)
+            else copy.deepcopy(record) for key, record in records.items()}
+
+
+def _atomic_write_progress(path, records):
+    temp_path = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def sanitize_progress_backup(progress_path, create_records=None):
+    path = Path(progress_path)
+    backup = path.with_suffix(path.suffix + ".bak")
+    try:
+        raw = json.loads(backup.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if create_records is not None:
+            _atomic_write_progress(backup, _sanitized_video_history(create_records))
+        return
+    except (UnicodeDecodeError, ValueError):
+        return
+    if not isinstance(raw, dict) or any(not isinstance(record, dict) for record in raw.values()):
+        return
+    cleaned = _sanitized_video_history(raw)
+    if cleaned != raw:
+        _atomic_write_progress(backup, cleaned)
+
+
+def _synchronized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return call
 
 
 class ReadingProgress:
@@ -43,7 +120,23 @@ class ReadingProgress:
         self.path = Path(path)
         self.shelf_cb = shelf_cb
         self._repository = repository
+        self._lock = threading.RLock()
         self._data: dict = self._load()
+        self._prune_video_history()
+
+    def _prune_video_history(self):
+        sanitize_progress_backup(self.path)
+        previous = self._data
+        cleaned = _sanitized_video_history(previous)
+        if cleaned != previous:
+            self._data = cleaned
+            try:
+                self._save(strict=True)
+            except (OSError, TypeError, ValueError):
+                self._data = previous
+                raise
+        if self._repository is not None:
+            self._repository.prune_video_history()
 
     # ------------------------------------------------------------------ #
     def _load(self) -> dict:
@@ -57,28 +150,15 @@ class ReadingProgress:
             pass
         return {}
 
-    def _save(self) -> None:
-        temp_path = None
+    def _save(self, strict=False) -> None:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
-            )
-            temp_path = Path(temp_name)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(self._data, handle, ensure_ascii=False, indent=2)
-            os.replace(temp_path, self.path)
-            temp_path = None
+            _atomic_write_progress(self.path, self._data)
         except (OSError, TypeError, ValueError):
-            pass
-        finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
+            if strict:
+                raise
 
     # ------------------------------------------------------------------ #
+    @_synchronized
     def save(
         self,
         source_id: str,
@@ -89,6 +169,10 @@ class ReadingProgress:
         position: float | None = None,
         page: int | None = None,
         location: dict | None = None,
+        title: str = "",
+        library_url: str = "",
+        folder: str = "",
+        detail_url: str = "",
     ) -> None:
         """记录/更新一部作品的阅读进度（换章/滚动/翻页/播放时调用）。
 
@@ -106,6 +190,7 @@ class ReadingProgress:
                 json.dumps(stored_location, ensure_ascii=False)
             except (TypeError, ValueError) as exc:
                 raise TypeError("location must contain only JSON-serializable values") from exc
+        self._prune_video_history()
         old = self._data.get(book_url, {})
         same_chapter = old.get("chapter_url") == chapter_url
         if location is None and same_chapter:
@@ -122,11 +207,17 @@ class ReadingProgress:
             "content_type": content_type,
             "chapter_url": chapter_url,
             "chapter_title": chapter_title,
+            "title": title or old.get("title", ""),
+            "library_url": library_url or old.get("library_url", ""),
+            "detail_url": detail_url or old.get("detail_url", ""),
+            "folder": folder or old.get("folder", ""),
             "position": position,
             "page": page,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "location": stored_location,
         }
+        if content_type == "video":
+            record["history_timestamp"] = time.time()
         self._data[book_url] = record
         if self._repository is not None:
             self._repository.upsert_book(book_url, source_id, book_url, content_type, {})
@@ -143,8 +234,10 @@ class ReadingProgress:
         query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
         return urlunsplit((parts.scheme.lower(), host.lower(), parts.path.rstrip("/") or "/", query, ""))
 
+    @_synchronized
     def resume(self, book_url: str) -> Optional[dict]:
         """取某本书的进度（供续读定位）。无则 None。"""
+        self._prune_video_history()
         rec = self._data.get(book_url)
         if rec is None:
             normalized = self._normalized_url(book_url)
@@ -157,6 +250,7 @@ class ReadingProgress:
             rec = (snapshot or {}).get("location")
         return copy.deepcopy(rec) if rec else None
 
+    @_synchronized
     def prune(self, shelf_cb: Optional[Callable[[str], bool]] = None) -> int:
         """清理过期记忆：超 TTL_SECONDS 且（书架回调未命中）→ 删除。
 
@@ -164,10 +258,13 @@ class ReadingProgress:
         书架未实现时传 None → 恒当作"未入书架"，超期即清理。
         返回删除条数。
         """
+        self._prune_video_history()
         now = time.time()
         removed = 0
         expired_keys = []
         for url, rec in self._data.items():
+            if rec.get("content_type") == "video":
+                continue
             try:
                 updated = time.strptime(rec.get("updated_at", ""), "%Y-%m-%dT%H:%M:%S")
                 ts = time.mktime(updated)
@@ -186,10 +283,21 @@ class ReadingProgress:
             self._save()
         return removed
 
+    @_synchronized
     def all(self) -> dict:
         """最新记忆快照（供首页"继续阅读"等展示）。"""
-        return json.loads(json.dumps(self._data))
+        self._prune_video_history()
+        return json.loads(json.dumps({key: record for key, record in self._data.items()
+                                     if record.get("content_type") != "video" or history_active(record)}))
 
+    def recent_videos(self, privacy=None, limit: int = 20) -> list[dict]:
+        records = [rec for rec in self.all().values()
+                   if rec.get("content_type") == "video" and rec.get("chapter_url")
+                   and not (privacy and privacy.playback_history_hidden(rec))]
+        records.sort(key=lambda rec: rec.get("updated_at", ""), reverse=True)
+        return records[:limit]
+
+    @_synchronized
     def clear(self) -> None:
         self._data = {}
         self._save()

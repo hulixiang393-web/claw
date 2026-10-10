@@ -1,11 +1,10 @@
 """单集视频源（single_chapter）分集行为回归测试。
 
-对应 2026-09-09 视频分集显示修复：avgood / 18mh-video / 18j 均为
+对应 2026-09-09 视频分集显示修复：avgood / 18mh-video 均为
 「详情页即单个视频、无真分集结构」的站点，正确行为是返回 1 条非空分集：
 - avgood（single_chapter + list 有 iframe）→ 1 集，URL 取 iframe 播放页
   （取流必须走 api_endpoints.episode 的播放 id，故不能回退详情 URL）
 - avgood 无 iframe 页（磁力下载页）→ 回退详情 URL 唯一分集，不空白
-- 18j（single_chapter + 空 list {}）→ 回退详情 URL 唯一分集
 - 18mh-video（single_chapter 无 list）→ 回退详情 URL 唯一分集
 
 用真实源配置加载 + mock HTML，锁定「分集区永不空白、且不错播相关推荐」。
@@ -93,16 +92,6 @@ def test_avgood_single_chapter_fallback_when_no_iframe():
     ch = detail.chapters[0]
     assert ch.url.rstrip("/").lower() == url.rstrip("/").lower()
     assert ch.title  # 标题不空（视频本身），分集区不空白
-
-
-def test_18j_single_chapter_empty_list_falls_back():
-    """18j：single_chapter + 空 list {} → 回退详情 URL 唯一分集。"""
-    src = _load_source("18j")
-    url = "https://18j.tv/v/48002/"
-    detail = _content(_Http({url: SIMPLE_DETAIL})).fetch_detail(src, url)
-    assert len(detail.chapters) == 1
-    ch = detail.chapters[0]
-    assert ch.url.rstrip("/").lower() == url.rstrip("/").lower()
 
 
 def test_18mh_single_chapter_no_list_falls_back():

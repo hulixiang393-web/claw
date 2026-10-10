@@ -26,6 +26,141 @@ class _Content:
         return list(self.candidates)
 
 
+@pytest.mark.parametrize("source_id,budget,expected", [
+    ("agedm", "pipeline", ("https://cdn/pipeline.m3u8", "")),
+    ("agedm", None, ("", "")),
+    ("demo", "pipeline", ("", "")),
+    ("demo", None, ("", "")),
+])
+def test_content_pipeline_budget_is_age_opt_in(monkeypatch, source_id, budget, expected):
+    from framework.content import Content
+
+    content = Content(None, None, None)
+    source = type("Source", (), {"source_id": source_id, "raw": {"endpoints": {"content": {"episode": {}}}}})()
+    if budget:
+        source.raw["endpoints"]["content"]["episode"]["stream_budget"] = budget
+    calls = []
+
+    def pipeline(*args, context=None, source_lock=False, **kwargs):
+        calls.append((context, source_lock))
+        time.sleep(0.08)
+        context.check()
+        return "https://cdn/pipeline.m3u8", ""
+
+    monkeypatch.setattr(content, "_fetch_video_streams_legacy", pipeline)
+    resolver = StreamResolver(content, total_budget=1, candidate_timeout=0.02)
+    assert resolver.resolve(source, "https://site/episode", source_lock=True) == expected
+    assert len(calls) == 1
+    assert calls[0][1] is True
+    until = time.monotonic() + 1
+    while resolver._inflight and time.monotonic() < until:
+        time.sleep(0.005)
+    assert resolver._inflight == {}
+    assert resolver.get_cached(source, "https://site/episode") == (expected if expected[0] else None)
+
+
+def test_pipeline_cancel_returns_promptly_and_keeps_worker_inflight(monkeypatch):
+    from framework.content import Content
+
+    content = Content(None, None, None)
+    source = _Source()
+    source.source_id = "agedm"
+    source.raw = {"endpoints": {"content": {"episode": {"stream_budget": "pipeline"}}}}
+    started = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def pipeline(*args, **kwargs):
+        started.set()
+        release.wait(2)
+        return "https://cdn/late.m3u8", ""
+
+    monkeypatch.setattr(content, "_fetch_video_streams_legacy", pipeline)
+    resolver = StreamResolver(content, total_budget=5, candidate_timeout=0.02)
+
+    def run():
+        try:
+            resolver.resolve(source, "https://site/episode")
+        except StreamCancelledError as exc:
+            errors.append(exc)
+
+    owner = threading.Thread(target=run)
+    owner.start()
+    try:
+        assert started.wait(1)
+        resolver.invalidate(source, "https://site/episode")
+        owner.join(0.5)
+        assert not owner.is_alive()
+        assert errors
+        assert resolver._inflight
+        assert resolver._cache == {}
+    finally:
+        release.set()
+        owner.join(2)
+    until = time.monotonic() + 1
+    while resolver._inflight and time.monotonic() < until:
+        time.sleep(0.005)
+    assert resolver._inflight == {}
+    assert resolver._cache == {}
+
+
+def test_pipeline_descriptor_is_source_agnostic():
+    def slow():
+        time.sleep(0.08)
+        return "https://cdn/pipeline.m3u8", ""
+
+    resolver = StreamResolver(
+        _Content([{"resolver": slow, "budget": "pipeline"}]),
+        total_budget=1, candidate_timeout=0.02,
+    )
+    assert resolver.resolve(_Source(), "https://site/episode") == ("https://cdn/pipeline.m3u8", "")
+
+
+def test_legacy_loader_keeps_short_budget_and_discards_late_result():
+    from types import SimpleNamespace
+
+    release = threading.Event()
+
+    def legacy(*args, **kwargs):
+        release.wait(1)
+        return "https://cdn/late.m3u8", ""
+
+    resolver = StreamResolver(
+        SimpleNamespace(_fetch_video_streams_legacy=legacy),
+        total_budget=1, candidate_timeout=0.02,
+    )
+    try:
+        assert resolver.resolve(_Source(), "https://site/episode") == ("", "")
+        assert resolver._inflight
+        assert resolver._cache == {}
+    finally:
+        release.set()
+    until = time.monotonic() + 1
+    while resolver._inflight and time.monotonic() < until:
+        time.sleep(0.005)
+    assert resolver._inflight == {}
+    assert resolver._cache == {}
+
+
+def test_short_candidate_still_times_out_and_tries_next():
+    release = threading.Event()
+
+    def slow():
+        release.wait(1)
+        return "https://cdn/late.m3u8", ""
+
+    resolver = StreamResolver(
+        _Content([slow, ("https://cdn/next.m3u8", "")]),
+        total_budget=1, candidate_timeout=0.02,
+    )
+    try:
+        assert resolver.resolve(_Source(), "https://site/episode") == (
+            "https://cdn/next.m3u8", ""
+        )
+    finally:
+        release.set()
+
+
 def test_direct_media_returns_before_loading_legacy_candidates():
     content = _Content([("https://cdn/legacy.m3u8", "")], delay=0.2)
     resolver = StreamResolver(content, total_budget=0.05)
@@ -443,6 +578,10 @@ def test_invalidation_discards_late_result_and_allows_fresh_resolution():
     assert not owner.is_alive()
     assert errors
     assert resolver._cache == {}
+    deadline = time.monotonic() + 1
+    while resolver._inflight and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert resolver._inflight == {}
     content.candidates = [("https://cdn/fresh.mp4", "")]
     assert resolver.resolve(_Source(), "https://site/episode") == ("https://cdn/fresh.mp4", "")
 

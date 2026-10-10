@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import inspect
 import ipaddress
 import mimetypes
 from contextlib import nullcontext
@@ -46,6 +47,9 @@ from urllib.parse import urljoin, unquote, quote, urlparse
 import requests
 from requests.adapters import HTTPAdapter
 
+from .adblock import trusted_media_context, trusted_source_id
+from urllib3.exceptions import HTTPError as UpstreamReadError
+
 # 无任何请求 N 秒后自动关闭（避免残留进程/端口）。放大到 600s：VLC 暂停/拖动
 # 进度是原地等待不再发请求，若 N 太小看门狗在播放期间误停代理 → URL 失效
 # （拖动进度后 VLC 报错）。流式转发循环内持续刷新 _last_use，正常播放不会触发。
@@ -60,6 +64,9 @@ _READ_CHUNK = 64 * 1024
 _SNIFF_BYTES = 16
 _CACHE_FETCH_WAIT = 30.0
 _PREFETCH_MAX_DEPTH = 64
+_trusted_source_id = trusted_source_id
+
+
 _PREFETCH_MAX_WORKERS = 8
 _PREFETCH_MAX_PENDING = 32
 _PREFETCH_TIMEOUT = 10.0
@@ -242,8 +249,8 @@ def _read_upstream_body(response) -> bytes:
         _update_upstream_diagnostic(response, len(body))
         return body
     try:
-        if (response.headers.get("Content-Encoding") or "").lower() in (
-                "gzip", "deflate", "br"):
+        encoding = (response.headers.get("Content-Encoding") or "").lower()
+        if encoding in ("gzip", "deflate", "br"):
             raw.decode_content = True
         chunks = []
         while True:
@@ -252,11 +259,30 @@ def _read_upstream_body(response) -> bytes:
                 break
             chunks.append(chunk)
             _update_upstream_diagnostic(response, len(chunk))
-        return b"".join(chunks)
+        body = b"".join(chunks)
+        if encoding == "zstd":
+            # 部分站点无视 Accept-Encoding: identity 强制回 zstd，urllib3
+            # 不会自动解压；zstandard 为可选依赖，缺失时原样返回（不新增依赖）。
+            body = _decode_zstd(body)
+        return body
     except (AttributeError, TypeError):
         body = response.content
         _update_upstream_diagnostic(response, len(body))
         return body
+
+
+def _decode_zstd(data: bytes) -> bytes:
+    """zstd 解压（可选依赖）：zstandard 缺失或解压失败时原样返回。"""
+    try:
+        import zstandard
+    except ImportError:
+        return data
+    try:
+        stream = zstandard.ZstdDecompressor().decompressobj()
+        out = stream.decompress(data)
+        return out + (stream.flush() or b"")
+    except Exception:
+        return data
 
 
 def _read_upstream_route_diagnostics() -> list[dict]:
@@ -336,6 +362,28 @@ def _context_fingerprint(target: str, headers: dict | None = None) -> str:
     return hashlib.sha256("\n".join(values).encode("utf-8", "replace")).hexdigest()
 
 
+def _manifest_strategy_fingerprint(ad_block: dict | None,
+                                   force_proxy: bool,
+                                   source_id: str = "") -> str:
+    payload = {
+        "version": 2,
+        "source_id": trusted_source_id(source_id),
+        "ad_block": ad_block or {},
+        "force_proxy": bool(force_proxy),
+    }
+    raw = repr(payload).encode("utf-8", "replace")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _manifest_cache_key(cache, target: str, ad_block: dict | None,
+                        force_proxy: bool, source_id=None) -> str:
+    material = (
+        target + "\n" + _manifest_strategy_fingerprint(ad_block, force_proxy, source_id)
+        if trusted_source_id(source_id) == "18j" else target
+    )
+    return cache.key_of(material)
+
+
 def _clean_detection_context(context: dict | None) -> dict | None:
     if not isinstance(context, dict):
         return None
@@ -358,7 +406,7 @@ def _manifest_contains_query(text: str, base_url: str) -> bool:
     return False
 
 
-def _proxy_get(target: str, headers: dict, timeout=30):
+def _proxy_get(target: str, headers: dict, timeout=30, attempts=2):
     """经系统代理会话取流。重试一次短退避：代理偶发连接重置/切节点时，
     否则上层把异常当 502 抛给播放器 → VLC demux 失败 → 播放中断。
     两次都失败则抛出最后一次异常。"""
@@ -366,7 +414,7 @@ def _proxy_get(target: str, headers: dict, timeout=30):
     deadline = None
     if isinstance(timeout, tuple):
         deadline = time.monotonic() + max(timeout)
-    for _attempt in range(2):
+    for _attempt in range(attempts):
         request_timeout = timeout
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -391,8 +439,10 @@ def _proxy_get(target: str, headers: dict, timeout=30):
 
 def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False,
                     cache_state: str | None = "miss",
-                    wait_ms: float | None = None, timeout=None):
+                    wait_ms: float | None = None, timeout=None, segment=False,
+                    retry_connect=True):
     """默认直连优先，失败后按 host 记忆并回退系统代理。"""
+    segment = segment or _classify_upstream_request_kind(target, {}) == "segment"
     deadline = (time.monotonic() + max(timeout)
                 if isinstance(timeout, tuple) else None)
 
@@ -408,7 +458,8 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False,
         started = time.perf_counter()
         try:
             resp = _proxy_get(target, headers,
-                              timeout=_request_timeout() or 30)
+                              timeout=_request_timeout() or 30,
+                              attempts=2 if retry_connect else 1)
         except requests.RequestException as exc:
             _record_upstream_diagnostic(
                 target, headers, "proxy", started,
@@ -435,7 +486,7 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False,
                          (_DIRECT_CONNECT_TIMEOUT, 60)), stream=True,
             )
             if resp is not None:
-                if resp.status_code < 400:
+                if resp.status_code < 400 or (segment and resp.status_code in (403, 429)):
                     record = _record_upstream_diagnostic(
                         target, headers, "direct", started, resp,
                         cache_state=cache_state, wait_ms=wait_ms,
@@ -461,7 +512,8 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False,
     started = time.perf_counter()
     try:
         resp = _proxy_get(target, headers,
-                          timeout=_request_timeout() or 30)
+                          timeout=_request_timeout() or 30,
+                          attempts=1 if segment else 2)
     except requests.RequestException as exc:
         _record_upstream_diagnostic(
             target, headers, "proxy", started,
@@ -479,12 +531,49 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False,
     return resp
 
 
+def _read_media_prefix(resp, target, headers, force_proxy, cache=None,
+                       fetch_key=None, fetch_state=None, segment=False):
+    segment = segment or _classify_upstream_request_kind(target, {}) == "segment"
+    for attempt in range(2):
+        if resp.status_code >= 400:
+            return resp, b"", False
+        try:
+            if fetch_state is not None and cache.fetch_cancelled(fetch_state):
+                raise RuntimeError("media fetch cancelled")
+            whole = (resp.headers.get("Content-Encoding") or "").lower() in (
+                "gzip", "deflate", "br", "zstd")
+            first = _read_upstream_body(resp) if whole else resp.raw.read(_SNIFF_BYTES)
+            if not whole:
+                _update_upstream_diagnostic(resp, len(first))
+                length = resp.headers.get("Content-Length", "")
+                if length.isdigit() and len(first) < min(_SNIFF_BYTES, int(length)):
+                    raise requests.ConnectionError("incomplete media prefix")
+            return resp, first, whole
+        except (requests.ConnectionError, requests.Timeout, UpstreamReadError):
+            resp.close()
+            if attempt or not segment:
+                raise
+            force_proxy = force_proxy or (
+                getattr(resp, "_media_proxy_diagnostic", {}).get("route") == "proxy")
+            time.sleep(0.1)
+            if fetch_state is not None and cache.fetch_cancelled(fetch_state):
+                raise RuntimeError("media fetch cancelled")
+            resp = _fetch_upstream(target, headers, force_proxy=force_proxy,
+                                   segment=segment, retry_connect=False)
+            if fetch_state is not None:
+                cache.set_fetch_response(fetch_key, fetch_state, resp)
+        except Exception:
+            resp.close()
+            raise
+
+
 def _set_response_read_timeout(response, timeout: float) -> None:
     raw = getattr(response, "raw", None)
     candidates = [raw, getattr(raw, "_sock", None)]
     fp = getattr(raw, "_fp", None)
-    candidates.extend((getattr(fp, "fp", None),
-                       getattr(getattr(fp, "fp", None), "raw", None)))
+    socket_raw = getattr(getattr(fp, "fp", None), "raw", None)
+    candidates.extend((getattr(fp, "fp", None), socket_raw,
+                       getattr(socket_raw, "_sock", None)))
     for candidate in candidates:
         setter = getattr(candidate, "settimeout", None)
         if setter is not None:
@@ -538,14 +627,17 @@ def _full_zero_offset_response(resp, client_range: str | None = None) -> bool:
     if client_range:
         return False
     if resp.status_code == 200:
-        return True
+        return not resp.headers.get("Content-Range")
     if resp.status_code != 206:
         return False
     content_range = resp.headers.get("Content-Range") or ""
     match = re.fullmatch(r"bytes\s+(0)-(\d+)/(\d+)", content_range.strip())
     if match is None:
         return False
-    return int(match.group(2)) + 1 == int(match.group(3))
+    total = int(match.group(3))
+    length = resp.headers.get("Content-Length", "")
+    return (total > 0 and int(match.group(2)) + 1 == total
+            and (not length or (length.isdigit() and int(length) == total)))
 
 
 def _content_total(resp) -> int | None:
@@ -649,7 +741,7 @@ class _FileTee:
                     self.fh.close()
             except Exception:
                 pass
-            complete = self.total is None or self.written >= self.total
+            complete = self.total is not None and self.written == self.total
             if complete and self.cache.commit_part(self.part, self.final):
                 committed = True
                 if self.is_mp4:
@@ -661,6 +753,7 @@ class _FileTee:
             elif complete:
                 failed = True
             else:
+                self.aborted = True
                 self._discard_files()
         except Exception:
             failed = True
@@ -770,6 +863,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ #
     def do_GET(self):  # noqa: N802
+        self._response_started = False
         proxy: "MediaProxy" = self.server.proxy  # type: ignore[attr-defined]
         public_base = (
             getattr(self.server, "public_base", None)
@@ -806,6 +900,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "token not found")
                 return
             target, headers, ad_block = entry[0], entry[1], entry[2]
+            source_id = entry[4] if len(entry) >= 5 else ""
             force_proxy = _tuple_force_proxy(entry)
             try:
                 # 拖动进度（Range 非 0 起始）若越过正在下载的缓存区间，先放弃
@@ -813,7 +908,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 if self.headers.get("Range"):
                     proxy._abort_tee_on_gap(target, self.headers.get("Range"))
                 proxy._forward(self, target, headers, ad_block, force_proxy,
-                               public_base)
+                               public_base, source_id)
             except Exception as exc:  # noqa: BLE001 —— 网络波动直接断流，播放器会提示
                 try:
                     self.send_error(502, f"proxy error: {exc}")
@@ -825,6 +920,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # 静音访问日志
         pass
 
+    def end_headers(self):
+        self._response_started = True
+        super().end_headers()
+
     def send_error(self, code, message=None, explain=None):
         """错误响应：先标记连接关闭。
 
@@ -833,7 +932,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         （代价仅是该次请求，与 keep-alive 无关）。
         """
         self.close_connection = True
-        super().send_error(code, message, explain)
+        if not getattr(self, "_response_started", False):
+            super().send_error(code, message, explain)
 
 
 class MediaProxy:
@@ -874,8 +974,8 @@ class MediaProxy:
         #   sem:  该系列独占的解析并发信号量
         self._series: dict[str, dict] = {}
         self._cache = cache  # 可注入测试用缓存实例；None → 懒加载单例
-        # cache_ctx key → (base_url, headers, ad_block, force_proxy)（当前四元组；
-        # 旧五元组读取仍兼容，endpoint base 不存入 cache_ctx）
+        # cache_ctx key → (base_url, headers, ad_block, force_proxy, final_base)
+        # （当前五元组；旧三元组/四元组读取仍兼容，endpoint base 不存入 cache_ctx）
         self._cache_ctx: dict[str, tuple] = {}
         self._manifest_cache: dict[str, tuple[float, str]] = {}
         self._mp4_tee: dict[str, _FileTee] = {}  # key → 进行中的 mp4 落盘
@@ -1046,65 +1146,83 @@ class MediaProxy:
             return
         canonical = cache.key_of(url)
         resp = None
+        lock = cache.path_lock(url)
+        acquired = False
         try:
-            if self._prefetch_url_cancelled(canonical):
+            deadline = time.monotonic() + _PREFETCH_TIMEOUT
+            acquired = lock.acquire(timeout=_PREFETCH_TIMEOUT)
+            if not acquired:
                 return
-            lock = cache.path_lock(url)
-            with lock:
-                final = cache.hls_segment_final(cache_key, url)
-                if final.is_file():
+            final = cache.hls_segment_final(cache_key, url)
+            for attempt in range(2):
+                if (self._prefetch_url_cancelled(canonical) or self._pf_disabled
+                        or final.is_file()):
                     return
-            try:
-                resp = _fetch_upstream(
-                    url, headers, force_proxy=force_proxy,
-                    timeout=(_PREFETCH_TIMEOUT, _PREFETCH_TIMEOUT),
-                )
-            except Exception as exc:
-                self._note_prefetch_failure(exc=exc)
-                return
-            with self._pf_lock:
-                self._pf_responses[canonical] = resp
-            if self._prefetch_url_cancelled(canonical):
-                return
-            with lock:
-                if self._prefetch_url_cancelled(canonical):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return
-                if final.is_file():
+                try:
+                    resp = _fetch_upstream(
+                        url, headers, force_proxy=force_proxy,
+                        timeout=(remaining, remaining), segment=True,
+                        retry_connect=False,
+                    )
+                except Exception as exc:
+                    self._note_prefetch_failure(exc=exc)
                     return
-                if resp.status_code >= 400:
-                    self._note_prefetch_failure(status=resp.status_code)
-                    return
-                self._note_prefetch_success()
-                tee = _FileTee(cache, cache_key,
-                               cache.hls_segment_part(cache_key, url), final,
-                               _content_total(resp), is_mp4=False)
-                if not tee.start():
-                    return
-            committed = False
-            try:
-                deadline = time.monotonic() + _PREFETCH_TIMEOUT
-                while True:
+                force_proxy = force_proxy or (
+                    getattr(resp, "_media_proxy_diagnostic", {}).get("route") == "proxy")
+                with self._pf_lock:
+                    self._pf_responses[canonical] = resp
+                tee = None
+                try:
+                    if resp.status_code >= 400:
+                        self._note_prefetch_failure(status=resp.status_code)
+                        return
+                    total = _content_total(resp)
+                    if (not total or not _full_zero_offset_response(resp)
+                            or (resp.headers.get("Content-Encoding") or "identity").lower() != "identity"):
+                        return
+                    tee = _FileTee(cache, cache_key,
+                                   cache.hls_segment_part(cache_key, url), final,
+                                   total, is_mp4=False)
+                    if not tee.start():
+                        return
+                    while True:
+                        if self._prefetch_url_cancelled(canonical):
+                            return
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise requests.Timeout("prefetch read timeout")
+                        _set_response_read_timeout(resp, remaining)
+                        chunk = resp.raw.read(_READ_CHUNK)
+                        if not chunk:
+                            break
+                        tee.write(chunk)
+                    if tee.written != total:
+                        raise requests.ConnectionError("incomplete prefetch body")
                     if self._prefetch_url_cancelled(canonical):
                         return
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        self._note_prefetch_failure(
-                            exc=requests.Timeout("prefetch read timeout"))
-                        return
-                    _set_response_read_timeout(resp, remaining)
-                    chunk = resp.raw.read(_READ_CHUNK)
-                    if not chunk:
-                        break
-                    tee.write(chunk)
-                with lock:
                     tee.finish()
-                committed = tee.done and not tee.aborted
-            except Exception as exc:
-                self._note_prefetch_failure(exc=exc)
-            finally:
-                if not committed:
-                    tee.abort()
+                    if not tee.aborted:
+                        self._note_prefetch_success()
+                    return
+                except (requests.ConnectionError, requests.Timeout, UpstreamReadError) as exc:
+                    if attempt:
+                        self._note_prefetch_failure(exc=requests.ConnectionError(str(exc)))
+                except Exception as exc:
+                    self._note_prefetch_failure(exc=exc)
+                    return
+                finally:
+                    if tee is not None and not tee.done:
+                        tee.abort()
+                    resp.close()
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    self._pf_cancel.wait(min(0.1, remaining))
         finally:
+            if acquired:
+                lock.release()
             with self._pf_lock:
                 self._pf_responses.pop(canonical, None)
                 self._pf_scheduled.discard(canonical)
@@ -1268,15 +1386,35 @@ class MediaProxy:
         return False
 
     # 缓存上下文注册：m3u8 被重写时把 key →
-    # (base_url, headers, ad_block, force_proxy) 记下；endpoint base
+    # (请求 URL, headers, ad_block, force_proxy, final base) 记下；endpoint base
     # 由当前收到请求的 server 提供，避免 local/LAN 串线。
+    # final base = 重写基准（resp.url 或请求 URL），_serve_cache 定位上游时用；
+    # 请求 URL 单独保留，保证 disk/memory 缓存键隔离语义不变。
     def _register_cache_ctx(self, key: str, target: str, headers: dict,
                             ad_block: dict | None,
-                            force_proxy: bool = False) -> None:
+                            force_proxy: bool = False,
+                            final_base: str | None = None,
+                            source_id=None) -> None:
         with self._lock:
-            self._cache_ctx[key] = (_context_target(target),
-                                    _clean_context_headers(headers),
-                                    ad_block, force_proxy)
+            self._cache_ctx[key] = (
+                _context_target(target), _clean_context_headers(headers),
+                ad_block, force_proxy,
+                final_base or _context_target(target),
+                source_id,
+            )
+
+
+    def _register_cache_ctx_if_missing(self, key: str, target: str,
+                                       headers: dict, ad_block: dict | None,
+                                       force_proxy: bool = False,
+                                       source_id=None) -> None:
+        with self._lock:
+            if key in self._cache_ctx:
+                return
+            self._cache_ctx[key] = (
+                _context_target(target), _clean_context_headers(headers),
+                ad_block, force_proxy, _context_target(target), source_id,
+            )
 
     # ------------------------------------------------------------------ #
     def _base_url(self, public_base: str | None = None) -> str:
@@ -1294,7 +1432,9 @@ class MediaProxy:
     def build_url(self, target_url: str, headers: dict | None = None,
                   ad_block: dict | None = None,
                   force_proxy: bool = False,
-                  public_base: str | None = None) -> str:
+                  public_base: str | None = None,
+                  source_id=None) -> str:
+
         """把目标媒体 URL 打包成本地代理 URL（播放器直接播这个）。
 
         ad_block：可选源 ad_block 配置。存在时代理转发 m3u8 会剔除广告段
@@ -1307,10 +1447,16 @@ class MediaProxy:
             return ""
         base = self._base_url(public_base)
         token = uuid.uuid4().hex
+        token_context = (
+            target_url, _strip_stale_headers(headers or {}), ad_block, force_proxy,
+        )
+        if trusted_source_id(source_id) == "18j":
+            token_context = token_context + (source_id,)
+
         with self._lock:
-            self._tokens[token] = (
-                target_url, _strip_stale_headers(headers or {}), ad_block, force_proxy,
-            )
+
+            self._tokens[token] = token_context
+
             if public_base:
                 self._lan_tokens.add(token)
         return f"{base}/s/{token}"
@@ -1517,7 +1663,8 @@ class MediaProxy:
     # 惰性系列：外部播放器全集播放列表
     # ------------------------------------------------------------------ #
     def register_series(self, resolver, on_play=None, count: int = 0,
-                        force_proxy: bool = False) -> str:
+                        force_proxy: bool = False, source_id: str = "") -> str:
+
         """注册一支惰性解析系列，返回不透明 key。
 
         resolver(idx) -> (video, audio, headers, ad_block)；抛异常表示该集取流
@@ -1533,6 +1680,7 @@ class MediaProxy:
                 "resolver": resolver, "on_play": on_play, "count": int(count),
                 "memo": {}, "sem": threading.Semaphore(_SERIES_SEM),
                 "force_proxy": bool(force_proxy),
+                "source_id": source_id,
             }
             while len(self._series) > _SERIES_MAX:   # FIFO 兜底：淘汰最旧一支
                 self._series.pop(next(iter(self._series)))
@@ -1545,8 +1693,10 @@ class MediaProxy:
 
     def warm_series_episode(self, key: str, idx: int, video: str,
                             audio: str = "", headers: dict | None = None,
-                            ad_block: dict | None = None,
-                            public_base: str | None = None) -> bool:
+                             ad_block: dict | None = None,
+                             public_base: str | None = None,
+                             source_id: str = "") -> bool:
+
         """把**已知的**取流结果预写入系列 memo（纯优化，无副作用）。
 
         点集流程 _FetchStreamTask 已用同款 merged=True 取过当前集的流，
@@ -1566,12 +1716,16 @@ class MediaProxy:
             if ser is None or not (0 <= int(idx) < int(ser["count"])):
                 return False
             force_proxy = ser["force_proxy"]
+            source_id = ser.get("source_id", "")
+
         try:
             entry = (video, audio,
                      self.build_url(video, headers or {},
                                     ad_block=ad_block,
-                                    force_proxy=force_proxy,
-                                    public_base=lan_base))
+                                     force_proxy=force_proxy,
+                                     public_base=lan_base,
+                                     source_id=source_id))
+
         except Exception:  # noqa: BLE001 —— 铸 token 失败：回落 resolver
             return False
         with self._lock:
@@ -1616,6 +1770,8 @@ class MediaProxy:
             sem = ser["sem"]
             resolver, on_play = ser["resolver"], ser["on_play"]
             force_proxy = ser["force_proxy"]
+            source_id = ser.get("source_id", "")
+
         if entry is None:
             if not sem.acquire(timeout=_SERIES_WAIT):
                 handler.send_error(503, "too many concurrent resolves")
@@ -1634,8 +1790,11 @@ class MediaProxy:
             # 既不回源也不用再扫 _tokens 反查。
             entry = (video, audio,
                      self.build_url(video, headers, ad_block=ad_block,
-                                    force_proxy=force_proxy,
-                                    public_base=lan_base))
+                                      force_proxy=force_proxy,
+                                     public_base=lan_base,
+                                     source_id=source_id))
+
+
             with self._lock:
                 cur = self._series.get(key)      # 解析期间可能已被注销
                 if cur is not None:
@@ -1701,23 +1860,30 @@ class MediaProxy:
     # ------------------------------------------------------------------ #
     def _new_token(self, target: str, headers: dict, ad_block: dict | None = None,
                    force_proxy: bool = False,
-                   public_base: str | None = None) -> str:
+                   public_base: str | None = None,
+                   source_id=None) -> str:
         token = uuid.uuid4().hex
+        token_context = (
+            target, _strip_stale_headers(headers), ad_block, force_proxy,
+        )
+        if trusted_source_id(source_id) == "18j":
+            token_context = token_context + (source_id,)
         with self._lock:
-            self._tokens[token] = (target, _strip_stale_headers(headers),
-                                   ad_block, force_proxy)
+            self._tokens[token] = token_context
             if public_base:
                 self._lan_tokens.add(token)
         return token
 
     def _proxy_url(self, target: str, base: str, headers: dict,
-                   ad_block: dict | None = None,
-                   force_proxy: bool = False,
-                   public_base: str | None = None) -> str:
+                    ad_block: dict | None = None,
+                    force_proxy: bool = False,
+                    public_base: str | None = None,
+                    source_id=None) -> str:
+
         output_base = self._base_url(public_base)
         full = urljoin(base, target)
         token = self._new_token(full, headers, ad_block, force_proxy,
-                                public_base)
+                                public_base, source_id)
         return f"{output_base}/s/{token}"
 
     # ------------------------------------------------------------------ #
@@ -1734,6 +1900,7 @@ class MediaProxy:
         if not start:
             return
         key = cache.key_of(target)
+
         with self._lock:
             tee = self._mp4_tee.get(key)
         if tee is not None and not tee.done and tee.written < start:
@@ -1748,9 +1915,12 @@ class MediaProxy:
 
     # ------------------------------------------------------------------ #
     def _forward(self, handler: "_ProxyHandler", target: str, headers: dict,
-                 ad_block: dict | None = None,
-                 force_proxy: bool = False,
-                 public_base: str | None = None) -> None:
+                  ad_block: dict | None = None,
+                  force_proxy: bool = False,
+                          public_base: str | None = None,
+                          source_id: str = "") -> None:
+
+
         """转发一次请求：m3u8 重写内部 URL（含广告过滤），否则流式转发。
 
         ad_block：源 ad_block 配置。非空时 m3u8 重写前先剔除广告段
@@ -1786,42 +1956,62 @@ class MediaProxy:
         # 命中直接 serve，未命中流式转发 + tee 落盘。
         if is_hls_url:
             self._forward_m3u8(handler, target, req_headers, ad_block,
-                               force_proxy, public_base)
+                               force_proxy, public_base, source_id)
             return
         self._forward_media(handler, target, req_headers, ad_block,
-                            force_proxy, public_base)
+                            force_proxy, public_base, source_id)
+
 
     # ------------------------------------------------------------------ #
     def _serve_m3u8_text(self, handler: "_ProxyHandler", text: str,
                          target: str, req_headers: dict,
                          ad_block: dict | None = None,
                          force_proxy: bool = False,
-                         public_base: str | None = None) -> None:
+                         public_base: str | None = None,
+                         manifest_key: str | None = None,
+                         skip_ad_filter: bool = False,
+                         final_base: str | None = None,
+                         source_id=None) -> None:
+
+
         """把已取回的 m3u8 文本：广告过滤 → 缓存过滤结果 → 重写内部 URL → 发送。
 
         由 _forward_m3u8（URL 是 .m3u8）与 _forward_media（短链/参数化 URL
         内容其实是 m3u8）共用。
+        target：请求 URL（缓存键/token 语义）。final_base：urljoin 重写基准，
+        为上游最终响应 URL（resp.url）。两者可能不同——包装接口 302 到 CDN 时，
+        相对分片/KEY 必须拼在最终 host 上，否则会拼成包装接口的假路径。
         """
         cache = self._ensure_cache()
         cache_on = bool(cache is not None and cache.enabled)
+        base = final_base or target
         # 播放路径广告过滤：HLS 一律走本地代理/过滤，剔除 m3u8 广告段再
         # 重写（不要求源配 ad_block；ad_block 显式 enabled:false 才关闭，
         # 判定与下载路径 filter_m3u8 一致）
-        text = self._filter_ad_segments(text, target, ad_block)
+        if not skip_ad_filter:
+            text = self._filter_ad_segments(text, base, ad_block, req_headers, source_id)
+        if manifest_key is not None:
+            self._manifest_cache[manifest_key] = (time.monotonic(), text, base)
         key = None
         if cache_on:
             try:
-                key = cache.key_of(target)
+                key = _manifest_cache_key(cache, target, ad_block,
+                                           force_proxy, source_id)
                 if not _manifest_contains_query(text, target):
                     cache.playlist_write(key, text.encode("utf-8", "replace"))
+
                 self._register_cache_ctx(key, target, req_headers, ad_block,
-                                         force_proxy)
+                                         force_proxy, final_base=base,
+                                         source_id=source_id)
+
             except Exception:  # noqa: BLE001 —— 缓存写失败不阻断播放
                 key = None
-        rewritten = self._rewrite_m3u8(text, target, req_headers, ad_block,
-                                       cache_on=bool(key), cache_key=key,
-                                       force_proxy=force_proxy,
-                                       public_base=public_base)
+        rewritten = self._rewrite_m3u8(text, base, req_headers, ad_block,
+                                        cache_on=bool(key), cache_key=key,
+                                        force_proxy=force_proxy,
+                                        public_base=public_base,
+                                        source_id=source_id)
+
         self._emit_m3u8(handler, rewritten)
 
     # ------------------------------------------------------------------ #
@@ -1839,19 +2029,32 @@ class MediaProxy:
     def _forward_m3u8(self, handler: "_ProxyHandler", target: str,
                        req_headers: dict, ad_block: dict | None = None,
                        force_proxy: bool = False,
-                       public_base: str | None = None) -> None:
+                         public_base: str | None = None,
+                       source_id: str = "") -> None:
+
+
         """转发 m3u8 播放列表：整读 → 重写内部 URL（含广告过滤/缓存）。"""
         # 连接池复用：requests.Session 保持到 CDN 的 keep-alive 连接，
 
         # HLS 分片逐个转发时不再每次重新握手（见 _get_session 注释）。
         # stream=True：只读头，body 手动流式透传（避免整段载入内存/拖慢首帧）。
         # 默认直连优先，失败后回退系统代理。
-        manifest_key = _context_fingerprint(target, req_headers)
+        manifest_key = ":".join((
+            _context_fingerprint(target, req_headers),
+            _manifest_strategy_fingerprint(ad_block, force_proxy, source_id),
+        ))
         cached_manifest = self._manifest_cache.get(manifest_key)
         now = time.monotonic()
         if cached_manifest and now - cached_manifest[0] < _MANIFEST_CACHE_TTL:
-            self._serve_m3u8_text(handler, cached_manifest[1], target, req_headers,
-                                  ad_block, force_proxy, public_base)
+            cached_base = (cached_manifest[2]
+                           if len(cached_manifest) > 2 else None)
+            self._serve_m3u8_text(
+                handler, cached_manifest[1], target, req_headers,
+                ad_block, force_proxy, public_base,
+                manifest_key=manifest_key, skip_ad_filter=True,
+                final_base=cached_base,
+                source_id=source_id,
+            )
             return
         resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
         try:
@@ -1873,10 +2076,16 @@ class MediaProxy:
                 self._send_body(handler, resp, body)
                 return
             text = body.decode("utf-8", "replace")
-            if not _manifest_contains_query(text, target):
-                self._manifest_cache[manifest_key] = (time.monotonic(), text)
-            self._serve_m3u8_text(handler, text, target, req_headers, ad_block,
-                                  force_proxy, public_base)
+            # 重写基准用最终响应 URL（302 后的 CDN host）：包装接口
+            # /media/m3u8?url=… 的相对分片/KEY 必须拼在最终 host 上。
+            final_base = getattr(resp, "url", None) or target
+            self._serve_m3u8_text(
+                handler, text, target, req_headers,
+                ad_block, force_proxy, public_base,
+                manifest_key=manifest_key, final_base=final_base,
+                source_id=source_id,
+            )
+
         finally:
             try:
                 resp.close()
@@ -1887,7 +2096,10 @@ class MediaProxy:
     def _forward_media(self, handler: "_ProxyHandler", target: str,
                        req_headers: dict, ad_block: dict | None = None,
                        force_proxy: bool = False,
-                       public_base: str | None = None) -> None:
+                         public_base: str | None = None,
+                       source_id: str = "") -> None:
+
+
         """转发普通媒体（mp4/mp3/ts/audio…）：优先本地缓存命中，否则流式转发。
 
         - mp4 已完整缓存 → 直接 serve 本地文件（支持 Range/206/416）
@@ -1906,6 +2118,7 @@ class MediaProxy:
             try:
                 key = cache.key_of(target)
                 entry = cache.entry(key)
+
                 if entry and entry.get("complete") and entry.get("kind") == "mp4":
                     p = cache.mp4_final(key)
                     if p.is_file():
@@ -1954,15 +2167,13 @@ class MediaProxy:
             # 预读多了会把每个分片的首字节延后一整个读取量的到达时间。
             # 压缩流必须整读解压（无法边读边判），此分支保留整读。
             # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
-            whole = False
-            if (resp.headers.get("Content-Encoding") or "").lower() in ("gzip", "deflate", "br"):
-                first = _read_upstream_body(resp)
-                whole = True  # 已整读解压：上游 Content-Length 是压缩态长度
-            else:
-                if fetch_state is not None and cache.fetch_cancelled(fetch_state):
-                    raise RuntimeError("media fetch cancelled")
-                first = resp.raw.read(_SNIFF_BYTES)
-                _update_upstream_diagnostic(resp, len(first))
+            resp, first, whole = _read_media_prefix(
+                resp, target, req_headers, force_proxy, cache, key, fetch_state)
+            if resp.status_code >= 400:
+                fetch_status = resp.status_code
+                fetch_error = RuntimeError("upstream error")
+                _send_upstream_error(handler, resp)
+                return
             is_m3u8 = first.startswith(b"#EXTM3U") or (
                 resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
 
@@ -1972,8 +2183,13 @@ class MediaProxy:
                 rest = resp.raw.read()
                 _update_upstream_diagnostic(resp, len(rest), finished=True)
                 text = (first + rest).decode("utf-8", "replace")
+                # 短链/参数化 URL 内容实为 m3u8：同样以最终响应 URL 为重写基准。
+                final_base = getattr(resp, "url", None) or target
                 self._serve_m3u8_text(handler, text, target, req_headers,
-                                      ad_block, force_proxy, public_base)
+                                        ad_block, force_proxy, public_base,
+                                        final_base=final_base, source_id=source_id)
+
+
                 return
 
             # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
@@ -1992,7 +2208,7 @@ class MediaProxy:
                     from_head = rng_start is None or rng_start == 0
                     if (not (entry and entry.get("complete"))
                             and already is None and from_head):
-                        total = _content_total(resp)
+                        total = len(first) if whole else _content_total(resp)
                         if total and _full_zero_offset_response(
                                 resp, req_headers.get("Range")):
                             st = _FileTee(cache, key, cache.mp4_part(key),
@@ -2024,12 +2240,10 @@ class MediaProxy:
                     self._touch()  # 流式期间持续刷新看门狗（暂停/拖动不误杀）
                     if tee:
                         tee.write(chunk)
+                if declared is not None and sent != declared:
+                    raise requests.ConnectionError("incomplete media body")
                 if chunked:
                     handler.wfile.write(b"0\r\n\r\n")
-                elif declared is not None and sent < declared:
-                    # 上游提前断流：声明了长度却没写满 → 该连接已无法定界，
-                    # 必须关闭，否则复用它的下一个请求会读到错位的残留字节
-                    handler.close_connection = True
                 _update_upstream_diagnostic(resp, 0, finished=True)
                 if tee:
                     tee.finish()
@@ -2053,6 +2267,9 @@ class MediaProxy:
                     tee.abort()
                     self._drop_mp4_tee(key, tee)
                 raise
+        except Exception as exc:
+            fetch_error = exc
+            raise
         finally:
             if fetch_owner:
                 cache.finish_fetch(key, fetch_state, fetch_status, fetch_error)
@@ -2104,7 +2321,10 @@ class MediaProxy:
             handler.send_error(502, "cache context lost")
             return
         base_url, base_headers, ad_block = ctx[0], ctx[1], ctx[2]
+        source_id = ctx[5] if len(ctx) > 5 else ""
         force_proxy = _tuple_force_proxy(ctx)
+
+        final_base = ctx[4] if len(ctx) > 4 and ctx[4] else None
         target = urljoin(base_url, seg_name)
         # 分片级预取钩子：取到第 seg_name 片后把后续 depth 片排队落盘。
         # 放锁外：预取自身会取同名 path_lock，锁内触发会自死锁。
@@ -2135,21 +2355,44 @@ class MediaProxy:
                 return
 
         # 定位到本段在缓存里的路径；已知总长才 tee（见 _content_total）。
-        lock = cache.path_lock(seg_name) if shared_fetch else nullcontext()
+        lock = cache.path_lock(target) if shared_fetch else nullcontext()
         with lock:
-            if seg_name.endswith(".m3u8"):
+            if seg_name.endswith(".m3u8") or target.lower().split("?", 1)[0].endswith(".m3u8"):
                 # 嵌套/变体播放列表：按自身 URL 的独立 key 缓存放过滤文本；
                 # 命中且已缓存 → 复用过滤结果，只重写（免上游往返/免重复过滤）
-                sub_key = cache.key_of(target)
+                sub_key = _manifest_cache_key(cache, target, ad_block,
+                                               force_proxy, source_id)
                 p = cache.playlist_file(sub_key)
                 if p.is_file():
                     cache.touch(sub_key)
                     cached = p.read_text(encoding="utf-8", errors="replace")
+                    with self._lock:
+                        child_ctx = self._cache_ctx.get(sub_key)
+                    child_base = (
+                        child_ctx[4]
+                        if child_ctx is not None and len(child_ctx) > 4 and child_ctx[4]
+                        else target
+                    )
+                    child_headers = child_ctx[1] if child_ctx is not None else base_headers
+                    child_ad_block = child_ctx[2] if child_ctx is not None else ad_block
+                    child_force_proxy = (
+                        _tuple_force_proxy(child_ctx)
+                        if child_ctx is not None else force_proxy
+                    )
+                    child_source_id = (
+                        child_ctx[5] if child_ctx is not None and len(child_ctx) > 5
+                        else source_id
+                    )
                     rewritten = self._rewrite_m3u8(
-                        cached, target, base_headers, ad_block,
+                        cached, child_base, child_headers, child_ad_block,
                         cache_on=True, cache_key=sub_key,
-                        force_proxy=force_proxy, public_base=public_base)
+                        force_proxy=child_force_proxy, public_base=public_base,
+                        source_id=child_source_id)
+
                     self._emit_m3u8(handler, rewritten)
+
+
+
                     if fetch_owner:
                         cache.finish_fetch(fetch_key, fetch_state, None)
                     return
@@ -2173,9 +2416,11 @@ class MediaProxy:
             fetch_status = None
             fetch_error = None
             try:
-                resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy)
+                resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy,
+                                       segment=not seg_name.endswith(".m3u8"))
             except Exception as exc:
-                cache.finish_fetch(fetch_key, fetch_state, 502, exc)
+                if fetch_owner:
+                    cache.finish_fetch(fetch_key, fetch_state, 502, exc)
                 fetch_owner = False
                 raise
             try:
@@ -2188,23 +2433,28 @@ class MediaProxy:
                     return
 
                 # 可能是「URL 不带 .m3u8 的嵌套播放列表」→ 先嗅探首块
-                whole = False
-                if (resp.headers.get("Content-Encoding") or "").lower() in ("gzip", "deflate", "br"):
-                    first = _read_upstream_body(resp)
-                    whole = True  # 已整读解压：上游 Content-Length 是压缩态长度
-                else:
-                    if fetch_state is not None and cache.fetch_cancelled(fetch_state):
-                        raise RuntimeError("media fetch cancelled")
-                    first = resp.raw.read(_SNIFF_BYTES)
-                    _update_upstream_diagnostic(resp, len(first))
+                resp, first, whole = _read_media_prefix(
+                    resp, target, req_headers, force_proxy, cache, fetch_key, fetch_state,
+                    segment=not seg_name.endswith(".m3u8"))
+                if resp.status_code >= 400:
+                    fetch_status = resp.status_code
+                    fetch_error = RuntimeError("upstream error")
+                    _send_upstream_error(handler, resp)
+                    return
                 is_m3u8 = first.startswith(b"#EXTM3U") or (
                     resp.headers.get("Content-Type") or "").find("mpegurl") >= 0
                 if is_m3u8:
                     rest = resp.raw.read()
                     _update_upstream_diagnostic(resp, len(rest or b""), finished=True)
                     text = (first + (rest or b"")).decode("utf-8", "replace")
+                    # 嵌套/变体播放列表同样以最终响应 URL 为重写基准：
+                    # /c/ name 已基于上一层 final base 解析，若本层再 302 需再对齐。
+                    final_base = getattr(resp, "url", None) or target
                     self._serve_m3u8_text(handler, text, target, req_headers,
-                                          ad_block, force_proxy, public_base)
+                                            ad_block, force_proxy, public_base,
+                                            final_base=final_base, source_id=source_id)
+
+
                     return
                 if seg_name.endswith(".m3u8"):
                     # 上游非 m3u8（动态校验失败/错误页）→ 原样回给播放器
@@ -2213,7 +2463,7 @@ class MediaProxy:
                 chunked, declared = _send_stream_headers(
                     handler, resp, override_len=len(first) if whole else None)
 
-                total = _content_total(resp)
+                total = len(first) if whole else _content_total(resp)
                 tee = None
                 # /c/ 分片：只对「从头起」的请求落盘（拖动产生的非 0 Range
                 # 不满足 _safe_keys 顺序写前提），与 mp4 tee 规则一致
@@ -2244,10 +2494,10 @@ class MediaProxy:
                         if tee:
                             tee.write(chunk)
 
+                    if declared is not None and sent != declared:
+                        raise requests.ConnectionError("incomplete media body")
                     if chunked:
                         handler.wfile.write(b"0\r\n\r\n")
-                    elif declared is not None and sent < declared:
-                        handler.close_connection = True  # 提前断流，连接不可复用
                     _update_upstream_diagnostic(resp, 0, finished=True)
                     if tee:
                         tee.finish()
@@ -2265,6 +2515,9 @@ class MediaProxy:
                     if tee:
                         tee.abort()
                     raise
+            except Exception as exc:
+                fetch_error = exc
+                raise
             finally:
                 if fetch_owner:
                     cache.finish_fetch(
@@ -2319,23 +2572,24 @@ class MediaProxy:
 
     # ------------------------------------------------------------------ #
     def _filter_ad_segments(self, m3u8_text: str, base_url: str,
-                            ad_block: dict | None = None) -> str:
-        """剔除 m3u8 中的广告段：交给 framework.adblock 的启发式规则。
+                             ad_block: dict | None = None,
+                             headers: dict | None = None,
+                             source_id=None) -> str:
 
-        ad_block：源 ad_block 配置（naming / m3u8 自定义规则）。内置规则
-        （CUE-OUT/CUE-IN 等）默认开启；ad_block 显式 enabled:false 才停用。
-        任何异常都返回原文（播放优先，过滤失败不影响播放）。
-        """
         try:
-            from framework.adblock import AdblockEngine  # noqa: PLC0415
+            from .adblock import AdblockEngine
+
+            raw = {} if ad_block is None else {"ad_block": ad_block}
+            source = type("Source", (), {"raw": raw})()
             engine = AdblockEngine()
-            if ad_block:
-                engine.configure(type("S", (), {"raw": {"ad_block": ad_block}})())
-            if engine.enabled:
-                return engine.filter_m3u8(m3u8_text, base_url)
-        except Exception:  # noqa: BLE001 —— 过滤引擎异常不阻断播放
-            pass
-        return m3u8_text
+            engine.configure(source, default_on=True)
+            return engine.filter_m3u8(
+                m3u8_text, base_url, source_id=source_id
+            )
+
+        except Exception:
+            return m3u8_text
+
 
     # ------------------------------------------------------------------ #
     def _rewrite_m3u8(self, text: str, base: str, headers: dict,
@@ -2343,7 +2597,9 @@ class MediaProxy:
                       cache_on: bool = False,
                       cache_key: str | None = None,
                       force_proxy: bool = False,
-                      public_base: str | None = None) -> str:
+                      public_base: str | None = None,
+                      source_id=None) -> str:
+
         """把 m3u8 内部 URL 重写为本机代理 URL（返回完整新文本）。
 
         - cache_on=False（无磁盘缓存路径）→ 全部走 /s/<token>
@@ -2369,20 +2625,26 @@ class MediaProxy:
                 tag = line.split(":", 1)[0].strip()
                 if tag in ("#EXT-X-KEY", "#EXT-X-SESSION-KEY"):
                     new_uri = self._proxy_url(m.group(1), base, headers,
-                                              ad_block, force_proxy,
-                                              public_base)
+                                               ad_block, force_proxy,
+                                               public_base, source_id)
+
                     out.append(line.replace(f'URI="{m.group(1)}"', f'URI="{new_uri}"'))
                     continue
                 uri = m.group(1)
-                out.append(line.replace(f'URI="{uri}"',
-                                         f'URI="{self._rewrite_cache_or_token(uri, base, headers, ad_block, cache_on, cache_key, force_proxy, public_base)}"'))
+                rewritten_uri = self._rewrite_cache_or_token(
+                    uri, base, headers, ad_block, cache_on, cache_key,
+                    force_proxy, public_base, source_id,
+                )
+
+                out.append(line.replace(f'URI="{uri}"', f'URI="{rewritten_uri}"'))
                 self._note_segment(segs, uri, base, cache_on, cache_key)
                 continue
 
             uri = line
             out.append(self._rewrite_cache_or_token(
-                uri, base, headers, ad_block, cache_on, cache_key, force_proxy,
-                public_base))
+                uri, base, headers, ad_block, cache_on, cache_key,
+                force_proxy, public_base, source_id))
+
             self._note_segment(segs, uri, base, cache_on, cache_key)
         if cache_on and cache_key is not None:
             self._set_seg_order(cache_key, segs)
@@ -2401,10 +2663,12 @@ class MediaProxy:
 
     # ------------------------------------------------------------------ #
     def _rewrite_cache_or_token(self, uri: str, base: str, headers: dict,
-                                 ad_block: dict | None, cache_on: bool,
-                                 cache_key: str | None,
-                                 force_proxy: bool = False,
-                                 public_base: str | None = None) -> str:
+                                ad_block: dict | None, cache_on: bool,
+                                cache_key: str | None,
+                                force_proxy: bool = False,
+                                public_base: str | None = None,
+                                source_id=None) -> str:
+
         """单个资源重写：cache_on 且已知缓存 key → /c/<key>/<full>，否则 /s/。
 
 /c/ 资源名 = quote 解析后的完整上游 URL：_serve_cache 反解时无需再次
@@ -2416,15 +2680,34 @@ unquote 即得上游原 URL，直接取回/落盘（文件存名由 _safe_seg_na
         cache = self._ensure_cache() if cache_on else None
         if cache_on and cache is not None and cache_key is not None:
             name = quote(full, safe="/:@")
+            if full.lower().split("?", 1)[0].endswith(".m3u8"):
+                child_key = _manifest_cache_key(
+                    cache, full, ad_block, force_proxy, source_id
+                )
+                self._register_cache_ctx_if_missing(
+                    child_key, full, headers, ad_block, force_proxy, source_id
+                )
             return f"{self._base_url(public_base)}/c/{cache_key}/{name}"
+
+
         return self._proxy_url(full, base, headers, ad_block, force_proxy,
-                               public_base)
+                                public_base, source_id)
+
 
 
 def proxy_url_for(url: str, headers: dict | None = None,
-                  ad_block: dict | None = None,
-                  force_proxy: bool = False) -> str:
+                    ad_block: dict | None = None,
+                    force_proxy: bool = False,
+                    source_id=None) -> str:
+
+
+
+
+
+
     """external_player 调用的入口：把目标 URL 打包成本地代理 URL。
+
+
 
     headers 为空时直接返回原 URL（无防盗链头则无需代理，避免无谓起进程）。
     force_proxy：True 时该 URL 的所有上游转发一律走系统代理会话（跳过
@@ -2433,4 +2716,12 @@ def proxy_url_for(url: str, headers: dict | None = None,
     is_hls = "m3u8" in url.lower()
     if not headers and not is_hls:
         return url
-    return MediaProxy.instance().build_url(url, headers or {}, ad_block, force_proxy)
+    proxy = MediaProxy.instance()
+    args = (url, headers or {}, ad_block, force_proxy)
+    try:
+        supports_source_id = "source_id" in inspect.signature(proxy.build_url).parameters
+    except (TypeError, ValueError):
+        supports_source_id = False
+    if supports_source_id:
+        return proxy.build_url(*args, source_id=source_id)
+    return proxy.build_url(*args)

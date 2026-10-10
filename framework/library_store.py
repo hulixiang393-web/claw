@@ -72,10 +72,14 @@ class LibraryStore:
                     self._data = raw.get("favorites", raw) if isinstance(raw, dict) else raw
                     if isinstance(self._data, dict):
                         for favorite in self._data.values():
-                            if isinstance(favorite, dict) and "folder" in favorite:
-                                favorite["folder"] = _normalize_folder_name(
-                                    favorite.get("folder")
+                            if isinstance(favorite, dict):
+                                favorite["reading_status"] = (
+                                    "completed" if favorite.get("reading_status") == "completed" else "reading"
                                 )
+                                if "folder" in favorite:
+                                    favorite["folder"] = _normalize_folder_name(
+                                        favorite.get("folder")
+                                    )
                     folders = raw.get("folders")
                     if isinstance(folders, list):
                         for folder in folders:
@@ -223,9 +227,32 @@ class LibraryStore:
             "favorited_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         with self._lock:
+            rec["reading_status"] = self._data.get(url, {}).get("reading_status", "reading")
             self._data[url] = rec
             self._save()
         return dict(rec)
+
+    def reading_status(self, url: str) -> str:
+        with self._lock:
+            return self._data.get(url, {}).get("reading_status", "reading")
+
+    def set_reading_status(self, url: str, status: str) -> bool:
+        if status not in ("reading", "completed"):
+            raise ValueError("无效阅读状态")
+        with self._lock:
+            rec = self._data.get(url)
+            if rec is None:
+                return False
+            previous = rec.get("reading_status", "reading")
+            if previous == status:
+                return True
+            rec["reading_status"] = status
+            try:
+                self._save()
+            except Exception:
+                rec["reading_status"] = previous
+                raise
+        return True
 
     def set_folder(self, url: str, folder: str) -> bool:
         """把某收藏移入指定收藏夹（folder 为空 = 移出到默认）。"""
@@ -303,6 +330,40 @@ class LibraryStore:
             items = [dict(v) for v in self._data.values()]
         items.sort(key=lambda r: r.get("favorited_at", ""), reverse=True)
         return items
+
+    def history_hidden(self, url: str = "", folder: str = "") -> bool:
+        record = self.get(url) if url else None
+        if record is not None:
+            folder = record.get("folder") or ""
+        return bool((self.folder_info(folder) or {}).get("locked"))
+
+    def playback_history_hidden(self, record: dict) -> bool:
+        url = record.get("library_url") or record.get("book_url", "")
+        if self.history_hidden(url, record.get("folder", "")):
+            return True
+        if record.get("source_id") or record.get("library_url") or not record.get("title"):
+            return False
+        from .shelf_service import _norm_title
+
+        title = _norm_title(record["title"])
+        matches = [item for item in self.list_all()
+                   if item.get("url") and _norm_title(item.get("title", "")) == title]
+        return len(matches) == 1 and self.history_hidden(matches[0]["url"])
+
+    def search_history_hidden(self, keyword: str, context_url: str = "", folder: str = "") -> bool:
+        if self.history_hidden(context_url, folder):
+            return True
+        word = " ".join(keyword.casefold().split())
+        if not word:
+            return False
+        for record in self.list_all():
+            if not self.history_hidden(record.get("url", ""), record.get("folder", "")):
+                continue
+            for value in (record.get("title"), record.get("url")):
+                value = " ".join(str(value or "").casefold().split())
+                if value and value in word:
+                    return True
+        return False
 
     def count(self) -> int:
         with self._lock:
@@ -389,6 +450,9 @@ class LibraryStore:
                     skipped += 1
                     continue
                 new_record = copy.deepcopy(record)
+                new_record["reading_status"] = (
+                    "completed" if new_record.get("reading_status") == "completed" else "reading"
+                )
                 old_record = staged_data.get(key)
                 if mode == "merge" and isinstance(old_record, dict):
                     old_ts = old_record.get("favorited_at") or ""

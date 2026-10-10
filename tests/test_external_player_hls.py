@@ -6,7 +6,7 @@ import framework.external_player as ep
 def _play(monkeypatch, url, headers):
     calls = []
 
-    def _proxy(u, *a, **k):
+    def _proxy(u, headers=None, ad_block=None, force_proxy=False, source_id=None):
         calls.append(u)
         return "PROXY:" + u
 
@@ -36,16 +36,34 @@ def test_hls_parameter_wrapped_url_is_proxied(monkeypatch):
 def test_hls_without_vlc_uses_proxy_url(monkeypatch):
     calls = []
     monkeypatch.setattr(ep, "_locate_vlc", lambda: None)
-    monkeypatch.setattr(ep, "proxy_url_for", lambda u, *a, **k: calls.append(u) or "http://127.0.0.1/s/token")
+    def proxy(u, headers=None, ad_block=None, force_proxy=False, source_id=None):
+        calls.append(u)
+        return "http://127.0.0.1/s/token"
+
+    monkeypatch.setattr(ep, "proxy_url_for", proxy)
     monkeypatch.setattr(ep.webbrowser, "open", lambda u: calls.append(u))
     ep.open_with_player("https://cdn.example.com/index.m3u8", headers={})
     assert calls == ["https://cdn.example.com/index.m3u8", "http://127.0.0.1/s/token"]
 
 
+def test_raw_source_id_does_not_enable_trusted_media_rules(monkeypatch):
+    calls = []
+
+    def proxy(u, headers=None, ad_block=None, force_proxy=False, source_id=None):
+        calls.append({"ad_block": ad_block, "force_proxy": force_proxy, "source_id": source_id})
+        return "PROXY:" + u
+
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: r"C:\\Program Files\\VideoLAN\\VLC\\vlc.exe")
+    monkeypatch.setattr(ep, "proxy_url_for", proxy)
+    monkeypatch.setattr(ep.subprocess, "Popen", lambda args, **kwargs: None)
+    ep.open_with_player("https://cdn.example.com/index.m3u8", source_id="source-a")
+    assert calls == [{"ad_block": None, "force_proxy": False, "source_id": None}]
+
+
 def test_hls_audio_slave_proxied(monkeypatch):
     calls = {}
 
-    def _proxy(u, *a, **k):
+    def _proxy(u, headers=None, ad_block=None, force_proxy=False, source_id=None):
         calls[u] = True
         return "PROXY:" + u
 

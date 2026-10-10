@@ -1,62 +1,90 @@
-"""最近搜索历史（search_history.py）。
-
-首页与搜索页共享。最多保留 20 条，超出滚动清掉最旧。
-对应 ui-home.md「最近搜索」+ ui-search.md「搜索历史」。
-
-用法：
-    hist = SearchHistory("search_history.json")
-    hist.push("凡人修仙传")        # 追加到最前，去重
-    hist.recent()                  # -> ["凡人修仙传", ...] 最多20条
-"""
-
 from __future__ import annotations
 
 import json
+import math
+import os
+import tempfile
+import time
 from pathlib import Path
 from typing import List
 
 MAX_ITEMS = 20
+HISTORY_TTL_SECONDS = 604800
 
 
 class SearchHistory:
-    def __init__(self, path: str | Path = "search_history.json"):
+    def __init__(self, path: str | Path = "search_history.json", privacy=None):
         self.path = Path(path)
-        self._items: List[str] = self._load()
+        self.privacy = privacy
+        self._items = self._load()
+        self._clean()
 
-    def _load(self) -> List[str]:
-        if not self.path.exists():
-            return []
+    def _load(self) -> list:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                return [str(x) for x in raw if isinstance(x, str)][:MAX_ITEMS]
+            return raw if isinstance(raw, list) else []
         except (json.JSONDecodeError, OSError):
-            pass
-        return []
+            return []
+
+    def _clean(self) -> None:
+        now = time.time()
+        valid = []
+        for item in self._items:
+            if not isinstance(item, dict):
+                continue
+            word, ts = item.get("keyword"), item.get("timestamp")
+            if not isinstance(word, str) or not word.strip():
+                continue
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                continue
+            if not math.isfinite(ts) or not 0 <= now - ts < HISTORY_TTL_SECONDS:
+                continue
+            valid.append({"keyword": word.strip(), "timestamp": ts})
+        valid.sort(key=lambda item: item["timestamp"], reverse=True)
+        cleaned, seen = [], set()
+        for item in valid:
+            if item["keyword"] not in seen:
+                cleaned.append(item)
+                seen.add(item["keyword"])
+        cleaned = cleaned[:MAX_ITEMS]
+        if cleaned != self._items:
+            previous = self._items
+            self._items = cleaned
+            try:
+                self._save()
+            except OSError:
+                self._items = previous
+                raise
 
     def _save(self) -> None:
+        temp_path = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(self._items, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except OSError:
-            pass
+            fd, name = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
+            temp_path = Path(name)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self._items, handle, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
-    def push(self, keyword: str) -> None:
-        """加入历史（去重、移到最前、最多20条）。"""
+    def push(self, keyword: str, context_url: str = "", folder: str = "") -> None:
+        self._clean()
         keyword = keyword.strip()
-        if not keyword:
+        if not keyword or self.hidden(keyword, context_url, folder):
             return
-        if keyword in self._items:
-            self._items.remove(keyword)
-        self._items.insert(0, keyword)
-        if len(self._items) > MAX_ITEMS:
-            self._items = self._items[:MAX_ITEMS]
+        self._items = [item for item in self._items if item["keyword"] != keyword]
+        self._items.insert(0, {"keyword": keyword, "timestamp": time.time()})
+        self._items = self._items[:MAX_ITEMS]
         self._save()
 
+    def hidden(self, keyword: str, context_url: str = "", folder: str = "") -> bool:
+        return bool(self.privacy and self.privacy.search_history_hidden(keyword, context_url, folder))
+
     def recent(self) -> List[str]:
-        return list(self._items)
+        self._clean()
+        return [item["keyword"] for item in self._items if not self.hidden(item["keyword"])]
 
     def clear(self) -> None:
         self._items = []

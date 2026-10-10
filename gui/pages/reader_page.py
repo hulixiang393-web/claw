@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal
 from PySide6.QtWidgets import (
@@ -45,20 +46,22 @@ READING_BG_THEMES = [
 
 class _SwitchSourceSignals(QObject):
     """换源后台任务信号。"""
-    done = Signal(object)  # new_detail
-    error = Signal(str)
+    done = Signal(object, object)
+    error = Signal(str, object)
 
 
 class _SwitchSourceTask(QRunnable):
     """后台切换播放源：重新抓详情（换 sid）。"""
 
-    def __init__(self, content, source, detail_url, sid):
+    def __init__(self, content, source, detail_url, sid, identity, generation):
         super().__init__()
         self.signals = _SwitchSourceSignals()
         self._content = content
         self._source = source
         self._url = detail_url
         self._sid = sid
+        self.identity = identity
+        self.generation = generation
 
     def run(self) -> None:
         try:
@@ -66,12 +69,12 @@ class _SwitchSourceTask(QRunnable):
                 self._source, self._url, self._sid
             )
             try:
-                self.signals.done.emit(new_detail)
+                self.signals.done.emit(new_detail, self)
             except RuntimeError:
                 pass
         except Exception as exc:  # noqa: BLE001
             try:
-                self.signals.error.emit(str(exc))
+                self.signals.error.emit(str(exc), self)
             except RuntimeError:
                 pass
 
@@ -105,9 +108,12 @@ class ReaderPage(BasePage):
         self._font_scale = float(font_scale or 1.0)
         self._current_source_id = None
         self._current_book_url = None
+        self._switch_generation = 0
+        self._switch_task = None
         self._current_start_url = ""
         self._current_content_type = ""  # 当前作品类型（收藏时记录）
         self._favorite_checker = None  # 可选回调: url -> bool（App 注入判断是否已收藏）
+        self._reading_status_checker = None
         self._pending_position = None  # 打开书续读位置（0~1 比例），_on_detail 传给视图
         self._pending_page = None  # 打开书续读翻页页索引（小说翻页模式）
         self._pending_location = None
@@ -159,6 +165,10 @@ class ReaderPage(BasePage):
         self.comic_view = ComicView(content)
         self.comic_view.set_cache_policy(lambda: self._comic_cache_allowed())
         self.video_view = VideoView(content, search=self._search)
+        self.video_view.progress_lookup = self._resume_progress
+        self.video_view.progress_allowed = self._progress_allowed
+        self.video_view.progress_writer = self._on_progress_signal
+        self.video_view.handoff_writer = self._on_video_handoff
         self.epub_view = EpubView(font_scale=self._font_scale)
         self.stack.addWidget(self.novel_view)
         self.stack.addWidget(self.comic_view)
@@ -170,7 +180,7 @@ class ReaderPage(BasePage):
         if reading_progress is not None:
             self.novel_view.chapter_changed.connect(self._on_progress_signal)
             self.comic_view.chapter_changed.connect(self._on_progress_signal)
-            self.video_view.episode_changed.connect(self._on_progress_signal)
+            self.video_view.position_changed.connect(self._on_progress_signal)
             # epub 本地阅读：用文件路径作 key 续读
             self.epub_view.chapter_changed.connect(self._on_progress_signal)
             self.epub_view.position_changed.connect(self._on_epub_position)
@@ -244,32 +254,54 @@ class ReaderPage(BasePage):
         if sid and url:
             self.open(sid, url, ctype)
 
+    def _invalidate_source_switch(self):
+        self._switch_generation += 1
+        self._switch_task = None
+
+    def _is_current_source_switch(self, task):
+        return (
+            task is not None and task is self._switch_task
+            and task.generation == self._switch_generation
+            and task.identity == (self._current_source_id, self._current_book_url)
+        )
+
     def _on_source_changed(self, payload) -> None:
         """换源：重新抓取该源详情 + 刷新 VideoView 分集。"""
-        if self._content is None or not isinstance(payload, (tuple, list)):
+        if self._content is None or not isinstance(payload, (tuple, list)) or len(payload) < 2:
             return
         detail, new_sid = payload[0], payload[1]
-        if detail is None or not new_sid:
+        if (detail is None or not new_sid or not self._current_book_url
+                or self._current_content_type != "video"
+                or detail is not self.video_view._detail
+                or self.video_view.library_url != self._current_book_url
+                or detail.source_id != self._current_source_id):
             return
-        # 后台切源（网络请求，不阻塞 UI）
+        self._invalidate_source_switch()
         task = _SwitchSourceTask(
-            self._content, self._current_source, detail.url, new_sid
+            self._content, self._current_source, detail.url, new_sid,
+            (self._current_source_id, self._current_book_url), self._switch_generation,
         )
         task.signals.done.connect(self._on_source_switched)
         task.signals.error.connect(self._on_source_switch_failed)
         self._switch_task = task  # 持有引用，防止被 GC
         QThreadPool.globalInstance().start(task)
 
-    def _on_source_switched(self, new_detail) -> None:
+    def _on_source_switched(self, new_detail, task=None) -> None:
         """换源成功：刷新 VideoView 分集列表。"""
-        if new_detail is None:
+        if not self._is_current_source_switch(task):
             return
+        self._switch_task = None
+        if new_detail is None or new_detail.source_id != task.identity[0]:
+            return
+        self.video_view.library_url = task.identity[1]
+        self._current_detail = new_detail
+        self._current_detail_url = new_detail.url
         self.video_view.reload_detail(new_detail)
-        # 进度记忆由 reload_detail → _load_episode(0) → episode_changed 正常落盘
-        # （新源当前集 url）。这里不再补一条空 url 的进度——那会把已存的
-        # chapter_url 覆盖成空，导致该书续读丢失。
 
-    def _on_source_switch_failed(self, err: str) -> None:
+    def _on_source_switch_failed(self, err: str, task=None) -> None:
+        if not self._is_current_source_switch(task):
+            return
+        self._switch_task = None
         self.video_view.play_label.setText(f"换源失败：{err}")
         self.video_view.set_source_sid(self.video_view._current_sid)
 
@@ -289,7 +321,22 @@ class ReaderPage(BasePage):
         location = payload[5] if len(payload) > 5 else None
         if detail is None:
             return
-        if not isinstance(detail, str) and self._favorite_checker is not None:
+        library_url = (location or {}).get("library_url", "") if isinstance(location, dict) else ""
+        book_url = detail if isinstance(detail, str) else library_url or getattr(detail, "url", "")
+        if not self._progress_allowed(book_url):
+            return
+        if getattr(detail, "content_type", "") == "video":
+            from framework.external_player import player_session
+            session = player_session()
+            if session is None or not isinstance(location, dict) or location.get("session_id") != id(session):
+                return
+            seconds, duration = location.get("seconds"), location.get("duration")
+            if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (seconds, duration)):
+                return
+            if not 0 < seconds <= duration or location.get("chapter_url") != url:
+                return
+            location = {key: location[key] for key in ("seconds", "duration", "chapter_url") if key in location}
+        elif not isinstance(detail, str) and self._favorite_checker is not None:
             try:
                 if not self._favorite_checker(getattr(detail, "url", "")):
                     return
@@ -305,16 +352,26 @@ class ReaderPage(BasePage):
                 return
             self._reading_progress.save(
                 detail.source_id,
-                detail.url,
+                library_url or detail.url,
                 detail.content_type,
                 url,
                 title,
                 position=position,
                 page=page,
                 location=location,
+                title=getattr(detail, "title", ""),
+                library_url=library_url,
+                detail_url=getattr(detail, "url", "") if getattr(detail, "content_type", "") == "video" else "",
             )
         except Exception:
             pass  # 记忆失败不影响阅读
+
+    def _on_video_handoff(self, detail, library_url, title, chapter_url):
+        if self._reading_progress is not None and self._progress_allowed(library_url or detail.url):
+            self._reading_progress.save(
+                detail.source_id, library_url or detail.url, "video", chapter_url, title,
+                title=detail.title, library_url=library_url, detail_url=detail.url,
+            )
 
     def _on_epub_position(self, payload) -> None:
         """本地 epub 章内滚动位置记忆（保留当前章节标题）。"""
@@ -355,6 +412,9 @@ class ReaderPage(BasePage):
         作品落盘（幂等），不改变其它行为。
         """
         try:
+            from framework.external_player import flush_player_progress
+
+            flush_player_progress()
             self._flush_current_progress()
         except Exception:  # noqa: BLE001 —— 记忆失败不影响退出
             pass
@@ -384,6 +444,7 @@ class ReaderPage(BasePage):
 
     def open(self, source_id: str, book_url: str, content_type: str, start_chapter_url: str = "") -> None:
         """打开一部作品（续读：记忆的章节/位置优先于调用方传入）。"""
+        self._invalidate_source_switch()
         # 切书前落盘当前作品的最新位置（防换书丢失最后几秒进度）
         self._flush_current_progress()
         try:
@@ -393,25 +454,29 @@ class ReaderPage(BasePage):
             return
         # 续读恢复：记忆里有这本书 → 用记忆的章覆盖 start_chapter_url，并取位置
         resume_pos, resume_page, resume_location = None, None, None
+        detail_url = book_url
         can_resume_online = True
-        if self._favorite_checker is not None and book_url:
+        if content_type != "video" and self._favorite_checker is not None and book_url:
             try:
                 can_resume_online = bool(self._favorite_checker(book_url))
             except Exception:
                 can_resume_online = False
         if self._reading_progress is not None and book_url and can_resume_online:
-            rec = self._reading_progress.resume(book_url)
+            rec = self._resume_progress(book_url)
             if rec and rec.get("chapter_url"):
                 start_chapter_url = rec["chapter_url"]
                 resume_pos = rec.get("position")
                 resume_page = rec.get("page")
                 resume_location = rec.get("location")
+                if content_type == "video":
+                    detail_url = rec.get("detail_url") or book_url
         self._pending_position = resume_pos
         self._pending_page = resume_page
         self._pending_location = resume_location
         self._current_source_id = source_id
         self._current_source = source
         self._current_book_url = book_url
+        self._current_detail_url = detail_url
         self._current_start_url = start_chapter_url
         self._current_content_type = content_type
         self._current_detail = None  # 详情就绪后由 _on_detail 填充（收藏复用完整元数据）
@@ -425,7 +490,7 @@ class ReaderPage(BasePage):
         from PySide6.QtCore import QThreadPool
 
         task = _LoadDetailTask(
-            self._content, source, book_url, content_type, start_chapter_url,
+            self._content, source, detail_url, content_type, start_chapter_url,
             source_id,
         )
         task.signals.finished.connect(self._on_detail)
@@ -439,7 +504,7 @@ class ReaderPage(BasePage):
         # 请求代际校验：快速连开多部作品时旧详情任务后到（detail.url/source 已非
         # 当前目标），若照常应用会用新的 _current_source_id/_pending_position 渲染
         # 旧书 → 错源/错续读位置。不匹配直接丢弃。
-        if source_id != self._current_source_id or detail.url != self._current_book_url:
+        if source_id != self._current_source_id or detail.url != getattr(self, "_current_detail_url", self._current_book_url):
             return
         # 切走视频视图前释放播放资源：换小说/漫画/另一部视频都不在后台
         # 继续播放、不堆积播放缓存（stop_playback 幂等，非视频时无副作用）
@@ -468,9 +533,10 @@ class ReaderPage(BasePage):
             )
         else:
             self.stack.setCurrentWidget(self.video_view)
+            self.video_view.library_url = self._current_book_url
             self.video_view.load(
                 self._manager.get(self._current_source_id), detail, start_chapter_url,
-                restore_position=pos,
+                restore_position=pos, restore_location=location,
             )
         if content_type in ("novel", "comic") and self.settings is not None:
             cfg = reader_prefetch_settings(self.settings)
@@ -531,6 +597,18 @@ class ReaderPage(BasePage):
             return bool(checker(getattr(self, "_current_book_url", "") or ""))
         except Exception:
             return False
+
+    def set_reading_status_checker(self, cb) -> None:
+        self._reading_status_checker = cb
+
+    def _progress_allowed(self, book_url: str) -> bool:
+        checker = getattr(self, "_reading_status_checker", None)
+        return checker is None or checker(book_url) != "completed"
+
+    def _resume_progress(self, book_url: str):
+        if self._reading_progress is not None and self._progress_allowed(book_url):
+            return self._reading_progress.resume(book_url)
+        return None
 
     def set_favorite_checker(self, cb) -> None:
         """注入收藏判断回调：cb(url) -> bool。App 层接 LibraryStore.has。"""
@@ -610,6 +688,7 @@ class ReaderPage(BasePage):
 
     def open_epub(self, path: str) -> None:
         """打开本地 epub（独立 epub 阅读器）。解析在后台线程，不卡 UI。"""
+        self._invalidate_source_switch()
         self._current_source_id = ""
         self._current_book_url = ""
         self.title_label.setText("epub 阅读")
@@ -663,8 +742,8 @@ class ReaderPage(BasePage):
         前景色按主题配套（夜间黑配浅字），浅色背景保持默认前景。
         """
         self._bg_idx = self._bg_index_for(bg)
-        if font_size > 0:
-            self._reading_font_size = font_size
+        self._reading_font_size = max(0, min(48, int(font_size or 0)))
+        font_size = self._reading_font_size
         fg = self._fg_for(bg)
         for view in (self.novel_view, self.comic_view, self.epub_view):
             view.set_reading_style(bg, font_size, fg=fg)
@@ -694,8 +773,13 @@ class ReaderPage(BasePage):
                 return f
         return ""
 
+    def closeEvent(self, event):
+        self._invalidate_source_switch()
+        super().closeEvent(event)
+
     def shutdown_video(self) -> None:
         """App 退出释放 VLC 播放器（必须先于 shutdown_vlc 释放实例）。"""
+        self._invalidate_source_switch()
         if hasattr(self, "video_view"):
             self.video_view.shutdown_video()
 

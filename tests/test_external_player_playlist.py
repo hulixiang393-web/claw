@@ -161,7 +161,7 @@ def test_handshake_failure_does_not_fall_back_to_browser(monkeypatch):
     """
     procs = _install(monkeypatch)
     opened = []
-    monkeypatch.setattr(ep.webbrowser, "open", lambda u: opened.append(u))
+    monkeypatch.setattr(ep.webbrowser, "open", lambda u: opened.append(u) or True)
     monkeypatch.setattr(
         ep, "_start_playlist_sync",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
@@ -925,9 +925,10 @@ def test_start_playlist_sync_runs_in_background(monkeypatch):
     import time as _t
     seen = {}
 
-    def _fake(start_idx, series, cb):
+    def _fake(start_idx, series, cb, state):
         seen["thread"] = _th.current_thread() is not _th.main_thread()
         seen["args"] = (start_idx, series, cb)
+        seen["state"] = state
 
     monkeypatch.setattr(ep, "_handshake_worker", _fake)
     series = [(0, "m0"), (1, "m1"), (2, "m2")]
@@ -991,7 +992,7 @@ def test_open_releases_lease_when_popen_fails(monkeypatch):
     monkeypatch.setattr(ep, "_watch_proc",
                         lambda proc, lid: watched.append(lid))
     opened = []
-    monkeypatch.setattr(ep.webbrowser, "open", lambda u: opened.append(u))
+    monkeypatch.setattr(ep.webbrowser, "open", lambda u: opened.append(u) or True)
     monkeypatch.setattr(ep.subprocess, "Popen",
                         lambda *a, **k: (_ for _ in ()).throw(
                             OSError("popen failed")))
@@ -1131,3 +1132,50 @@ def test_terminate_previous_releases_old_lease_before_new(monkeypatch):
     ep._terminate_previous()
     assert released == ["OLD", "NEW1"]
     assert ep._lease_id == ""
+
+
+def test_progress_monitor_binds_launched_process_and_stops_before_replacement(monkeypatch):
+    procs = _install(monkeypatch)
+    monitors = []
+    monkeypatch.setattr(ep, "_progress_monitor", None)
+    monkeypatch.setattr(ep.PlaybackMonitor, "start", lambda monitor: monitors.append(monitor))
+    callback = lambda idx, location: None
+    ep.open_with_player("D:/video.mp4", on_progress=callback, resume_positions={0: {"seconds": 120}})
+    assert "--no-one-instance" in procs[0].args
+    assert "--qt-continue=0" in procs[0].args
+    assert monitors[0].proc is procs[0]
+    assert monitors[0].state is ep._control_state
+    assert monitors[0].series == [(0, "D:/video.mp4")]
+    ep.open_with_player("D:/other.mp4", on_progress=callback)
+    assert monitors[0]._stop.is_set()
+    assert monitors[0].state is not monitors[1].state
+    assert procs[0].terminated == 1
+    ep._terminate_previous()
+
+
+def test_browser_fallback_does_not_start_progress_monitor(monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.setattr(ep, "_locate_vlc", lambda: None)
+    opened = []
+    monkeypatch.setattr(ep.webbrowser, "open", opened.append)
+    writes = []
+    ep.open_with_player("https://example.test/video.mp4", on_progress=lambda *args: writes.append(args))
+    assert opened == ["https://example.test/video.mp4"]
+    assert writes == []
+    assert ep.player_session() is None
+
+
+def test_old_handshake_does_not_command_new_session(monkeypatch):
+    old = {"port": 1}
+    current = {"port": 2}
+    monkeypatch.setattr(ep, "_control_state", old)
+    commands = []
+
+    def playlist(**kwargs):
+        monkeypatch.setattr(ep, "_control_state", current)
+        return [{"id": 7, "uri": "https://example.test/ep"}]
+
+    monkeypatch.setattr(ep, "player_playlist_items", playlist)
+    monkeypatch.setattr(ep, "player_command", lambda *args, **kwargs: commands.append(args))
+    ep._handshake_worker(1, [(1, "https://example.test/ep")], expected_state=old)
+    assert commands == []

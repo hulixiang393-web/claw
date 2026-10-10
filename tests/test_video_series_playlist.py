@@ -64,12 +64,12 @@ class _FakeProxy:
         self._n = 0
 
     def register_series(self, resolver, on_play=None, count=0,
-                        force_proxy=False):
+                        force_proxy=False, source_id=None):
         self._n += 1
         key = f"k{self._n}"
         self.registered.append({
             "key": key, "resolver": resolver, "on_play": on_play,
-            "count": count, "force_proxy": force_proxy,
+            "count": count, "force_proxy": force_proxy, "source_id": source_id,
         })
         return key
 
@@ -80,10 +80,11 @@ class _FakeProxy:
         self.unregistered.append(key)
 
     def warm_series_episode(self, key, idx, video, audio="", headers=None,
-                            ad_block=None):
+                            ad_block=None, public_base=None, source_id=None):
         self.warmed.append({
             "key": key, "idx": idx, "video": video, "audio": audio,
             "headers": headers, "ad_block": ad_block,
+            "public_base": public_base, "source_id": source_id,
         })
         return True
 
@@ -169,6 +170,7 @@ def test_build_series_playlist_full_order(_qapp, monkeypatch):
     # 注册参数：全集数 + force_proxy 透传
     assert proxy.registered[0]["count"] == 5
     assert proxy.registered[0]["force_proxy"] is True
+    assert proxy.registered[0]["source_id"] is None
 
 
 def test_series_title_falls_back_to_episode_no(_qapp, monkeypatch):
@@ -503,6 +505,7 @@ def test_series_resolver_snapshots_source_and_episodes(_qapp, monkeypatch):
 # --------------------------------------------------------------------- #
 def test_play_passes_series_playlist_and_real_url(_qapp, monkeypatch):
     """_play：全集入列、开播 MRL 用**当前集惰性 URL**、分类用**真实流地址**。"""
+
     view = _view(_video_detail(4), 2)
     proxy = _FakeProxy()
     _install_proxy(monkeypatch, proxy)
@@ -525,12 +528,15 @@ def test_play_passes_series_playlist_and_real_url(_qapp, monkeypatch):
     assert all(a == "" for _u, a, _t in seen["episodes"])
     # 当前集点集时已取的流（_FetchStreamTask 产物）预热进 memo：VLC 首个
     # /e/ 请求直接 302，免把同一条流再 resolver 一遍（省 2.6-4.0s）
-    assert proxy.warmed == [{
-        "key": "k1", "idx": 2,
-        "video": "https://cdn/real2.m3u8",
-        "audio": "https://cdn/real2-audio.m4a",
-        "headers": {}, "ad_block": {},
-    }]
+    assert proxy.warmed[0]["key"] == "k1"
+    assert proxy.warmed[0]["idx"] == 2
+    assert proxy.warmed[0]["video"] == "https://cdn/real2.m3u8"
+    assert proxy.warmed[0]["audio"] == "https://cdn/real2-audio.m4a"
+    assert proxy.warmed[0]["headers"] == {}
+    assert proxy.warmed[0]["ad_block"] == {}
+    assert proxy.warmed[0]["public_base"] is None
+    assert proxy.warmed[0]["source_id"] is None
+
 
 
 def test_play_does_not_warm_without_series(_qapp, monkeypatch):

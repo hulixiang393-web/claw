@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -26,11 +25,17 @@ def _newer(candidate: dict, existing: dict | None) -> bool:
 
 
 def migrate_legacy_data(repository, reading_progress_path, shelf_service, legacy_cache, legacy_chapters_root=None) -> MigrationReport:
+    from framework.reading_progress import ReadingProgress, sanitize_progress_backup
+
     progress_path = Path(reading_progress_path)
+    sanitize_progress_backup(progress_path)
     raw = {}
     if progress_path.exists():
         raw = json.loads(progress_path.read_text(encoding="utf-8"))
     progress_records = raw if isinstance(raw, dict) else {}
+    if any(isinstance(record, dict) and record.get("content_type") == "video"
+           for record in progress_records.values()):
+        progress_records = ReadingProgress(progress_path)._data
     imported_books = imported_chapters = imported_locations = imported_content = 0
 
     favorites = []
@@ -46,8 +51,12 @@ def migrate_legacy_data(repository, reading_progress_path, shelf_service, legacy
         source_id = record.get("source_id", favorite.get("source_id", ""))
         book_url = record.get("book_url", favorite.get("url", book_key))
         content_type = record.get("content_type", favorite.get("content_type", ""))
+        existing_snapshot = repository.get_book_snapshot(book_key) if content_type == "video" else None
         metadata = dict(favorite)
-        metadata.update({k: v for k, v in record.items() if k not in {"location"}})
+        metadata.update({k: v for k, v in record.items()
+                         if k != "location" and (v or k not in metadata)})
+        if content_type == "video":
+            metadata = {}
         repository.upsert_book(book_key, source_id, book_url, content_type, metadata)
         imported_books += 1
         location = record.get("location")
@@ -59,9 +68,14 @@ def migrate_legacy_data(repository, reading_progress_path, shelf_service, legacy
                 "page": record.get("page"),
                 "updated_at": record.get("updated_at", ""),
             }
-        existing_snapshot = repository.get_book_snapshot(book_key)
+        if content_type == "video":
+            location = record
+        else:
+            existing_snapshot = repository.get_book_snapshot(book_key)
         existing_location = (existing_snapshot or {}).get("location")
-        if location and _newer(location, existing_location):
+        if location and (not existing_location or (
+            content_type != "video" and _newer(location, existing_location)
+        )):
             repository.update_location(book_key, location)
             imported_locations += 1
 
@@ -117,7 +131,5 @@ def migrate_legacy_data(repository, reading_progress_path, shelf_service, legacy
             imported_content += 1
 
     if progress_path.exists():
-        backup = progress_path.with_suffix(progress_path.suffix + ".bak")
-        if not backup.exists():
-            shutil.copy2(progress_path, backup)
+        sanitize_progress_backup(progress_path, create_records=progress_records)
     return MigrationReport(imported_books, imported_chapters, imported_locations, imported_content)

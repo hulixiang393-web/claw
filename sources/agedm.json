@@ -115,14 +115,14 @@
     },
     "content": {
       "episode": {
+        "stream_budget": "pipeline",
         "list": {
           "root_selector": {
             "css": "a[href*='/play/']"
           },
           "fields": {
             "title": {
-              "css": "a[href*='/play/']",
-              "attr": "title"
+              "css": "a[href*='/play/']"
             },
             "url": {
               "css": "a[href*='/play/']",
@@ -131,12 +131,31 @@
           }
         },
         "play_url": {
-          "render": "playwright"
+          "render": "playwright",
+          "iframe_selector": {
+            "css": "iframe#iframeForVideo",
+            "attr": "src"
+          }
         },
         "render_config": {
-          "wait_until": "networkidle",
-          "timeout_ms": 45000,
-          "extra_delay_ms": 8000
+          "wait_until": "commit",
+          "timeout_ms": 10000,
+          "extra_delay_ms": 12000,
+          "slow_fallback_rounds": 0,
+          "recover_navigation_timeout": true
+        },
+        "source_switch": {
+          "auto_switch": false,
+          "list_selector": ".video_detail_playlist_wrapper .tab-pane",
+          "name_selector": ".video_detail_playlist_wrapper button[data-bs-target]",
+          "sid_regex": "/play/\\d+/(\\d+)/\\d+",
+          "default_sid": "1",
+          "ep_list_selector": ".video_detail_playlist_wrapper a[href*='/play/']",
+          "ep_href_contains": "/play/",
+          "ep_sid_regex": "/play/\\d+/(\\d+)/\\d+",
+          "ep_sid_in_path": true,
+          "detail_url_regex": "/play/(\\d+)/\\d+/\\d+",
+          "detail_url_template": "/detail/{id}"
         }
       }
     }

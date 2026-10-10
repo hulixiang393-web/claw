@@ -190,12 +190,13 @@ class Downloader:
                 try:
                     return self._download_hls(
                         video, self._source_headers(source), path,
-                        progress_cb, cancel_evt, pause_evt, source=source,
+                         progress_cb, cancel_evt, pause_evt, source=source,
+
                     )
                 except (MergeCancelled, MergePaused):
                     raise
                 except Exception:  # noqa: BLE001 自研 HLS 失败 → 回退 FFmpegMerger
-                    pass
+                    self._cleanup_download_artifacts(path)
                 # 自研 HLS 失败：代理 m3u8（如 18mh /media/m3u8）分片/key 不可
                 # 经代理取 → ffmpeg 直连 HLS 也 403。直接拿原 m3u8 URL 走 yt-dlp
                 # 兜底（yt-dlp 自带 Referer 透传 + HLS 解析，通常可过防盗链）。
@@ -220,7 +221,7 @@ class Downloader:
             except (MergeCancelled, MergePaused):
                 raise  # 用户取消/暂停是意图，不透传 yt-dlp 兜底
             except Exception:  # noqa: BLE001 合并失败 → 用视频流 URL 走 yt-dlp 兜底
-                # 直接下 m3u8/mp4 流（yt-dlp 泛 HLS/HTTP 提取，绕开 ffmpeg 合并失败）
+                self._cleanup_download_artifacts(path)
                 return self._download_via_ytdlp(video, path, "bestvideo+bestaudio/best", progress_cb, cancel_evt, pause_evt)
         # 取流为空 → 用章节页 URL 兜底（yt-dlp 能识别该站则下，否则报错明确）
         return self._download_via_ytdlp(chapter.url, path, "bestvideo+bestaudio/best", progress_cb, cancel_evt, pause_evt)
@@ -376,6 +377,20 @@ class Downloader:
             return None
         return None
 
+    @staticmethod
+    def _cleanup_download_artifacts(path) -> None:
+        target = Path(path)
+        candidates = {
+            target,
+            target.with_suffix(target.suffix + ".part"),
+            target.with_name(target.stem + ".part"),
+        }
+        for item in candidates:
+            try:
+                item.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _cleanup_parts(self, parts) -> None:
         for p in parts:
             try:
@@ -417,26 +432,34 @@ class Downloader:
         # 带 Referer 的源也尝试过滤：本地 m3u8 的段请求会继承 -headers
         # （ffmpeg 全局请求头 + protocol_whitelist 已放行 http/https），
         # 过滤失败（无法下载播放列表/解析失败）时静默回退原始 URL。
+        filtered = None
         if video.startswith(("http://", "https://")) and (
             ".m3u8" in video.lower() or "m3u8" in video.lower()
         ):
             filtered = self._filter_m3u8_for_download(source, video, path.parent)
             if filtered:
                 video = str(filtered)
-        # 合并期间实时上报输出文件大小 → 下载页进度条动起来；
+        # 合并期间实时上报输出文件大小 → 下载页进度条动起来;
         # cancel_evt：用户点「取消」→ 立即终止 ffmpeg（而非等整集下完）
         progress_cb = getattr(task, "image_progress_cb", None)
-        finalized = merger.merge(
-            video, audio, path,
-            progress_cb=progress_cb,
-            cancel_evt=getattr(task, "cancel_evt", None),
-            pause_evt=getattr(task, "pause_evt", None),
-        )
-        return finalized.stat().st_size if finalized.exists() else 0
+        try:
+            finalized = merger.merge(
+                video, audio, path,
+                progress_cb=progress_cb,
+                cancel_evt=getattr(task, "cancel_evt", None),
+                pause_evt=getattr(task, "pause_evt", None),
+            )
+            return finalized.stat().st_size if finalized.exists() else 0
+        finally:
+            if filtered is not None:
+                try:
+                    Path(filtered).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _filter_m3u8_for_download(self, source, video_url: str, book_dir) -> Optional[Path]:
-        """下载 m3u8 → adblock 剔除广告段 → 写本地临时文件。失败返回 None（用原 URL）。"""
-        from .adblock import adblock_for
+        """下载 m3u8 → 通用广告规则过滤 → 写本地临时文件。失败返回 None。"""
+        from .adblock import adblock_for, trusted_media_context
 
         ad = adblock_for(source, default_on=True)
         try:
@@ -445,15 +468,35 @@ class Downloader:
             return None
         if not text or not ad.enabled:
             return None
-        cleaned = ad.filter_m3u8(text, video_url)
+        manifest_url = video_url
+        if "#EXT-X-STREAM-INF" in text:
+            manifest_url = self._first_variant_url(text, video_url) or ""
+            if not manifest_url:
+                return None
+            try:
+                text = self._http.get_text(manifest_url, headers=source.request_headers(), timeout=20, retries=2)
+            except Exception:  # noqa: BLE001
+                return None
+        cleaned = ad.filter_m3u8(text, manifest_url,
+                                  source_id=trusted_media_context(getattr(source, "source_id", "")))
         if cleaned == text:
-            return None  # 无广告，用原 URL
-        # 写本地无广告 m3u8（相对段 URL 需基于原 m3u8 目录解析，ffmpeg 处理相对路径）
-        tmp = book_dir / "_clean.m3u8"
+            return None
+        import tempfile
+        temp_path = None
         try:
-            tmp.write_text(cleaned, encoding="utf-8")
-            return tmp
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".m3u8",
+                prefix=".claw_clean_", dir=str(book_dir), delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                handle.write(cleaned)
+            return temp_path
         except OSError:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return None
 
     # ------------------------------------------------------------------ #
@@ -462,17 +505,10 @@ class Downloader:
     def _download_hls(
         self, url, headers, path,
         progress_cb=None, cancel_evt=None, pause_evt=None,
-        source=None,
-    ) -> int:
-        """HLS（m3u8）分段并行下载 → ffmpeg 本地合并成 mp4。
+         source=None,
+     ) -> int:
 
-        ffmpeg 直连 HLS 的缺陷（xuandm 实测 ~9 分钟截断）：a) -headers 不传播
-        给分段请求，CDN 校验 Referer 时 403；b) 单段失败即中止，产出截断文件。
-        这里用 HttpClient 并行下载分段（worker 数取源 media.hls.workers，规避
-        单连接 CDN 限速）：每段带源 Referer + 最多 5 次重试 + 递增退避（间歇
-        403 重试可过），写本地 m3u8 + 本地 key，由 ffmpeg 完成 AES-128 解密与
-        -c copy 合并。彻底失败的分段写空 TS 包占位，不中断整集。
-        """
+        """HLS（m3u8）分段并行下载并合并成 mp4。"""
         import shutil
         import tempfile
         from urllib.parse import urljoin
@@ -491,27 +527,33 @@ class Downloader:
                     raise RuntimeError("HLS master 播放列表无可用画质")
                 playlist_url = variant
                 text = self._http.get_text(variant, headers=headers, timeout=20, retries=2)
-                if not text or "#EXTM3U" not in text:
-                    raise RuntimeError("HLS variant 播放列表无效")
+            if not text or "#EXTM3U" not in text:
+                raise RuntimeError("HLS variant 播放列表无效")
 
+            from .adblock import adblock_for, trusted_media_context
+            ad = adblock_for(source, default_on=True)
+            if ad.enabled and getattr(source, "source_id", "") == "18j":
+                text = ad.filter_m3u8(
+                     text, playlist_url,
+                     source_id=trusted_media_context("18j")
+
+                )
             segs, key_attrs, target_dur = self._parse_hls_segments(text, playlist_url)
+
+
             if not segs:
                 raise RuntimeError("HLS 播放列表无分段")
 
-            # 流内广告段剔除：段 URL 命中广告特征 / DISCONTINUITY 短段 → 跳过下载。
-            # 用 adblock 引擎（源级配置+内置规则）判定；无 ad_block 源也启用内置规则，
-            # 仅源显式 enabled:false 才关闭。
+
+            ad_segs = []
             try:
-                from .adblock import adblock_for
+                from .adblock import adblock_for, trusted_media_context
 
                 ad = adblock_for(source, default_on=True)
                 if ad.enabled:
                     ad_segs, _cleaned = ad.detect_m3u8_ads(text, playlist_url)
-                else:
-                    ad_segs = []
-            except Exception:  # noqa: BLE001 广告检测失败不影响下载
+            except Exception:
                 ad_segs = []
-
             # AES-128 密钥（下载到本地，本地 m3u8 引用它）
             key_local = None
             if key_attrs:
@@ -657,7 +699,7 @@ class Downloader:
     def _download_seg_retry(
         self, seg_url, headers, seg_file, cancel_evt, pause_evt, retries: int = 5,
     ) -> int:
-        """下载单段：最多 retries 次 + 递增退避（0.5s*attempt）。返回字节数，彻底失败 0。"""
+        """下载单段：最多 retries 次 + 递增退避。"""
         import time as _time
 
         h = dict(headers or {})
@@ -671,16 +713,13 @@ class Downloader:
                 if attempt < retries:
                     _time.sleep(0.5 * attempt)
         if not data:
-            return 0
+            raise RuntimeError("HLS 分片下载失败")
         seg_file.write_bytes(data)
         return len(data)
 
     @staticmethod
     def _write_hls_playlist(local_m3u8: Path, seg_items, key_attrs, key_local, target_dur) -> None:
-        """重写本地 m3u8：key 指本地 key + 分段指本地文件 + ENDLIST。
-
-        彻底失败的分段（字节 0）写 188B 空 TS 包占位，避免 ffmpeg 因文件缺失中止。
-        """
+        """重写本地 m3u8：key 指本地 key，分段指本地文件。"""
         lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
         lines.append(f"#EXT-X-TARGETDURATION:{int(target_dur) + 1 if target_dur else 10}")
         lines.append("#EXT-X-MEDIA-SEQUENCE:0")
@@ -694,10 +733,7 @@ class Downloader:
             dur = extinf if extinf and extinf > 0 else (target_dur or 10.0)
             lines.append(f"#EXTINF:{dur:.3f},")
             if not nbytes:
-                # 空 TS 包占位：文件缺失会让 ffmpeg 中止整集
-                (local_m3u8.parent / seg_name).write_bytes(
-                    b"\x47\x1f\xff\x10" + b"\xff" * 184
-                )
+                raise RuntimeError("HLS 分片无有效输出")
             lines.append(seg_name)
         lines.append("#EXT-X-ENDLIST")
         local_m3u8.write_text("\n".join(lines), encoding="utf-8")

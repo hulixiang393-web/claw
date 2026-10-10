@@ -10,7 +10,9 @@ from PySide6.QtCore import QEventLoop, QTimer, Qt
 
 from framework.content import Chapter
 from framework.settings_manager import reader_prefetch_settings
+from gui.pages.reader.epub_view import EpubView
 from gui.pages.reader.novel_view import NovelView
+from gui.pages.settings_page import SettingsPage
 
 
 def test_novel_location_helpers():
@@ -110,3 +112,48 @@ def test_novel_current_load_and_prefetch_do_not_duplicate(_qapp, monkeypatch):
     assert view._next_prefetch_queue == [1]
     assert view._prefetch_idx != 0
     assert started == [1]
+
+
+def test_plain_novel_style_is_serif_and_width_limited(_qapp):
+    view = NovelView(object())
+    css = view._plain_body_css()
+    assert "Georgia" in css
+    assert "text-indent: 2em" in css
+    assert "margin-bottom: 0.9em" in css
+    assert view.text.maximumWidth() == 960
+    assert view.paged_label.maximumWidth() == 960
+    view.deleteLater()
+
+
+def test_settings_reader_font_range_is_48(_qapp):
+    class _Settings:
+        def get(self, section, key, default=None):
+            return default
+
+        def set(self, section, key, value):
+            pass
+
+        def save(self):
+            pass
+
+    page = SettingsPage(_Settings(), SimpleNamespace())
+    assert page._ui_reading_font.maximum() == 48
+    page.deleteLater()
+
+
+def test_global_font_override_clears_manual_delta_and_clamps_at_48(_qapp):
+    novel = NovelView(object())
+    novel._adjust_font(20)
+    novel.set_font_scale(3)
+    assert novel._font_delta == 0
+    assert novel._base_font == 48
+    assert "font-size: 48px" in novel.text.styleSheet()
+
+    epub = EpubView()
+    epub._adjust_font(20)
+    epub.set_font_scale(3)
+    assert epub._font_delta == 0
+    assert epub._base_font == 48
+    assert "font-size: 48px" in epub.text.styleSheet()
+    novel.deleteLater()
+    epub.deleteLater()

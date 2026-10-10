@@ -215,6 +215,12 @@ class _ShelfCard(QFrame):
         self._badge_label.setStyleSheet("color: palette(highlight); font-size: 10px;")
         state.addWidget(self._badge_label)
         layout.addLayout(state)
+        if rec.get("kind") == "favorite" or rec.get("online"):
+            self._reading_status_label = QLabel(
+                "已看完" if rec.get("reading_status") == "completed" else "在看"
+            )
+            self._reading_status_label.setStyleSheet("color: palette(highlight); font-size: 11px;")
+            layout.addWidget(self._reading_status_label)
         # 标题收紧为单行后多余高度 → 底部 stretch（卡片等高不破）
         layout.addStretch(1)
 
@@ -546,6 +552,7 @@ class LibraryPage(BasePage):
         """主线程渲染扫描结果（本地在前）。"""
         if not self._visible_combo_state():
             return  # 筛选/搜索/排序已变化 → 旧结果丢弃，等新任务
+        self._clear_all()
         selected_folder = self.folder_combo.currentText()
         def _visible(b: dict) -> bool:
             folder = b.get("folder", "")
@@ -661,6 +668,8 @@ class LibraryPage(BasePage):
                 for field, value in favorite.items():
                     if field not in {"kind", "path", "episode_paths"} and value not in (None, "", [], {}):
                         merged[field] = value
+                merged["online"] = True
+                merged["reading_status"] = favorite.get("reading_status", "reading")
                 item = merged
                 matched.add(key)
             local_by_key[key] = item
@@ -1103,6 +1112,21 @@ class LibraryPage(BasePage):
             if is_local:
                 menu.addSeparator()
             url = rec.get("url", "")
+            if url and self._store is not None and self._store.has(url):
+                from PySide6.QtGui import QActionGroup
+
+                status_group = QActionGroup(menu)
+                status_group.setExclusive(True)
+                current = self._store.reading_status(url)
+                for status, label in (("reading", "在看"), ("completed", "已看完")):
+                    action = menu.addAction(label)
+                    action.setCheckable(True)
+                    action.setChecked(current == status)
+                    status_group.addAction(action)
+                    action.triggered.connect(
+                        lambda _, value=status: self._set_reading_status(rec, value)
+                    )
+                menu.addSeparator()
             if url:
                 if rec.get("content_type") in ("novel", "comic") and url not in self._precache_jobs:
                     menu.addAction("缓存本书（离线可读）").triggered.connect(
@@ -1417,6 +1441,19 @@ class LibraryPage(BasePage):
             if not self.is_folder_unlocked(name) and not self._prompt_unlock(name):
                 return False
         return True
+
+    def _set_reading_status(self, rec: dict, status: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        if not self._ensure_folder_unlocked(rec.get("folder", "")):
+            return
+        try:
+            changed = self._shelf.favorite_set_reading_status(rec.get("url", ""), status)
+        except OSError:
+            QMessageBox.warning(self, "状态更新失败", "无法保存阅读状态，请重试。")
+            return
+        if changed:
+            self._rebuild()
 
     def _move_favorite(self, rec: dict, folder: str) -> None:
         if not self._ensure_folder_unlocked(rec.get("folder", "")):

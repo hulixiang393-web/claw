@@ -148,6 +148,21 @@ def test_startup_render_ignores_historical_detail_without_eager_reads():
     assert content.cover_calls == []
 
 
+def test_repeated_scan_result_does_not_duplicate_shelf_cards():
+    page = _page()
+    records = [{**_online("book-a"), "title": "书甲"},
+               {**_online("book-b"), "title": "书乙"}]
+
+    page._render(records)
+    page._render(records)
+
+    assert len(page._cards_by_key) == 2
+    assert page.body.count() == 2
+    grid = page.body.itemAt(1).layout()
+    assert grid is not None
+    assert grid.count() == 2
+
+
 def test_render_does_not_fetch_detail_chapter_or_body():
     content = _ControlledContent()
     page = _page(content)

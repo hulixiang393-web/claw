@@ -11,13 +11,17 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+import math
+
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
     QVBoxLayout,
     QWidget,
+    QListWidget,
+    QListWidgetItem,
 )
 
 from framework.events import EventBus, EVENT_SOURCE_VISIBILITY_CHANGED
@@ -223,6 +227,7 @@ class HomePage(BasePage):
     search_requested = Signal(str)
     add_source_requested = Signal()
     settings_requested = Signal()
+    playback_requested = Signal(object)
 
     def __init__(
         self,
@@ -233,6 +238,8 @@ class HomePage(BasePage):
         history: SearchHistory,
         bulk_fetch=None,
         parent=None,
+        reading_progress=None,
+        privacy=None,
     ):
         super().__init__(parent)
         self._manager = source_manager
@@ -240,6 +247,8 @@ class HomePage(BasePage):
         self._theme_manager = theme_manager
         self._settings = settings
         self._history = history
+        self._reading_progress = reading_progress
+        self._privacy = privacy
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 16, 24, 16)
@@ -264,6 +273,13 @@ class HomePage(BasePage):
         layout.addWidget(self.recent)
         self.recent.search_clicked.connect(self._on_recent_clicked)
 
+        self.playback_title = QLabel("最近播放（0）")
+        layout.addWidget(self.playback_title)
+        self.playback_list = QListWidget()
+        self.playback_list.setMaximumHeight(180)
+        self.playback_list.itemClicked.connect(self._on_playback_clicked)
+        layout.addWidget(self.playback_list)
+
         # 迷你任务进度
         self.mini_progress = MiniProgress(event_bus)
         layout.addWidget(self.mini_progress)
@@ -283,7 +299,15 @@ class HomePage(BasePage):
             event_bus.subscribe(self.mascot.on_event)
             event_bus.subscribe(self._on_visibility_changed)
 
+        self._history_timer = QTimer(self)
+        self._history_timer.setInterval(1000)
+        self._history_timer.timeout.connect(self._refresh_visible_history)
+        self._history_timer.start()
         self.refresh()
+
+    def _refresh_visible_history(self):
+        if self.isVisible():
+            self._refresh_history()
 
     def _on_visibility_changed(self, event) -> None:
         if getattr(event, "type", "") == EVENT_SOURCE_VISIBILITY_CHANGED:
@@ -294,21 +318,58 @@ class HomePage(BasePage):
         """从数据源刷新本页。"""
         self.stats_row.reload()
         self.broken_card.update_sources(self._manager.list_broken())
-        self.recent.reload()
+        self._refresh_history()
         self._update_empty_state()
+
+    def _refresh_history(self):
+        records = self._reading_progress.recent_videos(self._privacy) if self._reading_progress else []
+        snapshot = (self._history.recent(), records)
+        if getattr(self, "_history_snapshot", None) == snapshot:
+            return
+        self._history_snapshot = snapshot
+        self.recent.reload()
+        self.playback_list.clear()
+        self.playback_title.setText(f"最近播放（{len(records)}）")
+        for record in records:
+            seconds = (record.get("location") or {}).get("seconds")
+            stamp = "仅记录集数"
+            if isinstance(seconds, (int, float)) and math.isfinite(seconds) and seconds >= 0:
+                seconds = int(seconds)
+                stamp = f"{seconds // 60:02d}:{seconds % 60:02d}"
+            label = f"{record.get('title') or record.get('book_url', '')} · {record.get('chapter_title', '')} · {stamp}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, record)
+            self.playback_list.addItem(item)
 
     def _update_empty_state(self) -> None:
         has_sources = len(self._manager.all()) > 0
         self.empty_state.setVisible(not has_sources)
         self.stats_row.setVisible(has_sources)
         self.broken_card.setVisible(has_sources and bool(self._manager.list_broken()))
-        self.recent.setVisible(has_sources)
+        self.recent.setVisible(True)
         self.mini_progress.setVisible(has_sources)
         self.batch_update.setVisible(has_sources)
 
     def _on_recent_clicked(self, keyword: str) -> None:
         """点击最近搜索词 → 切换 Tab 到搜索并预填（App 层接）。"""
-        self.search_requested.emit(keyword)
+        if keyword in self._history.recent():
+            self.search_requested.emit(keyword)
+
+    def _on_playback_clicked(self, item):
+        from framework.reading_progress import history_active
+
+        record = item.data(Qt.UserRole)
+        progress = getattr(self, "_reading_progress", None)
+        if progress is not None:
+            record = progress.all().get((record or {}).get("book_url"))
+        if not record or not history_active(record):
+            return
+        if record and not (self._privacy and self._privacy.playback_history_hidden(record)):
+            self.playback_requested.emit(record)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh()
 
     def _on_add_source(self) -> None:
         """去添加源 → 切 Tab 到源管理（App 层接）。"""

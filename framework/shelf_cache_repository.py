@@ -36,6 +36,7 @@ class ShelfCacheRepository:
         self._db.execute("PRAGMA foreign_keys = ON")
         self._init_schema()
         self._validate_schema_version()
+        self.prune_video_history()
         if repair_index:
             self.repair_index()
 
@@ -139,7 +140,40 @@ class ShelfCacheRepository:
             self._db.execute(f"INSERT INTO {table}(book_key,value_json) VALUES(?,?) ON CONFLICT(book_key) DO UPDATE SET value_json=excluded.value_json", (book_key, self._json(value)))
             self._db.execute("UPDATE books SET last_active_at=? WHERE book_key=?", (self.clock(), book_key))
 
+    def prune_video_history(self) -> None:
+        from framework.reading_progress import history_active, video_resume_record
+
+        with self._lock, self._db:
+            rows = self._db.execute(
+                "SELECT b.book_key,b.metadata,l.value_json FROM books b "
+                "LEFT JOIN locations l ON l.book_key=b.book_key WHERE b.content_type='video'"
+            ).fetchall()
+            for row in rows:
+                metadata = self._loads(row["metadata"])
+                location = self._loads(row["value_json"]) if row["value_json"] else {}
+                if location and not location.get("content_type"):
+                    combined = dict(metadata)
+                    combined.update({key: value for key, value in location.items()
+                                     if key not in {"seconds", "duration"}})
+                    combined["content_type"] = "video"
+                    if "seconds" in location or "duration" in location:
+                        combined["location"] = {key: location[key] for key in
+                                                ("seconds", "duration") if key in location}
+                    location = combined
+                    self._db.execute("UPDATE locations SET value_json=? WHERE book_key=?",
+                                     (self._json(location), row["book_key"]))
+                for value, table, column in ((location, "locations", "value_json"),
+                                             (metadata, "books", "metadata")):
+                    if value and not history_active(value):
+                        cleaned = video_resume_record(value)
+                        if cleaned != value:
+                            self._db.execute(
+                                f"UPDATE {table} SET {column}=? WHERE book_key=?",
+                                (self._json(cleaned), row["book_key"]),
+                            )
+
     def get_book_snapshot(self, book_key: str) -> dict | None:
+        self.prune_video_history()
         with self._lock:
             book = self._db.execute("SELECT * FROM books WHERE book_key=?", (book_key,)).fetchone()
             if not book:

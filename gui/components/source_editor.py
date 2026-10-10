@@ -1597,7 +1597,7 @@ class SourceEditor(QDialog):
     # ================================================================== #
     # 各类型参考源（用真实存在的源作为示例模板）
     _EXAMPLE_SOURCE = {
-        "novel": "23qb",
+        "novel": "zongheng",
         "comic": "18mh",
         "video": "bilibili",
     }

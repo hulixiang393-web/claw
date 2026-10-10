@@ -76,6 +76,7 @@ class Chapter:
     title: str
     url: str
     source_id: str = ""  # 该集所属播放源标识（换源站：sid 值）；普通源空
+    provider: str = ""
     # 该集封面（如 hanime1 详情页侧边栏播放清單内每集缩略图）；
     # 由 content.<type>.list.fields.cover 提取，空则章节界面回退作品封面
     cover: str = ""
@@ -926,7 +927,10 @@ class Content:
                 c_url = c_url.replace("{bvid}", bvid).replace("{id}", bvid)
                 # 模板里 {title}/{part} 等占位填充
                 c_url = utils.fill_template(c_url, it)
-                detail.chapters.append(Chapter(title=c_title, url=c_url))
+                provider = it.get("provider") or it.get("source") or ""
+                if not isinstance(provider, str):
+                    provider = ""
+                detail.chapters.append(Chapter(title=c_title, url=c_url, provider=provider))
         return detail
 
     @staticmethod
@@ -2848,13 +2852,17 @@ class Content:
                                          source_lock=False) -> list:
 
         context = self._stream_context(context, deadline)
-        return [
-            lambda context=None: self._fetch_video_streams_legacy(
-            source, episode_url, quality, merged, deadline=deadline, context=context,
-            source_lock=source_lock
-
-            )
-        ]
+        candidate = {
+            "resolver": lambda context=context: self._fetch_video_streams_legacy(
+                source, episode_url, quality, merged, deadline=deadline, context=context,
+                source_lock=source_lock,
+            ),
+        }
+        if source.source_id == "agedm":
+            block = self._content_block(source).get("episode") or {}
+            if block.get("stream_budget") == "pipeline":
+                candidate["budget"] = "pipeline"
+        return [candidate]
 
     def _fetch_video_streams_legacy(self, source: SourceConfig, episode_url: str, quality: str = "",
                                      merged: bool = False, deadline=None, context=None,
@@ -2957,7 +2965,8 @@ class Content:
                 )
 
         # 换源站：默认线路失败 → 自动轮换其他线路
-        if self._get_source_switch_cfg(source) and not source_lock:
+        switch_cfg = self._get_source_switch_cfg(source)
+        if switch_cfg and switch_cfg.get("auto_switch", True) and not source_lock:
             return self._fetch_play_url_auto_switch(
                 source, episode_url, deadline=deadline, context=context
             )
@@ -2993,8 +3002,21 @@ class Content:
 
             timeout_ms = int(rc.get("timeout_ms") or 45000)
             extra_delay_ms = int(rc.get("extra_delay_ms", 8000))
+            render_url = abs_ep
+            iframe_selector = play_cfg.get("iframe_selector")
+            if iframe_selector:
+                html = self._get(source, episode_url, deadline=deadline, context=context)
+                doc = self._parser.parse(html)
+                iframe_url = self._parser.extract_first(doc, iframe_selector, abs_ep)
+                if not iframe_url or not iframe_url.startswith(("https://", "http://")):
+                    raise ContentMissingError("未获取到播放 iframe", source_id=source.source_id)
+                render_url = iframe_url
+            recovery_options = {}
+            if source.source_id == "agedm" and rc.get("recover_navigation_timeout") is True:
+                recovery_options["recover_navigation_timeout"] = True
             vurl = fetch_rendered_video_sync(
-                abs_ep,
+                render_url,
+                **recovery_options,
                 wait_until=rc.get("wait_until") or "networkidle",
                 timeout_ms=timeout_ms,
                 extra_delay_ms=extra_delay_ms,
@@ -3960,7 +3982,7 @@ class Content:
             seen.add(href)
             title = node.text_content().strip() if hasattr(node, "text_content") else ""
             # 确保 URL 带 sid（无则补）
-            if f"sid={sid}" not in href:
+            if not switch.get("ep_sid_in_path") and f"sid={sid}" not in href:
                 sep = "&" if "?" in href else "?"
                 href = f"{href}{sep}sid={sid}"
             abs_url = self._abs_url(source, href)

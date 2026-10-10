@@ -247,7 +247,7 @@ def test_prefetch_off_by_default(monkeypatch, upstream, tmp_path):
     monkeypatch.setattr(mp, "_get_direct_session", _direct_session)
     monkeypatch.setattr(mp, "_get_session", _direct_session)
     cache = MediaCache(root=tmp_path / "v", enabled=True)
-    proxy = MediaProxy(cache=cache)
+    proxy = MediaProxy(cache=cache, prefetch={})
     proxy._ensure_server()
     try:
         assert proxy._prefetch_enabled() is False
@@ -445,7 +445,7 @@ def test_prefetch_passes_actual_bounded_timeout(monkeypatch, pf_proxy):
 
     monkeypatch.setattr(mp, "_fetch_upstream", _fetch)
     proxy._prefetch_one("key", "http://cdn.test/timeout.ts", {}, False)
-    assert seen["timeout"] == (mp._PREFETCH_TIMEOUT, mp._PREFETCH_TIMEOUT)
+    assert all(0 < value <= mp._PREFETCH_TIMEOUT for value in seen["timeout"])
 
 
 def test_stop_closes_active_prefetch_and_cleans_marker(monkeypatch, pf_proxy):

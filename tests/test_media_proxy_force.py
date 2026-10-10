@@ -344,13 +344,14 @@ def test_route_diagnostics_records_direct_success_without_sensitive_data(monkeyp
     assert len(records) == 1
     assert set(records[0]) == {
         "protocol", "host", "request_kind", "route", "status",
-        "status_code", "elapsed_ms", "first_byte_ms", "throughput_bps",
+        "status_code", "elapsed_ms", "first_byte_ms", "bytes", "throughput_bps",
         "cache_state", "wait_ms", "failure_category",
     }
     assert records[0]["host"] == "cdn.example.com"
     assert records[0]["request_kind"] == "manifest"
     assert records[0]["route"] == "direct"
     assert records[0]["status_code"] == 200
+    assert records[0]["bytes"] == 0
     assert records[0]["failure_category"] is None
     assert records[0]["elapsed_ms"] >= 0
     assert records[0]["first_byte_ms"] is None
@@ -648,6 +649,7 @@ def test_force_proxy_mp4_range_preserves_header_and_route(monkeypatch):
             "status_code": 206,
             "elapsed_ms": records[0]["elapsed_ms"],
             "first_byte_ms": records[0]["first_byte_ms"],
+            "bytes": 3,
             "throughput_bps": records[0]["throughput_bps"],
             "cache_state": "miss",
             "wait_ms": None,

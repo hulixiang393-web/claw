@@ -698,12 +698,13 @@ class EpubView(QWidget):
 
     @staticmethod
     def _clamp_font(size: int) -> int:
-        return max(12, min(28, size))
+        return max(12, min(48, size))
 
     def set_font_scale(self, scale: float) -> None:
-        """外部设置字体缩放（设置页实时生效）。保留用户 A+/A- 微调量。"""
+        """外部设置字体缩放（设置页实时生效）。"""
         if self._is_comic:
             return
+        self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * float(scale or 1.0)))
         self._apply_font()
 
@@ -713,13 +714,27 @@ class EpubView(QWidget):
         bg = self._reading_bg
         bg_css = f" background-color: {bg};" if bg else ""
         fg_css = f" color: {self._reading_fg};" if self._reading_fg else ""
-        return f"font-size: {size}px; line-height: 1.8; padding: 8px 12px;{bg_css}{fg_css}"
+        return (
+            "font-family: Georgia, 'Times New Roman', 'Noto Serif CJK SC', SimSun, serif; "
+            f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;"
+            " text-indent: 2em; margin-bottom: 0.9em;"
+            f"{bg_css}{fg_css}"
+        )
 
     def _apply_font(self) -> None:
         if self._is_comic:
             return
-        self._ensure_text_label()  # 被删则重建，避免操作失效对象
-        self.text.setStyleSheet(self._body_css())
+        self._ensure_text_label()
+        css = self._body_css()
+        self.text.setStyleSheet(css)
+        self.text.setMaximumWidth(960)
+        gallery_layout = getattr(self, "_gallery_layout", None)
+        if gallery_layout is not None:
+            for index in range(gallery_layout.count()):
+                widget = gallery_layout.itemAt(index).widget()
+                if isinstance(widget, QLabel) and widget.text():
+                    widget.setStyleSheet(css)
+                    widget.setMaximumWidth(960)
 
     def _adjust_font(self, delta: int) -> None:
         if self._is_comic:
@@ -737,6 +752,7 @@ class EpubView(QWidget):
         self._reading_bg = bg or ""
         self._reading_fg = fg or ""
         if font_size > 0:
+            self._font_delta = 0
             self._base_font = self._clamp_font(font_size)
         self._apply_font()
         self._apply_viewport_bg()

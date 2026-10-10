@@ -419,5 +419,158 @@ def test_mp4_mimetype_resolvable():
     assert mimetypes.guess_type("a.mp4")[0]
 
 
+@pytest.fixture
+def faulty_segment(relay, monkeypatch):
+    proxy, base = relay
+    monkeypatch.setattr(mp, "_DIRECT_FAIL", {})
+    state = {"hits": 0, "mode": "short", "body": bytes(range(256)) * 1024}
+
+    def serve(handler):
+        state["hits"] += 1
+        mode = state["mode"]
+        body = state["body"]
+        status = int(mode) if mode in ("403", "429") else 200
+        if mode == "partial":
+            status = 206
+        content_range = None
+        if handler.headers.get("Range") == "bytes=100-131171":
+            content_range = f"bytes 100-131171/{len(body)}"
+            body = body[100:131172]
+            status = 206
+        handler.send_response(status)
+        handler.send_header("Content-Type", "video/mp2t")
+        if mode != "unknown":
+            handler.send_header("Content-Length", str(len(body)))
+        if mode == "partial":
+            handler.send_header("Content-Range", f"bytes 20-{len(body) + 19}/{len(body) + 20}")
+        elif content_range:
+            handler.send_header("Content-Range", content_range)
+        handler.end_headers()
+        if mode == "always_empty" or (mode == "empty" and state["hits"] == 1):
+            payload = b""
+        elif mode == "short" or (mode == "once" and state["hits"] == 1):
+            payload = body[:70000]
+        else:
+            payload = body
+        handler.wfile.write(payload)
+        handler.wfile.flush()
+        handler.close_connection = True
+
+    monkeypatch.setattr(_FakeUpstream, "do_GET", serve)
+    return proxy, base + "/fault.ts", state
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("ranged", [False, True])
+def test_segment_disconnect_contains_only_original_prefix(faulty_segment, tmp_path, cached, ranged):
+    from framework.media_cache import MediaCache
+    from urllib.parse import quote
+
+    proxy, target, state = faulty_segment
+    cache = MediaCache(root=tmp_path / "segments")
+    proxy._cache = cache if cached else _OffCache()
+    key = cache.key_of(target)
+    if cached:
+        cache.mark_hls(key, 0)
+        proxy._register_cache_ctx(key, target, {}, None)
+        local = f"http://127.0.0.1:{_port(proxy)}/c/{key}/{quote(target, safe='/:@')}"
+    else:
+        local = proxy.build_url(target)
+    headers = {"Range": "bytes=100-131171"} if ranged else {}
+    expected = state["body"][100:131172] if ranged else state["body"]
+    c = _conn(proxy)
+    try:
+        c.request("GET", requests.utils.urlparse(local).path, headers=headers)
+        response = c.getresponse()
+        assert response.status == (206 if ranged else 200)
+        with pytest.raises(http.client.IncompleteRead) as error:
+            response.read()
+        partial = error.value.partial
+        assert partial
+        assert expected.startswith(partial)
+        assert b"HTTP/1.1" not in partial
+        assert state["hits"] == 1
+        assert not cache.hls_segment_final(key, target).exists()
+        state["mode"] = "ok"
+        assert requests.get(local, headers=headers, timeout=5).content == expected
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("mode", ["empty", "always_empty", "403", "429"])
+def test_segment_empty_body_retries_before_output(faulty_segment, tmp_path, cached, mode):
+    from framework.media_cache import MediaCache
+
+    proxy, target, state = faulty_segment
+    state["mode"] = mode
+    local = proxy.build_url(target)
+    if cached:
+        cache = MediaCache(root=tmp_path / "segments")
+        proxy._cache = cache
+        key = cache.key_of(target)
+        cache.mark_hls(key, 0)
+        proxy._register_cache_ctx(key, target, {}, None)
+        local = f"http://127.0.0.1:{_port(proxy)}/c/{key}/fault.ts"
+    response = requests.get(local, timeout=5)
+    expected_status = {"empty": 200, "always_empty": 502, "403": 403, "429": 429}[mode]
+    assert response.status_code == expected_status
+    if mode == "empty":
+        assert response.content == state["body"]
+    assert state["hits"] == (1 if mode in ("403", "429") else 2)
+    if cached:
+        assert _wait_fetch_finished(cache, key)
+
+
+def _wait_fetch_finished(cache, key):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if cache.fetch_state(key) is None:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+@pytest.mark.parametrize("mode, expected_hits, complete", [
+    ("once", 2, True), ("short", 2, False), ("partial", 1, False),
+    ("unknown", 1, False), ("403", 1, False), ("429", 1, False),
+])
+def test_prefetch_faults_commit_only_complete(faulty_segment, tmp_path, mode, expected_hits, complete):
+    from framework.media_cache import MediaCache
+
+    proxy, target, state = faulty_segment
+    state["mode"] = mode
+    cache = MediaCache(root=tmp_path / "segments")
+    proxy._cache = cache
+    key = cache.key_of(target)
+    cache.mark_hls(key, 0)
+    proxy._prefetch_one(key, target, {"Accept-Encoding": "identity"}, False)
+    final = cache.hls_segment_final(key, target)
+    assert state["hits"] == expected_hits
+    assert final.exists() is complete
+    if complete:
+        assert final.read_bytes() == state["body"]
+    assert not cache.hls_segment_part(key, target).exists()
+
+
+def test_same_segment_prefetch_recovery_is_serial(faulty_segment, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from framework.media_cache import MediaCache
+
+    proxy, target, state = faulty_segment
+    state["mode"] = "once"
+    cache = MediaCache(root=tmp_path / "segments")
+    proxy._cache = cache
+    key = cache.key_of(target)
+    cache.mark_hls(key, 0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(proxy._prefetch_one, key, target, {}, False) for _ in range(3)]
+        for future in futures:
+            assert future.result(timeout=5) is None
+    assert state["hits"] == 2
+    assert cache.hls_segment_final(key, target).read_bytes() == state["body"]
+    assert not cache.hls_segment_part(key, target).exists()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

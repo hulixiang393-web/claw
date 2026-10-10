@@ -474,7 +474,7 @@ class SearchPage(BasePage):
             self.status_label.setText("没有可搜索的源")
             return
 
-        # 每源一个状态 chip + 一个后台任务（并发由 ThreadPool 调度）
+        self.search_clicked.emit(keyword)
         self._build_status_bar(sources)
         self.status_bar.setVisible(True)
         self._pending_count = len(sources)

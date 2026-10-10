@@ -476,7 +476,11 @@ class NovelView(QWidget):
                     segment.setObjectName("readerBody")
                     segment.setWordWrap(True)
                     segment.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                    self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, segment)
+                    segment.setStyleSheet(self._plain_body_css())
+                    segment.setMaximumWidth(960)
+                    self.scroll_layout.insertWidget(
+                        self.scroll_layout.count() - 1, segment, alignment=Qt.AlignHCenter
+                    )
                 else:
                     image_url = fragment.get("url")
                     if isinstance(image_url, str) and image_url:
@@ -993,10 +997,11 @@ class NovelView(QWidget):
 
     @staticmethod
     def _clamp_font(size: int) -> int:
-        return max(12, min(28, size))
+        return max(12, min(48, size))
 
     def set_font_scale(self, scale: float) -> None:
-        """外部设置字体缩放（设置页实时生效）。保留用户 A+/A- 微调量。"""
+        """外部设置字体缩放（设置页实时生效）。"""
+        self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * float(scale or 1.0)))
         self._apply_font()
 
@@ -1004,17 +1009,33 @@ class NovelView(QWidget):
         self._font_delta += delta
         self._apply_font()
 
-    def _apply_font(self) -> None:
+    def _plain_body_css(self) -> str:
         size = self._clamp_font(self._base_font + self._font_delta)
-        bg = self._reading_bg  # 阅读区独立背景（空 = 透明跟随主题）
+        bg = self._reading_bg
         bg_css = f" background-color: {bg};" if bg else " background: transparent;"
         fg_css = f" color: {self._reading_fg};" if self._reading_fg else ""
-        self.text.setStyleSheet(
-            f"font-size: {size}px; line-height: 1.55; padding: 6px 10px;{bg_css}{fg_css}"
+        return (
+            "font-family: Georgia, 'Times New Roman', 'Noto Serif CJK SC', SimSun, serif; "
+            f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;"
+            " text-indent: 2em; margin-bottom: 0.9em;"
+            f"{bg_css}{fg_css}"
         )
-        self.paged_label.setStyleSheet(
-            f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;{bg_css}{fg_css}"
-        )
+
+    def _apply_plain_body_style(self) -> None:
+        css = self._plain_body_css()
+        widgets = [self.text, self.paged_label]
+        widgets.extend(self.scroll_body.findChildren(QLabel, "readerBody"))
+        seen = set()
+        for widget in widgets:
+            if id(widget) in seen:
+                continue
+            seen.add(id(widget))
+            widget.setStyleSheet(css)
+            widget.setMaximumWidth(960)
+        self.scroll_layout.setAlignment(self.text, Qt.AlignHCenter)
+
+    def _apply_font(self) -> None:
+        self._apply_plain_body_style()
         if getattr(self._source, "source_id", "") == "bookstack":
             self._apply_bookstack_style()
             self._resize_bookstack_body()
@@ -1031,6 +1052,7 @@ class NovelView(QWidget):
         self._reading_bg = bg or ""
         self._reading_fg = fg or ""
         if font_size > 0:
+            self._font_delta = 0
             self._base_font = self._clamp_font(font_size)
         self._apply_font()
 

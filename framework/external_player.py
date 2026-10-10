@@ -2,7 +2,6 @@
 
 播放交给独立播放器进程（VLC 桌面版优先，浏览器兜底），不再内嵌 libvlc：
 - 独立进程完整渲染管线，无 Qt 主线程/内嵌 hwnd 干扰 → 1080p+ 流畅
-- VLC 桌面版自带"恢复播放位置"（记住每个媒体的进度）→ 续读由播放器自己接管
 - 防盗链透传：VLC 命令行 --http-referrer 只对 Referer 生效，且实测 VLC 3.0.23
   无法覆盖 User-Agent（CDN 常拒绝 VLC 默认 UA）。因此**带防盗链头的媒体一律
   走本地代理（framework/media_proxy.py）**：代理把源配置的完整 headers
@@ -19,6 +18,8 @@
   playlist.json 建 {集下标: vlc_id} 映射并 pl_play 定位到起始集。
 """
 import logging
+import math
+from urllib.parse import unquote, urlsplit
 import os
 import re
 import secrets
@@ -34,6 +35,7 @@ try:
 except ImportError:  # pragma: no cover —— VLC 控制接口非必需，缺库时 player_command 静默 False
     requests = None
 
+from .adblock import trusted_source_id
 from .media_proxy import proxy_url_for
 
 log = logging.getLogger(__name__)
@@ -88,6 +90,7 @@ _playlist_items: list[dict] = []
 # ② 拉起失败（降级浏览器）当场释放；③ 铸 URL 阶段抛异常当场释放后上抛。
 # 另有一条 _terminate_previous（换源/重开播放器）先释放旧租约再取新的。
 _lease_id = ""
+_progress_monitor = None
 
 
 def _locate_vlc() -> str | None:
@@ -116,7 +119,10 @@ def _terminate_previous() -> None:
     _playlist_items：旧实例被关后其 HTTP 控制会话即失效（换集重开会重建），
     播放列表 id 映射同样对旧实例失效；并释放旧实例的代理租约。
     """
-    global _last_proc, _control_state, _playlist_items
+    global _last_proc, _control_state, _playlist_items, _progress_monitor
+    monitor, _progress_monitor = _progress_monitor, None
+    if monitor is not None:
+        monitor.stop()
     proc, _last_proc = _last_proc, None
     _control_state = None
     _playlist_items = []
@@ -259,12 +265,16 @@ def _locate_start(episodes: list, start_idx: int, url: str) -> int:
 
 def open_with_player(url: str, audio: str = "", referer: str = "",
                      user_agent: str = "", headers: dict | None = None,
-                     ad_block: dict | None = None,
-                     force_proxy: bool = False,
+                      ad_block: dict | None = None,
+                      force_proxy: bool = False,
+                      source_id: str = "",
+
                      episodes: list | None = None,
                      caching_ms: int = 0, classify_url: str = "",
                      start_idx: int = -1,
-                     on_playlist_ready=None) -> str:
+                      on_playlist_ready=None, on_progress=None,
+                       resume_positions: dict | None = None, on_handoff=None) -> str:
+
     """用外部播放器打开媒体地址。
 
     url      媒体直链（单流）。episodes 非空时它只用于**定位起始项**与分类，
@@ -297,7 +307,7 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
     附加能力：VLC 分支启动时附带 HTTP 控制接口（--extraintf=http），GUI
     键盘事件可经 player_command() 转成 VLC 控制命令（播放/暂停/进退等）。
     """
-    global _last_proc, _control_state, _lease_id
+    global _last_proc, _control_state, _lease_id, _progress_monitor
     if not url:
         return ""
     vlc = _locate_vlc()
@@ -322,13 +332,12 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                 for key, value in hdrs.items()
             )
             if force_proxy or needs_proxy_headers or is_hls:
-                play_url = proxy_url_for(target, hdrs, ad_block=ad_block,
-                                         force_proxy=force_proxy)
-                audio_url = (
-                    proxy_url_for(src_audio, hdrs, ad_block=ad_block,
-                                  force_proxy=force_proxy)
-                    if src_audio else ""
-                )
+                proxy_kwargs = {"ad_block": ad_block, "force_proxy": force_proxy}
+                if trusted_source_id(source_id) == "18j":
+                    proxy_kwargs["source_id"] = source_id
+
+                play_url = proxy_url_for(target, hdrs, **proxy_kwargs)
+                audio_url = proxy_url_for(src_audio, hdrs, **proxy_kwargs) if src_audio else ""
             else:
                 play_url = target
                 audio_url = src_audio
@@ -391,6 +400,8 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                 "--extraintf=http", "--http-host=127.0.0.1",
                 f"--http-port={port}", f"--http-password={http_password}",
             ]
+            if on_progress is not None:
+                args.extend(("--no-one-instance", "--qt-continue=0"))
             window: list[tuple[int, str]] = []
             start_pos = 0          # 实际开播集位：单集路径无列表可定位，恒为首项
             truncated = False
@@ -461,9 +472,17 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                     # 「签名对不上」这类病因恰恰只在堆栈里。
                     log.warning("外部播放器：启动握手失败（不影响已拉起的 VLC）: %s",
                                 exc, exc_info=True)
+            if on_progress is not None:
+                _progress_monitor = PlaybackMonitor(
+                    _control_state, _last_proc,
+                    window or [(max(0, start_idx), play_url)],
+                    on_progress, resume_positions,
+                )
+                _progress_monitor.start()
             if truncated:
                 return f"已用外部播放器打开（列表已截断，共 {len(window)} 集）"
             return "已用外部播放器打开"
+    _terminate_previous()
     hdrs = dict(headers or {})
     if referer:
         hdrs.setdefault("Referer", referer)
@@ -471,12 +490,19 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
         hdrs.setdefault("User-Agent", user_agent)
     target = url
     if "m3u8" in url.lower():
-        target = proxy_url_for(url, hdrs, ad_block=ad_block, force_proxy=force_proxy)
-    webbrowser.open(target)
+        proxy_kwargs = {"ad_block": ad_block, "force_proxy": force_proxy}
+        if trusted_source_id(source_id) == "18j":
+            proxy_kwargs["source_id"] = source_id
+
+        target = proxy_url_for(url, hdrs, **proxy_kwargs)
+    if not webbrowser.open(target):
+        return "浏览器打开失败"
+    if on_handoff is not None:
+        on_handoff()
     return "已在浏览器中打开"
 
 
-def player_command(command: str, val: str = "", item_id=None) -> bool:
+def player_command(command: str, val: str = "", item_id=None, expected_state=None) -> bool:
     """向最近一次拉起的 VLC 发送 HTTP 控制命令。
 
     无控制会话（浏览器 fallback / 启动失败 / 播放器已关 / requests 缺失）
@@ -488,7 +514,7 @@ def player_command(command: str, val: str = "", item_id=None) -> bool:
     pl_play 取值是**播放列表项 id**（非下标），必须先读 playlist.json 建映射。
     """
     state = _control_state
-    if not state or requests is None:
+    if not state or requests is None or (expected_state is not None and state is not expected_state):
         return False
     params = {"command": command}
     if val:
@@ -503,6 +529,151 @@ def player_command(command: str, val: str = "", item_id=None) -> bool:
         return r.status_code < 400
     except Exception:  # noqa: BLE001 —— 网络失败/端口未起：静默 False
         return False
+
+
+def player_session():
+    return _control_state
+
+
+def flush_player_progress():
+    monitor = _progress_monitor
+    if monitor is not None:
+        with monitor._lock:
+            monitor._publish(force=True)
+
+
+def _session_alive(state, proc) -> bool:
+    if state is None or state is not _control_state or proc is None or proc is not _last_proc:
+        return False
+    try:
+        return proc.poll() is None
+    except Exception:
+        return False
+
+
+def player_status(timeout: float = 1.0, expected_state=None) -> dict | None:
+    state, proc = _control_state, _last_proc
+    if requests is None or not _session_alive(state, proc):
+        return None
+    if expected_state is not None and state is not expected_state:
+        return None
+    try:
+        response = requests.get(
+            f"http://127.0.0.1:{state['port']}/requests/status.json",
+            auth=("", state["password"]), timeout=timeout,
+        )
+        if response.status_code >= 400:
+            return None
+        raw = response.json()
+        if raw.get("state") not in ("playing", "paused"):
+            return None
+        seconds, duration = float(raw["time"]), float(raw["length"])
+        item_id = int(raw["currentplid"])
+        if not all(math.isfinite(v) for v in (seconds, duration)):
+            return None
+        if duration <= 0 or seconds < 0 or seconds > duration or item_id < 0:
+            return None
+        if not _session_alive(state, proc):
+            return None
+        return {"seconds": seconds, "duration": duration, "item_id": item_id, "state": raw["state"]}
+    except Exception:
+        return None
+
+
+class PlaybackMonitor:
+    def __init__(self, state, proc, series, on_progress, resume_positions=None):
+        self.state = state
+        self.proc = proc
+        self.series = list(series)
+        self.on_progress = on_progress
+        self.resume_positions = dict(resume_positions or {})
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._seek_attempted = set()
+        self._awaiting_seek = {}
+        self._last = None
+        self._saved = None
+        self._saved_at = 0.0
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True, name="vlc-progress").start()
+
+    def stop(self):
+        self._stop.set()
+        with self._lock:
+            self._publish(force=True)
+
+    def _publish(self, force=False):
+        if not self._last or self._last == self._saved:
+            return
+        if self.state is not _control_state or self.proc is not _last_proc:
+            return
+        if not force and time.monotonic() - self._saved_at < 5.0:
+            return
+        idx, location = self._last
+        try:
+            self.on_progress(idx, {**location, "session_id": id(self.state)})
+        except Exception:
+            log.warning("播放进度回写失败", exc_info=True)
+            return
+        self._saved = self._last
+        self._saved_at = time.monotonic()
+
+    def tick(self):
+        with self._lock:
+            if self._stop.is_set() or not _session_alive(self.state, self.proc):
+                return False
+            status = player_status(expected_state=self.state)
+            if not status or status.get("state") not in ("playing", "paused"):
+                return True
+            items = player_playlist_items(timeout=1.0, refresh=True, expected_state=self.state)
+            current = next((item for item in items if item.get("id") == status["item_id"]), None)
+            matches = [idx for idx, mrl in self.series
+                       if current and _item_matches(current, mrl.split("#", 1)[0])]
+            if len(matches) != 1 or not _session_alive(self.state, self.proc):
+                return True
+            confirmed = player_status(expected_state=self.state)
+            if not confirmed or confirmed["item_id"] != status["item_id"]:
+                return True
+            status = confirmed
+            idx = matches[0]
+            seconds, duration = status["seconds"], status["duration"]
+            if not (math.isfinite(seconds) and math.isfinite(duration) and duration > 0 and 0 <= seconds <= duration):
+                return True
+            resume = self.resume_positions.get(idx) or {}
+            target = resume.get("seconds")
+            ratio = resume.get("position")
+            if target is None and isinstance(ratio, (int, float)) and math.isfinite(ratio) and 0 < ratio < 1:
+                target = ratio * duration
+            if isinstance(target, (int, float)) and math.isfinite(target) and target > 0:
+                if idx not in self._seek_attempted:
+                    self._seek_attempted.add(idx)
+                    self._awaiting_seek[idx] = (target, time.monotonic() + 10.0)
+                    if target < duration:
+                        player_command("seek", str(int(target)), expected_state=self.state)
+                    return True
+                if idx in self._awaiting_seek:
+                    expected, deadline = self._awaiting_seek[idx]
+                    if abs(seconds - expected) > 5 and time.monotonic() < deadline:
+                        return True
+                    self._awaiting_seek.pop(idx)
+            if seconds <= 0 or not _session_alive(self.state, self.proc):
+                return True
+            changed_item = self._last is not None and self._last[0] != idx
+            if changed_item:
+                self._publish(force=True)
+            self._last = (idx, {"seconds": seconds, "duration": duration})
+            self._publish(force=changed_item or self._saved is None or status["state"] == "paused")
+            return True
+
+    def run(self):
+        try:
+            while self.tick():
+                if self._stop.wait(1.0):
+                    break
+        finally:
+            with self._lock:
+                self._publish(force=True)
 
 
 def _flatten_playlist_tree(node) -> list[dict]:
@@ -534,7 +705,7 @@ def _flatten_playlist_tree(node) -> list[dict]:
 
 
 def player_playlist_items(timeout: float = 2.0,
-                          refresh: bool = False) -> list[dict]:
+                          refresh: bool = False, expected_state=None) -> list[dict]:
     """读最近一次 VLC 会话的完整播放列表（GET /requests/playlist.json）。
 
     返回 [{id, name, uri, current}, ...]；无控制会话 / 网络失败 / 状态码
@@ -553,6 +724,8 @@ def player_playlist_items(timeout: float = 2.0,
     `[it["id"] for it in items]` 才抓得住。
     """
     global _playlist_items
+    if expected_state is not None and _control_state is not expected_state:
+        return []
     if _playlist_items and not refresh:
         return _playlist_items
     state = _control_state
@@ -583,12 +756,16 @@ def player_playlist_items(timeout: float = 2.0,
         except (KeyError, TypeError, ValueError):
             pass
         out.append(it)
+    if state is not _control_state:
+        return []
     _playlist_items = out
     return _playlist_items
 
 
-def player_goto(item_id: int) -> bool:
+def player_goto(item_id: int, expected_state=None) -> bool:
     """跳播播放列表项 id（VLC pl_play 的 id 是项 id，非下标）。"""
+    if expected_state is not None:
+        return player_command("pl_play", item_id=item_id, expected_state=expected_state)
     return player_command("pl_play", item_id=item_id)
 
 
@@ -686,7 +863,13 @@ def _item_matches(item: dict, mrl: str) -> bool:
     uri = str((item or {}).get("uri") or "")
     if not uri:
         return False
-    return uri == mrl or uri.startswith(mrl + "#")
+    if uri == mrl or uri.startswith(mrl + "#"):
+        return True
+    if uri.startswith("file:"):
+        local = unquote(urlsplit(uri).path).lstrip("/")
+        target = unquote(urlsplit(mrl).path).lstrip("/") if mrl.startswith("file:") else mrl
+        return os.path.normcase(os.path.normpath(local)) == os.path.normcase(os.path.normpath(target))
+    return False
 
 
 def _start_playlist_sync(start_idx: int, series: list[tuple[int, str]],
@@ -694,13 +877,13 @@ def _start_playlist_sync(start_idx: int, series: list[tuple[int, str]],
     """后台起线程做握手（绝不阻塞调用方——GUI 主线程会卡 UI）。"""
     threading.Thread(
         target=_handshake_worker,
-        args=(start_idx, series, on_playlist_ready),
+        args=(start_idx, series, on_playlist_ready, _control_state),
         daemon=True,
     ).start()
 
 
 def _handshake_worker(start_idx: int, series: list[tuple[int, str]],
-                      on_playlist_ready=None) -> None:
+                      on_playlist_ready=None, expected_state=None) -> None:
     """轮询 playlist.json 直到起始项出现：建映射 +（非首集）pl_play 定位。
 
     series 是入列的 [(集下标, MRL), ...]（全集 1..N，或降级后的当前集往后窗口）。
@@ -718,7 +901,11 @@ def _handshake_worker(start_idx: int, series: list[tuple[int, str]],
     seen_items = 0
     seen_matched = 0
     while True:
+        if expected_state is not None and expected_state is not _control_state:
+            return
         items = player_playlist_items(timeout=1.0, refresh=True)
+        if expected_state is not None and expected_state is not _control_state:
+            return
         seen_items = max(seen_items, len(items))
         if items:
             mapping: dict[int, int] = {}
@@ -752,7 +939,9 @@ def _handshake_worker(start_idx: int, series: list[tuple[int, str]],
                     # 「降级去播第 1 集」这种退路，pl_play 失败就是「列表载入
                     # 却什么都不播」的黑窗。不重试（重发也未必比让用户手动点好），
                     # 但必须留日志——这是握手里最后一处静默放弃。
-                    if not player_goto(start_id):
+                    moved = (player_command("pl_play", item_id=start_id, expected_state=expected_state)
+                             if expected_state is not None else player_goto(start_id))
+                    if not moved:
                         log.warning(
                             "VLC 启动握手：pl_play 定位到起始集失败"
                             "（id=%s）；列表已载入但未定位播放，"

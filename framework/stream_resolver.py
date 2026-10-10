@@ -251,9 +251,27 @@ class StreamResolver:
         context.check()
         return "", ""
 
+    @staticmethod
+    def _wait_for_worker(done, timeout, context):
+        deadline = time.monotonic() + timeout
+        while True:
+            context.check()
+            remaining = min(deadline - time.monotonic(), context.remaining())
+            if remaining <= 0:
+                context.check()
+                return done.is_set()
+            if done.wait(min(0.05, remaining)):
+                context.check()
+                return True
+
     def _resolve_candidate(self, candidate, context, key):
+        timeout = self._candidate_timeout
+        if isinstance(candidate, dict) and callable(candidate.get("resolver")):
+            if candidate.get("budget") == "pipeline":
+                timeout = context.remaining()
+            candidate = candidate["resolver"]
         if callable(candidate):
-            remaining = min(self._candidate_timeout, context.remaining())
+            remaining = min(timeout, context.remaining())
             if remaining <= 0:
                 return None
             result = []
@@ -278,7 +296,7 @@ class StreamResolver:
                     done.set()
 
             self._start_worker(key, self._inflight[key], run)
-            if not done.wait(remaining):
+            if not self._wait_for_worker(done, remaining, context):
                 context.check()
                 return None
             if error:
@@ -287,12 +305,12 @@ class StreamResolver:
                 return None
             context.check()
             candidate = result[0] if result else None
-        elif isinstance(candidate, dict) and callable(candidate.get("resolver")):
-            return self._resolve_candidate(candidate["resolver"], context, key)
         return self._normalize_candidate(candidate)
 
     @staticmethod
     def _candidate_key(candidate):
+        if isinstance(candidate, dict) and callable(candidate.get("resolver")):
+            return ("callback", id(candidate["resolver"]), candidate.get("budget"))
         if callable(candidate):
             return ("callback", id(candidate))
         pair = StreamResolver._normalize_candidate(candidate)
@@ -344,7 +362,7 @@ class StreamResolver:
                 done.set()
 
         self._start_worker(key, self._inflight[key], run)
-        if not done.wait(remaining):
+        if not self._wait_for_worker(done, remaining, context):
             return []
         context.check()
         if error:

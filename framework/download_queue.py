@@ -81,8 +81,6 @@ class DownloadTask:
     done_chapters: List[int] = field(default_factory=list)  # 已完成章节索引（resume 重跑时跳过）
     dispatched: bool = False                        # 「已派发未完成」标记（resume 判断 worker 是否在跑）
     merge_progress: int = 0        # 视频合并已输出字节（UI 显示用）
-    has_ads: bool = False          # 视频任务：是否检测到流内广告段（加任务时预检）
-    ad_segments: dict = field(default_factory=dict)  # {章节索引: 广告段序号列表}
     start_time: float = 0.0
     end_time: float = 0.0
     out_dir: str = ""
@@ -200,75 +198,9 @@ class DownloadQueue:
             {"task_id": task.task_id, "title": task.title, "total": task.total},
             task,
         )
-        # 视频任务：后台预检 m3u8 流内广告段（不阻塞入队；失败静默，下载时再过滤）
-        if detail.content_type == "video" and task.total > 0:
-            self._spawn_ad_precheck(task)
         self._save()
         self._maybe_dispatch()
         return task
-
-    def _spawn_ad_precheck(self, task: DownloadTask) -> None:
-        """后台预检视频集 m3u8 广告段：取流 → detect_m3u8_ads → 标记 has_ads。
-
-        选中的每集都取一次流 URL（fetch_video_streams 带缓存/解密），对 HLS
-        播放列表做广告段检测。结果写入 task.has_ads / task.ad_segments，
-        UI 可据此展示「含广告，下载将自动剔除」。失败（网络/超时/限流）静默：
-        不影响入队，下载时 filter_m3u8 兜底。
-        """
-        def _precheck() -> None:
-            from .adblock import adblock_for
-
-            source = self._manager.get(task.source_id) if self._manager else None
-            if source is None:
-                return
-            ad = adblock_for(source, default_on=True)
-            if not ad.enabled:
-                return
-            found: dict = {}
-            for i, ch in enumerate(task.chapters):
-                if not task.selected[i]:
-                    continue
-                if task.cancel_evt.is_set():
-                    return
-                try:
-                    video, _audio = self._content.fetch_video_streams(
-                        source, ch.url, quality=task.quality or ""
-                    )
-                except Exception:  # noqa: BLE001
-                    continue  # 取流失败：静默跳过，下载时再试
-                if not video or ".m3u8" not in video.lower():
-                    continue  # 非 HLS（mp4/dash）不走 m3u8 广告段检测
-                try:
-                    text = self._http.get_text(
-                        video, headers=source.request_headers(), timeout=15, retries=1
-                    )
-                except Exception:  # noqa: BLE001
-                    continue
-                if not text or "#EXTM3U" not in text:
-                    continue
-                ad_segs, _cleaned = ad.detect_m3u8_ads(text, video)
-                if ad_segs:
-                    found[i] = ad_segs
-            if found:
-                with self._lock:
-                    task.has_ads = True
-                    task.ad_segments = found
-                # 通知 UI：任务卡片可展示广告检测结果
-                self._emit(
-                    EVENT_DOWNLOAD_PROGRESS,
-                    {
-                        "task_id": task.task_id,
-                        "done": task.done,
-                        "total": task.total,
-                        "speed_mbs": task.speed_mbs,
-                        "title": task.title,
-                        "has_ads": True,
-                    },
-                    task,
-                )
-
-        t = threading.Thread(target=_precheck, daemon=True, name=f"adcheck-{task.task_id}")
-        t.start()
 
     def tasks(self) -> List[DownloadTask]:
         """全部任务快照（调用方自行按状态分组）。"""

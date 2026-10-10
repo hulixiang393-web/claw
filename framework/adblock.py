@@ -25,8 +25,32 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Iterable, List, Optional
+
+
+_TRUSTED_CONTEXT_MARKER = object()
+
+
+class _TrustedMediaContext:
+    __slots__ = ("source_id", "_marker")
+
+    def __init__(self, source_id: str, marker) -> None:
+        self.source_id = source_id
+        self._marker = marker
+
+
+def trusted_media_context(source_id: str) -> object:
+    return (_TrustedMediaContext(source_id, _TRUSTED_CONTEXT_MARKER)
+            if source_id == "18j" else None)
+
+
+def trusted_source_id(value) -> str:
+    if (isinstance(value, _TrustedMediaContext)
+            and value._marker is _TRUSTED_CONTEXT_MARKER):
+        return value.source_id
+    return ""
 from urllib.parse import parse_qsl, urlparse
 
 try:
@@ -412,16 +436,114 @@ class AdblockEngine:
         return bool(re.search(r"(?:^|[^a-z])(?:banner|adverts?|ads?|gg|guanggao|tuiguang|promo)[-_/.]", low))
 
     # ------------------------------------------------------------------ #
-    def filter_m3u8(self, m3u8_text: str, base_url: str = "") -> str:
-        """剔除 m3u8 里的广告段，返回重写后的播放列表。
+    @staticmethod
+    def _filter_18j_preroll(m3u8_text: str) -> str:
+        lines = m3u8_text.splitlines()
+        if "#EXTM3U" not in lines or "#EXT-X-ENDLIST" not in lines:
+            return m3u8_text
 
-        通用启发式：
-        1. 段 URL 命中广告特征（is_ad_url）→ 剔除该段
-        2. 广告段通常紧跟在 #EXT-X-DISCONTINUITY 之后且时长异常短（< 3s）→ 剔除
-        剔除时连同其前后的 DISCONTINUITY 标记一并清理，保持列表合法。
-        """
-        ad_segs, cleaned = self.detect_m3u8_ads(m3u8_text, base_url)
-        return cleaned if ad_segs else m3u8_text
+        def is_media_uri(value: str) -> bool:
+            if not value or value.startswith("#") or any(char.isspace() for char in value):
+                return False
+            parsed = urlparse(value)
+            if parsed.scheme:
+                return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+            if parsed.netloc or not parsed.path:
+                return False
+            path = parsed.path.lower()
+            return "/" in path or path.endswith((
+                ".aac", ".avi", ".m4a", ".m4s", ".mp3", ".mp4", ".m3u8",
+                ".m3u", ".mov", ".ts", ".vtt", ".webm", ".webvtt",
+            ))
+        boundary = next(
+            (i for i, line in enumerate(lines) if line == "#EXT-X-DISCONTINUITY"),
+            None,
+        )
+        if boundary is None:
+            return m3u8_text
+
+        prefix = lines[:boundary]
+        prefix_media = []
+        prefix_duration = 0.0
+        pending_duration = None
+        for line in prefix:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#EXTINF:"):
+                match = re.fullmatch(r"#EXTINF:\s*([^,]+),?", stripped)
+                if match is None:
+                    return m3u8_text
+                try:
+                    duration = float(match.group(1))
+                except (TypeError, ValueError):
+                    return m3u8_text
+                if not math.isfinite(duration) or duration <= 0:
+                    return m3u8_text
+                pending_duration = duration
+                prefix_duration += duration
+                continue
+            if stripped.startswith("#"):
+                continue
+            if pending_duration is None or not is_media_uri(stripped):
+                return m3u8_text
+            prefix_media.append(stripped)
+            pending_duration = None
+        if not prefix_media or pending_duration is not None or prefix_duration <= 0:
+            return m3u8_text
+
+        suffix = lines[boundary + 1:]
+        key_active = False
+        suffix_media = []
+        endlist_indices = []
+        pending_suffix_duration = None
+        for index, line in enumerate(suffix, start=boundary + 1):
+            stripped = line.strip()
+            if stripped == "#EXT-X-ENDLIST":
+                endlist_indices.append(index)
+                continue
+            if stripped.startswith("#EXT-X-KEY:"):
+                key_active = bool(re.search(
+                    r"(?:^|,)METHOD\s*=\s*AES-128(?:,|$)",
+                    stripped.split(":", 1)[1],
+                ))
+                continue
+            if stripped.startswith("#EXTINF:"):
+                match = re.fullmatch(r"#EXTINF:\s*([^,]+),?", stripped)
+                if match is None:
+                    return m3u8_text
+                try:
+                    duration = float(match.group(1))
+                except (TypeError, ValueError):
+                    return m3u8_text
+                if not math.isfinite(duration) or duration <= 0:
+                    return m3u8_text
+                pending_suffix_duration = duration
+                continue
+            if stripped.startswith("#"):
+                continue
+            if (pending_suffix_duration is None
+                    or not is_media_uri(stripped)
+                    or not key_active):
+                return m3u8_text
+            suffix_media.append(index)
+            pending_suffix_duration = None
+        if not suffix_media or pending_suffix_duration is not None:
+            return m3u8_text
+        if len(endlist_indices) != 1 or endlist_indices[0] <= suffix_media[-1]:
+            return m3u8_text
+        if any(index > endlist_indices[0] and lines[index].strip() for index in range(endlist_indices[0] + 1, len(lines))):
+            return m3u8_text
+        return "\n".join(["#EXTM3U", *lines[boundary:]]) + ("\n" if m3u8_text.endswith("\n") else "")
+
+    def filter_m3u8(self, m3u8_text: str, base_url: str = "", source_id: str = "") -> str:
+        """剔除 m3u8 里的广告段，返回重写后的播放列表。"""
+        filtered = (
+            self._filter_18j_preroll(m3u8_text)
+            if trusted_source_id(source_id) == "18j" else m3u8_text
+        )
+        ad_segs, cleaned = self.detect_m3u8_ads(filtered, base_url)
+        return cleaned if ad_segs else filtered
     def detect_m3u8_ads(self, m3u8_text: str, base_url: str = "") -> tuple:
         """检测 m3u8 流内广告段（供加任务队列时标记）。
 

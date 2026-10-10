@@ -300,7 +300,8 @@ def test_safe_url_redacts_url_without_secondary_name_error():
     )
 
 
-def test_fetch_video_streams_passes_deadline_and_context_to_resolver():
+@pytest.mark.parametrize("source_lock", [False, True])
+def test_fetch_video_streams_passes_deadline_and_context_to_resolver(source_lock):
     src = source()
     cont = _content({})
     calls = []
@@ -314,11 +315,12 @@ def test_fetch_video_streams_passes_deadline_and_context_to_resolver():
     deadline = 123.45
     context = StreamBudget()
 
-    assert cont.fetch_video_streams(src, "episode", "720p", True, deadline=deadline, context=context) == (
-        "video",
-        "audio",
-    )
-    assert calls == [((src, "episode", "720p", True), {"deadline": deadline, "context": context})]
+    assert cont.fetch_video_streams(
+        src, "episode", "720p", True, deadline=deadline, context=context, source_lock=source_lock
+    ) == ("video", "audio")
+    assert calls == [((src, "episode", "720p", True), {
+        "deadline": deadline, "context": context, "source_lock": source_lock,
+    })]
 
 
 def test_fetch_video_streams_keeps_legacy_four_argument_call_compatible():
@@ -331,7 +333,7 @@ def test_fetch_video_streams_keeps_legacy_four_argument_call_compatible():
     args, kwargs = cont.fetch_video_streams(src, "episode", "720p", True)
 
     assert args == (src, "episode", "720p", True)
-    assert kwargs == {"deadline": None, "context": None}
+    assert kwargs == {"deadline": None, "context": None, "source_lock": False}
 
 
 def test_player_aaaa_cancelled_decryption_is_not_fallback(monkeypatch):

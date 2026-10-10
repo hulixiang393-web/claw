@@ -76,6 +76,7 @@ class ShelfItem:
     mtime: float = 0.0            # 本地文件最近修改时间（下载时间近似）
     updated_at: str = ""          # 最近阅读/收藏时间（排序用）
     missing: bool = False
+    reading_status: str = "reading"
 
     def to_rec(self) -> dict:
         """转旧版 UI rec dict（兼容过渡期渲染层）。"""
@@ -206,6 +207,7 @@ class ShelfService:
                     key = self._identity(favorite)
             if favorite is not None:
                 local.online = True
+                local.reading_status = favorite.reading_status
                 local.url = favorite.url or local.url
                 local.source_id = favorite.source_id or local.source_id
                 local.folder = favorite.folder or local.folder
@@ -355,6 +357,7 @@ class ShelfService:
                 tags=list(fav.get("tags") or []),
                 folder=fav.get("folder", ""),
                 updated_at=fav.get("favorited_at", ""),
+                reading_status=fav.get("reading_status", "reading"),
             )
             if self._progress is not None:
                 pres = self._progress.resume(it.key)
@@ -436,6 +439,9 @@ class ShelfService:
                 except Exception:
                     pass
         return n
+
+    def favorite_set_reading_status(self, url: str, status: str) -> bool:
+        return bool(self._store and self._store.set_reading_status(url, status))
 
     def favorite_move(self, url: str, folder: str) -> bool:
         return bool(self._store and self._store.set_folder(url, folder))

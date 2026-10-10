@@ -50,12 +50,16 @@ class _FakePage:
         self.waited = 0
         self._n_wait = 0
         self._req_cb = None
+        self._events = {}
+        self.main_frame = self.frames[0]
+        self.main_frame.url = "about:blank"
         # hits_after: [(第几次 wait 之后, 触发的媒体请求 URL), ...]
         self._hits_after = hits_after or []
         # src_after: [(第几次 wait 之后, 给 video 换上的 src), ...]
         self._src_after = []
 
     def on(self, event, cb):
+        self._events[event] = cb
         if event == "request":
             self._req_cb = cb
 
@@ -75,7 +79,7 @@ class _FakePage:
                 self.frames[0]._videos[0]._src = src
 
 
-def _run(page, extra_delay_ms=2500, slow_fallback_rounds=3, context=None):
+def _run(page, extra_delay_ms=2500, slow_fallback_rounds=3, context=None, **options):
     import contextlib
 
     @contextlib.contextmanager
@@ -94,10 +98,96 @@ def _run(page, extra_delay_ms=2500, slow_fallback_rounds=3, context=None):
         return pw.fetch_rendered_video_sync(
             "http://x/play", wait_until="domcontentloaded",
             timeout_ms=5000, extra_delay_ms=extra_delay_ms,
-            slow_fallback_rounds=slow_fallback_rounds, context=context)
+            slow_fallback_rounds=slow_fallback_rounds, context=context, **options)
     finally:
         pw._sync_browser = pw_orig
         pw._sync_page = pg_orig
+
+
+def _navigation_timeout(page, committed=True, status=200, hit=False, context=None):
+    from types import SimpleNamespace
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    def goto(url, **kwargs):
+        if committed:
+            page._events.get("response", lambda response: None)(SimpleNamespace(
+                status=status,
+                request=SimpleNamespace(is_navigation_request=lambda: True, frame=page.main_frame),
+            ))
+            page.main_frame.url = url
+            page._events.get("framenavigated", lambda frame: None)(page.main_frame)
+        if hit:
+            page._req_cb(_FakeRequest("https://cdn/ready.m3u8"))
+        if context is not None:
+            context.cancel()
+        raise PlaywrightTimeoutError("navigation timeout")
+
+    page.goto = goto
+
+
+@pytest.mark.parametrize("options", [{}, {"recover_navigation_timeout": False}, {"recover_navigation_timeout": True}])
+@pytest.mark.parametrize("delayed", [False, True])
+def test_committed_navigation_timeout_requires_opt_in(delayed, options):
+    page = _FakePage(hits_after=[(2, "https://cdn/ready.m3u8")] if delayed else [])
+    _navigation_timeout(page, hit=not delayed)
+    recovery = options.get("recover_navigation_timeout", False)
+    assert _run(page, slow_fallback_rounds=0, **options) == (
+        "https://cdn/ready.m3u8" if recovery else ""
+    )
+    assert page.waited == (500 if delayed and recovery else 0)
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+@pytest.mark.parametrize("committed,status", [(False, 200), (True, None), (True, 404), (True, 503)])
+def test_navigation_timeout_without_successful_commit_does_not_scan(committed, status, recovery):
+    page = _FakePage(videos=[_FakeVideo("https://cdn/stale.m3u8")])
+    _navigation_timeout(page, committed=committed, status=status, hit=True)
+    assert _run(page, recover_navigation_timeout=recovery) == ""
+    assert page.waited == 0
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+@pytest.mark.parametrize("status", [400, 403, 404, 503])
+def test_http_error_response_never_returns_stale_media(recovery, status):
+    from types import SimpleNamespace
+
+    page = _FakePage(videos=[_FakeVideo("https://cdn/stale.m3u8")])
+    page.goto = lambda *a, **k: SimpleNamespace(status=status)
+    assert _run(page, recover_navigation_timeout=recovery) == ""
+    assert page.waited == 0
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_real_navigation_error_does_not_recover(recovery):
+    from playwright.sync_api import Error
+
+    page = _FakePage(videos=[_FakeVideo("https://cdn/stale.m3u8")])
+
+    def goto(*args, **kwargs):
+        raise Error("net::ERR_NAME_NOT_RESOLVED")
+
+    page.goto = goto
+    assert _run(page, recover_navigation_timeout=recovery) == ""
+    assert page.waited == 0
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_cancelled_committed_navigation_timeout_never_returns_media(recovery):
+    page = _FakePage()
+    context = StreamBudget(time.monotonic() + 30)
+    _navigation_timeout(page, hit=True, context=context)
+    with pytest.raises(StreamCancelledError):
+        _run(page, context=context, recover_navigation_timeout=recovery)
+    assert page.waited == 0
+
+
+def test_committed_timeout_scan_stays_inside_pipeline_budget(monkeypatch):
+    now, page = _clocked_page(monkeypatch)
+    _navigation_timeout(page)
+    page._hits_after = [(8, "https://cdn/late.m3u8")]
+    with pytest.raises(StreamCancelledError):
+        _run(page, context=StreamBudget(now[0] + 0.5), recover_navigation_timeout=True)
+    assert page.waited <= 500
 
 
 def test_returns_immediately_when_src_ready():
