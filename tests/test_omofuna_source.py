@@ -1102,3 +1102,105 @@ def test_expired_detail_context_does_not_write_detail_cache():
     with pytest.raises(TimeoutError):
         cont.fetch_detail(src, "https://video.example/watch/1", context=context)
     assert cont._cache_get_detail("detail:omofuna:https://video.example/watch/1") is None
+
+
+# ---------------------------------------------------------------------- #
+# D6：死线路黑名单 TTL / 播放 URL 探测超时 可配置化
+# ---------------------------------------------------------------------- #
+def _with_runtime(cont, settings):
+    cont._health_reporter = type("_Runtime", (), {"_runtime": settings})()
+    return cont
+
+
+def _run_auto_switch_with_dead(monkeypatch, cont, src, episode_url, candidate_calls):
+    """把 auto_switch 的候选取流替换为纪实 spy：记录待抓取线路 URL。"""
+    def candidate_once(self, source, episode_url, deadline=None):
+        candidate_calls.append(episode_url)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(Content, "_switch_candidate_episode_urls", lambda *a, **k: [])
+    monkeypatch.setattr(Content, "_play_url_probe", lambda *a, **k: True)
+    monkeypatch.setattr(Content, "_fetch_play_url_candidates_once", candidate_once)
+    with pytest.raises(Exception, match="全部线路取流失败"):
+        cont._fetch_play_url_auto_switch(src, episode_url)
+
+
+def test_dead_line_ttl_default_prunes_after_600s(monkeypatch):
+    """死线路默认 TTL 600s 惰性过期：超过后不再跳过，自动恢复尝试。"""
+    src = source()
+    cont = _content({})
+    episode_url = "https://www.omofuna.com/anime/demo/play/3/1.html"
+    key = cont._episode_key(episode_url)
+    cont._dead_episode_lines[src.source_id] = {key: time.monotonic() - 700}
+    calls = []
+    _run_auto_switch_with_dead(monkeypatch, cont, src, episode_url, calls)
+    assert calls == [episode_url]  # 过期死线路已回源重抓
+
+
+def test_dead_line_ttl_reads_runtime_setting_extended(monkeypatch):
+    """sources_runtime.dead_line_ttl_seconds 可延长黑名单（站恢复困难场景）。"""
+    src = source()
+    cont = _with_runtime(_content({}), {"sources_runtime": {"dead_line_ttl_seconds": 1200}})
+    episode_url = "https://www.omofuna.com/anime/demo/play/3/1.html"
+    key = cont._episode_key(episode_url)
+    cont._dead_episode_lines[src.source_id] = {key: time.monotonic() - 700}
+    calls = []
+    _run_auto_switch_with_dead(monkeypatch, cont, src, episode_url, calls)
+    assert calls == []  # 700s < 1200s：仍在黑名单 → 跳过
+
+
+def test_dead_line_ttl_clamped_to_min_30s(monkeypatch):
+    """TTL 越界钳制到 [30, 3600]：过小的配置不会让死线路瞬间复活。"""
+    src = source()
+    cont = _with_runtime(_content({}), {"sources_runtime": {"dead_line_ttl_seconds": 5}})
+    episode_url = "https://www.omofuna.com/anime/demo/play/3/1.html"
+    key = cont._episode_key(episode_url)
+    cont._dead_episode_lines[src.source_id] = {key: time.monotonic() - 20}
+    calls = []
+    _run_auto_switch_with_dead(monkeypatch, cont, src, episode_url, calls)
+    assert calls == []  # 钳制到 30s：20s 内仍视为死线路
+
+
+def test_play_url_probe_timeout_cap_reads_setting_and_clamps(monkeypatch):
+    import requests
+
+    src = source()
+    cont = _content({})
+    calls = []
+
+    class _Response:
+        status_code = 200
+
+        class _Raw:
+            @staticmethod
+            def read(size):
+                return b"stream"
+
+        raw = _Raw()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def get(*a, **k):
+        calls.append(k)
+        return _Response()
+
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(Content, "_timeout", lambda self, source: 30.0)
+
+    # 默认上限 5s：源配置 30s 被压到 5s
+    assert cont._play_url_probe(src, "https://cdn.example/live.m3u8", deadline=time.monotonic() + 60)
+    assert calls and calls[0]["timeout"] == 5.0
+
+    # 显式 1s → 1s；越界负数 → 钳制到下限 1s
+    for raw_cap, expect in ((1, 1.0), (-2, 1.0)):
+        calls.clear()
+        runtime = type("_Runtime", (), {
+            "_runtime": {"sources_runtime": {"play_url_probe_timeout_cap": raw_cap}}
+        })()
+        cont._health_reporter = runtime
+        assert cont._play_url_probe(src, "https://cdn.example/live.m3u8", deadline=time.monotonic() + 60)
+        assert calls and calls[0]["timeout"] == expect

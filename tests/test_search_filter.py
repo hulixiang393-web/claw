@@ -191,5 +191,74 @@ def test_filter_chips_row(app):
     assert page._source_chip_row.isVisible() is False
 
 
+# ---------------------------------------------------------------------- #
+# D3：关键词过滤归一化（NFKC + casefold + 去空白）
+# ---------------------------------------------------------------------- #
+def test_normalize_match_text_is_strict_superset_of_raw():
+    """归一化匹配 ⊇ 裸子串匹配：命中全角/半角/大小写/空白差异的合法结果。"""
+    assert Search._normalize_match_text(" ＣｏＣｏ ") == "coco"
+    assert Search._normalize_match_text("ABC") == "abc"
+    assert Search._normalize_match_text("") == ""
+    # 原先能命中的（裸匹配）归一化后必然仍命中
+    assert Search._normalize_match_text("斗破") in Search._normalize_match_text("斗破苍穹")
+    # 但在全角下裸匹配失败、归一化能够命中
+    assert Search._normalize_match_text("coco") in Search._normalize_match_text("ＣｏＣｏ字幕组")
+
+
+def test_rendered_search_keyword_filter_matches_normalized_variant(monkeypatch):
+    """渲染搜索页关键词过滤用归一化匹配：全角标题命中半角关键词。"""
+    src = SourceConfig.from_dict(SRC)
+    item_cfg = {
+        "root_selector": {"css": ".item"},
+        "render_config": {"filter_keyword": True},
+    }
+    items = [
+        {"title": "ＣｏＣｏ字幕组", "href": "http://x.com/1", "text": "ＣｏＣｏ字幕组"},
+        {"title": "斗罗大陆", "href": "http://x.com/2", "text": "斗罗大陆"},
+    ]
+    monkeypatch.setattr(
+        "framework.playwright_helper.fetch_rendered_items_sync",
+        lambda *a, **k: items,
+    )
+    search = Search(http=None, parser=Parser())
+    results = search._search_html_rendered(
+        src, "http://x.com/s?q=coco", item_cfg, keyword="coco"
+    )
+    assert [r.title for r in results] == ["ＣｏＣｏ字幕组"]
+
+
+# ---------------------------------------------------------------------- #
+# D3：搜索关键词入参归一化（去首尾/压缩连续空白，不改大小写）
+# ---------------------------------------------------------------------- #
+def test_normalize_keyword_strips_and_collapses_whitespace():
+    from framework.search import _normalize_keyword
+
+    assert _normalize_keyword("  hello   world  ") == "hello world"
+    assert _normalize_keyword("\t斗破\n苍穹 ") == "斗破 苍穹"
+    assert _normalize_keyword("CoCo") == "CoCo"  # 大小写不变
+    assert _normalize_keyword(None) == ""
+    assert _normalize_keyword("   ") == ""
+
+
+def test_search_one_normalizes_keyword_in_built_url(monkeypatch):
+    """search_one 用归一化关键词构造查询：不同空白输入得到同一 URL。"""
+    src = SourceConfig.from_dict(SRC)
+    seen = []
+
+    def _fake_get(self, source, url, http=None):
+        seen.append(url)
+        return "<html></html>"
+
+    monkeypatch.setattr(Search, "_http_get", _fake_get)
+    monkeypatch.setattr(Search, "_verify_search", lambda *a, **k: None)
+    monkeypatch.setattr(Parser, "parse", lambda self, html: "<doc>")
+    monkeypatch.setattr(Parser, "parse_items", lambda self, *a, **k: [])
+    search = Search(http=None, parser=Parser())
+    search.search_one(src, "  hello   world ")
+    assert seen, "应发起请求"
+    assert "hello%20world" in seen[0]
+    assert "  " not in seen[0]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -310,3 +310,106 @@ def test_failed_detail_clears_state_and_retry_starts_again():
     content.release.set()
     _wait_for(lambda: len(opened) == 1)
     assert len(content.detail_calls) == 2
+
+
+def test_folder_filter_reuses_metadata_snapshot_without_content_reads(tmp_path, monkeypatch):
+    from framework.library_store import LibraryStore
+    from framework.reading_progress import ReadingProgress
+    from framework.shelf_service import ShelfService
+    from gui.components.cover_loader import CoverLoader
+
+    folder = tmp_path / "downloads" / "本地书"
+    folder.mkdir(parents=True)
+    (folder / "book.epub").write_bytes(b"unread epub")
+    store = LibraryStore(tmp_path / "library.json")
+    store.add("src", "u1", "本地书", content_type="novel", folder="甲",
+              cover="https://example.test/cover.png")
+    store.add("src", "u2", "在线书", content_type="comic", folder="乙")
+    content = _ControlledContent()
+    reads = []
+    progress = ReadingProgress(tmp_path / "progress.json")
+    repository = SimpleNamespace(
+        get_location=lambda *a: None,
+        cached_chapter_count=lambda *a: 0,
+        get_book_snapshot=lambda *a: reads.append("detail/chapters/images"),
+        cached_chapter_keys=lambda *a: reads.append("chapter directory"),
+        get_content=lambda *a: reads.append("body/media"),
+    )
+    progress._repository = repository
+    monkeypatch.setattr(progress, "resume", lambda *a: reads.append("resume"))
+    service = ShelfService(folder.parent, library_store=store, reading_progress=progress,
+                           data_dir=tmp_path, epub_detector=lambda *a: reads.append("epub"))
+    scans = []
+    scan = service.scan_local
+    monkeypatch.setattr(service, "scan_local", lambda *a, **kw: (scans.append(kw), scan(*a, **kw))[1])
+    cached = []
+    loader = CoverLoader.instance()
+    monkeypatch.setattr(loader, "load", lambda *a, **kw: reads.append("network"))
+    monkeypatch.setattr(loader, "load_cached", lambda url, callback, **kw: cached.append(url))
+    page = _page(content, shelf=service)
+    page._shelf_cache_repository = repository
+    backfills = []
+    page._cover_backfiller = backfills.append
+    _wait_for(lambda: page._metadata_snapshot is not None)
+    original_snapshot = page._metadata_snapshot
+    page.folder_combo.setCurrentText("甲")
+    page.folder_combo.setCurrentText("乙")
+    page.folder_combo.setCurrentText("全部")
+    assert page._metadata_snapshot is original_snapshot
+    page.activate()
+    assert len(scans) == 1
+    assert reads == []
+    assert backfills == []
+    assert cached
+    assert content.detail_calls == content.chapter_calls == content.body_calls == []
+    assert original_snapshot[0][0].url == ""
+    assert original_snapshot[0][0].folder == ""
+    assert set(page._cards_by_key) == {"u2"}
+    page._open_rec(_online("u2"))
+    assert content.started.wait(1)
+    content.release.set()
+    _wait_for(lambda: not page._detail_inflight)
+    assert len(content.detail_calls) == 1
+
+
+def test_same_filter_old_scan_cannot_overwrite_new_snapshot(monkeypatch):
+    from framework.shelf_service import ShelfItem
+    from gui.pages import library_page as module
+
+    tasks = []
+    monkeypatch.setattr(module.QThreadPool, "globalInstance",
+                        lambda: SimpleNamespace(start=tasks.append))
+    page = _page()
+    first = tasks[0]
+    page.activate()
+    assert len(tasks) == 1
+    page.refresh()
+    second = tasks[1]
+    assert first.cancel.is_set()
+    assert first.filters == second.filters
+    assert first.generation != second.generation
+    newest = ([], [ShelfItem("new", "favorite", "新", "novel", url="new")])
+    oldest = ([], [ShelfItem("old", "favorite", "旧", "novel", url="old")])
+    second.signals.done.emit(second.generation, second.filters, newest)
+    first.signals.done.emit(first.generation, first.filters, oldest)
+    assert set(page._cards_by_key) == {"new"}
+    assert page._metadata_snapshot is newest
+
+
+def test_filter_change_during_scan_uses_current_filter(monkeypatch, tmp_path):
+    from framework.library_store import LibraryStore
+    from framework.shelf_service import ShelfService
+    from gui.pages import library_page as module
+
+    tasks = []
+    monkeypatch.setattr(module.QThreadPool, "globalInstance",
+                        lambda: SimpleNamespace(start=tasks.append))
+    store = LibraryStore(tmp_path / "library.json")
+    store.add("src", "u1", "甲书", folder="甲")
+    store.add("src", "u2", "乙书", folder="乙")
+    service = ShelfService(tmp_path / "downloads", library_store=store, data_dir=tmp_path)
+    page = _page(shelf=service)
+    page.folder_combo.setCurrentText("乙")
+    assert len(tasks) == 1
+    tasks[0].run()
+    assert set(page._cards_by_key) == {"u2"}

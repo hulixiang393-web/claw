@@ -13,6 +13,41 @@ from framework.shelf_service import ShelfService
 BOOK = "https://example.test/book"
 
 
+def test_corrupt_library_fails_closed_without_overwrite(tmp_path):
+    path = tmp_path / "library.json"
+    path.write_text("{broken", encoding="utf-8")
+    before = path.read_bytes()
+    store = LibraryStore(path)
+    assert store.load_failed
+    assert store.reading_status(BOOK) == "unknown"
+    assert store.history_hidden(BOOK)
+    assert store.playback_history_hidden({"book_url": BOOK})
+    assert store.search_history_hidden("keyword")
+    assert store.add("demo", BOOK, "书") == {}
+    assert path.read_bytes() == before
+
+
+def test_corrupt_library_blocks_progress_and_legal_empty_library_allows(tmp_path):
+    from gui.app import MainWindow
+
+    bad = tmp_path / "library.json"
+    bad.write_text("{broken", encoding="utf-8")
+    store = LibraryStore(bad)
+    progress = ReadingProgress(tmp_path / "progress.json")
+    progress.save("demo", BOOK, "video", "ep", "chapter", title="secret",
+                  location={"seconds": 5, "duration": 100})
+    # 隐私状态不可判定：隐藏相关历史、阻止写进度
+    assert progress.recent_videos(store) == []
+    assert not MainWindow._local_progress_allowed(SimpleNamespace(library_store=store), BOOK)
+    # 合法空库：既非加载失败，也未隐藏/拦截
+    empty = LibraryStore(tmp_path / "empty.json")
+    assert not empty.load_failed
+    assert empty.list_all() == []
+    assert MainWindow._local_progress_allowed(SimpleNamespace(library_store=empty), BOOK)
+    shown = progress.recent_videos(empty)
+    assert shown and shown[0]["book_url"] == BOOK
+
+
 @pytest.mark.parametrize("raw", [{}, {"reading_status": "invalid"}, {"reading_status": None}])
 def test_legacy_favorite_defaults_to_reading(tmp_path, raw):
     path = tmp_path / "library.json"

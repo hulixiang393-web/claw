@@ -121,5 +121,34 @@ def test_append_works_does_not_relayout_repeatedly(app):
     _dispose(page)
 
 
+def test_late_detail_navigation_is_discarded_on_leave_and_new_click(app, monkeypatch):
+    from gui.pages import discover_page as module
+
+    page = _make_page()
+    source = SimpleNamespace(source_id="demo")
+    page._manager.get = lambda sid: source
+    tasks = []
+    monkeypatch.setattr(module.QThreadPool, "globalInstance",
+                        lambda: SimpleNamespace(start=tasks.append))
+    opened = []
+    page.read_requested.connect(opened.append)
+    page._on_work_clicked(_Work(1))
+    page._on_work_clicked(_Work(2))
+    tasks[0].signals.finished.emit("old", None)
+    assert opened == []
+    tasks[1].signals.finished.emit("current", None)
+    assert opened == ["current"]
+    page._on_work_clicked(_Work(3))
+    page.hide()
+    page.show()
+    tasks[2].signals.finished.emit("late", None)
+    assert opened == ["current"]
+    page._on_work_clicked(_Work(4))
+    page.invalidate_navigation()
+    tasks[3].signals.finished.emit("quit", None)
+    assert opened == ["current"]
+    _dispose(page)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

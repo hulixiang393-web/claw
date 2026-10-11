@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .atomic_io import atomic_write_json
+
 
 def _normalize_folder_name(raw) -> str:
     return raw.strip() if isinstance(raw, str) else ""
@@ -60,6 +62,8 @@ class LibraryStore:
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
         self._folder_locks: dict[str, dict] = {}
+        self.load_failed = False
+        self.load_error = ""
         self._load()
 
     # ------------------------------------------------------------------ #
@@ -86,26 +90,24 @@ class LibraryStore:
                             rec = _normalize_folder_entry(folder)
                             if rec["name"]:
                                 self._folder_locks[rec["name"]] = rec
-        except (OSError, json.JSONDecodeError):
-            self._data = {}  # 损坏文件 → 空收藏，不崩溃
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self.load_failed = True
+            self.load_error = f"{type(exc).__name__}: {exc}"
+            self._data = {}
+            self._folder_locks = {}
 
     def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "favorites": self._data,
-                    "folders": sorted(
-                        self._folder_locks.values(), key=lambda rec: rec["name"]
-                    ),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        if self.load_failed:
+            return
+        atomic_write_json(
+            self._path,
+            {
+                "favorites": self._data,
+                "folders": sorted(
+                    self._folder_locks.values(), key=lambda rec: rec["name"]
+                ),
+            },
         )
-        tmp.replace(self._path)
 
     # ------------------------------------------------------------------ #
     # 收藏夹
@@ -115,7 +117,7 @@ class LibraryStore:
                       recovery_salt=None) -> bool:
         """新建收藏夹（空夹也保留）。同名返回 False。"""
         name = _normalize_folder_name(name)
-        if not name:
+        if self.load_failed or not name:
             return False
         with self._lock:
             if name in self._folder_locks:
@@ -213,7 +215,7 @@ class LibraryStore:
             author: str = "", tags: list | None = None,
             folder: str = "") -> dict:
         """收藏一部作品。url 作唯一 key；已存在则更新元数据。返回记录。"""
-        if not url:
+        if not url or self.load_failed:
             return {}
         rec = {
             "source_id": source_id,
@@ -234,9 +236,13 @@ class LibraryStore:
 
     def reading_status(self, url: str) -> str:
         with self._lock:
+            if self.load_failed:
+                return "unknown"
             return self._data.get(url, {}).get("reading_status", "reading")
 
     def set_reading_status(self, url: str, status: str) -> bool:
+        if self.load_failed:
+            return False
         if status not in ("reading", "completed"):
             raise ValueError("无效阅读状态")
         with self._lock:
@@ -266,7 +272,7 @@ class LibraryStore:
 
     def set_cover(self, url: str, cover: str) -> bool:
         """后台补写收藏封面（仅改 cover，保留收藏时间等其余元数据）。"""
-        if not url or not cover:
+        if self.load_failed or not url or not cover:
             return False
         with self._lock:
             rec = self._data.get(url)
@@ -332,12 +338,16 @@ class LibraryStore:
         return items
 
     def history_hidden(self, url: str = "", folder: str = "") -> bool:
+        if self.load_failed:
+            return True
         record = self.get(url) if url else None
         if record is not None:
             folder = record.get("folder") or ""
         return bool((self.folder_info(folder) or {}).get("locked"))
 
     def playback_history_hidden(self, record: dict) -> bool:
+        if self.load_failed:
+            return True
         url = record.get("library_url") or record.get("book_url", "")
         if self.history_hidden(url, record.get("folder", "")):
             return True
@@ -351,6 +361,8 @@ class LibraryStore:
         return len(matches) == 1 and self.history_hidden(matches[0]["url"])
 
     def search_history_hidden(self, keyword: str, context_url: str = "", folder: str = "") -> bool:
+        if self.load_failed:
+            return True
         if self.history_hidden(context_url, folder):
             return True
         word = " ".join(keyword.casefold().split())

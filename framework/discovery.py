@@ -808,26 +808,41 @@ class Discovery:
     ) -> List[dict]:
         """并发检查一批链接可用性（每个链接一个线程）。
 
-        链接数 ≥ thread_cap（默认 3）时降级为固定 thread_cap 线程并行，
-        防止链接过多时线程爆炸（用户要求：链接过多则降为 3 线程）。
+        并发数 = 源 constraints（check_links_threads 或 max_concurrency）> 全局
+        network.check_links_threads > 入参 thread_cap（默认 3）；无显式限制时
+        按链接数自适应放宽到 8（仍是有界池，不线程爆炸）。
         返回 [{url, ok, status, error, time_ms}]。单链接失败不影响其他。
 
-        HttpClient 非线程安全：每 worker 各建独立实例；复用 App 层已由 settings
-        接线的 NetworkDefaults（含 impersonate/user_agents），与主 http 一致。
+        HttpClient 非线程安全：每个 worker 从连接模板克隆独立实例（新 Session，
+        共享 NetworkDefaults 配置），绝不复用共享 Session（见 decrypt_covers）。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
         import time
 
         urls = [u for u in urls if u]
         if not urls:
             return []
-        workers = min(len(urls), thread_cap) if len(urls) >= thread_cap else len(urls)
-        workers = max(workers, 1)
+        workers = self._check_link_workers(source, urls, thread_cap)
         results: List[dict] = [None] * len(urls)
         base_headers = self._default_headers(source)
+        # 连接模板：复用 App 层已接线的 HttpClient 配置（NetworkDefaults 含
+        # impersonate/user_agents，与主 http 一致）。
+        template = self._http
+        # D8：每个 worker 线程复用同一 HttpClient（thread-local），而非每个链接
+        # 新建。线程池线程会被复用，故实例数 ≤ workers，避免连接/Session 泄漏
+        # 与重复构造开销；仍保证 Session 绝不跨线程共享（隔离不变）。
+        _tls = threading.local()
+
+        def _client_for_thread() -> HttpClient:
+            http = getattr(_tls, "client", None)
+            if http is None:
+                http = self._clone_check_client(template)
+                _tls.client = http
+            return http
 
         def _check_one(idx: int, u: str) -> dict:
-            http = HttpClient(defaults=self._http.defaults)
+            http = _client_for_thread()
             t0 = time.time()
             try:
                 # get_text 走完整反爬/重试链（GET，HEAD 对 Cloudflare 不稳）
@@ -854,6 +869,65 @@ class Discovery:
             for fut in as_completed(futs):
                 results[futs[fut]] = fut.result()
         return results
+
+    def _check_link_workers(self, source: SourceConfig, urls: List[str], thread_cap: int) -> int:
+        """计算 check_links 并发数。
+
+        优先级（显式 > 全局 > 入参默认）：
+          1. source.raw.constraints.check_links_threads
+          2. 同源 constraints.max_concurrency（已有键，向后兼容）
+          3. 运行时 network.check_links_threads
+          4. 入参 thread_cap（默认 3）
+        无显式/全局限制时按链接数自适应放宽到 8（上下限 1..8）。
+        """
+        explicit = None
+        raw = getattr(source, "raw", None)
+        constraints = raw.get("constraints") if isinstance(raw, dict) else None
+        if isinstance(constraints, dict):
+            for key in ("check_links_threads", "max_concurrency"):
+                value = constraints.get(key)
+                if isinstance(value, int) and value >= 1:
+                    explicit = value
+                    break
+        base = max(1, int(thread_cap))
+        if explicit is not None:
+            base = max(1, min(8, explicit))
+        else:
+            global_cap = self._global_check_link_cap()
+            if global_cap is not None:
+                base = max(1, min(8, int(global_cap)))
+            else:
+                # 无显式限制：链接多时自适应放宽（上限 8，线程仍有限不爆炸）
+                return max(1, min(len(urls), 8))
+        return max(1, min(len(urls), base))
+
+    def _global_check_link_cap(self):
+        """读运行时 network.check_links_threads（SettingsManager 或 dict 均兼容）。"""
+        reporter = getattr(self, "_health_reporter", None)
+        runtime = getattr(reporter, "_runtime", None) if reporter is not None else None
+        if runtime is None:
+            return None
+        from .settings_manager import SettingsManager
+
+        if isinstance(runtime, SettingsManager):
+            return runtime.get("network", "check_links_threads", None)
+        if isinstance(runtime, dict):
+            return (runtime.get("network") or {}).get("check_links_threads")
+        return None
+
+    @staticmethod
+    def _clone_check_client(template: HttpClient) -> HttpClient:
+        """构造独立 HttpClient（每次新建 Session），配置与模板一致。
+
+        requests.Session 非线程安全，不可跨 worker 共享连接；按模板的
+        sleeper/defaults/cache 重建实例，得到配置一致但会话隔离的 client
+        （与旧实现仅传 defaults 相比，额外保留了 sleeper/cache 接线）。
+        """
+        return HttpClient(
+            sleeper=getattr(template, "_sleeper", None),
+            defaults=getattr(template, "defaults", None),
+            cache=getattr(template, "cache", None),
+        )
 
     def _default_headers(self, source: SourceConfig) -> dict:
         """源默认请求头（UA + 可选 Referer），供检查线程使用。"""

@@ -21,7 +21,8 @@ import pytest
 from PySide6.QtGui import QImage, QColor
 from PySide6.QtWidgets import QApplication
 
-from gui.app import MainWindow, _app_base_dir
+from gui import app as app_module
+from gui.app import MainWindow
 from framework.settings_manager import SettingsManager
 from framework.theme_manager import ThemeManager
 
@@ -86,8 +87,9 @@ def test_bg_opacity_zero_not_overridden(app, tmp_path):
     assert fake._bg_opacity() == 0.6
 
 
-def test_bg_compose_async_runs_off_gui_thread(app, tmp_path):
+def test_bg_compose_async_runs_off_gui_thread(app, tmp_path, monkeypatch):
     """_bg_image_qss_block 主线程立即返回；后台合成完成后注入中央区。"""
+    monkeypatch.setattr("gui.app._app_base_dir", lambda: Path(tmp_path))
     sm = _make_settings(tmp_path)
     fake = _Fake(sm)
     img = QImage(2000, 1500, QImage.Format_RGB32)
@@ -130,8 +132,9 @@ def _wait_key(app, key_file, needle, timeout=5.0) -> str:
     return text
 
 
-def test_bg_compose_cache_key_tracks_opacity(app, tmp_path):
+def test_bg_compose_cache_key_tracks_opacity(app, tmp_path, monkeypatch):
     """透明度变化 → 缓存 key 更新，重新合成产物随之变化。"""
+    monkeypatch.setattr("gui.app._app_base_dir", lambda: Path(tmp_path))
     sm = _make_settings(tmp_path)
     fake = _Fake(sm)
     img = QImage(1500, 1000, QImage.Format_RGB32)
@@ -140,7 +143,7 @@ def test_bg_compose_cache_key_tracks_opacity(app, tmp_path):
     img.save(bg_path, "JPG", 90)
     sm.set("ui", "background_image", bg_path)
 
-    cache_dir = Path(_app_base_dir()) / "data" / "cache"
+    cache_dir = Path(app_module._app_base_dir()) / "data" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     key_file = cache_dir / "bg_composed.key"
 

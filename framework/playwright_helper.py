@@ -26,6 +26,7 @@ import contextlib
 import functools
 import json
 import logging
+import os as _os
 import queue
 import re
 import threading
@@ -59,17 +60,35 @@ _SYNC_LOCK = threading.Lock()
 # 进程退出随 daemon 自清，彻底消除跨线程 UAF；常驻复用提速收益保留。
 # 代价：sync 类调用全局串行（排队执行），播放取流/正文渲染/搜索等业务并发
 # 时按序处理；图片批量渲染走 async API（每次独立浏览器），不经过本线程。
-_RENDER_QUEUE: "queue.Queue" = queue.Queue()
-_RENDER_THREAD: Optional[threading.Thread] = None
+_RENDER_QUEUES: List["queue.Queue"] = []
+_RENDER_THREADS: List[threading.Thread] = []
 _RENDER_THREAD_LOCK = threading.Lock()
+# 渲染 worker 数（默认 1 = 原单线程行为，行为完全一致）。可用
+# set_render_workers(n)（1..8）或环境变量 CLAW_RENDER_WORKERS 放开并发，
+# 供播放/正文渲染/搜索等 sync 调用并行化；每个 worker 独立队列+独立浏览器。
+_RENDER_WORKERS: int = 1
+_RENDER_TASKS: int = 0  # 无路由键任务的轮询游标
+# 可选：进程启动时经环境变量 CLAW_RENDER_WORKERS 配置 worker 池（钳制 1..8），
+# 与运行时 set_render_workers(n) 等价；未设置则保持默认 1（原单线程行为）。
+try:
+    _env_workers = int(_os.environ.get("CLAW_RENDER_WORKERS") or 0)
+except (TypeError, ValueError):
+    _env_workers = 0
+if 1 <= _env_workers <= 8:
+    _RENDER_WORKERS = _env_workers
 _SHUTDOWN_SENTINEL = object()
 
 
-def _render_thread_main() -> None:
-    """专用渲染线程主循环：串行执行 sync Playwright 任务，退出前关闭自己的浏览器。"""
+def _render_thread_main(q: "queue.Queue") -> None:
+    """渲染 worker 主循环：串行执行 sync Playwright 任务，退出前关闭自己的浏览器。
+
+    浏览器/事件循环/greenlet 绑定本线程（TID），跨线程复用或线程销毁后
+    复用 TID 会触发 Playwright sync 的 UAF——因此每个 worker 恒驻，与进程
+    同生命周期；多 worker 只是多条独立队列并行，互不共享浏览器。
+    """
     tid = threading.get_ident()
     while True:
-        item = _RENDER_QUEUE.get()
+        item = q.get()
         if item is _SHUTDOWN_SENTINEL:
             break
         fn, holder = item
@@ -92,22 +111,74 @@ def _render_thread_main() -> None:
             pass
 
 
-def _ensure_render_thread() -> None:
-    """惰性启动专用渲染线程（进程内唯一，不复用销毁，与进程同生命周期）。"""
-    global _RENDER_THREAD
+def set_render_workers(count: int) -> int:
+    """设置渲染 worker 池大小（钳制 1..8，默认 1）。
+
+    每个 worker 有独立队列与常驻 Chromium；数量只增不减（线程与进程同
+    生命周期，已启动的 worker 不销毁）。返回实际生效值（钳制后）。
+    也可通过环境变量 CLAW_RENDER_WORKERS 在进程启动时配置。
+    """
+    global _RENDER_WORKERS
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        return _RENDER_WORKERS
+    n = max(1, min(8, n))
+    _RENDER_WORKERS = n
+    return n
+
+
+def _ensure_render_threads() -> None:
+    """惰性启动渲染 worker 池；已有 worker 不足时按 _RENDER_WORKERS 补足。"""
+    global _RENDER_QUEUES, _RENDER_THREADS
     with _RENDER_THREAD_LOCK:
-        if _RENDER_THREAD is None or not _RENDER_THREAD.is_alive():
-            _RENDER_THREAD = threading.Thread(
+        while len(_RENDER_THREADS) < _RENDER_WORKERS:
+            index = len(_RENDER_THREADS)
+            q: "queue.Queue" = queue.Queue()
+            thread = threading.Thread(
                 target=_render_thread_main,
-                name="claw-render",
+                args=(q,),
+                name=f"claw-render-{index}",
                 daemon=True,
             )
-            _RENDER_THREAD.start()
+            _RENDER_QUEUES.append(q)
+            _RENDER_THREADS.append(thread)
+            thread.start()
 
 
-def run_on_render_thread(fn: Callable[[], object], context=None) -> object:
-    """把 fn 投递到专用渲染线程执行并阻塞等待结果（异常跨线程复抛）。
+def _worker_thread(index: int) -> Optional[threading.Thread]:
+    """按队列索引取 worker 线程；索引越界（shutdown 后）返回 None。"""
+    with _RENDER_THREAD_LOCK:
+        if 0 <= index < len(_RENDER_THREADS):
+            return _RENDER_THREADS[index]
+    return None
 
+
+def _route_worker(key) -> int:
+    """把任务路由到 worker 下标：key 哈希（同 key 稳定同 worker）；key 为空轮询。
+
+    默认单 worker 恒返回 0，与旧版单线程行为一致。
+    """
+    global _RENDER_TASKS
+    queues = _RENDER_QUEUES
+    if len(queues) <= 1:
+        return 0
+    if key is None:
+        _RENDER_TASKS += 1
+        return _RENDER_TASKS % len(queues)
+    try:
+        return abs(hash(key)) % len(queues)
+    except Exception:  # noqa: BLE001
+        _RENDER_TASKS += 1
+        return _RENDER_TASKS % len(queues)
+
+
+def run_on_render_thread(fn: Callable[[], object], context=None, key=None) -> object:
+    """把 fn 投递到渲染 worker 执行并阻塞等待结果（异常跨线程复抛）。
+
+    key：路由键（如 URL）。多 worker 下同 key 任务稳定路由同一 worker
+    （hash 路由，浏览器/队列亲和）；None 时轮询分发。默认 1 worker 时
+    恒为同一线程，行为与旧版完全一致。
     若渲染线程异常退出，等待方最多 1s 内抛出 RuntimeError，不会永久挂死。
     """
     if context is not None:
@@ -121,9 +192,10 @@ def run_on_render_thread(fn: Callable[[], object], context=None) -> object:
             context.check()
         return result
 
-    _ensure_render_thread()
+    _ensure_render_threads()
+    index = _route_worker(key)
     holder = {"done": threading.Event(), "result": None, "error": None}
-    _RENDER_QUEUE.put((execute, holder))
+    _RENDER_QUEUES[index].put((execute, holder))
     while True:
         wait_for = 1.0
         if context is not None:
@@ -132,7 +204,7 @@ def run_on_render_thread(fn: Callable[[], object], context=None) -> object:
         holder["done"].wait(timeout=wait_for)
         if holder["done"].is_set():
             break
-        thread = _RENDER_THREAD
+        thread = _worker_thread(index)
         if thread is None or not thread.is_alive():
             raise RuntimeError("Playwright 渲染线程异常退出，任务未完成")
     if context is not None:
@@ -143,32 +215,47 @@ def run_on_render_thread(fn: Callable[[], object], context=None) -> object:
 
 
 def _on_render_thread(fn: Callable) -> Callable:
-    """装饰器：把 `*_sync` 函数整体放到专用渲染线程中执行。"""
+    """装饰器：把 `*_sync` 函数整体放到渲染 worker 上执行。
+
+    以首参（url/表达式）作路由键：同 URL 连续调用稳定落到同一 worker，
+    多 worker 下也可分散不同 URL 到不同 worker 并行渲染。
+    """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         context = kwargs.get("context")
-        return run_on_render_thread(lambda: fn(*args, **kwargs), context=context)
+        route_key = args[0] if args else None
+        return run_on_render_thread(
+            lambda: fn(*args, **kwargs), context=context, key=route_key
+        )
     return wrapper
 
 
 @atexit.register
 def _close_sync_browser() -> None:
-    """进程退出时通知渲染线程关闭常驻浏览器，join 等待自清。
+    """进程退出时通知每个渲染 worker 关闭常驻浏览器，join 等待自清。
 
-    关闭动作须与 start() 同线程，故只在渲染线程内执行（收到 sentinel 后
-    break 循环，退出前 close+stop）。daemon 线程 + join 超时兜底，最坏
+    关闭动作须与 start() 同线程，故只在各 worker 线程内执行（收到 sentinel
+    后 break 循环，退出前 close+stop）。daemon 线程 + join 超时兜底，最坏
     随进程退出管道断开由 Chromium 自清。
     """
-    global _RENDER_THREAD
-    thread = _RENDER_THREAD
-    if thread is None or not thread.is_alive():
+    global _RENDER_QUEUES, _RENDER_THREADS
+    with _RENDER_THREAD_LOCK:
+        queues = list(_RENDER_QUEUES)
+        threads = list(_RENDER_THREADS)
+        _RENDER_QUEUES = []
+        _RENDER_THREADS = []
+    if not threads:
         return
-    try:
-        _RENDER_QUEUE.put(_SHUTDOWN_SENTINEL)
-        thread.join(timeout=5)
-    except Exception:  # noqa: BLE001
-        pass
-    _RENDER_THREAD = None
+    for q in queues:
+        try:
+            q.put(_SHUTDOWN_SENTINEL)
+        except Exception:  # noqa: BLE001
+            pass
+    for thread in threads:
+        try:
+            thread.join(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @contextlib.contextmanager

@@ -211,6 +211,13 @@ class CastSession:
             client = self._require_active()
         client.seek(seconds)
 
+    def set_volume(self, level: int) -> None:
+        """设置投屏设备主音量（0-100）。与 seek 同契约：锁内取 client 快照，
+        网络调用在锁外。设备不支持 RenderingControl 时由 client 抛受控错误。"""
+        with self._lock:
+            client = self._require_active()
+        client.set_volume(level)
+
     def set_episode(self, episode_index: int, media_url: str, title: str,
                     headers: dict, ad_block: dict | None,
                     force_proxy: bool) -> None:

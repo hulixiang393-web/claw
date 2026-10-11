@@ -395,6 +395,22 @@ class _CoverLoader(QObject):
         self._queue.append((url, callback, referer, MAX_RETRIES, cache, persist, source_id, source, True))
         self._pump()
 
+    def load_cached(self, url: str, callback, source_id: str = "") -> None:
+        pixmap = self._cache_get(url) if url else None
+        if pixmap is None and url and self._shelf_cache is not None:
+            getter = getattr(self._shelf_cache, "get_cached", None)
+            if getter is not None:
+                try:
+                    data = getter(self._shelf_key(source_id, url))
+                    if isinstance(data, bytes):
+                        candidate = QPixmap()
+                        if candidate.loadFromData(data) and not candidate.isNull():
+                            pixmap = candidate
+                            self._cache_put(url, pixmap)
+                except Exception:
+                    pixmap = None
+        callback(pixmap)
+
     @staticmethod
     def _shelf_key(source_id: str, url: str) -> str:
         """书架封面持久化键：含 source_id，跨源同 URL 不互扰。"""

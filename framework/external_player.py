@@ -496,9 +496,13 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
 
         target = proxy_url_for(url, hdrs, **proxy_kwargs)
     if not webbrowser.open(target):
+        log.warning("浏览器回退打开失败：%s", target)
         return "浏览器打开失败"
     if on_handoff is not None:
         on_handoff()
+    # 浏览器回退无 VLC 控制会话 → 无 PlaybackMonitor → 播放进度不会回写。
+    # 给出可观察提示，避免用户以为续播进度被记录。
+    log.debug("浏览器回退播放：无控制会话，播放进度不回写（target=%s）", target)
     return "已在浏览器中打开"
 
 
@@ -614,10 +618,12 @@ class PlaybackMonitor:
         try:
             self.on_progress(idx, {**location, "session_id": id(self.state)})
         except Exception:
-            log.warning("播放进度回写失败", exc_info=True)
+            log.warning("播放进度回写失败（第 %s 集）：%s", idx, location, exc_info=True)
             return
         self._saved = self._last
         self._saved_at = time.monotonic()
+        log.debug("播放进度已回写：第 %s 集 %.1fs/%.1fs",
+                  idx, location.get("seconds", 0.0), location.get("duration", 0.0))
 
     def tick(self):
         with self._lock:

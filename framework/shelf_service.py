@@ -19,7 +19,7 @@ import json
 import re
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -126,6 +126,10 @@ class ShelfService:
         self._meta_file = self._data_dir / meta_file_name
         self._type_cache: dict = {}
         self._lock = threading.Lock()
+        self._generation = 0
+        self._item_cache: dict = {}
+        self._meta_defer = 0
+        self._meta_dirty = False
         self._load_meta()
 
     # ------------------------------------------------------------------ #
@@ -145,8 +149,34 @@ class ShelfService:
         - keyword 非空 → 标题模糊匹配（书架搜索）
         - sort：recent（最近阅读/添加）/ added（最近添加）/ name（书名）
         """
-        locals_ = self.scan_local()
-        favs = self.favorites(folder=folder)
+        return self.filter_snapshot(
+            (self.scan_local(), self.favorites()), content_type, tag, folder, keyword, sort
+        )
+
+    def metadata_snapshot(self, cancel=None):
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+        locals_ = self.scan_local(metadata_only=True, cancel=cancel, generation=generation)
+        if locals_ is None or (cancel is not None and cancel.is_set()):
+            return None
+        return locals_, self.favorites()
+
+    def refresh_metadata(self, snapshot):
+        locals_ = []
+        for item in snapshot[0]:
+            summary = self._progress.summary(item.key) if self._progress is not None else None
+            locals_.append(replace(item, resume_title=(summary or {}).get("chapter_title", ""),
+                                   updated_at=(summary or {}).get("updated_at", "")))
+        return locals_, self.favorites()
+
+    def filter_snapshot(self, snapshot, content_type="", tag="", folder="全部",
+                        keyword="", sort="recent"):
+        locals_, favs = snapshot
+        locals_ = [replace(i, tags=list(i.tags), episode_paths=list(i.episode_paths))
+                   for i in locals_]
+        favs = [replace(i, tags=list(i.tags)) for i in favs
+                if folder == "全部" or (i.folder or "") == folder]
         merged = self._merge(locals_, favs)
 
         # 收藏夹筛选（合并条目已带收藏夹；本地未收藏的书在具体收藏夹下不显示）
@@ -207,6 +237,8 @@ class ShelfService:
                     key = self._identity(favorite)
             if favorite is not None:
                 local.online = True
+                if local.content_type == "epub" and favorite.content_type in ("novel", "comic"):
+                    local.content_type = favorite.content_type
                 local.reading_status = favorite.reading_status
                 local.url = favorite.url or local.url
                 local.source_id = favorite.source_id or local.source_id
@@ -249,69 +281,122 @@ class ShelfService:
     # ------------------------------------------------------------------ #
     # 本地扫描
     # ------------------------------------------------------------------ #
-    def scan_local(self) -> list[ShelfItem]:
+    def scan_local(self, metadata_only=False, cancel=None, generation=None) -> list[ShelfItem] | None:
         """扫描本地已下载目录（epub + 视频目录），排除隐藏名单。
 
         - {书名}/*.epub → 小说/漫画（类型走缓存检测），记录大小/mtime
         - {书名}/*.mp4|mkv|... → 视频（episode_count + 集文件列表）
         - 其余目录跳过。目录不存在返回空列表。
+
+        增量：以目录签名（mtime_ns）缓存上次结果，未变更目录直接复用元数据，
+        仅变更/新增目录重新读取；全量扫描仍是缓存缺失时的回退路径，输出一致。
+        generation：若提供，扫描结束时代际已过期（有更新的扫描发起）则返回 None，
+        调用方据此丢弃迟到结果；与 cancel 一起保证并发/取消正确。
         """
         hidden = self.hidden_local()
         items: list[ShelfItem] = []
         out = self._output_dir
+
+        def _stale() -> bool:
+            return generation is not None and generation != self._generation
+
         if not out.is_dir():
-            return items
-        for sub in sorted(out.iterdir()):
-            if not sub.is_dir() or sub.name in hidden:
-                continue
-            epubs = sorted(sub.glob("*.epub"))
-            if epubs:
-                # 一个文件夹可有多本 epub（同名书名目录下多本/合集）：
-                # path 取第一本（默认），episode_paths 记全部，供书架「选本阅读」。
-                paths = [str(p) for p in epubs]
-                path = paths[0]
+            return None if _stale() else items
+        seen: set = set()
+        # 扫描期间暂缓类型缓存落盘：逐本命中缓存不再各自重写整个 meta 文件，
+        # 结束时若有变更统一写盘一次（仅变更项进内存缓存）。
+        self._meta_defer += 1
+        try:
+            for sub in sorted(out.iterdir()):
+                if _stale():
+                    return None
+                if cancel is not None and cancel.is_set():
+                    return None if generation is not None else []
+                if not sub.is_dir() or sub.name in hidden:
+                    continue
+                seen.add(str(sub))
                 try:
-                    st = Path(path).stat()
-                    size, mtime = st.st_size, st.st_mtime
+                    sig = sub.stat().st_mtime_ns
                 except OSError:
-                    size, mtime = 0, 0.0
-                items.append(ShelfItem(
-                    key=path,
-                    kind="local",
-                    title=sub.name,
-                    content_type=self.epub_type(path),
-                    path=path,
-                    episode_count=len(epubs),
-                    episode_paths=paths,
-                    size_bytes=size,
-                    mtime=mtime,
-                ))
-                continue
-            vids = sorted(
-                f for f in sub.iterdir()
-                if f.is_file() and f.suffix.lower() in VIDEO_EXTS
-            )
-            if not vids:
-                continue
-            items.append(ShelfItem(
-                key=str(sub),          # 视频书 key=目录路径（代表整本，续读/去重用）
-                kind="local",
-                title=sub.name,
-                content_type="video",
-                path=str(sub),         # 视频书路径=目录
-                episode_count=len(vids),
-                episode_paths=[str(v) for v in vids],
-                size_bytes=sum((v.stat().st_size if v.is_file() else 0) for v in vids),
-                mtime=max((v.stat().st_mtime if v.is_file() else 0.0) for v in vids),
-            ))
+                    sig = None
+                cached = self._item_cache.get(str(sub))
+                if cached is not None and sig is not None and cached[0] == sig:
+                    item = self._cached_item_type(cached[1], metadata_only)
+                else:
+                    item = self._build_local_item(sub, metadata_only)
+                    if item is not None and sig is not None:
+                        self._item_cache[str(sub)] = (sig, replace(item))
+                if item is not None:
+                    items.append(item)
+            for key in [k for k in self._item_cache if k not in seen]:
+                self._item_cache.pop(key, None)
+        finally:
+            self._meta_defer -= 1
+            if self._meta_defer == 0 and self._meta_dirty:
+                self._meta_dirty = False
+                self._persist_meta()
+        if _stale():
+            return None
         # 补续读位置（本地=epub 路径 key；视频=目录路径 key）
         if self._progress is not None:
             for it in items:
-                pres = self._progress.resume(it.key)
+                pres = self._progress.summary(it.key)
                 if pres:
                     it.resume_title = pres.get("chapter_title", "")
                     it.updated_at = pres.get("updated_at", "")
         return items
+
+    def _build_local_item(self, sub: Path, metadata_only: bool) -> Optional[ShelfItem]:
+        """读单个本地书目录的元数据（epub 或视频），无有效内容返回 None。"""
+        epubs = sorted(sub.glob("*.epub"))
+        if epubs:
+            # 一个文件夹可有多本 epub（同名书名目录下多本/合集）：
+            # path 取第一本（默认），episode_paths 记全部，供书架「选本阅读」。
+            paths = [str(p) for p in epubs]
+            path = paths[0]
+            try:
+                st = Path(path).stat()
+                size, mtime = st.st_size, st.st_mtime
+            except OSError:
+                size, mtime = 0, 0.0
+            return ShelfItem(
+                key=path,
+                kind="local",
+                title=sub.name,
+                content_type=(self._type_cache.get(path, {}).get("type", "epub")
+                              if metadata_only else self.epub_type(path)),
+                path=path,
+                episode_count=len(epubs),
+                episode_paths=paths,
+                size_bytes=size,
+                mtime=mtime,
+            )
+        vids = sorted(
+            f for f in sub.iterdir()
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTS
+        )
+        if not vids:
+            return None
+        return ShelfItem(
+            key=str(sub),          # 视频书 key=目录路径（代表整本，续读/去重用）
+            kind="local",
+            title=sub.name,
+            content_type="video",
+            path=str(sub),         # 视频书路径=目录
+            episode_count=len(vids),
+            episode_paths=[str(v) for v in vids],
+            size_bytes=sum((v.stat().st_size if v.is_file() else 0) for v in vids),
+            mtime=max((v.stat().st_mtime if v.is_file() else 0.0) for v in vids),
+        )
+
+    def _cached_item_type(self, tpl: ShelfItem, metadata_only: bool) -> ShelfItem:
+        """复用缓存条目，仅按当前类型缓存/检测刷新 content_type（不重扫目录）。"""
+        if tpl.content_type == "video":
+            return replace(tpl)
+        path = tpl.path
+        ctype = (self._type_cache.get(path, {}).get("type", tpl.content_type)
+                 if metadata_only else self.epub_type(path))
+        return replace(tpl, content_type=ctype)
 
     def epub_type(self, path: str) -> str:
         """epub 类型检测（带 mtime+size 缓存，避免重复全量读文件）。"""
@@ -325,13 +410,11 @@ class ShelfService:
             return "epub"
         ctype = self._detect(path)
         if ctype:
+            entry = {"type": ctype, "mtime": st.st_mtime, "size": st.st_size}
             with self._lock:
-                self._type_cache[str(p)] = {
-                    "type": ctype,
-                    "mtime": st.st_mtime,
-                    "size": st.st_size,
-                }
-                self._save_meta()
+                if self._type_cache.get(str(p)) != entry:
+                    self._type_cache[str(p)] = entry
+                    self._save_meta()
         return ctype or "epub"
 
     # ------------------------------------------------------------------ #
@@ -360,7 +443,7 @@ class ShelfService:
                 reading_status=fav.get("reading_status", "reading"),
             )
             if self._progress is not None:
-                pres = self._progress.resume(it.key)
+                pres = self._progress.summary(it.key)
                 if pres:
                     it.resume_title = pres.get("chapter_title", "")
                     it.updated_at = pres.get("updated_at", "") or it.updated_at
@@ -507,6 +590,13 @@ class ShelfService:
             self._type_cache = {}
 
     def _save_meta(self) -> None:
+        """标记类型缓存已变更并落盘；扫描期间暂缓，结束统一写一次。"""
+        if self._meta_defer > 0:
+            self._meta_dirty = True
+            return
+        self._persist_meta()
+
+    def _persist_meta(self) -> None:
         try:
             self._meta_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._meta_file.with_suffix(".json.tmp")

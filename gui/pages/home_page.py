@@ -228,6 +228,7 @@ class HomePage(BasePage):
     add_source_requested = Signal()
     settings_requested = Signal()
     playback_requested = Signal(object)
+    retry_runtime_requested = Signal()
 
     def __init__(
         self,
@@ -259,6 +260,17 @@ class HomePage(BasePage):
         self.topbar = TopBar(self.mascot, theme_manager)
         self.topbar.settings_requested.connect(self.settings_requested.emit)
         layout.addWidget(self.topbar)
+
+        status_row = QHBoxLayout()
+        self.runtime_status = QLabel("")
+        self.runtime_status.setObjectName("statsLabel")
+        self.runtime_status.setVisible(False)
+        status_row.addWidget(self.runtime_status, stretch=1)
+        self.runtime_retry = QPushButton("重试")
+        self.runtime_retry.setVisible(False)
+        self.runtime_retry.clicked.connect(self.retry_runtime_requested.emit)
+        status_row.addWidget(self.runtime_retry)
+        layout.addLayout(status_row)
 
         # 统计卡片
         self.stats_row = StatsRow(source_manager)
@@ -314,6 +326,20 @@ class HomePage(BasePage):
             self.refresh()
 
     # ------------------------------------------------------------------ #
+    def set_runtime_services(self, source_manager, bulk_fetch) -> None:
+        self._manager = source_manager
+        self.stats_row._manager = source_manager
+        self.batch_update._manager = source_manager
+        self._bulk_fetch = bulk_fetch
+        self.batch_update._bulk_fetch = bulk_fetch
+        self.refresh()
+
+    def set_runtime_status(self, message: str = "") -> None:
+        visible = bool(message)
+        self.runtime_status.setText(message)
+        self.runtime_status.setVisible(visible)
+        self.runtime_retry.setVisible(visible)
+
     def refresh(self) -> None:
         """从数据源刷新本页。"""
         self.stats_row.reload()

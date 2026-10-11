@@ -226,3 +226,69 @@ def test_comic_batch_with_no_pending_restores_done_count():
     assert batch_downloader.calls == []
     assert task.done == task.total == 2
     assert task.status == TaskStatus.DONE
+
+
+def test_finalize_status_preserves_paused_and_priority():
+    queue = DownloadQueue(None, None, _Settings(), source_manager=None)
+    task = _task(count=1)
+
+    task.status = TaskStatus.PAUSED
+    queue._finalize_status(task)
+    assert task.status == TaskStatus.PAUSED  # 暂停保持，不被覆盖
+
+    task.status = TaskStatus.DOWNLOADING
+    task.failed = ["x"]
+    queue._finalize_status(task)
+    assert task.status == TaskStatus.FAILED
+
+    task.cancel_evt.set()  # 取消优先于失败
+    queue._finalize_status(task)
+    assert task.status == TaskStatus.CANCELED
+
+    task.cancel_evt.clear()
+    task.failed = []
+    task.status = TaskStatus.DOWNLOADING
+    queue._finalize_status(task)
+    assert task.status == TaskStatus.DONE
+
+
+class _SpillSettings(_Settings):
+    def get(self, section, key, default=None):
+        if section == "download" and key == "epub_material_bytes":
+            return 10
+        return super().get(section, key, default)
+
+
+def test_large_materials_spill_to_disk_and_resolve(tmp_path, monkeypatch):
+    downloader = Downloader(None, None, _SpillSettings(tmp_path))
+    task = _task(count=2)
+
+    downloader._store_epub_chapter(task, 0, "C1", "1234567890")  # = 阈值，仍驻内存
+    assert task.epub_chapters[0] == ("C1", "1234567890")
+
+    downloader._store_epub_chapter(task, 1, "C2", "abcdefghij")  # 超阈值 → 全部落盘
+    assert not isinstance(task.epub_chapters[0][1], str)
+    assert not isinstance(task.epub_chapters[1][1], str)
+
+    assert downloader._ordered_epub_chapters(task) == [
+        ("C1", "1234567890"),
+        ("C2", "abcdefghij"),
+    ]
+
+    monkeypatch.setattr(epub_builder, "build_novel_epub", lambda *a, **k: None)
+    downloader.finalize_epub(task)
+    assert not downloader._material_dir(task).exists()  # 合成成功后清理材料
+
+
+def test_large_comic_materials_spill_and_cleanup_on_discard(tmp_path):
+    downloader = Downloader(None, None, _SpillSettings(tmp_path))
+    task = _task(content_type="comic", count=1)
+
+    downloader._store_epub_chapter(task, 0, "C1", [b"x" * 6, b"y" * 6])  # 超阈值
+    marker = task.epub_chapters[0][1]
+    assert not isinstance(marker, (str, list))
+    assert downloader._ordered_epub_chapters(task) == [("C1", [b"x" * 6, b"y" * 6])]
+
+    downloader.discard_materials(task)  # 取消/重启：清理落盘材料并复位溢出状态
+    assert not downloader._material_dir(task).exists()
+    assert getattr(task, "_spill_active", False) is False

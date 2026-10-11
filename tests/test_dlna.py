@@ -436,3 +436,66 @@ def test_get_position_info_normalizes_values_and_sends_expected_request(monkeypa
         "track": 2,
         "uri": "http://tv/video.m3u8",
     }
+
+
+def _rendering_renderer():
+    return dlna.parse_device_description(
+        "http://192.168.1.20:80/root.xml", DEVICE_XML
+    )
+
+
+def test_set_volume_routes_to_rendering_control_service(monkeypatch):
+    """E2：音量动作必须投到 RenderingControl 控制点（而非 AVTransport）。"""
+    renderer = _rendering_renderer()
+    captured = []
+
+    def fake_urlopen(request, timeout):
+        captured.append(request)
+        return _Response(_soap_response("SetVolume"))
+
+    monkeypatch.setattr(dlna.urllib.request, "urlopen", fake_urlopen)
+    dlna.DlnaClient(renderer, timeout=4).set_volume(42)
+
+    request = captured[0]
+    assert request.full_url == renderer.rendering_control_url
+    assert request.full_url != renderer.av_transport_control_url
+    assert request.get_header("Soapaction") == (
+        '"urn:schemas-upnp-org:service:RenderingControl:1#SetVolume"'
+    )
+    body = request.data.decode("utf-8")
+    assert "<InstanceID>0</InstanceID>" in body
+    assert "<Channel>Master</Channel>" in body
+    assert "<DesiredVolume>42</DesiredVolume>" in body
+
+
+def test_get_volume_parses_current_volume(monkeypatch):
+    renderer = _rendering_renderer()
+    monkeypatch.setattr(
+        dlna.urllib.request, "urlopen",
+        lambda request, timeout: _Response(
+            _soap_response("GetVolume", "<CurrentVolume>33</CurrentVolume>")),
+    )
+    assert dlna.DlnaClient(renderer).get_volume() == 33
+
+
+def test_set_volume_without_rendering_control_raises_unsupported(monkeypatch):
+    """E2：设备无 RenderingControl 服务 → 受控失败（不发起网络请求）。"""
+    def _boom(request, timeout):
+        raise AssertionError("不应发起 SOAP 请求")
+
+    monkeypatch.setattr(dlna.urllib.request, "urlopen", _boom)
+    client = dlna.DlnaClient(_renderer())
+    with pytest.raises(dlna.DlnaError) as raised:
+        client.set_volume(50)
+    assert raised.value.action == "SetVolume"
+    assert raised.value.code == "unsupported"
+
+
+@pytest.mark.parametrize("level", [-1, 101, "loud", None, 3.5])
+def test_set_volume_rejects_invalid_level_without_request(monkeypatch, level):
+    def _boom(request, timeout):
+        raise AssertionError("非法音量不应发起 SOAP 请求")
+
+    monkeypatch.setattr(dlna.urllib.request, "urlopen", _boom)
+    with pytest.raises(ValueError):
+        dlna.DlnaClient(_rendering_renderer()).set_volume(level)

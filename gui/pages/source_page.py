@@ -422,6 +422,14 @@ class SourcePage(BasePage):
         # 刷新后沿用当前过滤词（不重建过滤状态）
         self._apply_source_filter(self._search_input.text())
 
+    def rebind_runtime(self, source_manager, checker, cookie_manager=None) -> None:
+        """运行时就绪后注入真实服务并重建源行（构造期可能持有占位/None 服务）。"""
+        self._manager = source_manager
+        self._checker = checker
+        if cookie_manager is not None:
+            self._cookie_manager = cookie_manager
+        self.refresh()
+
     def refresh(self) -> None:
         self._rebuild_rows()
 

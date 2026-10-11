@@ -13,11 +13,14 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import threading
 from pathlib import Path
 from typing import Any
+
+from .atomic_io import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +40,9 @@ DEFAULTS: dict = {
         "user_agents": [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         ],
+        # 源链接批量可用性检查（check_links）并发：None = 不限制，按链接数
+        # 自适应（3..8）；源 constraints 显式配置优先于本值。
+        "check_links_threads": None,
     },
     "ui": {
         "theme": "sakura",
@@ -114,6 +120,12 @@ DEFAULTS: dict = {
         "broken_source_warn_interval_hours": 24,
         "auto_disable_after_failures": 3,
         "selfcheck_strategy": "soft",
+        # 播放死线路黑名单 TTL（秒）：probe 失败的子线路惰性过期时长，
+        # 站修复后超时自动恢复尝试；有效范围 30..3600，越界钳制。
+        "dead_line_ttl_seconds": 600,
+        # 播放 URL 可达性探测超时上限（秒）：probe 只做可达性判断，
+        # 不必等满源配置超时；有效范围 1..30，越界钳制。
+        "play_url_probe_timeout_cap": 5,
     },
 }
 
@@ -146,7 +158,12 @@ class SettingsManager:
 
     # ------------------------------------------------------------------ #
     def get(self, section: str, key: str, default: Any = None) -> Any:
-        return self._data.get(section, {}).get(key, default)
+        with self._lock:
+            value = self._data.get(section, {}).get(key, default)
+        # 内层 list/dict 返回副本，避免调用方原地修改泄漏到内部数据；标量/None 直接返回。
+        if isinstance(value, (list, dict)):
+            return copy.deepcopy(value)
+        return value
 
     def set(self, section: str, key: str, value: Any) -> None:
         self._data.setdefault(section, {})[key] = value
@@ -159,14 +176,11 @@ class SettingsManager:
 
     def save(self) -> None:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             with self._lock:
-                tmp.write_text(
-                    json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-                tmp.replace(self.path)  # 原子替换（锁内：并发 save 不会半写覆盖）
-        except OSError as exc:
+                # 锁内序列化 + 原子替换：并发 save 不会半写覆盖。
+                atomic_write_json(self.path, self._data)
+        except (OSError, TypeError, ValueError) as exc:
+            # OSError：磁盘/权限问题；TypeError/ValueError：值不可 JSON 序列化。
             log.warning("保存配置失败：%s", exc)
 
     def reset_to_defaults(self) -> None:

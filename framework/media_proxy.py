@@ -640,6 +640,15 @@ def _full_zero_offset_response(resp, client_range: str | None = None) -> bool:
             and (not length or (length.isdigit() and int(length) == total)))
 
 
+def _is_contiguous_206(resp, offset: int) -> bool:
+    """206 且 Content-Range 起始字节恰为 offset → 可安全续传（不重叠/无缺口）。"""
+    if resp.status_code != 206:
+        return False
+    cr = resp.headers.get("Content-Range") or ""
+    m = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", cr.strip())
+    return bool(m and int(m.group(1)) == offset)
+
+
 def _content_total(resp) -> int | None:
     """从响应推断完整媒体总长（200+Content-Length / 206+Content-Range）。
 
@@ -675,26 +684,30 @@ class _FileTee:
     """
 
     __slots__ = ("cache", "key", "part", "final", "total", "written",
-                 "fh", "is_mp4", "done", "aborted")
+                 "fh", "is_mp4", "done", "aborted", "resume")
 
     def __init__(self, cache, key: str, part, final, total: int | None,
-                 is_mp4: bool):
+                 is_mp4: bool, resume: int = 0):
         self.cache = cache
         self.key = key
         self.part = part
         self.final = final
         self.total = total
-        self.written = 0
+        self.resume = int(resume or 0)
+        self.written = self.resume
         self.fh = None
         self.is_mp4 = is_mp4
         self.done = False
         self.aborted = False
 
     def start(self) -> bool:
-        """打开 .part 准备写盘；失败返回 False（本次不缓存，仍继续转发）。"""
+        """打开 .part 准备写盘；失败返回 False（本次不缓存，仍继续转发）。
+
+        resume>0：在既有 `.part` 尾部追加（续传），不截断已下载字节。
+        """
         try:
             self.part.parent.mkdir(parents=True, exist_ok=True)
-            self.fh = open(self.part, "wb")
+            self.fh = open(self.part, "ab" if self.resume else "wb")
             self.cache.inflight_add(self.key)
             return True
         except Exception:
@@ -2413,11 +2426,35 @@ class MediaProxy:
             rng = handler.headers.get("Range")
             if rng and not seg_name.endswith(".m3u8"):
                 req_headers["Range"] = rng
+            # 跨重启续传：同一分片存在未完成 `.part` 且客户端未带 Range →
+            # 从已下载偏移向上游续取剩余字节，不重复下载已完成部分。
+            resume_offset = 0
+            part_path = None
+            if not seg_name.endswith(".m3u8") and not rng:
+                part_path = cache.hls_segment_part(cache_key, seg_name)
+                try:
+                    if part_path.is_file():
+                        resume_offset = part_path.stat().st_size
+                except OSError:
+                    resume_offset = 0
+                if resume_offset > 0:
+                    req_headers["Range"] = f"bytes={resume_offset}-"
             fetch_status = None
             fetch_error = None
             try:
                 resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy,
                                        segment=not seg_name.endswith(".m3u8"))
+                if resume_offset and resp.status_code == 416:
+                    # 偏移越界（.part 已完整但尚未提交）→ 弃 part，从头重取。
+                    try:
+                        resp.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    cache.discard_part(part_path)
+                    resume_offset = 0
+                    req_headers.pop("Range", None)
+                    resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy,
+                                           segment=True)
             except Exception as exc:
                 if fetch_owner:
                     cache.finish_fetch(fetch_key, fetch_state, 502, exc)
@@ -2460,22 +2497,54 @@ class MediaProxy:
                     # 上游非 m3u8（动态校验失败/错误页）→ 原样回给播放器
                     self._send_body(handler, resp, first + (resp.raw.read() or b""))
                     return
-                chunked, declared = _send_stream_headers(
-                    handler, resp, override_len=len(first) if whole else None)
-
                 total = len(first) if whole else _content_total(resp)
+                resume = bool(
+                    resume_offset and not handler.headers.get("Range")
+                    and total and total > resume_offset
+                    and _is_contiguous_206(resp, resume_offset))
+                head_bytes = b""
+                if resume:
+                    # 先把磁盘已完成头部读入内存（在 tee 以追加模式打开同一文件
+                    # 之前关闭读句柄，避免 Windows 上的双句柄共享问题）。
+                    try:
+                        head_bytes = cache.hls_segment_part(cache_key, seg_name).read_bytes()
+                    except OSError:
+                        head_bytes = b""
+                    if len(head_bytes) != resume_offset:
+                        resume = False
+                        resume_offset = 0
+                        head_bytes = b""
+                if resume:
+                    # 续传：对客户端仍是完整 200——回放磁盘头部 + 续流剩余字节。
+                    handler.send_response(200)
+                    for hk in _MEDIA_HDRS:
+                        if hk in ("Content-Length", "Content-Range"):
+                            continue
+                        hv = resp.headers.get(hk)
+                        if hv:
+                            handler.send_header(hk, hv)
+                    handler.send_header("Content-Length", str(total))
+                    handler.end_headers()
+                    chunked, declared = False, total
+                else:
+                    chunked, declared = _send_stream_headers(
+                        handler, resp, override_len=len(first) if whole else None)
                 tee = None
-                # /c/ 分片：只对「从头起」的请求落盘（拖动产生的非 0 Range
-                # 不满足 _safe_keys 顺序写前提），与 mp4 tee 规则一致
-                if total and _full_zero_offset_response(
-                        resp, handler.headers.get("Range")):
+                # /c/ 分片：新抓（完整 200）或续传（206 偏移）都落盘；拖动产生的
+                # 非 0 Range 不落盘（不满足顺序写前提），与 mp4 tee 规则一致。
+                if total and (resume or _full_zero_offset_response(
+                        resp, handler.headers.get("Range"))):
                     final = cache.hls_segment_final(cache_key, seg_name)
                     st = _FileTee(cache, cache_key, cache.hls_segment_part(cache_key, seg_name),
-                                  final, total, is_mp4=False)
+                                  final, total, is_mp4=False,
+                                  resume=resume_offset if resume else 0)
                     if st.start():
                         tee = st
                 sent = 0
                 try:
+                    if resume and head_bytes:
+                        handler.wfile.write(_frame(head_bytes, chunked))
+                        sent += len(head_bytes)
                     if first:
                         handler.wfile.write(_frame(first, chunked))
                         sent += len(first)

@@ -1327,6 +1327,14 @@ class SearchPage(BasePage):
         self._more_pending = False
         self._load_more_results()
 
+    def rebind_runtime(self, source_manager, search, content=None) -> None:
+        """运行时就绪后注入真实服务并按启用源刷新（构造期可能持有占位服务）。"""
+        self._manager = source_manager
+        self._search = search
+        if content is not None:
+            self._content = content
+        self.refresh()
+
     def refresh(self) -> None:
         """重建源菜单；已有搜索时清空旧结果并按当前可见源重跑。"""
         self._rebuild_sources_menu()

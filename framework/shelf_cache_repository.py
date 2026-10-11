@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+_OWNED_TMP_PREFIXES = (".payload-", ".delete-")
+
+
 class ShelfCacheRepository:
     def __init__(
         self,
@@ -98,8 +101,24 @@ class ShelfCacheRepository:
                 if not path.exists():
                     self._db.execute("DELETE FROM content WHERE book_key=? AND chapter_key=?", (row["book_key"], row["chapter_key"]))
             for path in self.content_root.rglob("*"):
-                if path.is_file() and (path.suffix == ".tmp" or path.name.startswith(".delete-") or path.resolve() not in indexed):
+                if not path.is_file():
+                    continue
+                if self._is_owned_payload(path) and path.resolve() not in indexed:
                     path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _is_owned_payload(path: Path) -> bool:
+        """仅把仓库自己生成的临时/载荷文件视为可回收孤儿。
+
+        临时文件（put_content 的 .payload-*.tmp、cleanup_inactive 的 .delete-*.tmp）
+        与 payload-*.gz 才删除；绝不触碰 redis_*.gz、redis_shelf.gz.tmp、媒体缓存、
+        背景图等相邻共享缓存，即使 content_root 被误指向共享目录也只删除本仓库
+        命名产物。
+        """
+        name = path.name
+        if name.startswith("payload-") and name.endswith(".gz"):
+            return True
+        return name.endswith(".tmp") and name.startswith(_OWNED_TMP_PREFIXES)
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -140,14 +159,19 @@ class ShelfCacheRepository:
             self._db.execute(f"INSERT INTO {table}(book_key,value_json) VALUES(?,?) ON CONFLICT(book_key) DO UPDATE SET value_json=excluded.value_json", (book_key, self._json(value)))
             self._db.execute("UPDATE books SET last_active_at=? WHERE book_key=?", (self.clock(), book_key))
 
-    def prune_video_history(self) -> None:
+    def prune_video_history(self, book_key: str | None = None) -> None:
         from framework.reading_progress import history_active, video_resume_record
 
         with self._lock, self._db:
-            rows = self._db.execute(
+            query = (
                 "SELECT b.book_key,b.metadata,l.value_json FROM books b "
                 "LEFT JOIN locations l ON l.book_key=b.book_key WHERE b.content_type='video'"
-            ).fetchall()
+            )
+            params: tuple = ()
+            if book_key is not None:
+                query += " AND b.book_key=?"
+                params = (book_key,)
+            rows = self._db.execute(query, params).fetchall()
             for row in rows:
                 metadata = self._loads(row["metadata"])
                 location = self._loads(row["value_json"]) if row["value_json"] else {}
@@ -172,8 +196,21 @@ class ShelfCacheRepository:
                                 (self._json(cleaned), row["book_key"]),
                             )
 
+    def cached_chapter_count(self, book_key: str) -> int:
+        with self._lock:
+            return self._db.execute(
+                "SELECT COUNT(*) FROM content WHERE book_key=?", (book_key,)
+            ).fetchone()[0]
+
+    def get_location(self, book_key: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT value_json FROM locations WHERE book_key=?", (book_key,)
+            ).fetchone()
+            return self._loads(row[0]) if row else None
+
     def get_book_snapshot(self, book_key: str) -> dict | None:
-        self.prune_video_history()
+        self.prune_video_history(book_key)
         with self._lock:
             book = self._db.execute("SELECT * FROM books WHERE book_key=?", (book_key,)).fetchone()
             if not book:
@@ -202,50 +239,66 @@ class ShelfCacheRepository:
     def put_content(self, book_key: str, chapter_key: str, content_type: str, payload: bytes | str, metadata: dict) -> dict:
         raw = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
         checksum = hashlib.sha256(raw).hexdigest()
+        # 锁仅护共享内存/SQLite 结构：命中判断在锁内，gzip 压缩与磁盘 IO 移到锁外，
+        # 避免整段压缩期间阻塞其它读线程（get_content / get_location 等）。
         with self._lock:
             existing = self._db.execute("SELECT * FROM content WHERE book_key=? AND chapter_key=?", (book_key, chapter_key)).fetchone()
             if existing and existing["checksum"] == checksum and existing["content_type"] == content_type and existing["metadata"] == self._json(metadata) and Path(existing["path"]).exists():
                 row = dict(existing)
                 row["metadata"] = metadata
                 return row
-            tmp, path = self._new_payload_paths()
-            try:
-                with gzip.open(tmp, "wb") as fh:
-                    fh.write(raw)
-                    fh.flush()
-                os.replace(tmp, path)
-                now = self.clock()
-                created_at = existing["created_at"] if existing else now
+        tmp, path = self._new_payload_paths()
+        try:
+            with gzip.open(tmp, "wb") as fh:
+                fh.write(raw)
+                fh.flush()
+            os.replace(tmp, path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+            raise
+        stale_path = None
+        try:
+            now = self.clock()
+            with self._lock, self._db:
+                current = self._db.execute(
+                    "SELECT created_at,path FROM content WHERE book_key=? AND chapter_key=?",
+                    (book_key, chapter_key),
+                ).fetchone()
+                created_at = current["created_at"] if current else now
                 row = {"book_key": book_key, "chapter_key": chapter_key, "content_type": content_type, "path": str(path), "size": len(raw), "metadata": self._json(metadata), "checksum": checksum, "created_at": created_at, "accessed_at": now}
-                with self._db:
-                    self._write_content_index(row, now, book_key)
-                if existing:
-                    try:
-                        Path(existing["path"]).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                row["metadata"] = metadata
-                return row
-            except Exception:
-                tmp.unlink(missing_ok=True)
-                path.unlink(missing_ok=True)
-                raise
+                self._write_content_index(row, now, book_key)
+                if current and current["path"] != str(path):
+                    stale_path = Path(current["path"])
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        if stale_path is not None:
+            try:
+                stale_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        row["metadata"] = metadata
+        return row
 
     def get_content(self, book_key: str, chapter_key: str) -> bytes | str | None:
+        # 锁内只取索引行；gzip 解压（可能较慢）在锁外执行，解压失败再回锁删脏索引。
         with self._lock:
             row = self._db.execute("SELECT * FROM content WHERE book_key=? AND chapter_key=?", (book_key, chapter_key)).fetchone()
             if not row:
                 return None
-            try:
-                with gzip.open(row["path"], "rb") as fh:
-                    raw = fh.read()
-            except OSError:
-                with self._db:
-                    self._db.execute("DELETE FROM content WHERE book_key=? AND chapter_key=?", (book_key, chapter_key))
-                return None
-            with self._db:
-                self._db.execute("UPDATE content SET accessed_at=? WHERE book_key=? AND chapter_key=?", (self.clock(), book_key, chapter_key))
-            return raw.decode("utf-8") if row["content_type"].startswith(("text/", "application/json", "application/xml")) else raw
+            path = row["path"]
+            content_type = row["content_type"]
+        try:
+            with gzip.open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            with self._lock, self._db:
+                self._db.execute("DELETE FROM content WHERE book_key=? AND chapter_key=?", (book_key, chapter_key))
+            return None
+        with self._lock, self._db:
+            self._db.execute("UPDATE content SET accessed_at=? WHERE book_key=? AND chapter_key=?", (self.clock(), book_key, chapter_key))
+        return raw.decode("utf-8") if content_type.startswith(("text/", "application/json", "application/xml")) else raw
 
     def _evict_locked(self) -> None:
         for book_key in [r[0] for r in self._db.execute("SELECT book_key FROM books")]:
@@ -338,7 +391,10 @@ class ShelfCacheRepository:
     def cleanup_inactive(self, days: int, now: float | None = None) -> int:
         cutoff = (self.clock() if now is None else now) - days * 86400
         with self._lock:
-            books = [r[0] for r in self._db.execute("SELECT book_key FROM books WHERE last_active_at < ?", (cutoff,))]
+            books = [r[0] for r in self._db.execute(
+                "SELECT book_key FROM books WHERE last_active_at < ? AND COALESCE(pinned,0)=0",
+                (cutoff,),
+            )]
             moved: list[tuple[Path, Path]] = []
             try:
                 for book_key in books:

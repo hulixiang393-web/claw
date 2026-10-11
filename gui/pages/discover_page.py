@@ -97,6 +97,7 @@ class DiscoverPage(BasePage):
         self._restore_rest_scheduled = False
         self._restore_session = 0
         self._restoring_scroll = False  # 钉底/恢复滚动位置时抑制 on_scroll 级联
+        self._detail_generation = 0
         self._current_source = None
         self._current_page = 0
         self._has_more = True
@@ -220,7 +221,17 @@ class DiscoverPage(BasePage):
 
         if self._bus is not None:
             self._bus.subscribe(self._on_visibility_changed)
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.instance().aboutToQuit.connect(self.invalidate_navigation)
         self._reload_sources()
+
+    def invalidate_navigation(self) -> None:
+        self._detail_generation += 1
+
+    def hideEvent(self, event) -> None:
+        self.invalidate_navigation()
+        super().hideEvent(event)
 
     def _on_visibility_changed(self, event) -> None:
         if getattr(event, "type", "") == EVENT_SOURCE_VISIBILITY_CHANGED:
@@ -252,6 +263,14 @@ class DiscoverPage(BasePage):
         viewport.mousePressEvent = on_press
         viewport.mouseMoveEvent = on_move
         viewport.mouseReleaseEvent = on_release
+
+    def rebind_runtime(self, source_manager, discovery, content, bulk_fetch) -> None:
+        """运行时就绪后注入真实服务并刷新源列表（构造期可能持有占位服务）。"""
+        self._manager = source_manager
+        self._discovery = discovery
+        self._content = content
+        self._bulk_fetch = bulk_fetch
+        self._reload_sources()
 
     def _on_type_filter_changed(self, idx: int) -> None:
         """类型筛选变化 → 按类型重建源列表（数据源分类显示）。"""
@@ -1157,12 +1176,20 @@ class DiscoverPage(BasePage):
         if source is None:
             return
         # 后台拉详情，避免主线程卡顿
+        self._detail_generation += 1
+        generation = self._detail_generation
+        epoch = self._source_epoch
         task = _FetchDetailTask(self._content, source, work.url)
-        task.signals.finished.connect(self._on_detail_loaded)
+        task.signals.finished.connect(
+            lambda detail, err: self._on_detail_loaded(detail, err, generation, epoch)
+        )
         self._detail_task = task  # 持有引用
         QThreadPool.globalInstance().start(task)
 
-    def _on_detail_loaded(self, detail, err) -> None:
+    def _on_detail_loaded(self, detail, err, generation=None, epoch=None) -> None:
+        if ((generation is not None and generation != self._detail_generation)
+                or (epoch is not None and epoch != self._source_epoch)):
+            return
         if err or detail is None:
             source_name = getattr(self._current_source, "source_name", "")
             prefix = f"{source_name} " if source_name else ""

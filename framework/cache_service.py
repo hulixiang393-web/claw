@@ -17,6 +17,7 @@ dict + LRU + TTL + 字节配额 + pickle-gz 持久化。永不 raise：
 from __future__ import annotations
 
 import atexit
+import builtins
 import fnmatch
 import gzip
 import logging
@@ -27,10 +28,55 @@ import time
 from collections import OrderedDict
 from typing import Any, Optional
 
+from .atomic_io import atomic_write_stream
+
 log = logging.getLogger(__name__)
 
 # 每 key 的近似固定开销（dict entry + LRU 指针 + ttl 元数据）
 _OVERHEAD_PER_KEY = 200
+
+# 受限反序列化白名单：只允许基础容器/标量，禁止执行未知代码。
+_ALLOWED_BUILTINS = frozenset(
+    {
+        "dict", "list", "set", "frozenset", "tuple", "str", "bytes",
+        "bytearray", "int", "float", "bool", "complex", "NoneType",
+    }
+)
+# 本项目明确允许落盘的自定义类型（发现页会话快照含 Work 实例）。
+_ALLOWED_PROJECT_TYPES = {("framework.discovery", "Work")}
+
+
+class _RestrictedUnpickler(pickle.Unpickler):
+    """缓存专用 unpickler：仅允许白名单类型，篡改/损坏数据触发异常而非执行代码。"""
+
+    def find_class(self, module: str, name: str):
+        if module == "builtins" and name in _ALLOWED_BUILTINS:
+            return getattr(builtins, name)
+        if (module, name) in _ALLOWED_PROJECT_TYPES:
+            import importlib
+
+            return getattr(importlib.import_module(module), name)
+        raise pickle.UnpicklingError(f"缓存反序列化被拒绝：{module}.{name}")
+
+
+def _validate_cache_payload(payload: Any) -> None:
+    """显式结构校验：载荷或条目结构异常即视为缓存损坏。"""
+    if not isinstance(payload, dict):
+        raise ValueError("缓存载荷不是字典")
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise ValueError("缓存 data 不是列表")
+    for entry in data:
+        if (
+            not isinstance(entry, (tuple, list))
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+        ):
+            raise ValueError("缓存条目格式非法")
+    for field in ("ttl", "bytes"):
+        value = payload.get(field)
+        if value is not None and not isinstance(value, dict):
+            raise ValueError(f"缓存 {field} 不是字典")
 
 
 def _value_bytes(value: Any) -> int:
@@ -102,6 +148,9 @@ class RedisLikeStore:
                 self._data.move_to_end(key)  # LRU 命中
                 return self._data[key]
             return None
+
+    def get_cached(self, key: str) -> Any:
+        return self.get(key)
 
     def set(self, key: str, value: Any, ttl: Optional[float] = None) -> bool:
         """写缓存。False = 跳过（单 key 超配额）。"""
@@ -218,7 +267,7 @@ class RedisLikeStore:
 
     # ------------------------------------------------------------------ #
     def save(self) -> None:
-        """落盘（pickle-gz 单文件）。失败静默。"""
+        """落盘（gzip + pickle 单文件，流式写入）。失败静默。"""
         if not self._persist_path:
             return
         try:
@@ -228,19 +277,19 @@ class RedisLikeStore:
                 "bytes": self._bytes,
                 "bytes_used": self._bytes_used,
             }
-            os.makedirs(os.path.dirname(self._persist_path) or ".", exist_ok=True)
-            tmp = self._persist_path + ".tmp"
-            with open(tmp, "wb") as fh:
-                with gzip.GzipFile(fileobj=fh, mode="wb") as gz:
+
+            def _write(handle):
+                with gzip.GzipFile(fileobj=handle, mode="wb") as gz:
                     pickle.dump(payload, gz, protocol=4)
-            os.replace(tmp, self._persist_path)
+
+            atomic_write_stream(self._persist_path, _write)
             self._last_save_ts = time.time()
             self._writes = 0
         except Exception as exc:  # noqa: BLE001
             log.warning("[cache] 落盘失败 %s: %s", self._persist_path, exc)
 
     def load(self) -> None:
-        """读盘。失败静默（空缓存）。"""
+        """读盘。失败/被篡改 → 降级为空缓存（不执行未知代码）。"""
         if not self._persist_path:
             return
         try:
@@ -248,7 +297,8 @@ class RedisLikeStore:
                 return
             with open(self._persist_path, "rb") as fh:
                 with gzip.GzipFile(fileobj=fh, mode="rb") as gz:
-                    payload = pickle.load(gz)
+                    payload = _RestrictedUnpickler(gz).load()
+            _validate_cache_payload(payload)
             with self._lock:
                 self._data = OrderedDict(payload["data"])
                 self._ttl = payload.get("ttl") or {}
@@ -286,23 +336,37 @@ _search_singleton: Optional[RedisLikeStore] = None
 _session_singleton: Optional[RedisLikeStore] = None
 
 
-def _configure_defaults(data_dir: Optional[str] = None) -> None:
-    """将两个池的落盘路径与配额重置到默认值（全局仅一次）。"""
-    global _shelf_singleton, _search_singleton, _session_singleton
+def _configure_shelf(data_dir: Optional[str] = None) -> RedisLikeStore:
+    """按传入目录独立构建书架缓存池。"""
+    global _shelf_singleton
     base = data_dir or _DEFAULT_DATA_DIR
     _shelf_singleton = RedisLikeStore(
         quota=3 * 1024 * 1024 * 1024, persist_path=os.path.join(base, "redis_shelf.gz")
     )
+    return _shelf_singleton
+
+
+def _configure_search(data_dir: Optional[str] = None) -> RedisLikeStore:
+    """按传入目录独立构建搜索/发现缓存池。"""
+    global _search_singleton
+    base = data_dir or _DEFAULT_DATA_DIR
     _search_singleton = RedisLikeStore(
         quota=10 * 1024 * 1024 * 1024, persist_path=os.path.join(base, "redis_search.gz")
     )
-    # 会话级缓存：发现页快照落盘，最多保留最近 5 个源。
+    return _search_singleton
+
+
+def _configure_session(data_dir: Optional[str] = None) -> RedisLikeStore:
+    """按传入目录独立构建会话级缓存池（发现页快照，最多保留最近 5 个源）。"""
+    global _session_singleton
+    base = data_dir or _DEFAULT_DATA_DIR
     _session_singleton = RedisLikeStore(
         quota=2 * 1024 * 1024 * 1024,
         persist_path=os.path.join(base, "redis_session.gz"),
         source_lru_prefix=("snap:", "disc:"),
         source_lru_limit=5,
     )
+    return _session_singleton
 
 
 def _ensure_loaded(store: Optional[RedisLikeStore]) -> Optional[RedisLikeStore]:
@@ -321,7 +385,7 @@ def get_shelf_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]:
     global _shelf_singleton
     if _shelf_singleton is None:
         try:
-            _configure_defaults(data_dir)
+            _configure_shelf(data_dir)
         except Exception as exc:  # noqa: BLE001
             log.warning("[cache] 书架缓存初始化失败: %s", exc)
             _shelf_singleton = None
@@ -333,7 +397,7 @@ def get_search_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]
     global _search_singleton
     if _search_singleton is None:
         try:
-            _configure_defaults(data_dir)
+            _configure_search(data_dir)
         except Exception as exc:  # noqa: BLE001
             log.warning("[cache] 搜索缓存初始化失败: %s", exc)
             _search_singleton = None
@@ -349,7 +413,7 @@ def get_session_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore
     global _session_singleton
     if _session_singleton is None:
         try:
-            _configure_defaults(data_dir)
+            _configure_session(data_dir)
         except Exception as exc:  # noqa: BLE001
             log.warning("[cache] 会话缓存初始化失败: %s", exc)
             _session_singleton = None

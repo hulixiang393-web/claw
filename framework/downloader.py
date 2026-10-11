@@ -39,6 +39,25 @@ def render_name(template: str, **kw) -> str:
     return re.sub(r"\{(\w+)\}", _repl, template)
 
 
+class _SpilledMaterial:
+    """落盘后的章节材料占位（内存有界：大书不再整本驻留内存）。
+
+    novel → files=[单个 .txt]；comic → files=[img_*, ...]（有序）。
+    load() 还原为原始载荷（str / list[bytes]），供 finalize 合成 epub。
+    """
+
+    __slots__ = ("kind", "files")
+
+    def __init__(self, kind: str, files: list[str]) -> None:
+        self.kind = kind
+        self.files = files
+
+    def load(self):
+        if self.kind == "novel":
+            return Path(self.files[0]).read_text(encoding="utf-8")
+        return [Path(f).read_bytes() for f in self.files]
+
+
 class Downloader:
     """按内容类型落盘的下载执行器。
 
@@ -92,7 +111,93 @@ class Downloader:
         missing = index + 1 - len(task.epub_chapters)
         if missing > 0:
             task.epub_chapters.extend([None] * missing)
-        task.epub_chapters[index] = (title, payload)
+        task.epub_chapters[index] = (title, self._maybe_spill(task, index, payload))
+
+    # ---- 内存有界：超阈值把章节材料落盘，以 _SpilledMaterial 占位 ------- #
+    def _material_root(self) -> Path:
+        import tempfile
+
+        return Path(tempfile.gettempdir()) / "claw_epub_materials"
+
+    def _material_dir(self, task) -> Path:
+        key = sanitize_filename(getattr(task, "task_id", "") or "task")
+        return self._material_root() / key
+
+    def _material_threshold(self) -> int:
+        try:
+            return int(self._settings.get(
+                "download", "epub_material_bytes", 64 * 1024 * 1024
+            ) or 0)
+        except Exception:  # noqa: BLE001
+            return 64 * 1024 * 1024
+
+    @staticmethod
+    def _payload_size(payload) -> int:
+        if isinstance(payload, str):
+            return len(payload.encode("utf-8"))
+        if isinstance(payload, (bytes, bytearray)):
+            return len(payload)
+        try:
+            return sum(len(b) for b in payload if b)
+        except TypeError:
+            return 0
+
+    def _spill_payload(self, task, index: int, payload) -> _SpilledMaterial:
+        d = self._material_dir(task)
+        d.mkdir(parents=True, exist_ok=True)
+        if isinstance(payload, str):
+            f = d / f"{index:06d}.txt"
+            f.write_text(payload, encoding="utf-8")
+            return _SpilledMaterial("novel", [str(f)])
+        files: list[str] = []
+        for i, b in enumerate(payload or []):
+            if not b:
+                continue
+            f = d / f"{index:06d}_{i:04d}.img"
+            f.write_bytes(b)
+            files.append(str(f))
+        return _SpilledMaterial("comic", files)
+
+    def _maybe_spill(self, task, index: int, payload):
+        """累计材料超过阈值后：把已有材料一并落盘，并新增也落盘（内存回落）。"""
+        threshold = self._material_threshold()
+        if threshold <= 0:
+            return payload
+        size = self._payload_size(payload)
+        total = int(getattr(task, "_epub_material_bytes", 0) or 0) + size
+        setattr(task, "_epub_material_bytes", total)
+        active = bool(getattr(task, "_spill_active", False))
+        if not active and total <= threshold:
+            return payload
+        if not active:
+            setattr(task, "_spill_active", True)
+            for i, item in enumerate(task.epub_chapters):
+                if item is None:
+                    continue
+                title, material = item
+                if isinstance(material, _SpilledMaterial):
+                    continue
+                task.epub_chapters[i] = (title, self._spill_payload(task, i, material))
+        return self._spill_payload(task, index, payload)
+
+    @staticmethod
+    def _resolve_payload(payload):
+        return payload.load() if isinstance(payload, _SpilledMaterial) else payload
+
+    def _resolve_item(self, item):
+        title, payload = item
+        return (title, self._resolve_payload(payload))
+
+    def discard_materials(self, task) -> None:
+        """清理章节材料临时目录并复位溢出状态（取消/重启时调用）。"""
+        import shutil
+
+        try:
+            shutil.rmtree(self._material_dir(task), ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+        setattr(task, "_spill_active", False)
+        setattr(task, "_epub_material_bytes", 0)
 
     def _ordered_epub_chapters(self, task) -> list[tuple[str, object]]:
         chapters = list(getattr(task, "epub_chapters", []) or [])
@@ -101,19 +206,21 @@ class Downloader:
         selected = list(getattr(task, "selected", []) or [])
         done = set(getattr(task, "done_chapters", []) or [])
         if done:
-            return [
+            picked = [
                 item
                 for index, item in enumerate(chapters)
                 if item is not None and index in done
             ]
-        if not any(item is None for item in chapters):
-            return [item for item in chapters if item is not None]
-        return [
-            item
-            for index, item in enumerate(chapters)
-            if item is not None
-            and (not selected or (index < len(selected) and selected[index]))
-        ]
+        elif not any(item is None for item in chapters):
+            picked = [item for item in chapters if item is not None]
+        else:
+            picked = [
+                item
+                for index, item in enumerate(chapters)
+                if item is not None
+                and (not selected or (index < len(selected) and selected[index]))
+            ]
+        return [self._resolve_item(item) for item in picked]
 
     # ------------------------------------------------------------------ #
     def download_chapter(self, source, task, chapter, index: int) -> int:
@@ -932,6 +1039,7 @@ class Downloader:
         book_dir.mkdir(parents=True, exist_ok=True)
         out = book_dir / f"{sanitize_filename(task.title or 'untitled')}.epub"
         if self._skip_file(out):
+            self.discard_materials(task)  # 续传命中：材料不再需要
             return out  # 已存在（续传）
         ctype = task.content_type
         title = task.title or "untitled"
@@ -940,4 +1048,5 @@ class Downloader:
             build_comic_epub(title, out, chapters, merge=merge)
         else:
             build_novel_epub(title, out, chapters, merge=merge)
+        self.discard_materials(task)  # 合成成功：清理落盘材料
         return out

@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -102,8 +104,8 @@ def test_fetch_comic_pages_second_hit_zero_network():
     imgs = c.fetch_comic_pages(src, url)
     assert imgs == ["https://c.example/pic/1.jpg", "https://c.example/pic/2.jpg"]
     assert http.calls.get(url, 0) == 1
-    key = f"pages:{src.source_id}:{url}"
-    assert store.get(key) == imgs  # URL 列表已落 pages: 键（7 天）
+    key = f"pages:v3:{src.source_id}:{url}"
+    assert store.get(key) == imgs  # URL 列表已落 pages:v3: 键（7 天）
 
     # 二次（模拟重启后/重开同一章）：直接命中 Redis，不再下载
     imgs2 = c.fetch_comic_pages(src, url)
@@ -129,6 +131,50 @@ def test_fetch_cover_reuses_detail_cache():
     cover2 = c.fetch_cover(src, url)
     assert cover2 == cover
     assert http.calls.get(url, 0) == 1
+
+
+def test_fetch_comic_pages_concurrent_dedup_single_network():
+    """B8：同一漫画章并发预取/加载时只发一份网络请求。
+
+    两个线程同时抓取同一 URL（跳过缓存强制走抓取路径），在途结果
+    应被复用（_inflight_call 去重），底层 HTTP 只被调用一次。
+    """
+    store = _make_store()
+    http = _FakeHttp()
+
+    class _SlowHttp(_FakeHttp):
+        def get_text(self, url, **kw):
+            time.sleep(0.2)
+            return super().get_text(url, **kw)
+
+    slow = _SlowHttp()
+    c = _make_content(store, slow)
+    src = SourceConfig.from_dict(COMIC_RAW, "<mem>")
+    url = "https://c.example/ch/1.html"
+    results = {}
+    errors = []
+
+    def _call():
+        try:
+            results[threading.get_ident()] = c.fetch_comic_pages(
+                src, url, use_cache=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_call)
+    t2 = threading.Thread(target=_call)
+    t1.start()
+    time.sleep(0.05)  # 确保 t1 已进入在途抓取
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors
+    expected = ["https://c.example/pic/1.jpg", "https://c.example/pic/2.jpg"]
+    for r in results.values():
+        assert r == expected
+    assert slow.calls.get(url, 0) == 1  # 并发同资源仅一次网络请求
 
 
 if __name__ == "__main__":

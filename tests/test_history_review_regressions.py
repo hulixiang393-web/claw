@@ -6,6 +6,7 @@ import pytest
 import framework.external_player as player
 from framework.library_store import LibraryStore
 from framework.reading_progress import ReadingProgress
+from framework.search_history import SearchHistory
 
 
 @pytest.fixture
@@ -15,6 +16,25 @@ def history_clock(monkeypatch):
     clock = [1800000000.0]
     monkeypatch.setattr(module.time, "time", lambda: clock[0])
     return clock
+
+
+def test_bootstrap_history_snapshot_does_not_write_cleanup(tmp_path, history_clock):
+    search_path = tmp_path / "search.json"
+    search_path.write_text(json.dumps([{"keyword": "old", "timestamp": 1}]), encoding="utf-8")
+    search_before = search_path.read_bytes()
+    search = SearchHistory(search_path, defer_cleanup=True)
+    assert search.recent() == []
+    assert search_path.read_bytes() == search_before
+
+    progress_path = tmp_path / "progress.json"
+    progress_path.write_text(json.dumps({"book": {
+        "book_url": "book", "content_type": "video", "history_timestamp": 1,
+        "chapter_url": "c", "location": {"seconds": 1}
+    }}), encoding="utf-8")
+    progress_before = progress_path.read_bytes()
+    progress = ReadingProgress(progress_path, defer_cleanup=True)
+    assert progress.all() == {}
+    assert progress_path.read_bytes() == progress_before
 
 
 def test_search_ttl_capacity_and_refresh(tmp_path, history_clock):
@@ -412,6 +432,35 @@ def test_seek_recovery_is_bounded(mode, monkeypatch):
     assert writes and writes[-1]["seconds"] == 31
     monitor.tick()
     assert len(commands) == (0 if mode == "too_long" else 1)
+
+
+@pytest.mark.parametrize("resume, expected", [
+    ({"seconds": 120}, "120"),
+    ({"position": 0.5}, "450"),
+])
+def test_seek_target_uses_saved_progress_not_fixed_offset(resume, expected, monkeypatch):
+    """E1 回归：续播寻位用「已保存进度」（秒或播放比例），而非固定 ±10s。
+
+    外置播放器回退路径在播放开始后按历史进度一次寻位——历史里存的是绝对
+    seconds，或 0~1 的 position 比例（比例 × 时长）。此处锁定寻位目标等于
+    保存进度，防止退化成固定偏移。
+    """
+    state = {"port": 1}
+    proc = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(player, "_control_state", state)
+    monkeypatch.setattr(player, "_last_proc", proc)
+    monkeypatch.setattr(player.time, "monotonic", lambda: 100.0)
+    status = {"item_id": 7, "seconds": 0, "duration": 900, "state": "playing"}
+    monkeypatch.setattr(player, "player_status", lambda **kw: dict(status))
+    monkeypatch.setattr(player, "player_playlist_items",
+                        lambda **kw: [{"id": 7, "uri": "file:///D:/a.mp4"}])
+    commands = []
+    monkeypatch.setattr(player, "player_command",
+                        lambda *a, **kw: commands.append(a) or True)
+    monitor = player.PlaybackMonitor(
+        state, proc, [(0, "D:/a.mp4")], lambda i, loc: None, {0: dict(resume)})
+    monitor.tick()
+    assert commands == [("seek", expected)]
 
 
 def test_local_browser_handoff_preserves_privacy_and_precision(_qapp, tmp_path, monkeypatch):

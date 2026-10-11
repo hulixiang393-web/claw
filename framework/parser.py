@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
@@ -21,6 +22,11 @@ try:
     _LXML = True
 except ImportError:
     _LXML = False
+
+log = logging.getLogger(__name__)
+
+# 未装 lxml 的回退模式只告警一次（进程内），避免每次解析都刷日志
+_WARNED_FALLBACK = False
 
 
 def _normalize_selector(sel: dict) -> Optional[dict]:
@@ -48,7 +54,14 @@ class Parser:
             try:
                 return lxml.html.fromstring(html)
             except Exception:
+                pass
+            try:
                 return lxml.html.document_fromstring(html)
+            except Exception:
+                # D7：解析失败不再静默；记录可观察错误后向上抛出，交由调用方
+                # 处理（fail visible），避免把不可解析的 HTML 当作有效文档。
+                log.error("HTML 解析失败（lxml 无法构造文档），已按失败处理")
+                raise
         return html
 
     # ------------------------------------------------------------------ #
@@ -168,16 +181,31 @@ class Parser:
         root_selector: dict | None,
         fields: Dict[str, dict | None],
         base_url: str,
+        *,
+        source_id: str = "",
+        page_url: str = "",
     ) -> List[Dict[str, str]]:
         """按字段表解析条目列表。
 
         root_selector 定位每个条目根；fields 是 {字段名: selector}。
         返回 [{字段: 值}]，相对 URL 已拼接。
+        source_id / page_url 只用于诊断日志（可选），不影响解析结果。
         """
         root_selector = _normalize_selector(root_selector)
         if not self._lxml:
-            # 降级：整页当单条目
-            return [self._parse_fields_on_doc(doc, fields, base_url)]
+            # D7：缺少 lxml 是「解析器不可用」状态，不再静默降级。旧行为把整页
+            # 当单条目返回，结果错误且掩盖了配置/环境问题。这里明确记录错误并
+            # 返回明确失败（空列表），让上层可观察、可定位（fail visible）。
+            global _WARNED_FALLBACK
+            if not _WARNED_FALLBACK:
+                _WARNED_FALLBACK = True
+                log.error(
+                    "解析器不可用：未安装 lxml，无法按 selector 解析条目，已返回空结果"
+                    "（source=%s url=%s）。请安装：pip install lxml。",
+                    source_id or "-",
+                    page_url or base_url or "-",
+                )
+            return []
         if root_selector is None:
             roots = [doc]
         else:

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from framework.content import Content, Detail
 from framework.settings_manager import reader_prefetch_settings
 from framework.source_manager import SourceManager
+from framework.reading_progress import GenerationGuard
 
 from .reader.novel_view import NovelView
 from .reader.comic_view import ComicView
@@ -108,7 +109,8 @@ class ReaderPage(BasePage):
         self._font_scale = float(font_scale or 1.0)
         self._current_source_id = None
         self._current_book_url = None
-        self._switch_generation = 0
+        self._switch_guard = GenerationGuard()
+        self._switch_generation = self._switch_guard.current()
         self._switch_task = None
         self._current_start_url = ""
         self._current_content_type = ""  # 当前作品类型（收藏时记录）
@@ -255,7 +257,11 @@ class ReaderPage(BasePage):
             self.open(sid, url, ctype)
 
     def _invalidate_source_switch(self):
-        self._switch_generation += 1
+        if hasattr(self, '_switch_guard'):
+            self._switch_guard.invalidate()
+            self._switch_generation = self._switch_guard.current()
+        else:
+            self._switch_generation += 1
         self._switch_task = None
 
     def _is_current_source_switch(self, task):
@@ -272,7 +278,7 @@ class ReaderPage(BasePage):
         detail, new_sid = payload[0], payload[1]
         if (detail is None or not new_sid or not self._current_book_url
                 or self._current_content_type != "video"
-                or detail is not self.video_view._detail
+                or detail is not getattr(self.video_view, "detail", None)
                 or self.video_view.library_url != self._current_book_url
                 or detail.source_id != self._current_source_id):
             return
@@ -303,7 +309,7 @@ class ReaderPage(BasePage):
             return
         self._switch_task = None
         self.video_view.play_label.setText(f"换源失败：{err}")
-        self.video_view.set_source_sid(self.video_view._current_sid)
+        self.video_view.set_source_sid(self.video_view.current_sid)
 
     def _on_progress_signal(self, payload) -> None:
         """记录阅读进度（换章/换集/滚动/翻页/播放触发）。
@@ -314,11 +320,26 @@ class ReaderPage(BasePage):
         """
         if self._reading_progress is None or not isinstance(payload, (tuple, list)):
             return
-        detail, title = payload[0], payload[1]
-        url = payload[2] if len(payload) > 2 else ""
-        position = payload[3] if len(payload) > 3 else None
-        page = payload[4] if len(payload) > 4 else None
-        location = payload[5] if len(payload) > 5 else None
+        try:
+            if len(payload) >= 6:
+                detail, title, url, position, page, location = payload[0], payload[1], payload[2], payload[3], payload[4], payload[5]
+            elif len(payload) == 5:
+                detail, title, url, position, page = payload[0], payload[1], payload[2], payload[3], payload[4]
+                location = None
+            elif len(payload) == 4:
+                detail, title, url, position = payload[0], payload[1], payload[2], payload[3]
+                page = None
+                location = None
+            elif len(payload) == 3:
+                detail, title, url = payload[0], payload[1], payload[2]
+                position = page = location = None
+            elif len(payload) == 2:
+                detail, title = payload[0], payload[1]
+                url = position = page = location = None
+            else:
+                return
+        except (IndexError, TypeError):
+            return
         if detail is None:
             return
         library_url = (location or {}).get("library_url", "") if isinstance(location, dict) else ""
@@ -398,12 +419,36 @@ class ReaderPage(BasePage):
         if self._reading_progress is None or not self._current_book_url:
             return
         view = self.stack.currentWidget()
-        if view in (self.novel_view, self.comic_view):
-            ctx = view.current_context()
-            if ctx is not None:
-                pos, page = view.position_snapshot()
-                location = view._build_current_location()
-                self._on_progress_signal((*ctx, pos, page, location))
+        from framework.reading_progress import PositionSnapshot
+
+        ctx = PositionSnapshot.make_current_context(view)
+        if ctx is not None:
+            pos, page = PositionSnapshot.make_position_snapshot(view)
+            location = PositionSnapshot.make_location(view)
+            self._on_progress_signal((*ctx, pos, page, location))
+            return
+        # For views that don't implement the common helpers but follow known patterns
+        # epub: chapter_changed gives (path, title); position_changed gives (path, ratio)
+        if view is self.epub_view:
+            try:
+                ctx = getattr(view, 'current_context', lambda: None)()
+                if ctx is not None:
+                    pos, page = getattr(view, 'position_snapshot', lambda: (0.0, None))()
+                    loc = getattr(view, '_build_current_location', lambda: None)()
+                    self._on_progress_signal((*ctx, pos, page, loc))
+            except Exception:
+                pass
+            return
+        if view is self.video_view:
+            try:
+                ctx = getattr(view, 'current_context', lambda: None)()
+                if ctx is not None:
+                    pos, page = getattr(view, 'position_snapshot', lambda: (None, None))()
+                    loc = getattr(view, '_build_current_location', lambda: None)()
+                    self._on_progress_signal((*ctx, pos, page, loc))
+            except Exception:
+                pass
+            return
 
     def flush_progress(self) -> None:
         """对外：落盘当前阅读进度（App 退出 / 切走阅读 Tab 时调用）。
@@ -425,8 +470,9 @@ class ReaderPage(BasePage):
             return
         view = self.novel_view if self._current_content_type == "novel" else self.comic_view
         chapter_url = ""
-        if 0 <= getattr(view, "_current_idx", -1) < len(getattr(view, "_chapters", [])):
-            chapter_url = getattr(view._chapters[view._current_idx], "url", "")
+        ctx = getattr(view, "current_context", lambda: None)()
+        if isinstance(ctx, (tuple, list)) and len(ctx) >= 3:
+            chapter_url = ctx[2] or ""
         try:
             pos, page = view.position_snapshot()
             self._pending_position, self._pending_page = pos, page
@@ -715,8 +761,7 @@ class ReaderPage(BasePage):
             if last_title:
                 for i, ch in enumerate(chapters):
                     if ch.title == last_title:
-                        self.epub_view._pending_pos = last_pos
-                        self.epub_view._load_chapter(i)
+                        self.epub_view.load_chapter(i, last_pos)
                         show = ch.title
                         break
             self.title_label.setText(show)

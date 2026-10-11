@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from framework.media_cache import _strip_signed_params
 
-from PySide6.QtCore import Qt, QTimer, QElapsedTimer, Signal, QThreadPool, QRunnable, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject
 from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -34,6 +34,16 @@ from PySide6.QtWidgets import (
 
 from framework.content import Content, Detail
 
+from gui.pages.reader.comic_tasks import (
+    _PixmapDecodeSignals,
+    _PixmapDecodeTask,
+    _ComicSignals,
+    _LoadComicTask,
+    _PrefetchSignals,
+    _PrefetchRenderTask,
+)
+from gui.pages.reader.auto_scroll import AutoScrollMixin
+
 # 预加载后续话数：当前话加载完成即预渲染后续 PREFETCH_COUNT 话（串行队列，不抢当前话首屏）
 PREFETCH_COUNT = 3  # 默认向后预加载话数
 PREFETCH_BACK = 1  # 默认向前缓存话数
@@ -46,16 +56,18 @@ LAZY_BATCH = 12
 # 默认 3 档 = 90*1.25^2 ≈ 140px/s（原 480px/s 整体偏快，已下调）。
 AUTO_BASE_PX_PER_SEC = 90.0
 AUTO_RATIO = 1.25
-AUTO_TICK_MS = 16  # 高频帧驱动：对齐 60Hz 屏幕刷新，视觉连续不断顿
 
 
-class ComicView(QWidget):
+class ComicView(AutoScrollMixin, QWidget):
     """漫画翻页阅读视图。"""
 
     chapter_changed = Signal(object)  # 发 (detail, chapter_title, chapter_url)
     position_changed = Signal(object)  # (detail, title, url, position, None) 章内位置续读
     fullscreen_requested = Signal()  # 工具条 ⛶ → ReaderPage 切主窗全屏
     background_cycle_requested = Signal()  # 「背景」按钮 → ReaderPage 循环切换护眼背景色
+
+    AUTO_SCROLL_TICK_MS = 16  # 高频帧驱动：对齐 60Hz 屏幕刷新，视觉连续不断顿
+    AUTO_SCROLL_PRECISE = True
 
     def __init__(self, content: Content, parent=None):
         super().__init__(parent)
@@ -87,15 +99,11 @@ class ComicView(QWidget):
         self._restore_cancel_token = 0
         self._reading_bg = ""  # 阅读区独立背景色（空=透明跟随主题）
         self._reading_fg = ""  # 夜间黑等深色背景下的前景色（漫画以图为主，预留）
-        self._auto_scrolling = False  # 自动滚动开关
+        self._auto_scrolling = False  # 自动滚动开关（状态机由 AutoScrollMixin 接管）
         self._auto_pos = 0.0  # 自动滚动记住的位置（浮点，按速度递增，重排不打断）
-        # 自动滚动定时器：高频帧驱动（16ms≈60fps，对齐屏幕刷新），步进按真实经过
-        # 时间换算成像素，避免低频跳变（35ms+固定步进 = 一顿一顿）与定时器抖动。
-        self._auto_timer = QTimer(self)
-        self._auto_timer.setInterval(16)
-        self._auto_timer.setTimerType(Qt.PreciseTimer)
-        self._auto_elapsed = QElapsedTimer()  # 帧间真实耗时基准（速度恒定）
-        self._auto_last_tick = 0.0  # 上一帧时间戳（单调秒），dt 基准
+        # 自动滚动定时器：高频帧驱动（16ms、PreciseTimer，对齐屏幕刷新），
+        # 步进按真实经过时间换算成像素，避免低频跳变与定时器抖动。
+        self._build_auto_scroll_timer()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -210,7 +218,6 @@ class ComicView(QWidget):
         if app is not None:
             app.installEventFilter(self)
         # 自动滚动定时器 + 快捷键
-        self._auto_timer.timeout.connect(self._auto_scroll_tick)
         QShortcut(QKeySequence(Qt.Key_Space), self).activated.connect(self._toggle_auto_scroll)
         # 用户手动拖动滚动条时停止自动滚动（否则每 16ms tick 会拉回原位，无法拖动）
         self.scroll.verticalScrollBar().sliderPressed.connect(self._on_scrollbar_user_interaction)
@@ -977,28 +984,7 @@ class ComicView(QWidget):
             pass
 
     # ---- 自动滚动 ----
-    def _toggle_auto_scroll(self) -> None:
-        """切换自动滚动：停止/启动，按钮文字同步更新。"""
-        if self._auto_scrolling:
-            self._stop_auto_scroll()
-        else:
-            vbar = self.scroll.verticalScrollBar()
-            if vbar.maximum() <= 0 or self._mode != "gallery":
-                return
-            self._auto_scrolling = True
-            self._auto_pos = float(vbar.value())  # 记住当前位置，按速度递增
-            self._auto_elapsed.start()
-            self._auto_last_tick = time.monotonic()
-            self.auto_scroll_btn.setText("⏸ 停止")
-            self._auto_timer.start()
 
-    def _stop_auto_scroll(self) -> None:
-        """停止自动滚动并复位按钮。"""
-        if not self._auto_scrolling:
-            return
-        self._auto_scrolling = False
-        self._auto_timer.stop()
-        self.auto_scroll_btn.setText("▶ 自动滚动")
 
     def _on_scrollbar_user_interaction(self) -> None:
         """用户手动拖动滚动条（sliderPressed）时停止自动滚动，让手动接管。"""
@@ -1006,31 +992,6 @@ class ComicView(QWidget):
         self._scroll_epoch += 1
         self._stop_auto_scroll()
 
-    def _auto_scroll_tick(self) -> None:
-        """按真实经过时间推进位置，向下平滑滚动；到底自动停止。
-
-        用独立的浮点位置 `_auto_pos` 累积，不读回 `vbar.value()`：图片懒加载
-        重排不会打断推进节奏，也不会因重排修正叠加导致跳过某一页。
-
-        步进 = 速度(px/s) × 本帧真实耗时：即使事件循环繁忙导致 tick 抖动，
-        滚动也保持恒定速度帧间连续，不出现「按固定频率一下一下跳」的顿挫感。
-        """
-        vbar = self.scroll.verticalScrollBar()
-        if vbar.maximum() <= 0:
-            self._stop_auto_scroll()
-            return
-        now = time.monotonic()
-        dt = now - self._auto_last_tick
-        self._auto_last_tick = now
-        if dt > 0.1:  # 长时间挂起（切后台/卡顿恢复）不一次性猛跳
-            dt = AUTO_TICK_MS / 1000.0
-        speed_px_s = self._auto_speed_px_s(self.auto_scroll_speed_slider.value())
-        self._auto_pos += speed_px_s * dt
-        if self._auto_pos >= vbar.maximum():
-            vbar.setValue(vbar.maximum())
-            self._stop_auto_scroll()
-            return
-        vbar.setValue(int(self._auto_pos))
 
     def _auto_speed_px_s(self, level: int) -> float:
         """档位速度（px/s）：等比数列，相邻档位相差 1.25 倍。
@@ -1040,14 +1001,16 @@ class ComicView(QWidget):
         """
         return AUTO_BASE_PX_PER_SEC * (AUTO_RATIO ** (level - 1))
 
-    def _update_auto_scroll_slider_state(self) -> None:
-        """根据当前模式启用/禁用自动滚动速度滑块。
 
-        只按模式判定（不依赖 maximum>0）：漫画懒加载分批渲染，加载结束瞬间
-        maximum 可能仍为 0 造成滑块被误禁用且后续不再刷新 → 拖不动。画廊模式
-        下始终可拖（数值只是档位，无需内容高度）。
-        """
-        self.auto_scroll_speed_slider.setEnabled(self._mode == "gallery")
+
+    def _auto_scroll_step(self, dt: float) -> float:
+        """每帧推进量：按真实经过时间 × 速度曲线（AutoScrollMixin 驱动）。"""
+        speed_px_s = self._auto_speed_px_s(self.auto_scroll_speed_slider.value())
+        return speed_px_s * dt
+
+    def _auto_scroll_allowed(self) -> bool:
+        """画廊模式允许自动滚动。"""
+        return self._mode == "gallery"
 
     def _restore_position_with_retry(self, pos: float, tries: int = 8) -> None:
         """按 0~1 比例恢复滚动位置，重试链随懒加载高度增长逐步到位。
@@ -1223,36 +1186,6 @@ class ComicView(QWidget):
         super().keyPressEvent(event)
 
 
-class _PixmapDecodeSignals(QObject):
-    """后台图片解码完成信号（跨线程回主线程）。"""
-
-    done = Signal(object)  # QImage（解码失败/空 → null QImage）
-
-
-class _PixmapDecodeTask(QRunnable):
-    """后台线程解码图片字节 → QImage（JPEG/PNG 解压是重活，移出主线程防卡 UI）。
-
-    主线程收到 QImage 后仅做 QPixmap.fromImage（轻量拷贝），不再阻塞解压。
-    """
-
-    def __init__(self, data: bytes):
-        super().__init__()
-        self.signals = _PixmapDecodeSignals()
-        self._data = data
-
-    def run(self) -> None:
-        img = QImage()
-        try:
-            if self._data:
-                img.loadFromData(self._data)
-        except Exception:  # noqa: BLE001
-            img = QImage()
-        try:
-            self.signals.done.emit(img)
-        except RuntimeError:
-            pass
-
-
 class _ComicImageLabel(QLabel):
     """漫画单页图片（异步加载 + 跟随容器宽度自适应缩放）。
 
@@ -1375,98 +1308,3 @@ class _ComicImageLabel(QLabel):
             # 点击放大查看（简化：切换为原始大小）
             pass
         super().mousePressEvent(event)
-
-
-class _ComicSignals(QObject):
-    """漫画加载信号。"""
-    finished = Signal(object, object, object, object)  # (gen, chapter, images, err)
-    partial = Signal(object, object, object, object)  # (gen, chapter, 已就绪前缀, None) 边抓边显示
-
-
-class _LoadComicTask(QRunnable):
-    """后台加载漫画话图片 URL（on_page 分批回调，边抓边显示）。"""
-
-    def __init__(self, content, source, chapter, gen: int = 0, cancel_evt=None, use_cache=True):
-        super().__init__()
-        self.signals = _ComicSignals()
-        self._content = content
-        self._source = source
-        self._chapter = chapter
-        self._gen = gen
-        self._cancel_evt = cancel_evt  # 换书取消令牌：置位后分页抓取尽早退出
-        self._use_cache = use_cache
-
-    def run(self) -> None:
-        images, err = [], None
-        try:
-            try:
-                images = self._content.fetch_comic_pages(
-                    self._source, self._chapter.url,
-                    on_page=self._emit_partial, cancel_evt=self._cancel_evt,
-                    use_cache=self._use_cache,
-                )
-            except TypeError as exc:
-                if "use_cache" not in str(exc):
-                    raise
-                images = self._content.fetch_comic_pages(
-                    self._source, self._chapter.url,
-                    on_page=self._emit_partial, cancel_evt=self._cancel_evt,
-                )
-        except Exception as exc:
-            err = str(exc)
-        try:
-            self.signals.finished.emit(self._gen, self._chapter, images, err)
-        except RuntimeError:
-            pass
-
-    def _emit_partial(self, part) -> None:
-        """解密/抓取进度分批回调 → 主线程 partial 信号（增量渲染）。"""
-        try:
-            self.signals.partial.emit(self._gen, self._chapter, list(part), None)
-        except RuntimeError:
-            pass
-
-
-class _PrefetchSignals(QObject):
-    """预加载信号。"""
-
-    finished = Signal(object, object, object, object)  # (gen, chapter_url, images, err)
-
-
-class _PrefetchRenderTask(QRunnable):
-    """后台预渲染后续话的图片（fetch_comic_pages 全量渲染）。
-
-    提前把下一话的 canvas base64 图都取好，切话时 _load_episode 命中
-    _prefetched[url]["images"] → 秒开，不用现场爬 Playwright。
-    """
-
-    def __init__(self, content, source, chapter, gen: int = 0, cancel_evt=None, use_cache=True):
-        super().__init__()
-        self.signals = _PrefetchSignals()
-        self._content = content
-        self._source = source
-        self._chapter = chapter
-        self._gen = gen
-        self._cancel_evt = cancel_evt  # 换书取消令牌：置位后分页抓取尽早退出
-        self._use_cache = use_cache
-
-    def run(self) -> None:
-        images, err = [], None
-        try:
-            try:
-                images = self._content.fetch_comic_pages(
-                    self._source, self._chapter.url, cancel_evt=self._cancel_evt,
-                    use_cache=self._use_cache,
-                )
-            except TypeError as exc:
-                if "use_cache" not in str(exc):
-                    raise
-                images = self._content.fetch_comic_pages(
-                    self._source, self._chapter.url, cancel_evt=self._cancel_evt
-                )
-        except Exception as exc:
-            err = str(exc)
-        try:
-            self.signals.finished.emit(self._gen, self._chapter.url, images, err)
-        except RuntimeError:
-            pass

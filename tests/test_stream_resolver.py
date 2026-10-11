@@ -600,3 +600,108 @@ def test_invalidation_is_scoped_to_source_and_url():
     assert resolver.resolve(_Source(), "https://site/episode") == ("https://cdn/fresh.mp4", "")
     assert resolver.resolve(source, "https://site/episode") == ("https://cdn/old.mp4", "")
     assert resolver.resolve(_Source(), "https://site/other") == ("https://cdn/old.mp4", "")
+
+
+# ---------------------------------------------------------------------- #
+# D4：源级流解析选项（signed_query_names / cache_ttl）
+# ---------------------------------------------------------------------- #
+def test_instance_signed_query_names_merge_with_builtin():
+    resolver = StreamResolver(_Content(), cache_ttl=30, signed_query_names=["x-sign", "X-TOKEN"])
+    assert "x-sign" in resolver._signed_query_names
+    assert "x-token" in resolver._signed_query_names  # 大写下沉
+    assert "token" in resolver._signed_query_names  # 内置集保留（含相邻键）
+    assert "expire" in resolver._signed_query_names
+
+
+def test_resolve_per_call_cache_ttl_is_used_for_cache_write(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("framework.stream_resolver.time.monotonic", lambda: now[0])
+    content = _Content([("https://cdn/video.m3u8", "")])
+    resolver = StreamResolver(content, cache_ttl=60)
+    assert resolver.resolve(_Source(), "https://site/episode", cache_ttl=2) == (
+        "https://cdn/video.m3u8",
+        "",
+    )
+    key = ("demo", "https://site/episode", "", True)
+    expires_at = resolver._cache[key][0]
+    assert expires_at == pytest.approx(102.0)
+    now[0] = 102.1
+    assert resolver.resolve(_Source(), "https://site/episode") == ("https://cdn/video.m3u8", "")
+    assert content.calls == 2  # 短路 TTL 已过 → 重新取流
+
+
+def test_resolve_per_call_signed_names_override_defeats_cache(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("framework.stream_resolver.time.monotonic", lambda: now[0])
+    content = _Content([("https://cdn/video.m3u8?x-sign=abc", "")])
+    resolver = StreamResolver(content, cache_ttl=60)
+    assert resolver.resolve(_Source(), "https://site/episode", signed_query_names=["x-sign"]) == (
+        "https://cdn/video.m3u8?x-sign=abc",
+        "",
+    )
+    now[0] = 102.0
+    assert resolver.resolve(_Source(), "https://site/episode", signed_query_names=["x-sign"]) == (
+        "https://cdn/video.m3u8?x-sign=abc",
+        "",
+    )
+    assert content.calls == 2  # 命中签名参数 → 永不可缓存
+
+
+def test_stream_resolver_options_reads_source_raw():
+    from framework.stream_resolver import stream_resolver_options
+
+    source = type("Source", (), {"raw": {"stream_resolver": {
+        "signed_query_names": ["x-sign"],
+        "cache_ttl": "12.5",
+    }}})()
+    assert stream_resolver_options(source) == {
+        "signed_query_names": ["x-sign"],
+        "cache_ttl": 12.5,
+    }
+    # 显式入参优先
+    assert stream_resolver_options(source, signed_query_names=["other"])["signed_query_names"] == ["other"]
+    assert stream_resolver_options(source, cache_ttl=3)["cache_ttl"] == 3.0
+    # 非法 cache_ttl 省略（走 resolver 默认）
+    assert "cache_ttl" not in stream_resolver_options(source, cache_ttl="abc")
+    # 未配置 → 空 dict
+    assert stream_resolver_options(type("S", (), {"raw": {}})()) == {}
+
+
+# ---------------------------------------------------------------------- #
+# D4：实例级默认从 settings 读取 + 非法输入安全回退
+# ---------------------------------------------------------------------- #
+def test_stream_resolver_defaults_from_settings_manager(tmp_path):
+    from framework.settings_manager import SettingsManager
+
+    settings = SettingsManager(tmp_path / "settings.json")
+    settings.set("sources_runtime", "stream_cache_ttl_seconds", 12.5)
+    settings.set("sources_runtime", "stream_signed_query_names", ["X-Sign", "appsig"])
+    from framework.stream_resolver import stream_resolver_defaults
+
+    opts = stream_resolver_defaults(settings)
+    assert opts["cache_ttl"] == 12.5
+    assert list(opts["signed_query_names"]) == ["X-Sign", "appsig"]
+
+
+def test_stream_resolver_defaults_from_dict_and_missing_falls_back():
+    from framework.stream_resolver import stream_resolver_defaults
+
+    # 未配置键 → 不返回任何覆盖（走 StreamResolver 内置硬编码默认）
+    assert stream_resolver_defaults({"sources_runtime": {}}) == {}
+    assert stream_resolver_defaults(None) == {}
+    assert stream_resolver_defaults("bogus") == {}
+    # 非法类型 → 回退默认（不返回键）
+    assert stream_resolver_defaults(
+        {"sources_runtime": {"stream_cache_ttl_seconds": "abc"}}
+    ) == {}
+
+
+def test_resolver_init_bad_ttl_and_bad_names_fall_back():
+    # 非法 TTL / 不可迭代 names：回退内置默认，不抛异常（安全默认）
+    r = StreamResolver(_Content(), cache_ttl="not-a-number", signed_query_names=12345)
+    assert r._cache_ttl == StreamResolver.DEFAULT_CACHE_TTL
+    assert "signature" in r._signed_query_names
+    # None names → 仍保留内置签名集
+    r2 = StreamResolver(_Content(), cache_ttl=None)
+    assert r2._cache_ttl == StreamResolver.DEFAULT_CACHE_TTL
+    assert "token" in r2._signed_query_names

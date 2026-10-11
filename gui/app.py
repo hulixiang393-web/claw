@@ -13,9 +13,18 @@ import logging
 import math
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, QTimer, Qt
+from PySide6.QtCore import (
+    QObject,
+    QRunnable,
+    QSignalBlocker,
+    QThreadPool,
+    QTimer,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,6 +57,351 @@ from gui.pages.search_page import SearchPage
 from gui.pages.download_page import DownloadPage
 
 log = logging.getLogger(__name__)
+
+# 退出时对后台线程池 / VLC 预热线程的有界等待上限（超时容忍，绝不无限阻塞退出）。
+_POOL_WAIT_MS = 2000
+_VLC_WARMUP_JOIN_S = 2.0
+
+
+class _AppRunnable(QRunnable):
+    """gui/app.py 内后台 QRunnable 基类：收敛重复的构造与回收样板。
+
+    - 统一 QRunnable 初始化（子类只需调用 super().__init__()）；
+    - emit_safe：跨线程发信号时若接收者已销毁（RuntimeError）静默丢弃，
+      与既有 `except RuntimeError: pass` 语义一致，行为不变。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @staticmethod
+    def emit_safe(signal, *args) -> None:
+        """线程安全地 emit：接收者已销毁（RuntimeError）时丢弃，不抛出。"""
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            pass
+
+
+class _BootstrapSourceManager:
+    """运行时就绪前的占位 SourceManager：只提供只读空结果，避免页面构造期崩溃。
+
+    真实服务在 READY 后通过各页 rebind_runtime 注入，本对象只承担占位；
+    任何写操作（set_event_bus 等）都是无副作用的空实现。
+    """
+
+    def all(self):
+        return []
+
+    def list_broken(self):
+        return []
+
+    def count_by_type(self):
+        return {}
+
+    def count_enabled(self):
+        return 0
+
+    def count_broken(self):
+        return 0
+
+    def get(self, source_id):
+        return None
+
+    def discoverable_sources(self):
+        return []
+
+    def enabled_sources(self):
+        return []
+
+    def set_event_bus(self, bus) -> None:
+        return None
+
+    def set_adult_visible(self, visible) -> None:
+        return None
+
+    def apply_enabled_selection(self, selected_ids) -> None:
+        return None
+
+    def get_health(self, source_id):
+        from framework.source_manager import SourceHealth
+
+        return SourceHealth()
+
+
+class _SettingsSnapshot:
+    _missing = object()
+
+    def __init__(self, data):
+        self._data = data
+
+    def get(self, section, key=_missing, default=None):
+        value = self._data.get(section, {})
+        if key is self._missing:
+            return dict(value) if isinstance(value, dict) else {}
+        return value.get(key, default) if isinstance(value, dict) else default
+
+    def get_section(self, section):
+        return self.get(section)
+
+
+@dataclass
+class _RuntimeServices:
+    source_manager: object
+    cookie_manager: object
+    shelf_cache: object
+    search_cache: object
+    shelf_cache_repository: object
+    http: object
+    parser: object
+    checker: object
+    discovery: object
+    decrypter: object
+    content: object
+    bulk_fetch: object
+    provider_memory: object
+    search: object
+    download_queue: object
+
+
+class _StartupSignals(QObject):
+    ready = Signal(object, int)
+    failed = Signal(str, int)
+
+
+def _release_services(services) -> None:
+    """释放一套未发布的运行时服务（失败/迟到/取消）：关闭连接、回收资源。
+
+    幂等且静默：任何一步失败都不抛出，避免释放路径本身再次影响主流程。
+    """
+    if services is None:
+        return
+    for name, method in (("shelf_cache_repository", "close"), ("http", "close")):
+        resource = getattr(services, name, None)
+        closer = getattr(resource, method, None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                log.debug("释放运行时服务 %s 失败", name, exc_info=True)
+
+
+class _EventBusQtBridge(QObject):
+    """把任意线程 emit 的事件排队投递回 GUI 线程执行。
+
+    `forward` 可能在下载 worker 等后台线程被调用；通过 Qt 信号
+    （QueuedConnection，接收者生命周期在主线程）保证 handler 始终在主线程执行。
+    close() 后迟发事件直接丢弃，且单个 handler 异常被隔离并记录。
+    """
+
+    event = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._closed = False
+        self.event.connect(self._deliver, Qt.QueuedConnection)
+
+    def forward(self, handler, event) -> None:
+        if self._closed:
+            return
+        self.event.emit((handler, event))
+
+    def _deliver(self, payload) -> None:
+        if self._closed:
+            return
+        handler, event = payload
+        try:
+            handler(event)
+        except Exception:  # noqa: BLE001 —— 隔离单订阅者异常，不影响其它
+            log.exception(
+                "事件订阅者处理失败：%s",
+                getattr(handler, "__qualname__", type(handler).__name__),
+            )
+
+    def close(self) -> None:
+        self._closed = True
+
+
+class _GuiEventBus:
+    """页面用的 EventBus 门面：订阅回调统一经桥接在主线程执行。
+
+    页面拿到的就是这个对象，只暴露 subscribe/unsubscribe/emit；所有订阅
+    包装后经 _EventBusQtBridge 回主线程，后台线程 emit 不再直接触碰 QWidget。
+    """
+
+    def __init__(self, bus, bridge):
+        self._bus = bus
+        self._bridge = bridge
+        self._wrappers = {}
+
+    def subscribe(self, handler) -> None:
+        if handler in self._wrappers:
+            return
+        def wrapper(event, _handler=handler):
+            self._bridge.forward(_handler, event)
+
+        self._wrappers[handler] = wrapper
+        self._bus.subscribe(wrapper)
+
+    def unsubscribe(self, handler) -> None:
+        wrapper = self._wrappers.pop(handler, None)
+        if wrapper is not None:
+            self._bus.unsubscribe(wrapper)
+
+    def emit(self, event) -> None:
+        self._bus.emit(event)
+
+    def close(self) -> None:
+        for wrapper in list(self._wrappers.values()):
+            self._bus.unsubscribe(wrapper)
+        self._wrappers.clear()
+
+
+class _StartupTask(threading.Thread):
+    def __init__(self, window, base_dir, settings_snapshot, library_store, generation, signals, cancel):
+        super().__init__(daemon=True, name="runtime-startup")
+        self._window = window
+        self._base_dir = base_dir
+        self._library_store = library_store
+        self._settings = settings_snapshot
+        self._generation = generation
+        self._cancel = cancel
+        self._signals = signals
+
+    def run(self) -> None:
+        try:
+            from framework.cache_service import get_shelf_cache, get_search_cache
+            from framework.cookie_manager import CookieManager
+            from framework.shelf_cache_repository import ShelfCacheRepository
+            from framework.shelf_cache_migration import migrate_legacy_data
+            from framework.shelf_service import ShelfService
+            from framework.ikanpp_provider_memory import ProviderMemory
+
+            base_dir = self._base_dir
+            settings = self._settings
+            source_manager = SourceManager(
+                sources_dir=base_dir / "sources",
+                health_file=base_dir / "data" / "health.json",
+                runtime_settings=settings,
+            )
+            cookie_manager = CookieManager(base_dir / "data")
+            source_manager.set_cookie_provider(cookie_manager.to_cookie_header)
+            shelf_cache = get_shelf_cache(str(base_dir / "data" / "cache"))
+            search_cache = get_search_cache(str(base_dir / "data" / "cache"))
+            from framework.settings_manager import shelf_cache_settings
+            cfg = shelf_cache_settings(settings)
+            repository = ShelfCacheRepository(
+                base_dir / "data" / "shelf.sqlite3",
+                base_dir / "data" / "cache" / "payload",
+                max_book_bytes=cfg["max_book_mb"] * 1024 * 1024,
+                max_total_bytes=cfg["max_total_mb"] * 1024 * 1024,
+                repair_index=False,
+            )
+            legacy_shelf = ShelfService(
+                settings.get("download", "output_dir", "downloads"),
+                library_store=self._library_store,
+                data_dir=base_dir / "data",
+            )
+            _run_startup_migration(
+                repository,
+                base_dir / "data" / "reading_progress.json",
+                legacy_shelf,
+                shelf_cache,
+                base_dir,
+            )
+            repository.repair_index()
+
+            http = HttpClient(defaults=network_defaults_from_settings(settings))
+            parser = Parser()
+            checker = StructureChecker(
+                http,
+                parser,
+                default_strategy=settings.get("sources_runtime", "selfcheck_strategy", "soft"),
+            )
+            discovery = Discovery(http, parser, checker, health_reporter=source_manager)
+            decrypter = Decrypter(http)
+            content = Content(
+                http,
+                parser,
+                checker,
+                decrypter,
+                health_reporter=source_manager,
+                repository=repository,
+            )
+            bulk_fetch = BulkFetch(discovery, event_bus=None, index_dir=base_dir / "data")
+            provider_memory = ProviderMemory(base_dir / "data" / "ikanpp_provider_memory.json")
+            search = Search(
+                http,
+                parser,
+                discovery,
+                concurrent=int(settings.get("network", "concurrent_search_sources", 4)),
+                cookie_manager=cookie_manager,
+                provider_memory=provider_memory,
+            )
+            download_queue = DownloadQueue(
+                content=content,
+                http=http,
+                settings=settings,
+                source_manager=source_manager,
+                event_bus=None,
+                history_path=base_dir / "data" / "downloads.json",
+            )
+            content._cache = shelf_cache
+            discovery.cache = search_cache
+            search.cache = search_cache
+            http.cache = None
+            services = _RuntimeServices(
+                source_manager,
+                cookie_manager,
+                shelf_cache,
+                search_cache,
+                repository,
+                http,
+                parser,
+                checker,
+                discovery,
+                decrypter,
+                content,
+                bulk_fetch,
+                provider_memory,
+                search,
+                download_queue,
+            )
+            if self._cancel.is_set():
+                _release_services(services)
+                return
+            _run_deferred_history_cleanup(self._window)
+            self._signals.ready.emit(services, self._generation)
+        except Exception as exc:
+            try:
+                repository.close()
+            except (NameError, AttributeError, OSError):
+                log.debug("启动失败后关闭 shelf repository 失败", exc_info=True)
+            log.exception("后台初始化基础服务失败")
+            if self._cancel.is_set():
+                return
+            try:
+                self._signals.failed.emit(f"{type(exc).__name__}: {exc}", self._generation)
+            except RuntimeError:
+                pass
+
+
+def _run_deferred_history_cleanup(window) -> None:
+    """启动后台阶段执行搜索历史/阅读进度的延迟清理与落盘。
+
+    仅由 _StartupTask.run（后台线程）调用：保证 bootstrap 首帧构造只读，
+    清理/脱敏/写盘不发生在主/UI 线程；清理基于内存当前数据，不覆盖
+    后台阶段期间用户的新写入。仓库引用仍由发布成功后主线程挂接。
+    """
+    history = getattr(window, "search_history", None)
+    progress = getattr(window, "reading_progress", None)
+    try:
+        if history is not None:
+            history.run_deferred_cleanup()
+        if progress is not None:
+            progress.run_deferred_cleanup()
+    except Exception:  # noqa: BLE001 —— 清理失败只记录日志，不阻塞服务发布
+        log.exception("后台清理历史/进度失败")
 
 # 导航栏顺序（对应 ui-index.md）
 TABS = [
@@ -96,7 +450,7 @@ def _sync_source_visibility(settings, source_manager, event_bus=None) -> None:
 
 def _make_reading_progress(path: Path, shelf_cb, repository=None):
     from framework.reading_progress import ReadingProgress
-    return ReadingProgress(path, shelf_cb=shelf_cb, repository=repository)
+    return ReadingProgress(path, shelf_cb=shelf_cb, repository=repository, defer_cleanup=True)
 
 
 def _legacy_chapters_root(base_dir: Path) -> Path:
@@ -234,135 +588,48 @@ class MainWindow(QMainWindow):
         # 锁死最小尺寸：防止详情抽屉/内容变化时窗口自动缩放或闪屏
         self.setMinimumSize(900, 640)
 
-        # 基础设施
         base_dir = _app_base_dir()
+        self._base_dir = base_dir
         self.settings = SettingsManager(base_dir / "app_config.json")
         self.event_bus = EventBus()
+        self._runtime_bridge = _EventBusQtBridge(self)
+        self._gui_bus = _GuiEventBus(self.event_bus, self._runtime_bridge)
+        self._gui_bus.subscribe(self._on_download_event)
         self.theme_manager = ThemeManager(self.settings)
-        self.source_manager = SourceManager(
-            sources_dir=base_dir / "sources",
-            health_file=base_dir / "data" / "health.json",
-            runtime_settings=self.settings,
-        )
-        # 登录 Cookie 管理：源管理界面登录 → 存 cookie → 请求自动附带
-        from framework.cookie_manager import CookieManager
-
-        self.cookie_manager = CookieManager(base_dir / "data")
-        self.source_manager.set_cookie_provider(self.cookie_manager.to_cookie_header)
-        self.search_history = SearchHistory(base_dir / "data" / "search_history.json", privacy=self._ensure_library_store())
-        from framework.shelf_cache_repository import ShelfCacheRepository
         from framework.library_store import LibraryStore
-        from framework.shelf_service import ShelfService
-        from framework.cache_service import get_shelf_cache, get_search_cache
-        shelf_cache = None
-        try:
-            shelf_cache = get_shelf_cache(str(base_dir / "data" / "cache"))
-        except Exception:
-            shelf_cache = None
+
+        self.library_store = LibraryStore(base_dir / "data" / "library.json")
+        self.search_history = SearchHistory(
+            base_dir / "data" / "search_history.json", privacy=self.library_store,
+            defer_cleanup=True,
+        )
+        self.source_manager = _BootstrapSourceManager()
+        self.cookie_manager = None
+        self.shelf_cache = None
+        self.search_cache = None
         self.shelf_cache_repository = None
-        try:
-            from framework.settings_manager import shelf_cache_settings
-            cfg = shelf_cache_settings(self.settings)
-            self.shelf_cache_repository = ShelfCacheRepository(
-                base_dir / "data" / "shelf.sqlite3",
-                base_dir / "data" / "cache",
-                max_book_bytes=cfg["max_book_mb"] * 1024 * 1024,
-                max_total_bytes=cfg["max_total_mb"] * 1024 * 1024,
-                repair_index=False,
-            )
-        except Exception:
-            self.shelf_cache_repository = None
+        self.http = None
+        self.parser = None
+        self.checker = None
+        self.discovery = None
+        self.decrypter = None
+        self.content = None
+        self.bulk_fetch = None
+        self.ikanpp_provider_memory = None
+        self.search = None
+        self.download_queue = None
         self.reading_progress = _make_reading_progress(
-            base_dir / "data" / "reading_progress.json",
-            self._favorite_has,
-            self.shelf_cache_repository,
+            base_dir / "data" / "reading_progress.json", self._favorite_has
         )
-        if self.shelf_cache_repository is not None:
-            try:
-                legacy_store = LibraryStore(base_dir / "data" / "library.json")
-                legacy_shelf = ShelfService(
-                    self.settings.get("download", "output_dir", "downloads"),
-                    library_store=legacy_store,
-                    data_dir=base_dir / "data",
-                )
-                _run_startup_migration(
-                    self.shelf_cache_repository,
-                    base_dir / "data" / "reading_progress.json",
-                    legacy_shelf,
-                    shelf_cache,
-                    base_dir,
-                )
-            except Exception:
-                self.shelf_cache_repository = None
-                self.reading_progress = _make_reading_progress(
-                    base_dir / "data" / "reading_progress.json",
-                    self._favorite_has,
-                )
-        self.reading_progress.prune(shelf_cb=self._favorite_has)
-
-        # 爬取执行链（网络默认值从 settings 接线：impersonate/user_agents 默认关闭）
-        self.http = HttpClient(defaults=network_defaults_from_settings(self.settings))
-        self.parser = Parser()
-        self.checker = StructureChecker(
-            self.http, self.parser,
-            default_strategy=self.settings.get("sources_runtime", "selfcheck_strategy", "soft"),
-        )
-        self.discovery = Discovery(
-            self.http, self.parser, self.checker, health_reporter=self.source_manager
-        )
-        self.decrypter = Decrypter(self.http)
-        self.content = Content(
-            self.http, self.parser, self.checker, self.decrypter,
-            health_reporter=self.source_manager,
-            repository=self.shelf_cache_repository,
-        )
-        self.bulk_fetch = BulkFetch(
-            self.discovery,
-            event_bus=self.event_bus,
-            index_dir=base_dir / "data",
-        )
-        from framework.ikanpp_provider_memory import ProviderMemory
-
-        self.ikanpp_provider_memory = ProviderMemory(
-            base_dir / "data" / "ikanpp_provider_memory.json"
-        )
-        self.search = Search(
-            self.http, self.parser, self.discovery,
-            concurrent=int(self.settings.get("network", "concurrent_search_sources", 4)),
-            cookie_manager=self.cookie_manager,
-            provider_memory=self.ikanpp_provider_memory,
-        )
-        self.download_queue = DownloadQueue(
-            content=self.content,
-            http=self.http,
-            settings=self.settings,
-            source_manager=self.source_manager,
-            event_bus=self.event_bus,
-            history_path=base_dir / "data" / "downloads.json",
-        )
-        # 下载完成/新增 → 刷新书架（新下载的书出现在本地组）；收藏变化在 _on_favorite 刷新
-        self.event_bus.subscribe(self._on_download_event)
-        # Redis 持久化缓存注入：书架池（封面/详情/正文/漫画页）+ 搜索&发现池（搜索/列表）。
-        # 数据目录随 data/ 走 settings（与首页索引同目录）。
-        search_cache = get_search_cache(str(base_dir / "data" / "cache"))
-        self.discovery.cache = search_cache
-        self.content._cache = shelf_cache
-        self.search.cache = search_cache
-        self.http.cache = None  # 上层显式查/写，HttpClient 仅持句柄供复用（不透明拦截）
-        # 封面缓存预算接线（cover_cache_size_mb）+ 书架封面持久化
-        from gui.components.cover_loader import CoverLoader
-
-        CoverLoader.instance().configure(
-            self.settings.get("ui", "cover_cache_size_mb", 256),
-            shelf_cache=shelf_cache,
-        )
-        # 正文图/封面下载收敛到框架 HttpClient：共享实例带 CF cookie / impersonate 等能力
-        CoverLoader.instance().use_http(self.http)
-        # 登记全部源：列表/搜索封面回填只传 source_id，需据此补源级 direct
-        # （爱丽丝等直连源封面经系统代理会失败/变慢 → 封面空白）
-        for _src in self.source_manager.all():
-            CoverLoader.instance().register_source(_src)
-        _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
+        self._runtime_state = "UNINITIALIZED"
+        self._runtime_generation = 0
+        self._runtime_task = None
+        self._runtime_cancel = threading.Event()
+        self._runtime_signals = _StartupSignals()
+        self._runtime_signals.ready.connect(self._on_runtime_ready)
+        self._runtime_signals.failed.connect(self._on_runtime_failed)
+        self._pending_navigation = None
+        self._closing = False
 
         # Tab 索引映射
         self._tab_index = {key: i for i, (_, key) in enumerate(TABS)}
@@ -390,14 +657,244 @@ class MainWindow(QMainWindow):
         # 全局快捷键
         self._install_shortcuts()
 
-        # 首次启动源选择引导（可跳过；未做过源选择时窗口显示后弹出）
-        self._schedule_source_selection()
 
     def _apply_initial_theme(self) -> None:
         if not self._initial_theme_pending:
             return
         self._initial_theme_pending = False
         self._apply_theme_qss(self.theme_manager.current_key())
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._runtime_state == "UNINITIALIZED":
+            QTimer.singleShot(0, self._start_runtime_initialization)
+
+    def _start_runtime_initialization(self) -> None:
+        if self._closing or self._runtime_state == "LOADING":
+            return
+        self._runtime_state = "LOADING"
+        self._runtime_cancel.set()
+        self._runtime_cancel = threading.Event()
+        self._runtime_generation += 1
+        generation = self._runtime_generation
+        snapshot = _SettingsSnapshot(self.settings.as_dict())
+        self._runtime_signals = _StartupSignals()
+        self._runtime_signals.ready.connect(self._on_runtime_ready)
+        self._runtime_signals.failed.connect(self._on_runtime_failed)
+        self._runtime_task = _StartupTask(
+            self,
+            self._base_dir,
+            snapshot,
+            self.library_store,
+            generation,
+            self._runtime_signals,
+            self._runtime_cancel,
+        )
+        self._runtime_task.start()
+
+    def _on_runtime_ready(self, services, generation: int) -> None:
+        # 迟到/已关闭的 ready：直接回收这套私有服务，绝不覆盖新 generation 状态
+        if self._closing or generation != self._runtime_generation:
+            _release_services(services)
+            return
+        try:
+            self._prepare_runtime_services(services)
+        except Exception as exc:
+            # 发布失败：_prepare_runtime_services 已整体回滚 self 引用，
+            # 此处回收私有连接并进入可重试 FAILED。
+            try:
+                self.reading_progress.attach_repository(None)
+            except Exception:  # noqa: BLE001
+                log.exception("发布失败后解除阅读进度仓库绑定失败")
+            _release_services(services)
+            self._on_runtime_failed(f"{type(exc).__name__}: {exc}", generation)
+            return
+        # 所有绑定完成后才置 READY
+        self._runtime_state = "READY"
+        for step in (
+            self._replace_runtime_placeholders,
+            self._schedule_source_selection,
+            self._replace_pending_navigation,
+        ):
+            try:
+                step()
+            except Exception:  # noqa: BLE001 —— 后置 UI 动作失败不影响已发布服务
+                log.exception("READY 后置动作失败：%s", getattr(step, "__name__", step))
+
+    def _prepare_runtime_services(self, services) -> None:
+        """把可失败的绑定/配置做完，最后一次性发布服务引用。
+
+        发布语义为「先备齐全部服务对象 → 单一原子提交点 → 失败整体回滚」：
+        1) 备齐阶段先收集本次要发布的全部字段值，不改动 self 上的服务引用；
+        2) 提交阶段先快照将被覆盖字段的旧值，任一步失败即恢复全部旧引用与
+           进度仓库绑定，避免异常路径残留半套服务。成功后由调用方置 READY。
+        """
+        services.download_queue._bus = self.event_bus
+        services.bulk_fetch._bus = self.event_bus
+        from gui.components.cover_loader import CoverLoader
+
+        CoverLoader.instance().configure(
+            self.settings.get("ui", "cover_cache_size_mb", 256),
+            shelf_cache=services.shelf_cache,
+        )
+        CoverLoader.instance().use_http(services.http)
+        for source in services.source_manager.all():
+            CoverLoader.instance().register_source(source)
+
+        # 备齐：先取齐所有字段值（provider_memory 对外名为 ikanpp_provider_memory）
+        published = {}
+        for name in _RuntimeServices.__dataclass_fields__:
+            target = "ikanpp_provider_memory" if name == "provider_memory" else name
+            published[target] = getattr(services, name)
+
+        # 单一原子提交点：快照旧值 → 提交 → 任一步失败整体回滚
+        previous = {target: getattr(self, target, None) for target in published}
+        try:
+            for target, value in published.items():
+                setattr(self, target, value)
+            # 清理/脱敏/写盘已在后台线程完成；这里仅补挂仓库引用（幂等）。
+            self.reading_progress.attach_repository(services.shelf_cache_repository)
+            _sync_source_visibility(self.settings, services.source_manager, self.event_bus)
+            self._rebind_pages(services)
+        except BaseException:
+            for target, value in previous.items():
+                setattr(self, target, value)
+            try:
+                self.reading_progress.attach_repository(None)
+            except Exception:  # noqa: BLE001
+                log.exception("发布失败回滚：解除阅读进度仓库绑定失败")
+            raise
+
+    def _rebind_pages(self, services) -> None:
+        """把已构建页面的占位/旧服务替换为真实运行时服务（未构建的保持惰性）。"""
+        page = getattr(self, "home_page", None)
+        if page is not None:
+            page.set_runtime_services(services.source_manager, services.bulk_fetch)
+            page.set_runtime_status("")
+        binder = getattr(getattr(self, "discover_page", None), "rebind_runtime", None)
+        if callable(binder):
+            binder(
+                services.source_manager, services.discovery,
+                services.content, services.bulk_fetch,
+            )
+        binder = getattr(getattr(self, "search_page", None), "rebind_runtime", None)
+        if callable(binder):
+            binder(services.source_manager, services.search, services.content)
+        binder = getattr(getattr(self, "source_page", None), "rebind_runtime", None)
+        if callable(binder):
+            binder(services.source_manager, services.checker, services.cookie_manager)
+        binder = getattr(getattr(self, "library_page", None), "rebind_runtime", None)
+        if callable(binder):
+            binder(
+                services.source_manager, services.content,
+                services.shelf_cache_repository,
+            )
+
+    def _on_runtime_failed(self, error: str, generation: int) -> None:
+        if self._closing or generation != self._runtime_generation:
+            return
+        self._runtime_state = "FAILED"
+        page = getattr(self, "home_page", None)
+        if page is not None:
+            page.set_runtime_status("基础服务初始化失败，可重试")
+
+    def _replace_pending_navigation(self) -> None:
+        pending = self._pending_navigation
+        self._pending_navigation = None
+        if pending is None:
+            return
+        channel, action = pending
+        idx = self._tab_index.get(channel)
+        if idx is not None:
+            self._ensure_tab_page(idx)
+        if callable(action):
+            try:
+                action()
+            except Exception:  # noqa: BLE001
+                log.exception("执行待处理导航失败：%s", channel)
+        elif idx is not None:
+            self.tabs.setCurrentIndex(idx)
+
+    def _replace_runtime_placeholders(self) -> None:
+        idx = self.tabs.currentIndex()
+        if idx >= 0 and TABS[idx][1] in self._lazy_tab_builders:
+            self._ensure_tab_page(idx)
+
+    def closeEvent(self, event) -> None:
+        # 退出编排：停止新任务 → 使旧回调失效 → 有界等待 worker/线程池/VLC 预热
+        # 收尾 → flush → 关闭 repository 连接。全程有界，不强杀事务线程。
+        self._closing = True
+        self._runtime_cancel.set()
+        self._runtime_generation += 1
+        self._runtime_state = "CLOSING"
+        try:
+            self._gui_bus.close()
+        except Exception:  # noqa: BLE001
+            log.debug("退出：关闭 GUI 事件总线失败", exc_info=True)
+        try:
+            self._runtime_bridge.close()
+        except Exception:  # noqa: BLE001
+            log.debug("退出：关闭运行时事件桥失败", exc_info=True)
+        task = self._runtime_task
+        is_alive = getattr(task, "is_alive", None)
+        join = getattr(task, "join", None)
+        if task is not None and callable(is_alive) and is_alive() and callable(join):
+            join(5.0)  # 有界等待，不阻塞退出过久
+        # 有界等待线程池与 VLC 预热线程收尾（超时容忍，绝不无限阻塞退出）
+        self._wait_for_background_tasks()
+        try:
+            reader = getattr(self, "reader", None)
+            if reader is not None:
+                reader.flush_progress()
+        except Exception:  # noqa: BLE001
+            log.debug("退出：落盘阅读进度失败", exc_info=True)
+        self._clear_task_references()
+        self._close_bound_services()
+        super().closeEvent(event)
+
+    def _wait_for_background_tasks(self) -> None:
+        """有界等待全局线程池与 VLC 预热线程收尾；超时容忍，不无限阻塞退出。"""
+        try:
+            done = QThreadPool.globalInstance().waitForDone(_POOL_WAIT_MS)
+        except Exception:  # noqa: BLE001
+            done = False
+            log.debug("退出：等待线程池失败", exc_info=True)
+        if not done:
+            log.debug("退出：线程池仍有任务未在 %dms 内完成，容忍超时", _POOL_WAIT_MS)
+        thread = getattr(self, "_vlc_warmup_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(_VLC_WARMUP_JOIN_S)
+            if thread.is_alive():
+                log.debug(
+                    "退出：VLC 预热线程未在 %.1fs 内结束，容忍超时", _VLC_WARMUP_JOIN_S
+                )
+
+    def _clear_task_references(self) -> None:
+        """清空 App 持有的后台任务引用（退出释放，避免集合常驻内存）。"""
+        for attr in ("_cover_backfill_tasks", "_bg_compose_tasks", "_dl_tasks"):
+            tasks = getattr(self, attr, None)
+            if tasks:
+                tasks.clear()
+
+    def _close_bound_services(self) -> None:
+        """关闭已发布的 repository / http 连接（幂等）。"""
+        repo = getattr(self, "shelf_cache_repository", None)
+        if repo is not None:
+            closer = getattr(repo, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001
+                    log.debug("退出：关闭 shelf_cache_repository 失败", exc_info=True)
+            self.shelf_cache_repository = None
+        http = getattr(self, "http", None)
+        if http is not None:
+            closer = getattr(http, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001
+                    log.debug("退出：关闭 http 连接失败", exc_info=True)
 
     # ------------------------------------------------------------------ #
     def _build_pages(self) -> None:
@@ -411,6 +908,8 @@ class MainWindow(QMainWindow):
         self._lazy_tab_builders = {
             "discover": self._build_discover,
             "search": self._build_search,
+            "reader": self._build_reader,
+            "download": self._build_download,
             "library": self._build_library,
             "source": self._build_source,
             "settings": self._build_settings,
@@ -418,10 +917,6 @@ class MainWindow(QMainWindow):
         for label, key in TABS:
             if key == "home":
                 page = self._build_home()
-            elif key == "reader":
-                page = self._build_reader()
-            elif key == "download":
-                page = self._build_download()
             elif key in self._lazy_tab_builders:
                 page = self._build_placeholder(label)
             else:
@@ -434,8 +929,14 @@ class MainWindow(QMainWindow):
         builder = self._lazy_tab_builders.get(key)
         if builder is None:
             return self.tabs.widget(idx)
+        # 阅读/下载需要真实服务，未 READY 时保持占位（导航意图由 pending 承接）；
+        # 发现/搜索/书架/源管理/设置可在任意状态构造，READY 后经 rebind 注入真实服务。
+        if key in {"reader", "download"} and self._runtime_state != "READY":
+            return self.tabs.widget(idx)
         selected_idx = self.tabs.currentIndex()
+
         page = builder()
+
         self._lazy_tab_builders.pop(key, None)
         old = self.tabs.widget(idx)
         label = self.tabs.tabText(idx)
@@ -489,7 +990,10 @@ class MainWindow(QMainWindow):
         # 放后台线程不阻塞启动；首播时实例已就绪 → 秒开。
         from framework.vlc_player import warmup_vlc
 
-        threading.Thread(target=warmup_vlc, daemon=True, name="vlc-warmup").start()
+        self._vlc_warmup_thread = threading.Thread(
+            target=warmup_vlc, daemon=True, name="vlc-warmup"
+        )
+        self._vlc_warmup_thread.start()
         return self.reader
 
     def _on_reader_fullscreen(self, fs: bool) -> None:
@@ -532,7 +1036,7 @@ class MainWindow(QMainWindow):
             discovery=self.discovery,
             content=self.content,
             bulk_fetch=self.bulk_fetch,
-            event_bus=self.event_bus,
+            event_bus=self._gui_bus,
             theme_manager=self.theme_manager,
             session_cache=get_session_cache(),
             settings=self.settings,
@@ -595,8 +1099,8 @@ class MainWindow(QMainWindow):
             self.reader.flush_progress()
         self._last_tab_idx = idx
         page = self._ensure_tab_page(idx)
-        if page is getattr(self, "library_page", None) and hasattr(page, "refresh"):
-            page.refresh()
+        if page is getattr(self, "library_page", None) and hasattr(page, "activate"):
+            page.activate()
 
     # ------------------------------------------------------------------ #
     def _on_batch_add_shelf(self, items, folder="") -> None:
@@ -637,12 +1141,12 @@ class MainWindow(QMainWindow):
         """
         if not items:
             return
-        from PySide6.QtCore import QThreadPool, QRunnable, QObject, Signal
+        from PySide6.QtCore import QObject, Signal
 
         class _ShelfDlSignals(QObject):
             done = Signal(object)  # (list[(result, detail_or_None)])
 
-        class _FetchDetailTask(QRunnable):
+        class _FetchDetailTask(_AppRunnable):
             def __init__(self, content, source, url, item):
                 super().__init__()
                 self.signals = _ShelfDlSignals()
@@ -657,10 +1161,9 @@ class MainWindow(QMainWindow):
                     detail = self._content.fetch_detail(self._source, self._url)
                 except Exception:  # noqa: BLE001
                     detail = None
-                try:
-                    self.signals.done.emit((self._item, self._source, self._url, detail))
-                except RuntimeError:
-                    pass
+                self.emit_safe(
+                    self.signals.done, (self._item, self._source, self._url, detail)
+                )
 
         self._dl_tasks = []
         self._dl_results = []
@@ -731,7 +1234,7 @@ class MainWindow(QMainWindow):
             source_manager=self.source_manager,
             search=self.search,
             content=self.content,
-            event_bus=self.event_bus,
+            event_bus=self._gui_bus,
             shelf_folder_provider=self._available_shelf_folders,
         )
         page.open_requested.connect(self._open_from_search)
@@ -746,19 +1249,64 @@ class MainWindow(QMainWindow):
     def _record_search(self, keyword: str, context_url: str = "", folder: str = "") -> None:
         self.search_history.push(keyword, context_url=context_url, folder=folder)
 
+    def _ensure_reader(self):
+        """返回可用的阅读器；未 READY 时返回 None（延迟构造到 READY）。"""
+        if self.reader is not None:
+            return self.reader
+        if self._runtime_state != "READY":
+            return None
+        self._ensure_tab_page(self._tab_index["reader"])
+        return self.reader
+
+    def _ensure_download_page(self):
+        if getattr(self, "download_page", None) is not None:
+            return self.download_page
+        if self._runtime_state != "READY":
+            return None
+        self._ensure_tab_page(self._tab_index["download"])
+        return getattr(self, "download_page", None)
+
+    def _queue_navigation(self, channel: str, action) -> None:
+        """记录最新导航意图（原始参数快照在闭包里），READY 后精确执行一次。"""
+        if self._closing:
+            return
+        self._pending_navigation = (channel, action)
+        idx = self._tab_index.get(channel)
+        if idx is not None:
+            self.tabs.setCurrentIndex(idx)
+
+    def _show_reader_online(self, source_id, url, content_type, chapter_url="") -> bool:
+        reader = self._ensure_reader()
+        if reader is None:
+            return False
+        reader.open(source_id, url, content_type, chapter_url)
+        self.tabs.setCurrentIndex(self._tab_index["reader"])
+        return True
+
+    def _show_reader_epub(self, path) -> bool:
+        reader = self._ensure_reader()
+        if reader is None:
+            return False
+        from pathlib import Path
+
+        reader.open_epub(str(Path(path).resolve()))
+        self.tabs.setCurrentIndex(self._tab_index["reader"])
+        return True
+
     def _open_from_search(self, source_id: str, url: str, content_type: str) -> None:
         """搜索页点结果卡片 → 打开 reader 播放/阅读。"""
-        if self.reader is None:
-            return
-        self.reader.open(source_id, url, content_type)
-        self.tabs.setCurrentIndex(self._tab_index["reader"])
+        if not self._show_reader_online(source_id, url, content_type):
+            self._queue_navigation(
+                "reader",
+                lambda: self._show_reader_online(source_id, url, content_type),
+            )
 
     def _build_download(self) -> DownloadPage:
         from gui.pages.download_page import DownloadPage
 
         self.download_page = DownloadPage(
             queue=self.download_queue,
-            event_bus=self.event_bus,
+            event_bus=self._gui_bus,
             settings=self.settings,
         )
         # 下载完成「打开阅读」→ 内置 epub 阅读器
@@ -766,16 +1314,15 @@ class MainWindow(QMainWindow):
         return self.download_page
 
     def _open_epub(self, path: str) -> None:
-        """下载页「打开阅读」→ 用内置 epub 阅读器打开。"""
-        if self.reader is None or not path:
-            return
-        from pathlib import Path
+        """下载页「打开阅读」→ 用内置 epub 阅读器打开。
 
-        # 统一解析路径，与书架扫描（shelf_service output_dir .resolve()）生成的
-        # 续读 key 完全一致，否则相对目录配置下续读匹配不上。
-        path = str(Path(path).resolve())
-        self.reader.open_epub(path)
-        self.tabs.setCurrentIndex(self._tab_index["reader"])
+        路径在 _show_reader_epub 内统一 resolve()，与书架扫描生成的续读 key
+        一致；未 READY 时排队原始路径快照，READY 后打开。
+        """
+        if not path:
+            return
+        if not self._show_reader_epub(path):
+            self._queue_navigation("reader", lambda: self._show_reader_epub(path))
 
     def _build_library(self):
         """书架：本地 epub + 收藏聚合。"""
@@ -825,11 +1372,14 @@ class MainWindow(QMainWindow):
         source_manager = getattr(self, "source_manager", None)
         if store is None or content is None or source_manager is None:
             return
-        from PySide6.QtCore import QThreadPool, QRunnable
 
-        class _CoverBackfillTask(QRunnable):
+        class _CoverBackfillSignals(QObject):
+            finished = Signal(object)  # 完成的任务对象（供主线程注销引用）
+
+        class _CoverBackfillTask(_AppRunnable):
             def __init__(self, content, source_manager, store, recs):
                 super().__init__()
+                self.signals = _CoverBackfillSignals()
                 self._content = content
                 self._source_manager = source_manager
                 self._store = store
@@ -854,32 +1404,48 @@ class MainWindow(QMainWindow):
                     return False
 
             def run(self) -> None:
-                for r in self._recs:
-                    try:
-                        source = self._source_manager.get(r.get("source_id", ""))
-                        if source is None:
+                try:
+                    for r in self._recs:
+                        try:
+                            source = self._source_manager.get(r.get("source_id", ""))
+                            if source is None:
+                                continue
+                            if not self._cover_invalid(r.get("cover", ""), source):
+                                continue  # 已有有效封面，不重复补
+                            cover = self._content.fetch_cover(
+                                source, r.get("url", "")
+                            )
+                            if not cover or self._cover_invalid(cover, source):
+                                continue  # 仍然取不到有效封面 → 保持原样待下轮
+                            self._store.set_cover(r.get("url", ""), cover)
+                        except Exception:  # noqa: BLE001 —— 单条失败静默，继续补其它
                             continue
-                        if not self._cover_invalid(r.get("cover", ""), source):
-                            continue  # 已有有效封面，不重复补
-                        cover = self._content.fetch_cover(
-                            source, r.get("url", "")
-                        )
-                        if not cover or self._cover_invalid(cover, source):
-                            continue  # 仍然取不到有效封面 → 保持原样待下轮
-                        self._store.set_cover(r.get("url", ""), cover)
-                    except Exception:  # noqa: BLE001 —— 单条失败静默，继续补其它
-                        continue
+                finally:
+                    # 完成（含异常）→ 通知主线程注销引用，避免集合随触发次数无限增长
+                    self.emit_safe(self.signals.finished, self)
 
-        # 持有任务引用防 GC（书架在 App 生命周期内常驻）
+        # 持有任务引用防 GC；完成后经信号在主线程移除，避免集合无界增长。
+        task = _CoverBackfillTask(content, source_manager, store, recs)
+        task.signals.finished.connect(self._on_cover_backfill_finished)
         self._cover_backfill_tasks = getattr(self, "_cover_backfill_tasks", None) or []
-        self._cover_backfill_tasks.append(_CoverBackfillTask(
-            content, source_manager, store, recs
-        ))
-        QThreadPool.globalInstance().start(self._cover_backfill_tasks[-1])
+        self._cover_backfill_tasks.append(task)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_cover_backfill_finished(self, task) -> None:
+        """封面回填任务完成 → 注销其引用（主线程槽；防止集合无界增长）。"""
+        tasks = getattr(self, "_cover_backfill_tasks", None)
+        if not tasks:
+            return
+        try:
+            tasks.remove(task)
+        except ValueError:
+            pass
 
     def _local_progress_allowed(self, library_url: str) -> bool:
         store = getattr(self, "library_store", None)
-        return store is None or store.reading_status(library_url) != "completed"
+        if store is None:
+            return True
+        return store.reading_status(library_url) not in {"completed", "unknown"}
 
     def _play_local_video(self, rec: dict) -> None:
         """播本地视频：记住上次看到哪集（下次默认定位该集）；单集直接播，多集弹选择。"""
@@ -990,17 +1556,18 @@ class MainWindow(QMainWindow):
 
         content_type 为空时从源配置兜底推断（兼容早期收藏未存类型的记录）。
         """
-        if self.reader is None or not isinstance(payload, (tuple, list)) or len(payload) < 3:
+        if not isinstance(payload, (tuple, list)) or len(payload) < 3:
             return
-        source_id, url, content_type = payload
+        source_id, url, content_type = payload[0], payload[1], payload[2]
         if not content_type:
             try:
                 content_type = self.source_manager.get(source_id).content_type
             except Exception:  # noqa: BLE001
                 content_type = ""
-        self.reader.open(source_id, url, content_type)
-        # 跳转阅读 Tab
-        self.tabs.setCurrentIndex(self._tab_index["reader"])
+        if not self._show_reader_online(source_id, url, content_type):
+            self._queue_navigation(
+                "reader", lambda: self._show_reader_online(source_id, url, content_type)
+            )
 
     def _download_from_shelf(self, payload) -> None:
         """书架收藏在线书右键「下载到本地」→ 后台拉详情 → 加入下载队列。
@@ -1084,7 +1651,7 @@ class MainWindow(QMainWindow):
             checker=self.checker,
             sources_dir=base_dir / "sources",
             cookie_manager=self.cookie_manager,
-            event_bus=self.event_bus,
+            event_bus=self._gui_bus,
         )
         # 编辑某源 → 打开编辑器对话框
         self.source_page.edit_requested.connect(self._open_source_editor)
@@ -1117,16 +1684,16 @@ class MainWindow(QMainWindow):
             self.source_manager.load_dir(
                 _app_base_dir() / "sources"
             )
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 —— 重载失败保留旧源，仅记录
+            log.warning("保存源后重载源目录失败", exc_info=True)
         # 源配置（含 direct）可能变化 → 刷新 CoverLoader 的源注册表
         try:
             from gui.components.cover_loader import CoverLoader
 
             for _src in self.source_manager.all():
                 CoverLoader.instance().register_source(_src)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:  # noqa: BLE001 —— 注册失败不影响已保存的源
+            log.debug("保存源后刷新封面源注册表失败", exc_info=True)
         if hasattr(self, "source_page"):
             self.source_page.refresh()
 
@@ -1138,6 +1705,11 @@ class MainWindow(QMainWindow):
         )
 
         if detail is None:
+            return
+        if self._runtime_state != "READY" or self.download_queue is None:
+            self._queue_navigation(
+                "download", lambda: self._open_download_dialog(detail)
+            )
             return
         chapters = list(getattr(detail, "chapters", None) or [])
         total = len(chapters)
@@ -1153,22 +1725,30 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentWidget(self.download_page)
 
     def _open_reader(self, detail) -> None:
-        """从发现详情抽屉「开始阅读」→ 打开阅读器。"""
-        if detail is None or self.reader is None:
-            self.tabs.setCurrentIndex(self._tab_index["reader"])
+        """从发现详情抽屉「开始阅读」→ 打开阅读器。
+
+        参数快照为原始字段值（source_id/url/content_type/首章 url），避免闭包
+        持有可变 detail；未 READY 时排队，READY 后精确打开一次。
+        """
+        if detail is None:
             return
-        self.reader.open(
-            detail.source_id,
-            detail.url,
-            detail.content_type,
-            detail.chapters[0].url if detail.chapters else "",
-        )
-        self.tabs.setCurrentIndex(self._tab_index["reader"])
+        source_id = getattr(detail, "source_id", "")
+        url = getattr(detail, "url", "")
+        content_type = getattr(detail, "content_type", "")
+        chapters = list(getattr(detail, "chapters", None) or [])
+        first_chapter = chapters[0].url if chapters else ""
+        if not self._show_reader_online(source_id, url, content_type, first_chapter):
+            self._queue_navigation(
+                "reader",
+                lambda: self._show_reader_online(
+                    source_id, url, content_type, first_chapter
+                ),
+            )
 
     def _build_home(self) -> HomePage:
         page = HomePage(
             source_manager=self.source_manager,
-            event_bus=self.event_bus,
+            event_bus=self._gui_bus,
             theme_manager=self.theme_manager,
             settings=self.settings,
             history=self.search_history,
@@ -1176,7 +1756,9 @@ class MainWindow(QMainWindow):
             reading_progress=self.reading_progress,
             privacy=self._ensure_library_store(),
         )
+        self.home_page = page
         page.playback_requested.connect(self._resume_playback)
+        page.retry_runtime_requested.connect(self._start_runtime_initialization)
         # 首页内部导航联动主窗口 Tab
         page.add_source_requested.connect(
             lambda: self.tabs.setCurrentIndex(self._tab_index["source"])
@@ -1263,11 +1845,19 @@ class MainWindow(QMainWindow):
         app.setPalette(palette)
 
         self.event_bus.emit(Event(EVENT_THEME_CHANGED, {"theme": theme}))
-        # 通知各页
+        # 通知各页：单页回调失败不影响其余页面，记录原因便于定位
         for i in range(self.tabs.count()):
             page = self.tabs.widget(i)
             if hasattr(page, "on_theme_changed"):
-                page.on_theme_changed(theme)
+                try:
+                    page.on_theme_changed(theme)
+                except Exception:  # noqa: BLE001
+                    log.warning(
+                        "主题回调失败：tab=%s page=%s",
+                        self.tabs.tabText(i),
+                        type(page).__name__,
+                        exc_info=True,
+                    )
 
     def _bg_image_qss_block(self) -> str:
         """背景图：按主题 bg 色 + 用户图片 + 透明度 → 合成后注入中央区。
@@ -1304,7 +1894,7 @@ class MainWindow(QMainWindow):
                 if cache_path.is_file() and cache_path.stat().st_size > 0:
                     cache_hit = True
         except OSError:
-            pass
+            log.debug("读取背景图缓存 key 失败，按未命中处理", exc_info=True)
         if cache_hit:
             self._load_bg_pixmap(cache_path)
         else:
@@ -1344,7 +1934,7 @@ class MainWindow(QMainWindow):
         序列号防重叠：连续触发（快速换图/调透明度）只采纳最新一次结果，
         过期任务静默退出且不写盘，避免旧参数覆盖新参数对应缓存。
         """
-        from PySide6.QtCore import QThreadPool, QRunnable, QObject, Signal
+        from PySide6.QtCore import QObject, Signal
 
         self._bg_seq = getattr(self, "_bg_seq", 0) + 1
         seq = self._bg_seq
@@ -1354,7 +1944,7 @@ class MainWindow(QMainWindow):
         class _BgSignals(QObject):
             done = Signal(int, object)  # (seq, cache_path or None)
 
-        class _BgComposeTask(QRunnable):
+        class _BgComposeTask(_AppRunnable):
             def __init__(self, signals, seq):
                 super().__init__()
                 self.signals = signals
@@ -1376,7 +1966,7 @@ class MainWindow(QMainWindow):
                     bg_q.fill(QColor(self._bg_color))
                     fg_q = QImage(self._bg_file)
                     if fg_q.isNull():
-                        self.signals.done.emit(self._seq, None)
+                        self.emit_safe(self.signals.done, self._seq, None)
                         return
                     fg_q = fg_q.scaled(
                         self._w, self._h,
@@ -1395,12 +1985,10 @@ class MainWindow(QMainWindow):
                     with open(tmp_key, "w", encoding="utf-8") as fh:
                         fh.write(self._cache_key)
                     os.replace(tmp_key, self._key_file)
-                    self.signals.done.emit(self._seq, self._cache_path)
-                except Exception:  # noqa: BLE001
-                    try:
-                        self.signals.done.emit(self._seq, None)
-                    except RuntimeError:
-                        pass
+                    self.emit_safe(self.signals.done, self._seq, self._cache_path)
+                except Exception:  # noqa: BLE001 —— 合成失败不崩溃，通知回退
+                    log.debug("背景图后台合成失败，回退为无背景", exc_info=True)
+                    self.emit_safe(self.signals.done, self._seq, None)
 
         seq = self._bg_seq
         signals = _BgSignals()
@@ -1520,40 +2108,6 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
 }}
 """
 
-    def _schedule_source_visibility_sync(self) -> None:
-        """把设置应用后的源可见性刷新合并到下一轮事件循环。"""
-        if getattr(self, "_source_visibility_sync_scheduled", False):
-            return
-        self._source_visibility_sync_scheduled = True
-
-        from PySide6.QtCore import QTimer
-
-        def _sync():
-            self._source_visibility_sync_scheduled = False
-            _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
-
-        QTimer.singleShot(0, _sync)
-
-    def _schedule_cover_cache_refresh(self) -> None:
-        """把封面缓存配置刷新合并到下一轮事件循环，采用最新设置。"""
-        if getattr(self, "_cover_cache_refresh_scheduled", False):
-            return
-        self._cover_cache_refresh_scheduled = True
-
-        from PySide6.QtCore import QTimer
-
-        def _refresh():
-            self._cover_cache_refresh_scheduled = False
-            from gui.components.cover_loader import CoverLoader
-            from framework.cache_service import get_shelf_cache
-
-            CoverLoader.instance().configure(
-                self.settings.get("ui", "cover_cache_size_mb", 256),
-                shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
-            )
-
-        QTimer.singleShot(0, _refresh)
-
     def _schedule_settings_refresh(self) -> None:
         """合并设置应用后的 GUI 刷新，并在主线程下一轮读取最新设置。"""
         if getattr(self, "_settings_refresh_scheduled", False):
@@ -1602,97 +2156,6 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
         settings_tab = self._tab_index["settings"]
         sc = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
         sc.activated.connect(lambda: self.tabs.setCurrentIndex(settings_tab))
-
-    # ------------------------------------------------------------------ #
-    def _schedule_startup_diag(self) -> None:
-        """启动自动诊断：等窗口显示后，后台对所有启用源跑一次 selfcheck。
-
-        对应 ui-source.md #4「启动自动诊断」。静默不阻塞启动；
-        诊断结果经 SourceManager.update_health 持久化，源管理页健康灯自动刷新。
-        """
-        from PySide6.QtCore import QTimer, QThreadPool, QRunnable, QObject, Signal
-
-        class _DiagSignals(QObject):
-            finished = Signal(str, bool, str)  # (source_id, ok, err)
-
-        class _DiagTask(QRunnable):
-            def __init__(self, checker, source, url):
-                super().__init__()
-                self.signals = _DiagSignals()
-                self._checker = checker
-                self._source = source
-                self._url = url
-
-            def run(self) -> None:
-                ok, err = False, ""
-                try:
-                    ok = self._checker.check(self._source, self._url)
-                except Exception as exc:  # noqa: BLE001
-                    err = str(exc)
-                try:
-                    self.signals.finished.emit(self._source.source_id, ok, err)
-                except RuntimeError:
-                    pass
-
-        def _diag_url(source) -> str:
-            """自检目标 URL：优先 discovery 列表入口，否则 base_url / homepage。"""
-            from urllib.parse import urljoin
-
-            raw = source.raw
-            endpoints = raw.get("endpoints") or {}
-            discovery = endpoints.get("discovery") or {}
-            rel = (
-                discovery.get("works_list_url")
-                or discovery.get("list_url")
-                or discovery.get("list_categories_url")
-            )
-            base = source.base_url or source.homepage
-            if not base:
-                return ""
-            if rel:
-                return rel if rel.startswith("http") else urljoin(base, rel)
-            return base
-
-        def _run_one(source) -> None:
-            url = _diag_url(source)
-            if not url:
-                self._on_startup_diag_done(source.source_id, False, "缺少可自检的 URL")
-                return
-            task = _DiagTask(self.checker, source, url)
-            task.signals.finished.connect(self._on_startup_diag_done)
-            QThreadPool.globalInstance().start(task)
-
-        def _start() -> None:
-            sources = [s for s in self.source_manager.all() if s.enabled]
-            for s in sources:
-                _run_one(s)
-
-        # 延迟到窗口显示后再跑，不阻塞启动
-        QTimer.singleShot(0, _start)
-
-    def _on_startup_diag_done(self, source_id: str, ok: bool, err: str) -> None:
-        """启动诊断完成：更新健康状态 + 刷新源管理页健康灯。"""
-        from framework.source_manager import HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN
-
-        if ok:
-            state = HEALTH_OK
-        elif err:
-            state = HEALTH_BROKEN
-        else:
-            state = HEALTH_WARN
-        try:
-            self.source_manager.update_health(source_id, state, err if err else "")
-        except Exception:  # noqa: BLE001
-            return
-        # 刷新源管理页（若已构建）健康灯
-        page = getattr(self, "source_page", None)
-        if page is not None:
-            for row in getattr(page, "_rows", []) or []:
-                if row.source().source_id == source_id:
-                    health = self.source_manager.get_health(source_id)
-                    row.set_health(health)
-                    row.set_error(err if not ok else "")
-                    break
 
     # ------------------------------------------------------------------ #
     # 源选择引导（首次启动 + 设置界面「源选择」共用）
@@ -1754,20 +2217,6 @@ def main() -> int:
     win = MainWindow()
     win.show()
 
-    def repair_shelf_cache_index() -> None:
-        repository = win.shelf_cache_repository
-        if repository is None:
-            return
-        try:
-            repository.repair_index()
-        except Exception:
-            log.exception("后台修复书架缓存索引失败")
-
-    threading.Thread(
-        target=repair_shelf_cache_index,
-        daemon=True,
-        name="shelf-cache-index-repair",
-    ).start()
     return app.exec()
 
 

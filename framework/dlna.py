@@ -1,5 +1,6 @@
 import re
 import socket
+import time
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -11,6 +12,7 @@ _SSDP_ADDRESS = ("239.255.255.250", 1900)
 _MEDIA_RENDERER_ST = "urn:schemas-upnp-org:device:MediaRenderer:1"
 _AV_TRANSPORT = "AVTransport"
 _RENDERING_CONTROL = "RenderingControl"
+_RENDERING_CONTROL_ST = "urn:schemas-upnp-org:service:RenderingControl:1"
 _SOAP_ENV = "http://schemas.xmlsoap.org/soap/envelope/"
 _DIDL = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
 _DC = "http://purl.org/dc/elements/1.1/"
@@ -114,6 +116,13 @@ def parse_device_description(location: str, body: bytes) -> DlnaRenderer:
 
 
 def discover_renderers(timeout: float = 2.0) -> list[DlnaRenderer]:
+    """连发 3 次 SSDP M-SEARCH（间隔约 250ms）聚合去重可用投屏设备。
+
+    单次组播包在丢包/慢路由下常漏设备：同一轮内连续重发可显著提升发现率。
+    单轮 recv 超时取「调用方 timeout」与「剩余总预算」的较小值——既不放大小
+    timeout（保持既有快速返回语义），又保证总时长有界（≤ 约 2s）。按 UDN +
+    LOCATION 去重后才回源取设备描述，避免同一设备重复拉取。
+    """
     request = (
         "M-SEARCH * HTTP/1.1\r\n"
         "HOST: 239.255.255.250:1900\r\n"
@@ -122,25 +131,37 @@ def discover_renderers(timeout: float = 2.0) -> list[DlnaRenderer]:
         f"ST: {_MEDIA_RENDERER_ST}\r\n\r\n"
     ).encode("ascii")
     responses = {}
+    rounds = 3
+    gap = 0.25
+    deadline = time.monotonic() + min(timeout * rounds + gap * (rounds - 1), 2.0)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(timeout)
-        sock.sendto(request, _SSDP_ADDRESS)
-        while True:
-            try:
-                data, _ = sock.recvfrom(65535)
-            except socket.timeout:
+        for attempt in range(rounds):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
+            sock.settimeout(min(timeout, remaining))
+            try:
+                sock.sendto(request, _SSDP_ADDRESS)
             except OSError:
                 break
-            parsed = parse_ssdp_response(data)
-            location = parsed.get("location")
-            response_st = parsed.get("st")
-            if location and (not response_st or response_st == _MEDIA_RENDERER_ST):
-                usn = parsed.get("usn", "")
-                udn = usn.split("::", 1)[0] if usn else location
-                responses.setdefault(udn, [])
-                if location not in responses[udn]:
-                    responses[udn].append(location)
+            while True:
+                try:
+                    data, _ = sock.recvfrom(65535)
+                except (socket.timeout, OSError):
+                    break
+                parsed = parse_ssdp_response(data)
+                location = parsed.get("location")
+                response_st = parsed.get("st")
+                if location and (not response_st or response_st == _MEDIA_RENDERER_ST):
+                    usn = parsed.get("usn", "")
+                    udn = usn.split("::", 1)[0] if usn else location
+                    responses.setdefault(udn, [])
+                    if location not in responses[udn]:
+                        responses[udn].append(location)
+            if attempt < rounds - 1:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(gap, remaining))
 
     renderers = []
     seen = set()
@@ -179,6 +200,19 @@ def parse_dlna_time(value: str) -> int | None:
     return hours * 3600 + minutes * 60 + seconds
 
 
+def _clamp_volume(level) -> int:
+    """音量入参校验：必须为 0-100 的整数，否则受控失败（ValueError）。
+
+    严格要求 int（bool 也拒），不接受可被 int() 静默截断的 float/字符串，
+    避免 3.5 → 3 这类隐性精度丢失。
+    """
+    if isinstance(level, bool) or not isinstance(level, int):
+        raise ValueError("volume must be an integer within 0-100")
+    if not 0 <= level <= 100:
+        raise ValueError("volume must be within 0-100")
+    return level
+
+
 def _metadata(uri: str, title: str, mime_type: str) -> str:
     item = ET.Element(f"{{{_DIDL}}}DIDL-Lite")
     container = ET.SubElement(item, f"{{{_DIDL}}}item", {"id": "0", "parentID": "-1", "restricted": "1"})
@@ -196,17 +230,21 @@ class DlnaClient:
         self.renderer = renderer
         self.timeout = timeout
 
-    def _soap(self, action: str, arguments: dict[str, str] | None = None) -> ET.Element:
+    def _soap(self, action: str, arguments: dict[str, str] | None = None, *,
+              control_url: str | None = None,
+              service_type: str | None = None) -> ET.Element:
+        service_type = service_type or self.renderer.service_type
+        control_url = control_url or self.renderer.av_transport_control_url
         envelope = ET.Element(f"{{{_SOAP_ENV}}}Envelope")
         body = ET.SubElement(envelope, f"{{{_SOAP_ENV}}}Body")
-        action_element = ET.SubElement(body, f"{{{self.renderer.service_type}}}{action}")
+        action_element = ET.SubElement(body, f"{{{service_type}}}{action}")
         for name, value in (arguments or {}).items():
             child = ET.SubElement(action_element, name)
             child.text = value
         payload = ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
-        soap_action = f'"{self.renderer.service_type}#{action}"'
+        soap_action = f'"{service_type}#{action}"'
         request = urllib.request.Request(
-            self.renderer.av_transport_control_url,
+            control_url,
             data=payload,
             headers={
                 "Content-Type": 'text/xml; charset="utf-8"',
@@ -266,6 +304,37 @@ class DlnaClient:
 
     def seek(self, seconds: int) -> None:
         self._soap("Seek", {"InstanceID": "0", "Unit": "REL_TIME", "Target": format_dlna_time(seconds)})
+
+    def set_volume(self, level: int) -> None:
+        """设置电视主音量（0-100）。无 RenderingControl 服务 → 受控失败。"""
+        if self.renderer.rendering_control_url is None:
+            raise DlnaError("SetVolume", "unsupported",
+                            "renderer has no RenderingControl service")
+        self._soap(
+            "SetVolume",
+            {"InstanceID": "0", "Channel": "Master",
+             "DesiredVolume": str(_clamp_volume(level))},
+            control_url=self.renderer.rendering_control_url,
+            service_type=_RENDERING_CONTROL_ST,
+        )
+
+    def get_volume(self) -> int | None:
+        """读取电视主音量（0-100）；缺失 RenderingControl → 受控失败。"""
+        if self.renderer.rendering_control_url is None:
+            raise DlnaError("GetVolume", "unsupported",
+                            "renderer has no RenderingControl service")
+        root = self._soap(
+            "GetVolume", {"InstanceID": "0", "Channel": "Master"},
+            control_url=self.renderer.rendering_control_url,
+            service_type=_RENDERING_CONTROL_ST,
+        )
+        for element in root.iter():
+            if _local_name(element.tag) == "CurrentVolume":
+                try:
+                    return int(_text(element))
+                except ValueError:
+                    return None
+        return None
 
     def get_transport_info(self) -> dict:
         root = self._soap("GetTransportInfo", {"InstanceID": "0"})

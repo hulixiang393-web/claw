@@ -164,6 +164,37 @@ def test_defaults_to_shared_instance(_qapp):
     assert http.calls
 
 
+def test_cache_only_does_not_load_bundle_or_request_network(_qapp, tmp_path, monkeypatch):
+    from framework.cache_service import RedisLikeStore
+
+    store = RedisLikeStore(1024 * 1024, str(tmp_path / "redis_shelf.gz"))
+    store.set("cover:src:hit", _png_bytes())
+    store.set("body:src:book", "正文")
+    store.save()
+    cold_store = RedisLikeStore(1024 * 1024, str(tmp_path / "redis_shelf.gz"))
+    loader = cl._CoverLoader()
+    http = _FakeHttp(_png_bytes())
+    loader.use_http(http)
+    calls = []
+    monkeypatch.setattr(cold_store, "load", lambda: calls.append("bundle"))
+    monkeypatch.setattr(loader, "_pump", lambda: calls.append("network"))
+    loader.configure(shelf_cache=cold_store)
+    got = []
+    loader.load_cached("hit", got.append, source_id="src")
+    assert got == [None]
+    loader.configure(shelf_cache=store)
+    loader.load_cached("hit", got.append, source_id="src")
+    loader.load_cached("missing", got.append, source_id="src")
+    store.set("cover:src:bad", b"invalid image")
+    loader.load_cached("bad", got.append, source_id="src")
+    assert got[1] is not None and not got[1].isNull()
+    assert got[2:] == [None, None]
+    assert calls == []
+    assert http.calls == []
+    assert loader._queue == []
+    assert loader._active == 0
+
+
 if __name__ == "__main__":
     import pytest
 

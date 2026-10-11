@@ -42,6 +42,9 @@ except ImportError:  # pragma: no cover
 
 _INDEX_NAME = "index.json"
 
+# 未完成 `.part` 的保留窗口：窗口内跨重启可续传，过期才回收（防无限堆积）。
+_PART_TTL = 24 * 60 * 60
+
 
 class _Inflight:
     __slots__ = ("event", "done", "cancel", "error", "status", "headers", "response")
@@ -99,7 +102,8 @@ class MediaCache:
     def __init__(self, root: str | Path | None = None, *,
                  max_videos: int | None = None,
                  max_bytes: int | None = None,
-                 enabled: bool = True):
+                 enabled: bool = True,
+                 prune_interval: float = 60.0):
         if root is not None:
             self.root = Path(root).resolve()
         else:
@@ -118,6 +122,11 @@ class MediaCache:
         self._path_locks: dict[str, threading.Lock] = {}
         self._path_locks_guard = threading.Lock()
         self._last_flush = 0.0
+        # touch 命中路径的淘汰节流窗口（秒）：命中极频繁，逐次全表 LRU 排序
+        # 开销随影片数增长；限定至多每 prune_interval 秒扫一次，显式 prune
+        # 与 mark_* 建条目仍即时淘汰，语义不变。
+        self._prune_interval = max(0.0, float(prune_interval))
+        self._last_prune = 0.0
         atexit.register(self.flush)
         self._startup_reclaim()
 
@@ -187,14 +196,24 @@ class MediaCache:
         return e.get("kind") if e else None
 
     def touch(self, key: str) -> None:
-        """播放/命中时刷新 last_access（LRU 依据）。"""
+        """播放/命中时刷新 last_access（LRU 依据）。
+
+        淘汰走节流路径：命中是最高频调用，无需每次命中都全表排序。
+        """
         with self._lock:
             e = self._index.get(key)
             if e is None:
                 return
             e["last_access"] = time.time()
             self._maybe_flush()
-            self._prune_locked()
+            self._prune_throttled()
+
+    def _prune_throttled(self) -> None:
+        """节流淘汰：距上次淘汰不足 prune_interval 秒则跳过（调用方持锁）。"""
+        now = time.time()
+        if now - self._last_prune < self._prune_interval:
+            return
+        self._prune_locked()
 
     def mark_mp4(self, key: str, size: int, complete: bool) -> None:
         with self._lock:
@@ -383,28 +402,36 @@ class MediaCache:
     # 启动回收 + 淘汰
     # ------------------------------------------------------------------ #
     def _startup_reclaim(self) -> None:
-        """App 启动回收：建目录、载索引、清遗留 .part、剔除失效条目、LRU。"""
+        """App 启动回收：建目录、载索引、清理过期 .part、剔除失效条目、LRU。
+
+        未完成的 `.part` 在 TTL 窗口内保留：跨重启可对同一分片续传（不重复
+        下载已完成字节）；仅清理超过 TTL 的遗留 `.part`，防止无限堆积。
+        """
         with self._lock:
             try:
                 self.root.mkdir(parents=True, exist_ok=True)
             except OSError:
                 pass
             self._load_index()
-            for p in list(self.root.glob("*.part")):
-                try:
-                    p.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            self._reclaim_parts(self.root)
             for d in list(self.root.iterdir()):
                 if d.is_dir():
-                    for p in list(d.glob("*.part")):
-                        try:
-                            p.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                    self._reclaim_parts(d)
             self._drop_missing()
             self._prune_locked()
             self._write_index()
+
+    @staticmethod
+    def _reclaim_parts(directory: Path) -> None:
+        """目录内 `.part` 回收：TTL 内的保留供续传，过期的删除。"""
+        now = time.time()
+        for p in list(directory.glob("*.part")):
+            try:
+                if now - p.stat().st_mtime <= _PART_TTL:
+                    continue
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _load_index(self) -> None:
         idx = self.root / _INDEX_NAME
@@ -441,6 +468,7 @@ class MediaCache:
 
     def _prune_locked(self) -> None:
         """影片粒度 LRU：只留最近 N=3 部（可配）+ 字节配额兜底（如 2GB）。"""
+        self._last_prune = time.time()
         if not self.enabled:
             return
         complete = {k: e for k, e in self._index.items()

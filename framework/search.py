@@ -28,6 +28,18 @@ from .utils import fill_json, fill_template, jsonpath
 
 log = logging.getLogger(__name__)
 
+
+def _normalize_keyword(keyword) -> str:
+    """D3：搜索关键词入参归一化——去除首尾空白、连续空白压成单空格。
+
+    只做空白归一化，**不改变大小写**（部分站点搜索对大小写敏感，改动会
+    破坏其查询语义）。非字符串安全转成字符串；空/None 返回空串。
+    """
+    try:
+        return " ".join(str(keyword or "").split())
+    except Exception:  # noqa: BLE001 —— 异常输入安全回退空串
+        return ""
+
 # 搜索页数放开：不设默认限量（有多少加载多少，翻到站底由连续空页自然停）。
 # 此常量是引擎级硬保护——仅防"分页 URL 模板失效 → 每页都返回页首内容 → 永不
 # 触发空页停"的死循环，绝不是搜索结果限制。正常源空页即停，远达不到此值。
@@ -215,6 +227,9 @@ class Search:
         页后台抓到即追加），避免 max_pages 调大后全部抓完才显示导致卡死。
         """
         http = http or self._http
+        # D3：入参归一化（去首尾/压缩连续空白，不改大小写），保证不同空白
+        # 输入查询一致；下游 URL 构造与过滤均使用归一化后的关键词。
+        keyword = _normalize_keyword(keyword)
         api = source.raw.get("api_endpoints") or {}
         search_cfg = api.get("search") or {}
         if search_cfg.get("engine") == "ytdlp":
@@ -720,9 +735,16 @@ class Search:
             title = it.get("title") or it.get("text") or ""
             if not title or not url or url in seen_urls:
                 continue
-            # 关键词过滤：标题/文本含关键词才算真实命中（剔除热门榜无关项）
-            if filter_keyword and kw and kw not in title and kw not in it.get("text", ""):
-                continue
+            # 关键词过滤：标题/文本含关键词才算真实命中（剔除热门榜无关项）。
+            # 归一化子串匹配（NFKC+casefold+去空白）：相比裸匹配只放宽不收紧，
+            # 兼容全角/半角混写与大小写差异的合法结果（如 kw="斗破" 命中"斗破蒼穹"）。
+            if filter_keyword and kw:
+                kw_norm = Search._normalize_match_text(kw)
+                if kw_norm and (
+                    kw_norm not in Search._normalize_match_text(title)
+                    and kw_norm not in Search._normalize_match_text(it.get("text", ""))
+                ):
+                    continue
             seen_urls.add(url)
             results.append(
                 SearchResult(
@@ -1056,6 +1078,16 @@ class Search:
                     )
                 )
         return self._provider_fallback(source, keyword, results, http)
+
+    @staticmethod
+    def _normalize_match_text(value: str) -> str:
+        """关键词匹配归一化：NFKC + casefold + 去首尾空白。
+
+        相比原裸子串匹配只会放宽（NFKC/casefold/去空白对字符串是自映射：
+        原始 a 匹配 b ⇒ 归一化 a 匹配归一化 b），不会误杀以前能命中的结果；
+        目的是命中「全角/半角混用、大小写不同、首尾带空格」的合法标题。
+        """
+        return unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
 
     @staticmethod
     def _normalize_provider_text(value: str) -> str:

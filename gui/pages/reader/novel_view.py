@@ -38,8 +38,13 @@ from PySide6.QtWidgets import (
 
 from framework.content import Content, Detail
 
+from gui.pages.reader.auto_scroll import AutoScrollMixin
 
-class NovelView(QWidget):
+
+from gui.pages.reader.novel_tasks import _LoadChapterSignals, _LoadChapterTask
+
+
+class NovelView(AutoScrollMixin, QWidget):
     """小说正文阅读视图。"""
 
     chapter_changed = Signal(object)  # 发出 (detail, chapter_title) 供续读
@@ -85,10 +90,10 @@ class NovelView(QWidget):
         self._pending_restore = None  # 打开书续读位置 (position, page, location)，首次显示章时定位
         self._restore_generation = 0
         self._restore_cancel_token = 0
-        self._auto_scrolling = False  # 自动滚动开关
+        self._auto_scrolling = False  # 自动滚动开关（状态机由 AutoScrollMixin 接管）
         self._auto_pos = 0.0  # 自动滚动记住的位置（浮点，按速度递增，重排不打断）
-        self._auto_timer = QTimer(self)  # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
-        self._auto_timer.setInterval(35)
+        # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
+        self._build_auto_scroll_timer()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -278,7 +283,6 @@ class NovelView(QWidget):
             app.installEventFilter(self)
 
         # 自动滚动定时器 + 快捷键
-        self._auto_timer.timeout.connect(self._auto_scroll_tick)
         QShortcut(QKeySequence(Qt.Key_Space), self).activated.connect(self._toggle_auto_scroll)
         # 用户手动拖动滚动条时停止自动滚动（否则 tick 会拉回原位，无法拖动）
         self.scroll.verticalScrollBar().sliderPressed.connect(self._on_scrollbar_user_interaction)
@@ -940,26 +944,7 @@ class NovelView(QWidget):
             pass
 
     # ---- 自动滚动 ----
-    def _toggle_auto_scroll(self) -> None:
-        """切换自动滚动：停止/启动，按钮文字同步更新。"""
-        if self._auto_scrolling:
-            self._stop_auto_scroll()
-        else:
-            vbar = self.scroll.verticalScrollBar()
-            if vbar.maximum() <= 0 or self._mode != "scroll":
-                return
-            self._auto_scrolling = True
-            self._auto_pos = float(vbar.value())  # 记住当前位置，按速度递增
-            self.auto_scroll_btn.setText("⏸ 停止")
-            self._auto_timer.start()
 
-    def _stop_auto_scroll(self) -> None:
-        """停止自动滚动并复位按钮。"""
-        if not self._auto_scrolling:
-            return
-        self._auto_scrolling = False
-        self._auto_timer.stop()
-        self.auto_scroll_btn.setText("▶ 自动滚动")
 
     def _on_scrollbar_user_interaction(self) -> None:
         """用户手动拖动滚动条（sliderPressed）时停止自动滚动，让手动接管。"""
@@ -967,27 +952,16 @@ class NovelView(QWidget):
         self._restore_generation += 1
         self._stop_auto_scroll()
 
-    def _auto_scroll_tick(self) -> None:
-        """把记住的位置按设定速度递增，平滑向下滚动；到底自动停止。
 
-        用独立浮点位置累积，不读回 vbar.value()：正文/图片重排不会打断推进，
-        也不会与重排修正叠加导致跳过内容。
-        """
-        vbar = self.scroll.verticalScrollBar()
-        if vbar.maximum() <= 0:
-            self._stop_auto_scroll()
-            return
-        self._auto_pos += self.auto_scroll_speed_slider.value() * 5
-        if self._auto_pos >= vbar.maximum():
-            vbar.setValue(vbar.maximum())
-            self._stop_auto_scroll()
-            return
-        vbar.setValue(int(self._auto_pos))
 
-    def _update_auto_scroll_slider_state(self) -> None:
-        """根据当前模式启用/禁用自动滚动速度滑块。（仅按模式判定，
-        避免内容高度懒加载中 maximum==0 时误禁用后不再刷新 → 拖不动）"""
-        self.auto_scroll_speed_slider.setEnabled(self._mode == "scroll")
+
+    def _auto_scroll_step(self, dt: float) -> float:
+        """每帧推进量：固定步进（档位 × 5px，忽略 dt），保持原行为。"""
+        return self.auto_scroll_speed_slider.value() * 5
+
+    def _auto_scroll_allowed(self) -> bool:
+        """滚动模式允许自动滚动。"""
+        return self._mode == "scroll"
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         """用户普通滚轮（无 Ctrl）→ 停止自动滚动。"""
@@ -1326,54 +1300,3 @@ class NovelView(QWidget):
             return
         ch._cached_text = text
         self._pump_prev_prefetch()
-
-
-class _LoadChapterSignals(QObject):
-    """章节加载信号。"""
-
-    finished = Signal(object, object, object)  # (chapter, text, err)
-
-
-class _LoadChapterTask(QRunnable):
-    """后台加载章节正文（信号跨线程安全）。"""
-
-    def __init__(self, content, source, chapter, load_images=False):
-        super().__init__()
-        self.signals = _LoadChapterSignals()
-        self._content = content
-        self._source = source
-        self._chapter = chapter
-        self._load_images = bool(load_images)
-
-    def run(self) -> None:
-        text, err = "", None
-        try:
-            if (
-                getattr(self._source, "source_id", "") == "bookstack"
-                and hasattr(self._content, "fetch_bookstack_chapter")
-            ):
-                rich = self._content.fetch_bookstack_chapter(self._source, self._chapter.url)
-                self._chapter._cached_rich_content = rich
-                self._chapter._cached_image_urls = [
-                    {"type": "image", "url": url} for url in rich.image_urls
-                ]
-                text = rich.text
-                self._chapter._cached_text = text
-                self._chapter._images_attempted = True
-            elif self._load_images and hasattr(self._content, "fetch_chapter_with_images"):
-                try:
-                    text, self._chapter._cached_image_urls = self._content.fetch_chapter_with_images(
-                        self._source, self._chapter.url
-                    )
-                    self._chapter._images_attempted = True
-                except (AttributeError, NotImplementedError, TypeError):
-                    text = self._content.fetch_chapter(self._source, self._chapter.url)
-                    self._chapter._images_attempted = True
-            else:
-                text = self._content.fetch_chapter(self._source, self._chapter.url)
-        except Exception as exc:
-            err = str(exc)
-        try:
-            self.signals.finished.emit(self._chapter, text, err)
-        except RuntimeError:
-            pass  # 页面已销毁

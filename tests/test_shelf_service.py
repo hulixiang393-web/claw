@@ -230,7 +230,7 @@ def test_delete_folder_moves_favorites_to_uncategorized(base: Path):
 
 def test_resume_title_merged(base: Path):
     class FakeProgress:
-        def resume(self, key):
+        def summary(self, key):
             return {"chapter_title": f"第{len(key)}章"} if key else None
 
     store = LibraryStore(base / "lib.json")
@@ -273,3 +273,65 @@ def test_to_rec_roundtrip():
     assert rec["episode_count"] == 3
     assert rec["resume_title"] == "读到X"
     assert "missing" not in rec
+
+
+def test_scan_local_reuses_unchanged_dir_metadata(base: Path, monkeypatch):
+    """增量扫描：目录未变更时复用元数据，不重读目录；变更才重建。"""
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=lambda p: "novel"
+    )
+    real = ShelfService._build_local_item
+    calls: list[str] = []
+
+    def spy(self, sub, metadata_only):
+        calls.append(str(sub))
+        return real(self, sub, metadata_only)
+
+    monkeypatch.setattr(ShelfService, "_build_local_item", spy)
+
+    svc.scan_local()
+    svc.scan_local()
+    assert len(calls) == 1  # 第二次直接复用缓存条目
+
+    make_epub(base / "dl" / "书A" / "第二本.epub")  # 目录变更 → 重建
+    items = svc.scan_local()
+    assert len(calls) == 2
+    assert [i.title for i in items].count("书A") == 1
+
+
+def test_scan_local_discards_stale_generation(base: Path):
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=lambda p: "novel"
+    )
+    assert svc.metadata_snapshot() is not None
+    stale = svc._generation - 1
+    assert svc.scan_local(metadata_only=True, generation=stale) is None  # 迟到结果丢弃
+    assert svc.scan_local(metadata_only=True, generation=svc._generation) is not None
+
+
+def test_scan_local_cancel_stops_and_reports(base: Path):
+    import threading
+
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=lambda p: "novel"
+    )
+    ev = threading.Event()
+    ev.set()
+    assert svc.scan_local(cancel=ev) == []
+    assert svc.metadata_snapshot(cancel=ev) is None
+
+
+def test_scan_local_persists_type_cache_once(base: Path, monkeypatch):
+    """一次全量扫描多本，类型缓存落盘只写一次（不再逐本重写整表）。"""
+    for name in ("书A", "书B", "书C"):
+        make_epub(base / "dl" / name / f"{name}.epub")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=lambda p: "novel"
+    )
+    writes: list[int] = []
+    monkeypatch.setattr(svc, "_persist_meta", lambda: writes.append(1))
+    svc.scan_local()
+    assert len(writes) == 1

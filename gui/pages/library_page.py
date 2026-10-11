@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal
 from PySide6.QtWidgets import (
@@ -40,7 +41,7 @@ from .base_page import BasePage
 
 
 class _ScanSignals(QObject):
-    done = Signal(object)  # list[dict]（ShelfItem.to_rec）
+    done = Signal(object, object, object)
 
 
 class _DetailLoadSignals(QObject):
@@ -74,33 +75,30 @@ class _DetailLoadTask(QRunnable):
 class _ScanTask(QRunnable):
     """后台书架扫描：目录遍历 + 类型检测 + 合并去重全部在 worker 线程。"""
 
-    def __init__(self, service, content_type: str, tag: str, folder: str,
-                 keyword: str, sort: str):
+    def __init__(self, service, filters, generation):
         super().__init__()
         self.signals = _ScanSignals()
         self._service = service
-        self._ctype = content_type
-        self._tag = tag
-        self._folder = folder
-        self._kw = keyword
-        self._sort = sort
+        self.filters = filters
+        self.generation = generation
+        self.cancel = threading.Event()
 
     def run(self) -> None:
+        if self.cancel.is_set():
+            return
         try:
-            items = self._service.list_items(
-                content_type=self._ctype, tag=self._tag, folder=self._folder,
-                keyword=self._kw, sort=self._sort,
-            )
-            recs = [it.to_rec() for it in items]
-            try:
-                self.signals.done.emit(recs)
-            except RuntimeError:
-                pass
-        except Exception:  # noqa: BLE001 —— 扫描失败保持空书架，不崩溃
-            try:
-                self.signals.done.emit([])
-            except RuntimeError:
-                pass
+            if hasattr(self._service, "metadata_snapshot"):
+                snapshot = self._service.metadata_snapshot(cancel=self.cancel)
+            else:
+                snapshot = ([], self._service.list_items())
+        except Exception:
+            snapshot = ([], [])
+        if self.cancel.is_set():
+            return
+        try:
+            self.signals.done.emit(self.generation, self.filters, snapshot)
+        except RuntimeError:
+            pass
 
 
 class _ShelfCard(QFrame):
@@ -249,10 +247,9 @@ class _ShelfCard(QFrame):
             return
         from gui.components.cover_loader import CoverLoader
 
-        CoverLoader.instance().load(
+        CoverLoader.instance().load_cached(
             url, self._on_cover_ready,
             source_id=self.rec.get("source_id") or "",
-            persist=True,  # 书架封面持久化：Redis cover: 键命中免重复下载
         )
 
     def _on_cover_ready(self, pixmap) -> None:
@@ -371,7 +368,9 @@ class LibraryPage(BasePage):
         self._batch_selected: dict[str, dict] = {}
         self._unlocked: set[str] = set()
         self._shelf_export_dir = Path(shelf_export_dir) if shelf_export_dir else Path("library")
-        self._scan_task = None  # 后台扫描任务持有引用（防 GC）
+        self._scan_task = None
+        self._scan_generation = 0
+        self._metadata_snapshot = None
         # 缺封面收藏后台补写回调（App 层注入：内容层 fetch_cover → store.set_cover）
         self._cover_backfiller = cover_backfiller
 
@@ -499,6 +498,19 @@ class LibraryPage(BasePage):
         )
 
     # ------------------------------------------------------------------ #
+    def rebind_runtime(
+        self, source_manager=None, content=None, shelf_cache_repository=None
+    ) -> None:
+        """运行时就绪后注入真实服务并重扫（构造期可能持有占位/None 服务）。"""
+        if source_manager is not None:
+            self._source_manager = source_manager
+        if content is not None:
+            self._content = content
+        if shelf_cache_repository is not None:
+            self._shelf_cache_repository = shelf_cache_repository
+            self._shelf._repository = shelf_cache_repository
+        self.refresh()
+
     def _rebuild(self) -> None:
         """重建列表：后台扫描（含搜索/排序/合并）→ 主线程渲染。"""
         self._clear_all()
@@ -517,10 +529,35 @@ class LibraryPage(BasePage):
         self._last_kw = keyword
         self._last_sort = sort
 
-        task = _ScanTask(self._shelf, want, "", folder, keyword, sort)
-        task.signals.done.connect(self._render)
+        filters = (want, "", folder, keyword, sort)
+        if self._metadata_snapshot is not None:
+            if hasattr(self._shelf, "filter_snapshot"):
+                books = self._shelf.filter_snapshot(self._metadata_snapshot, *filters)
+            else:
+                books = self._metadata_snapshot[1]
+            self._render([it.to_rec() for it in books])
+            return
+        if self._scan_task is not None:
+            return
+        self._scan_generation += 1
+        task = _ScanTask(self._shelf, filters, self._scan_generation)
+        task.signals.done.connect(self._on_scan_done)
         self._scan_task = task
         QThreadPool.globalInstance().start(task)
+
+    def _on_scan_done(self, generation, filters, snapshot) -> None:
+        task = self._scan_task
+        if (generation != self._scan_generation or task is None
+                or task.cancel.is_set() or filters != task.filters):
+            return
+        self._scan_task = None
+        self._metadata_snapshot = snapshot or ([], [])
+        self._rebuild()
+
+    def activate(self) -> None:
+        if self._metadata_snapshot is not None and hasattr(self._shelf, "refresh_metadata"):
+            self._metadata_snapshot = self._shelf.refresh_metadata(self._metadata_snapshot)
+        self._rebuild()
 
     def _sync_combos(self) -> None:
         """刷新收藏夹下拉（保持当前选择）。"""
@@ -615,7 +652,6 @@ class LibraryPage(BasePage):
             for grp in group_favorites(favorites):
                 items.append(self._to_shelf_item(grp))
             self._add_group("收藏", items)
-        self._maybe_backfill_covers(favorites)
 
     def _maybe_backfill_covers(self, favorites: list[dict]) -> None:
         """收藏记录封面无效 → 后台补详情封面（幂等、失败静默、不阻塞渲染）。
@@ -773,7 +809,7 @@ class LibraryPage(BasePage):
         for rec in items:
             self._shelf.favorite_move(rec.get("url", ""), target)
         self._batch_selected.clear()
-        self._rebuild()
+        self.activate()
 
     def _batch_delete(self) -> None:
         from PySide6.QtWidgets import QMessageBox
@@ -786,17 +822,18 @@ class LibraryPage(BasePage):
         for rec in items:
             self._shelf.favorite_remove(rec.get("url", ""))
         self._batch_selected.clear()
-        self._rebuild()
+        self.activate()
 
     def _cached_badge(self, book_key: str) -> str:
         repo = self._shelf_cache_repository
-        if repo is None or not book_key:
+        getter = getattr(repo, "cached_chapter_count", None)
+        if getter is None or not book_key:
             return ""
         try:
-            keys = repo.cached_chapter_keys(book_key)
-        except Exception:  # noqa: BLE001
+            count = getter(book_key)
+        except Exception:
             return ""
-        return f"已缓存 {len(keys)} 章" if keys else ""
+        return f"已缓存 {count} 章" if count else ""
 
     def _set_precache_badge(self, book_key: str, done: int, total: int, done_state: bool = False) -> None:
         card = self._cards_by_key.get(book_key)
@@ -1064,7 +1101,7 @@ class LibraryPage(BasePage):
         if not self._shelf.delete_folder(name):
             return
         self._previous_folder = "全部"
-        self._rebuild()
+        self.activate()
 
     def _show_card_menu(self, rec: dict, pos) -> None:
         """右键菜单：本地书 + 收藏操作（合并条目两者都提供）。"""
@@ -1378,7 +1415,7 @@ class LibraryPage(BasePage):
                 path.unlink(missing_ok=True)
         except OSError:
             pass
-        self._rebuild()
+        self.refresh()
 
     def _remove_local(self, rec: dict) -> None:
         """本地书：从书架列表移除（不删文件，仅取消显示）。"""
@@ -1392,6 +1429,11 @@ class LibraryPage(BasePage):
         if resp != QMessageBox.Yes:
             return
         self._shelf.hide_local(rec.get("title", ""))
+        if self._metadata_snapshot is not None:
+            self._metadata_snapshot = (
+                [it for it in self._metadata_snapshot[0] if it.title != rec.get("title")],
+                self._metadata_snapshot[1],
+            )
         self._rebuild()
 
     def _clear_folder(self) -> None:
@@ -1430,7 +1472,7 @@ class LibraryPage(BasePage):
             } if self._store is not None else set()
             removed = self._shelf.clear_all_favorites(exclude_folders=locked_folders)
         QMessageBox.information(self, "清空收藏", f"已移除 {removed} 本收藏。")
-        self._rebuild()
+        self.activate()
 
     def _ensure_folder_unlocked(self, *names: str) -> bool:
         checked = set()
@@ -1453,19 +1495,19 @@ class LibraryPage(BasePage):
             QMessageBox.warning(self, "状态更新失败", "无法保存阅读状态，请重试。")
             return
         if changed:
-            self._rebuild()
+            self.activate()
 
     def _move_favorite(self, rec: dict, folder: str) -> None:
         if not self._ensure_folder_unlocked(rec.get("folder", "")):
             return
         self._shelf.favorite_move(rec.get("url", ""), folder)
-        self._rebuild()
+        self.activate()
 
     def _remove_favorite(self, rec: dict) -> None:
         if not self._ensure_folder_unlocked(rec.get("folder", "")):
             return
         self._shelf.favorite_remove(rec.get("url", ""))
-        self._rebuild()
+        self.activate()
 
     def _open_folder(self, rec: dict) -> None:
         import os
@@ -1553,7 +1595,7 @@ class LibraryPage(BasePage):
             self, "导入完成",
             f"导入 {result['imported']} 本收藏，新增 {result['folders_added']} 个收藏夹。",
         )
-        self._rebuild()
+        self.activate()
 
     # ------------------------------------------------------------------ #
     def _on_card_clicked(self, item: dict) -> None:
@@ -1663,4 +1705,18 @@ class LibraryPage(BasePage):
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
+        if self._scan_task is not None:
+            self._scan_task.cancel.set()
+        self._scan_generation += 1
+        self._scan_task = None
+        self._metadata_snapshot = None
+        self.cancel_precache_jobs()
         self._rebuild()
+
+    def cancel_precache_jobs(self) -> None:
+        """取消在跑的预缓存后台任务，停止扫描并尽快释放线程；卡片角标随重建更新。"""
+        for job in list(self._precache_jobs.values()):
+            cancel = getattr(job, "cancel", None)
+            if callable(cancel):
+                cancel()
+        self._precache_jobs.clear()

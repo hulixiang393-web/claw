@@ -292,3 +292,77 @@ def test_clear_done_button_keeps_failed(app, tmp_path):
     btn = next(b for b in page.findChildren(QPushButton) if b.text() == "清除已完成")
     btn.click()
     assert {t.status for t in q.tasks()} == {TaskStatus.FAILED}
+
+
+# --------------------------------------------------------------------- #
+# 增量/去重 + 原子写（C7）
+# --------------------------------------------------------------------- #
+def test_save_skips_rewrite_when_content_unchanged(tmp_path, monkeypatch):
+    import framework.download_history as dh
+
+    p = tmp_path / "downloads.json"
+    hist = dh.DownloadHistory(p)
+    writes: list[str] = []
+    real = dh.atomic_write_text
+
+    def spy(path, text, **kwargs):
+        writes.append(text)
+        return real(path, text, **kwargs)
+
+    monkeypatch.setattr(dh, "atomic_write_text", spy)
+    t = DownloadTask(
+        task_id="t1", source_id="s", content_type="novel", url="u",
+        title="旧名", total=1, status=TaskStatus.DONE,
+    )
+
+    hist.save([t])
+    hist.save([t])  # 内容未变 → 不再整表重写
+    assert len(writes) == 1
+
+    t.title = "新名"
+    hist.save([t])  # 内容变化 → 覆盖写
+    assert len(writes) == 2
+
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["version"] == 1
+    assert data["tasks"][0]["title"] == "新名"
+
+
+def test_save_after_clear_rewrites_deleted_file(tmp_path):
+    p = tmp_path / "downloads.json"
+    h = DownloadHistory(p)
+    t = DownloadTask(task_id="t1", source_id="s", content_type="novel",
+                     url="u", title="T", total=1, status=TaskStatus.DONE)
+    h.save([t])
+    h.clear()
+    assert not p.exists()
+    h.save([t])  # clear 复位指纹 → 重新落盘
+    assert p.exists()
+
+
+# --------------------------------------------------------------------- #
+# 节流状态清理（C10）
+# --------------------------------------------------------------------- #
+def test_remove_and_clear_done_purge_throttle_state(tmp_path):
+    q, _ = _make_queue(tmp_path)
+    a = _done_task(q)
+    b = q.add_task(_Detail())
+    b.status = TaskStatus.DONE
+    c = q.add_task(_Detail())
+    c.status = TaskStatus.FAILED
+
+    q._last_img_emit = {}
+    q._last_img_emit[a.task_id] = 1.0
+    q.remove_done(a.task_id)
+    assert a.task_id not in q._last_img_emit
+    assert b.task_id not in q._last_img_emit
+
+    q._last_img_emit[b.task_id] = 2.0
+    q._last_img_emit[c.task_id] = 3.0
+    q.clear_done()
+    assert b.task_id not in q._last_img_emit
+    assert q._last_img_emit.get(c.task_id) == 3.0  # 非 DONE 保留
+
+    q._last_img_emit[c.task_id] = 4.0
+    q.clear_all()
+    assert q._last_img_emit == {}

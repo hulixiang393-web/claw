@@ -19,13 +19,14 @@ import copy
 import json
 import math
 import os
-import tempfile
 import time
 import threading
 from functools import wraps
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from .atomic_io import atomic_write_json
 
 # 记忆有效期（秒）：超时未加入书架则清理
 MEMORY_TTL_SECONDS = 24 * 3600
@@ -63,20 +64,7 @@ def _sanitized_video_history(records):
 
 
 def _atomic_write_progress(path, records):
-    temp_path = None
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
-        temp_path = Path(temp_name)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(records, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_path, path)
-        temp_path = None
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+    atomic_write_json(path, records)
 
 
 def sanitize_progress_backup(progress_path, create_records=None):
@@ -111,6 +99,7 @@ class ReadingProgress:
         path: str | Path = "reading_progress.json",
         shelf_cb: Optional[Callable[[str], bool]] = None,
         repository=None,
+        defer_cleanup=False,
     ):
         """shelf_cb(book_url) -> bool：该书是否已入书架。
 
@@ -122,9 +111,23 @@ class ReadingProgress:
         self._repository = repository
         self._lock = threading.RLock()
         self._data: dict = self._load()
-        self._prune_video_history()
+        self._defer_cleanup = defer_cleanup
+        if not defer_cleanup:
+            self._prune_video_history()
+
+    def run_deferred_cleanup(self) -> None:
+        with self._lock:
+            self._defer_cleanup = False
+            self._prune_video_history()
+
+
+    def attach_repository(self, repository) -> None:
+        with self._lock:
+            self._repository = repository
 
     def _prune_video_history(self):
+        if self._defer_cleanup:
+            return
         sanitize_progress_backup(self.path)
         previous = self._data
         cleaned = _sanitized_video_history(previous)
@@ -235,6 +238,19 @@ class ReadingProgress:
         return urlunsplit((parts.scheme.lower(), host.lower(), parts.path.rstrip("/") or "/", query, ""))
 
     @_synchronized
+    def summary(self, book_url: str) -> Optional[dict]:
+        rec = self._data.get(book_url)
+        if rec is None:
+            normalized = self._normalized_url(book_url)
+            rec = next((candidate for key, candidate in self._data.items()
+                        if self._normalized_url(key) == normalized), None)
+        if rec is None and self._repository is not None:
+            rec = self._repository.get_location(book_url)
+        if not rec or (rec.get("content_type") == "video" and not history_active(rec)):
+            return None
+        return {key: rec[key] for key in ("chapter_title", "updated_at") if key in rec}
+
+    @_synchronized
     def resume(self, book_url: str) -> Optional[dict]:
         """取某本书的进度（供续读定位）。无则 None。"""
         self._prune_video_history()
@@ -301,3 +317,47 @@ class ReadingProgress:
     def clear(self) -> None:
         self._data = {}
         self._save()
+class PositionSnapshot:
+    @staticmethod
+    def make_position_snapshot(view) -> tuple:
+        if hasattr(view, 'position_snapshot'):
+            try:
+                return view.position_snapshot()
+            except Exception:
+                pass
+        return None, None
+
+    @staticmethod
+    def make_current_context(view):
+        if hasattr(view, 'current_context'):
+            try:
+                return view.current_context()
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def make_location(view):
+        if hasattr(view, '_build_current_location'):
+            try:
+                return view._build_current_location()
+            except Exception:
+                pass
+        return None
+
+class GenerationGuard:
+    def __init__(self):
+        self._generation = 0
+
+    def next(self):
+        self._generation += 1
+        return self._generation
+
+    def current(self):
+        return self._generation
+
+    def is_current(self, gen):
+        return gen == self._generation
+
+    def invalidate(self):
+        self._generation += 1

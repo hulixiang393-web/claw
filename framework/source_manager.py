@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .atomic_io import atomic_write_json, read_text_lenient
 from .config import CONTENT_TYPES, SourceConfig, load_source
 from .errors import ConfigError, SourceNotFoundError
 
@@ -44,8 +45,11 @@ class SourceManager:
         sources_dir: str | Path | None = None,
         health_file: str | Path | None = None,
         runtime_settings: Optional[dict] = None,
+        runtime_file: str | Path | None = None,
     ):
-        """runtime_settings：可选，读 sources_runtime.* 策略（自动禁用阈值/告警间隔）。"""
+        """runtime_settings：可选，读 sources_runtime.* 策略（自动禁用阈值/告警间隔）。
+        runtime_file：自动禁用集持久化路径；缺省与 health_file 同目录的
+        sources_runtime.json（health_file 为空则不持久化）。"""
         self._sources: Dict[str, SourceConfig] = {}
         self._health: Dict[str, SourceHealth] = {}
         self._warnings: List[str] = []
@@ -56,10 +60,21 @@ class SourceManager:
         self._soft_deleted: set = set()  # 软删除了的 source_id（配置保留，列表/发现均不出现）
         self._adult_visible: bool = True  # 18+ 源是否显示（设置 content.show_adult_sources）
         self._bus = None
+        self._cache_invalidator = None  # 可选：自动禁用后清理整源缓存（Content 注册）
+        if runtime_file is not None:
+            self._auto_disabled_file = Path(runtime_file)
+        elif health_file is not None:
+            # 默认与 health.json 同目录：重启后恢复自动禁用状态，
+            # 避免「重启→重试→失败→再禁用」在每次启动时重复循环。
+            self._auto_disabled_file = Path(health_file).parent / "sources_runtime.json"
+        else:
+            self._auto_disabled_file = None
         if self._health_file is not None:
             self._load_health()
+        self._load_auto_disabled()
         if sources_dir is not None:
             self.load_dir(sources_dir)
+        self._apply_auto_disabled()
 
     # ------------------------------------------------------------------ #
     # 加载
@@ -151,6 +166,15 @@ class SourceManager:
         """注入 EventBus（App 层在 source_manager 建好后调用一次）。"""
         self._bus = bus
 
+    def set_cache_invalidator(self, invalidator) -> None:
+        """注入整源缓存失效回调（Content.__init__ 自动注册）。
+
+        源健康状态迁入 broken 时（含随后触发的连续失败自动禁用）调用
+        invalidator(source_id)，清掉该源详情/正文/播放流的旧缓存；手动
+        禁用/软删除不触发。回调失败不影响禁用本身。
+        """
+        self._cache_invalidator = invalidator
+
     def soft_deleted_ids(self) -> List[str]:
         return list(self._soft_deleted)
 
@@ -166,6 +190,7 @@ class SourceManager:
         self._auto_disabled.discard(source_id)
         self._soft_deleted.add(source_id)
         self._sources.pop(source_id, None)
+        self._save_auto_disabled()
 
     def restore(self, source_id: str) -> None:
         """恢复软删除的源：清 $deleted 并重新启用（源文件仍在 sources 目录）。"""
@@ -247,6 +272,7 @@ class SourceManager:
         source.enabled = enabled
         # 手动启停后由用户掌控，清除自动禁用标记（不再走自动恢复路径）
         self._auto_disabled.discard(source_id)
+        self._save_auto_disabled()
 
     def set_enabled_persist(self, source_id: str, enabled: bool) -> None:
         """启停并持久化 $enabled 到源 JSON（供删除/禁用等需要重启后保留的场景）。"""
@@ -274,6 +300,7 @@ class SourceManager:
             source.enabled = enabled
             self._auto_disabled.discard(source.source_id)
             self._persist_enabled(source, enabled)
+        self._save_auto_disabled()
 
     @staticmethod
     def _persist_enabled(source: SourceConfig, enabled: bool) -> None:
@@ -302,6 +329,7 @@ class SourceManager:
 
     def update_health(self, source_id: str, state: str, error: str = "") -> None:
         health = self.get_health(source_id)
+        prev_state = health.state
         changed = health.state != state or (bool(error) and health.last_error != error)
         health.state = state
         if error:
@@ -310,10 +338,31 @@ class SourceManager:
         if len(health.history) > MAX_HEALTH_HISTORY:
             health.history = health.history[-MAX_HEALTH_HISTORY:]
         self._apply_policy(source_id, health)
+        # D1：源被判定 broken（状态由非 broken 迁入 broken）时，同步失效该源
+        # 缓存，避免带毒缓存（结构变更/失效结果）在恢复前反复命中而持续失败。
+        # 只在状态迁移时触发，避免每次 broken 上报都重复清理；清理失败不影响
+        # 健康状态记录（安全，回调内部已兜底）。
+        if state == HEALTH_BROKEN and prev_state != HEALTH_BROKEN:
+            self._invalidate_source_cache(source_id)
         # 状态/错误未变化时跳过写盘：后台自检每次成功（ok, ""）若都全量写
         # health.json，会拖慢每一章/每一集的抓取。只在状态变化时落盘。
         if self._health_file is not None and changed:
             self._save_health()
+
+    def _invalidate_source_cache(self, source_id: str) -> None:
+        """调用注入的整源缓存失效回调；未接线/回调异常时静默不影响调用方。
+
+        仅清该源前缀业务缓存（回调由 Content 实现），与源_cache 生命周期一致。
+        """
+        invalidator = self._cache_invalidator
+        if invalidator is None:
+            return
+        try:
+            invalidator(source_id)
+        except Exception:  # noqa: BLE001 —— 清理失败不影响健康状态/禁用本身
+            log.warning(
+                "[source] 清理源缓存失败：%s", source_id, exc_info=True
+            )
 
     # ------------------------------------------------------------------ #
     # 自动禁用 / 告警策略（sources_runtime.*）
@@ -350,6 +399,7 @@ class SourceManager:
                 health.last_error = ""
                 self._auto_disabled.discard(source_id)
                 self._warnings.append(f"源 {source_id} 健康恢复，已自动重新启用")
+                self._save_auto_disabled()
             return
         if health.state != HEALTH_BROKEN:
             return
@@ -369,6 +419,10 @@ class SourceManager:
                 note = "连续失败自动禁用" if not health.last_error else f"连续失败自动禁用：{health.last_error}"
                 health.last_error = note
                 self._warnings.append(f"源 {source_id} 连续失败 {streak} 次，已自动禁用")
+                self._save_auto_disabled()
+                # 整源缓存失效：该源判定不可用，清掉其详情/正文/播放流旧缓存，
+                # 恢复后重新抓取。只清该源前缀键，不碰共享/全局缓存。
+                self._invalidate_source_cache(source_id)
 
     def _load_health(self) -> None:
         if not self._health_file.exists():
@@ -400,6 +454,64 @@ class SourceManager:
             )
         except OSError:
             pass  # 健康状态写失败不阻塞
+
+    # ------------------------------------------------------------------ #
+    # 自动禁用集持久化（sources_runtime.json）
+    # ------------------------------------------------------------------ #
+    def _load_auto_disabled(self) -> None:
+        """从 runtime 文件恢复自动禁用集（重启后保持禁用直至健康恢复）。"""
+        path = self._auto_disabled_file
+        if path is None:
+            return
+        text = read_text_lenient(path)
+        if not text:
+            return
+        try:
+            raw = json.loads(text)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(raw, dict):
+            return
+        values = raw.get("auto_disabled")
+        if not isinstance(values, list):
+            return
+        self._auto_disabled = {
+            str(s) for s in values if isinstance(s, (str, int)) and str(s)
+        }
+
+    def _save_auto_disabled(self) -> None:
+        """原子写自动禁用集（atomic_io：临时文件 + os.replace）。失败静默。"""
+        path = self._auto_disabled_file
+        if path is None:
+            return
+        try:
+            atomic_write_json(path, {"auto_disabled": sorted(self._auto_disabled)})
+        except (OSError, TypeError, ValueError):
+            pass  # 持久化失败不阻塞：内存态已生效
+
+    def _apply_auto_disabled(self) -> None:
+        """重启后应用自动禁用集：仍在集合中的源保持禁用（直至健康恢复/手动启用）。
+
+        用户手动禁用的源（$enabled 显式为 false）从集合中移除并持久化——
+        自动恢复路径不打开用户手动关闭的源（手动禁用永不自动打开）。
+        """
+        if not self._auto_disabled:
+            return
+        changed = False
+        for sid in list(self._auto_disabled):
+            src = self._sources.get(sid)
+            if src is None:
+                self._auto_disabled.discard(sid)
+                changed = True
+                continue
+            if src.raw.get("$enabled") is False:
+                self._auto_disabled.discard(sid)
+                changed = True
+                continue
+            if src.enabled:
+                src.enabled = False
+        if changed:
+            self._save_auto_disabled()
 
     def discoverable_sources(self) -> List[SourceConfig]:
         """配置了发现规则且已启用的源（发现界面只列这些）。"""

@@ -497,6 +497,12 @@ class EpubView(QWidget):
         if 0 <= nxt < len(self._chapters):
             self._load_chapter(nxt)
 
+    def load_chapter(self, idx: int, ratio: float | None = None) -> None:
+        """公共入口：跳转到指定章，可选携带章节内阅读比例（0-1）用于续读定位。"""
+        if ratio is not None:
+            self._pending_pos = float(ratio)
+        self._load_chapter(idx)
+
     # ------------------------------------------------------------------ #
     def _load_chapter(self, idx: int) -> None:
         """加载章节：后台读该章内容（文本/图字节），UI 不阻塞；旧章内容保留到新内容就绪。"""
@@ -506,6 +512,7 @@ class EpubView(QWidget):
         ch = self._chapters[idx]
         self.toc_list.setCurrentRow(idx)
         self.progress_label.setText(f"第{idx+1}/{len(self._chapters)}章 · {ch.title}")
+        self._current_chapter_title = ch.title
         task = _LoadChapterTask(idx, ch, self._epub)
         task.signals.done.connect(self._on_chapter_loaded)
         self._load_task = task  # 持有引用防 GC
@@ -809,6 +816,24 @@ class EpubView(QWidget):
             event.accept()
             return True
         return super().eventFilter(obj, event)
+
+
+    def position_snapshot(self):
+        vbar = self.scroll.verticalScrollBar()
+        if vbar.maximum() > 0:
+            return vbar.value() / vbar.maximum(), None
+        return 0.0, None
+
+    def current_context(self):
+        if not getattr(self, '_path', '') or getattr(self, '_current_idx', -1) < 0:
+            return None
+        ch = self._chapters[self._current_idx] if self._current_idx < len(self._chapters) else None
+        if ch is None:
+            return None
+        return (self._path, ch.title, self._path)
+
+    def _build_current_location(self):
+        return None
 
     def refresh(self) -> None:
         pass

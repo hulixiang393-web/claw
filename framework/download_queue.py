@@ -331,8 +331,20 @@ class DownloadQueue:
             t.end_time = 0.0
             t.cancel_evt = threading.Event()
             t.pause_evt = threading.Event()
+        downloader = getattr(self, "_downloader", None)
+        if downloader is not None:
+            try:
+                downloader.discard_materials(t)  # 从零重来：清理残留材料与溢出状态
+            except Exception:  # noqa: BLE001
+                pass
         self._save()
         self._maybe_dispatch()
+
+    def _forget_emit(self, task_id: str) -> None:
+        """清除图片/视频进度节流残留，避免已移除任务的条目长期滞留内存。"""
+        emits = getattr(self, "_last_img_emit", None)
+        if emits:
+            emits.pop(task_id, None)
 
     def remove_done(self, task_id: str) -> None:
         """从列表移除（文件保留）。仅限终态：DONE / FAILED / CANCELED。"""
@@ -346,16 +358,20 @@ class DownloadQueue:
                 TaskStatus.CANCELED,
             ):
                 self._tasks.remove(t)
+        self._forget_emit(task_id)
         self._save()
 
     def clear_done(self) -> None:
         """清除「下载已完成」的记录（DONE 任务移除，文件保留）。"""
         with self._lock:
             before = len(self._tasks)
+            removed = [t.task_id for t in self._tasks if t.status == TaskStatus.DONE]
             self._tasks[:] = [
                 t for t in self._tasks if t.status != TaskStatus.DONE
             ]
             changed = len(self._tasks) != before
+        for task_id in removed:
+            self._forget_emit(task_id)
         if changed:
             self._save()
 
@@ -363,6 +379,9 @@ class DownloadQueue:
         """清除全部下载记录（含完成/失败/未完成，文件保留）。"""
         with self._lock:
             self._tasks.clear()
+        emits = getattr(self, "_last_img_emit", None)
+        if emits:
+            emits.clear()
         self._save()
 
     # ---- 队列级控制 ---------------------------------------------------- #
@@ -510,9 +529,33 @@ class DownloadQueue:
                 task.dispatched = False  # 真正结束才清位（供 resume 判断）
                 self._active_workers -= 1
                 task.end_time = time.time()
+            if task.cancel_evt.is_set():
+                # 取消：清理章节材料临时目录（失败不清理，保留供 retry 续用）
+                downloader = getattr(self, "_downloader", None)
+                if downloader is not None:
+                    try:
+                        downloader.discard_materials(task)
+                    except Exception:  # noqa: BLE001
+                        pass
             self._save()  # 终态落定即持久化（完成/失败/取消）
             self._emit_final(task)
             self._maybe_dispatch()
+
+    @staticmethod
+    def _finalize_status(task: DownloadTask) -> None:
+        """统一终态判定（novel/video 与 comic 批量/串行三处共用）。
+
+        规则：暂停保持 PAUSED（不覆盖）；取消优先于失败；有失败章节→FAILED；
+        否则 DONE。调用方须持有 self._lock。
+        """
+        if task.status == TaskStatus.PAUSED:
+            return
+        if task.cancel_evt.is_set():
+            task.status = TaskStatus.CANCELED
+        elif task.failed:
+            task.status = TaskStatus.FAILED
+        else:
+            task.status = TaskStatus.DONE
 
     def _download_all(self, task: DownloadTask) -> None:
         source = self._manager.get(task.source_id) if self._manager else None
@@ -570,14 +613,7 @@ class DownloadQueue:
         # 终态判定（novel / video 并发循环）
         with self._lock:
             task.end_time = time.time()
-            if task.status == TaskStatus.PAUSED:
-                pass  # 暂停：保持 PAUSED（不覆盖）
-            elif task.cancel_evt.is_set():
-                task.status = TaskStatus.CANCELED
-            elif task.failed:
-                task.status = TaskStatus.FAILED
-            else:
-                task.status = TaskStatus.DONE
+            self._finalize_status(task)
 
     def _dl_one_chapter(self, task: DownloadTask, source, idx: int) -> None:
         """并发下载单个章节（含重试/暂停/取消/进度上报，线程安全）。
@@ -772,12 +808,7 @@ class DownloadQueue:
         # 终态判定
         with self._lock:
             task.end_time = time.time()
-            if task.cancel_evt.is_set():
-                task.status = TaskStatus.CANCELED
-            elif task.failed:
-                task.status = TaskStatus.FAILED
-            else:
-                task.status = TaskStatus.DONE
+            self._finalize_status(task)
 
     def _download_comic_serial(self, task: DownloadTask, source) -> None:
         """非 Playwright 漫画：逐章串行下载图片，复用 fetch_comic_pages。"""
@@ -853,12 +884,7 @@ class DownloadQueue:
         # 终态判定（与 _download_comic_batch 一致）
         with self._lock:
             task.end_time = time.time()
-            if task.cancel_evt.is_set():
-                task.status = TaskStatus.CANCELED
-            elif task.failed:
-                task.status = TaskStatus.FAILED
-            else:
-                task.status = TaskStatus.DONE
+            self._finalize_status(task)
 
     def _on_image_bytes(self, task: DownloadTask, nbytes: int) -> None:
         """图片下载进度回调：实时更新 bytes_written + 节流发进度。"""

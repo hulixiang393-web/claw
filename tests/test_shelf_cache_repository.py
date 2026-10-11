@@ -20,7 +20,7 @@ def make_repo(tmp_path: Path, **kwargs) -> ShelfCacheRepository:
 def test_repair_index_false_defers_full_repair_until_requested(tmp_path: Path):
     root = tmp_path / "content"
     root.mkdir()
-    orphan = root / "orphan.gz"
+    orphan = root / "payload-orphan.gz"
     orphan.write_bytes(b"orphan")
 
     repo = ShelfCacheRepository(
@@ -49,6 +49,29 @@ def test_repair_index_entry_point_repairs_stale_index(tmp_path: Path):
     assert deferred.get_book_snapshot("book")["content"]
     deferred.repair_index()
     assert deferred.get_book_snapshot("book")["content"] == []
+
+
+def test_shelf_progress_summary_reads_only_location_and_counts(tmp_path, monkeypatch):
+    from framework.reading_progress import ReadingProgress
+
+    repo = make_repo(tmp_path)
+    repo.upsert_book("book", "s", "u", "novel", {})
+    repo.replace_chapters("book", [{"chapter_key": "c1", "title": "目录"}])
+    repo.put_content("book", "c1", "text/plain", "正文", {})
+    repo.update_location("book", {"chapter_title": "第一章", "updated_at": "now"})
+    progress = ReadingProgress(tmp_path / "progress.json", repository=repo)
+    calls = []
+    for name in ("get_book_snapshot", "get_content", "cached_chapter_keys"):
+        monkeypatch.setattr(repo, name, lambda *a, n=name: calls.append(n))
+    queries = []
+    repo._db.set_trace_callback(queries.append)
+    assert progress.summary("book") == {"chapter_title": "第一章", "updated_at": "now"}
+    assert repo.cached_chapter_count("book") == 1
+    assert calls == []
+    assert len(queries) == 2
+    assert "locations" in queries[0]
+    assert "COUNT(*)" in queries[1]
+    repo.close()
 
 
 def test_schema_book_chapter_snapshot_and_restart(tmp_path: Path):
@@ -154,13 +177,57 @@ def test_startup_reconciles_orphan_and_temp_files_but_preserves_indexed_content(
     repo.upsert_book("book", "s", "u", "novel", {})
     repo.put_content("book", "c1", "text/plain", "keep", {})
     root = tmp_path / "content"
-    (root / "orphan.gz").write_bytes(b"orphan")
-    (root / "interrupted.tmp").write_bytes(b"partial")
+    (root / "payload-orphan.gz").write_bytes(b"orphan")
+    (root / ".payload-interrupted.tmp").write_bytes(b"partial")
     repo.close()
     restarted = make_repo(tmp_path)
     assert restarted.get_content("book", "c1") == "keep"
-    assert not (root / "orphan.gz").exists()
-    assert not (root / "interrupted.tmp").exists()
+    assert not (root / "payload-orphan.gz").exists()
+    assert not (root / ".payload-interrupted.tmp").exists()
+
+
+def test_repair_preserves_neighbor_redis_and_legacy_shared_payload(tmp_path: Path):
+    shared = tmp_path / "cache"
+    content_root = shared / "payload"
+    repo = ShelfCacheRepository(tmp_path / "shelf.sqlite3", content_root, repair_index=False)
+    repo.upsert_book("book", "s", "u", "novel", {})
+    repo.put_content("book", "c1", "text/plain", "keep", {})
+    (shared / "redis_shelf.gz").write_bytes(b"redis-neighbor")
+    legacy = shared / "payload-legacy.gz"
+    legacy.write_bytes(b"legacy-shared-payload")
+    orphan = content_root / "payload-orphan.gz"
+    orphan.write_bytes(b"orphan")
+    neighbor_tmp = content_root / "redis_shelf.gz.tmp"
+    neighbor_tmp.write_bytes(b"neighbor-tmp")
+    (content_root / ".payload-interrupted.tmp").write_bytes(b"partial")
+
+    repo.repair_index()
+
+    assert (shared / "redis_shelf.gz").read_bytes() == b"redis-neighbor"
+    assert legacy.read_bytes() == b"legacy-shared-payload"
+    assert not orphan.exists()
+    assert neighbor_tmp.read_bytes() == b"neighbor-tmp"
+    assert not (content_root / ".payload-interrupted.tmp").exists()
+    repo.close()
+
+
+def test_legacy_shared_root_payload_survives_restart_on_dedicated_root(tmp_path: Path):
+    shared = tmp_path / "cache"
+    legacy = ShelfCacheRepository(tmp_path / "shelf.sqlite3", shared, repair_index=False)
+    legacy.upsert_book("book", "s", "u", "novel", {})
+    legacy.put_content("book", "c1", "text/plain", "legacy", {})
+    old_path = next((shared).rglob("payload-*.gz"))
+    legacy.close()
+
+    payload_root = shared / "payload"
+    payload_root.mkdir(parents=True, exist_ok=True)
+    (payload_root / "payload-orphan.gz").write_bytes(b"orphan")
+    restarted = ShelfCacheRepository(tmp_path / "shelf.sqlite3", payload_root)
+
+    assert restarted.get_content("book", "c1") == "legacy"
+    assert old_path.exists()
+    assert not (payload_root / "payload-orphan.gz").exists()
+    restarted.close()
 
 
 def test_failed_content_index_write_removes_new_payload_artifact(tmp_path: Path, monkeypatch):
@@ -226,3 +293,59 @@ def test_unsupported_schema_version_is_rejected(tmp_path: Path):
         conn.execute("UPDATE schema_version SET version=999")
     with pytest.raises(RuntimeError, match="schema version"):
         ShelfCacheRepository(db, tmp_path / "content")
+
+
+def test_cleanup_inactive_never_purges_pinned_books(tmp_path: Path):
+    now = [1000.0]
+    repo = make_repo(tmp_path, clock=lambda: now[0])
+    repo.upsert_book("keep", "s", "u", "novel", {})
+    repo.upsert_book("stale", "s", "v", "novel", {})
+    repo.put_content("keep", "c", "text/plain", "K", {})
+    repo.put_content("stale", "c", "text/plain", "S", {})
+    repo.set_book_pinned("keep", True)
+
+    now[0] = 1000 + 30 * 86400
+    assert repo.cleanup_inactive(5) == 1  # 仅未固定且不活跃的 stale 被清理
+
+    assert repo.get_content("keep", "c") == "K"
+    assert repo.get_content("stale", "c") is None
+
+
+def test_prune_video_history_can_scope_to_single_book(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    stale = {"content_type": "video", "history_timestamp": 1.0,
+             "chapter_url": "c", "position": 5}
+    repo.upsert_book("a", "s", "a", "video", dict(stale))
+    repo.upsert_book("b", "s", "b", "video", dict(stale))
+
+    repo.prune_video_history("a")
+
+    def meta(key):
+        row = repo._db.execute(
+            "SELECT metadata FROM books WHERE book_key=?", (key,)
+        ).fetchone()
+        return repo._loads(row[0])
+
+    a = meta("a")
+    assert "history_timestamp" not in a
+    assert a["position"] == 5  # 续读字段保留（仅清理历史凭据）
+    assert "history_timestamp" in meta("b")  # b 未被波及（作用域限定）
+
+
+def test_content_io_runs_outside_repository_lock(tmp_path: Path, monkeypatch):
+    """gzip 压缩/解压必须移出锁外（锁仅护共享内存结构），不阻塞并发读者。"""
+    import framework.shelf_cache_repository as mod
+
+    repo = make_repo(tmp_path)
+    repo.upsert_book("book", "s", "u", "novel", {})
+    owned: list[bool] = []
+    real_open = mod.gzip.open
+
+    def spy(*args, **kwargs):
+        owned.append(repo._lock._is_owned())
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(mod.gzip, "open", spy)
+    repo.put_content("book", "c1", "text/plain", "hello", {})
+    assert repo.get_content("book", "c1") == "hello"
+    assert owned == [False, False]  # 压缩、解压时均未持锁

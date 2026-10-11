@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from typing import List, Optional
 
+from .atomic_io import atomic_write_text
+
 HISTORY_VERSION = 1
 
 # 恢复未完成任务的统一错误提示
@@ -102,10 +104,14 @@ class DownloadHistory:
 
     def __init__(self, path: str | Path):
         self._path = Path(path)
+        # 上次写盘内容的指纹：内容未变时跳过整表重写（downloads.json 被高频
+        # _save 触发，去重可避免状态未变的空写）。external 改动由 load/clear 复位。
+        self._last_text: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     def load(self) -> List:
         """读取并恢复任务列表。文件缺失/损坏 → []（不抛异常）。"""
+        self._last_text = None
         if not self._path.exists():
             return []
         try:
@@ -123,21 +129,31 @@ class DownloadHistory:
         return tasks
 
     def save(self, tasks) -> None:
-        """全量写盘。写失败静默（下载不阻塞）。"""
+        """增量/去重写盘：仅当序列化内容变化时才原子覆盖，写失败静默。
+
+        保持既有 JSON 结构（{"version":1,"tasks":[...]}）；原子写保证崩溃时
+        旧文件不被半写破坏。
+        """
         payload = {
             "version": HISTORY_VERSION,
             "tasks": [_serialize(t) for t in tasks],
         }
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
+            text = json.dumps(payload, ensure_ascii=False, indent=1)
+        except (TypeError, ValueError):
+            return
+        if text == self._last_text:
+            return  # 内容未变：跳过整表重写
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            atomic_write_text(self._path, text, encoding="utf-8")
         except OSError:
-            pass
+            return
+        self._last_text = text
 
     def clear(self) -> None:
         """删除记录文件（需配合调用方清空 tasks）。"""
+        self._last_text = None
         try:
             self._path.unlink(missing_ok=True)
         except OSError:

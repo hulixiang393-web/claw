@@ -55,6 +55,7 @@ def test_startup_keeps_lazy_pages_unbuilt_and_does_not_schedule_diagnostics(
         MainWindow,
         "_schedule_startup_diag",
         lambda self: diagnostics.append("scheduled"),
+        raising=False,
     )
 
     window = _window(monkeypatch, tmp_path)
@@ -122,5 +123,46 @@ def test_replacing_discover_page_preserves_selected_tab_without_reentrant_builds
     assert TABS[window.tabs.currentIndex()][1] == "discover"
     assert built.count("discover") == 1
     assert all(name not in built for name in ("search", "source", "settings"))
+    _qapp.processEvents()
+    window.close()
+
+
+def test_library_first_tab_and_reentry_scan_once_discover_stays_unbuilt(
+    _qapp, monkeypatch, tmp_path
+):
+    from framework.shelf_service import ShelfService
+    from gui.pages.library_page import LibraryPage, _ScanTask
+    from PySide6.QtCore import QThreadPool
+    from types import SimpleNamespace
+
+    built = _stub_page_builders(monkeypatch)
+    tasks = []
+    monkeypatch.setattr(QThreadPool, "globalInstance",
+                        lambda: SimpleNamespace(start=tasks.append))
+    service = ShelfService(tmp_path / "downloads", data_dir=tmp_path)
+    scans = []
+    scan = service.scan_local
+    monkeypatch.setattr(service, "scan_local",
+                        lambda *a, **kw: (scans.append(kw), scan(*a, **kw))[1])
+
+    def build_library(window):
+        built.append("library")
+        window.library_page = LibraryPage(shelf_service=service)
+        return window.library_page
+
+    monkeypatch.setattr(MainWindow, "_build_library", build_library)
+    window = _window(monkeypatch, tmp_path)
+    assert "library" not in built
+    assert "discover" not in built
+    library_idx = next(i for i, (_, key) in enumerate(TABS) if key == "library")
+    window.tabs.setCurrentIndex(library_idx)
+    scan_tasks = [task for task in tasks if isinstance(task, _ScanTask)]
+    assert len(scan_tasks) == 1
+    scan_tasks[0].run()
+    window.tabs.setCurrentIndex(0)
+    window.tabs.setCurrentIndex(library_idx)
+    assert len(scans) == 1
+    assert built.count("library") == 1
+    assert "discover" not in built
     _qapp.processEvents()
     window.close()

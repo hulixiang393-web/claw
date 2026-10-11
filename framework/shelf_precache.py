@@ -83,11 +83,15 @@ class ShelfPrecacheJob(QRunnable):
                 text = self._content._cache_get(key, book_key=self._book_key)
                 if text is None:
                     text = self._content.fetch_chapter(self._source, url)
+                    if self._cancelled:
+                        return
                     if text:
                         self._content._cache_set(
                             key, text, ttl=7 * 86400, book_key=self._book_key
                         )
                         self._write_repository(self._source.source_id, abs_url, text)
+                if self._cancelled:
+                    return
                 if text is not None:
                     kept.append(abs_url)
                     done += 1
@@ -101,6 +105,8 @@ class ShelfPrecacheJob(QRunnable):
                     log.debug("[precache] progress callback failed", exc_info=True)
             self._emit(self.signals.progress, done, span)
 
+        if self._cancelled:
+            return
         try:
             self._repository.set_book_pinned(self._book_key, True)
             self._repository.evict_book_content(self._book_key, kept)
