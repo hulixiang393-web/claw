@@ -981,7 +981,7 @@ class DiscoverPage(BasePage):
                         pix = QPixmap()
                         pix.loadFromData(base64.b64decode(b64))
                         if not pix.isNull():
-                            card.set_cover_pixmap(pix)
+                            card.set_cover_data(data_uri)
                             hit += 1
                     except Exception:
                         pass

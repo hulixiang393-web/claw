@@ -93,6 +93,7 @@ class WorkCard(QFrame):
         # 调用 load_cover() 触发。
         self._defer_cover = defer_cover
         self._cover_loaded = False
+        self._cover_request_generation = 0
         self._placeholder_active = False
         self._source_filterable = source_filterable
 
@@ -224,6 +225,9 @@ class WorkCard(QFrame):
         """
         if not data_uri or not data_uri.startswith("data:"):
             return
+        # Invalidate an older encrypted-URL request before displaying the
+        # decoded cover; its late failure must not restore the placeholder.
+        self._cover_request_generation += 1
         try:
             self.work.cover = data_uri
         except Exception:  # noqa: BLE001
@@ -247,9 +251,21 @@ class WorkCard(QFrame):
 
     def _load_cover(self, url: str) -> None:
         """通过 CoverLoader 加载封面（全局最多 16 个并发）。"""
+        self._cover_request_generation += 1
+        generation = self._cover_request_generation
         CoverLoader.instance().load(
-            url, self._on_cover_ready, source_id=self.work.source_id
+            url,
+            lambda pixmap, u=url, g=generation: self._on_cover_ready_for(u, g, pixmap),
+            source_id=self.work.source_id,
         )
+
+    def _on_cover_ready_for(self, url: str, generation: int, pixmap) -> None:
+        """Ignore a result from a cover request superseded by a newer one."""
+        if generation != self._cover_request_generation:
+            return
+        if not self.work or self.work.cover != url:
+            return
+        self.set_cover_pixmap(pixmap)
 
     def _on_check_toggled(self, checked: bool) -> None:
         self.checked.emit(self.work, checked)

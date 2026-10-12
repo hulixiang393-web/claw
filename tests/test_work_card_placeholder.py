@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
+from gui.components.cover_loader import CoverLoader
 from gui.components.work_card import WorkCard, _make_text_cover, COVER_HEIGHT
 
 
@@ -77,6 +78,38 @@ def test_real_cover_clears_placeholder_flag(app):
     pm = QPixmap(10, 10)
     pm.fill()
     card.set_cover_pixmap(pm)
+    assert card._placeholder_active is False
+    card.deleteLater()
+    app.processEvents()
+
+
+def test_stale_cover_failure_cannot_replace_decrypted_cover(app, monkeypatch):
+    """旧的加密 URL 请求失败后，不得覆盖已经回填的解密封面。"""
+    import base64
+
+    from PySide6.QtCore import QBuffer
+    from PySide6.QtGui import QImage
+
+    image = QImage(8, 8, QImage.Format_RGB32)
+    image.fill(0xFF3366AA)
+    buffer = QBuffer()
+    buffer.open(QBuffer.WriteOnly)
+    image.save(buffer, "PNG")
+    data_uri = "data:image/png;base64," + base64.b64encode(bytes(buffer.data())).decode()
+
+    pending = {}
+
+    def fake_load(url, callback, **kwargs):
+        pending["callback"] = callback
+
+    monkeypatch.setattr(CoverLoader.instance(), "load", fake_load)
+    card = WorkCard(_Work(cover="https://img.example/encrypted-cover"), defer_cover=True)
+    card.resize(200, COVER_HEIGHT)
+    card.load_cover()
+    card.set_cover_data(data_uri)
+    assert card._placeholder_active is False
+
+    pending["callback"](None)
     assert card._placeholder_active is False
     card.deleteLater()
     app.processEvents()
