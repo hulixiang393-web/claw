@@ -215,7 +215,8 @@ class VideoMixin:
         # api_endpoints.episode 的源生效（episode API 源的分集 URL 是内容页）。
         api = source.raw.get("api_endpoints") or {}
         if not api.get("episode") and self._looks_like_direct_media(episode_url):
-            return episode_url
+            # 页面内嵌 JSON 常把 URL 写成 `https:\/\/...`，交给播放器前还原。
+            return episode_url.replace("\\/", "/")
         # JSON API 播放地址（api_endpoints.episode）
         episode_api = api.get("episode") or {}
         if episode_api:

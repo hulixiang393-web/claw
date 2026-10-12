@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from framework.discovery import Discovery, Work
+from framework.discovery import Category, Discovery, Work
 from framework.content import Content
 from framework.bulk_fetch import BulkFetch
 from framework.events import EventBus, EVENT_SOURCE_VISIBILITY_CHANGED
@@ -461,6 +461,23 @@ class DiscoverPage(BasePage):
         self._clear_cat_buttons()
         if self._current_source is None:
             return
+        # 静态分类不需要线程池往返；立即建按钮并开始首屏请求，网络源的
+        # 首个作品页可以比原先少一个 UI 事件循环延迟。
+        disc = self._current_source.get_discovery_config()
+        static = ((disc.get("list_item") or {}).get("categories") or [])
+        if static:
+            cats = []
+            seen = set()
+            for item in static:
+                if not isinstance(item, dict) or not item.get("title") or not item.get("url"):
+                    continue
+                url = str(item["url"])
+                if url in seen:
+                    continue
+                seen.add(url)
+                cats.append(Category(title=str(item["title"]), url=url))
+            self._on_categories_loaded(cats, None, self._source_epoch)
+            return
         epoch = self._source_epoch
         task = _FetchCategoriesTask(self._discovery, self._current_source)
         task.signals.finished.connect(
@@ -597,6 +614,19 @@ class DiscoverPage(BasePage):
         self._preload_ahead = max(0, min(2, int(pages)))
         self._preload_concurrency = max(1, min(2, int(concurrency)))
 
+    def _preload_depth(self) -> int:
+        """返回当前源的首屏预加载深度。
+
+        Playwright 源的渲染线程默认串行；并发派发第 2 页只会让首屏请求
+        排队。此类源先显示第 1 页，滚动后仍按原规则懒加载后续页面。
+        """
+        source = self._current_source
+        if source is not None:
+            render = (source.get_discovery_config() or {}).get("render")
+            if render in ("playwright", "playwright_fallback"):
+                return 0
+        return self._preload_ahead
+
     def _pump_preload(self) -> None:
         while self._preload_pending:
             if len(self._active_pages) >= self._preload_concurrency:
@@ -632,7 +662,8 @@ class DiscoverPage(BasePage):
             self._render_restored(self._pending_restore)
             self._pending_restore = None
             return
-        self._preload_pending = list(range(1, 1 + self._preload_ahead + 1))
+        depth = self._preload_depth()
+        self._preload_pending = list(range(1, 1 + depth + 1))
         self._pump_preload()
 
     def _render_restored(self, snap: dict) -> None:
@@ -831,7 +862,7 @@ class DiscoverPage(BasePage):
             requested_max = max(self._active_pages | self._loaded_pages, default=0)
             page = requested_max + 1
             loaded_max = max(self._loaded_pages, default=0)
-            if page > loaded_max + self._preload_ahead:
+            if page > loaded_max + self._preload_depth():
                 return  # 预加载缓冲已到位，等用户继续滚动
         if page in self._active_pages or page in self._loaded_pages:
             return  # 已请求或已加载
@@ -1072,7 +1103,7 @@ class DiscoverPage(BasePage):
             return  # 视口已填满，等滚动触发下一页
         loaded_max = max(self._loaded_pages or {0})
         next_page = loaded_max + 1
-        if next_page > 1 + self._preload_ahead:
+        if next_page > 1 + self._preload_depth():
             return  # 预加载深度到顶（只缓冲 2 页），等滚动
         if next_page in self._active_pages or next_page in self._loaded_pages:
             return

@@ -101,11 +101,11 @@ def test_override_is_floor_not_cap(monkeypatch):
 
 
 def test_ikanpp_source_declares_30s():
-    """ikanpp 源配置里落 30s，否则上面的参数根本没人传。"""
+    """ikanpp 源配置里落 30s，否则源级缓冲不会生效。"""
     p = Path(__file__).resolve().parent.parent / "sources" / "ikanpp.json"
     raw = json.loads(p.read_text(encoding="utf-8"))
     hls = (raw.get("media") or {}).get("hls") or {}
-    assert hls.get("network_caching_ms") == 45000
+    assert hls.get("network_caching_ms") == 30000
 
 
 # --------------------------------------------------------------------------- #

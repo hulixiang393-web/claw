@@ -999,10 +999,12 @@ class MediaProxy:
         self._pf_scheduled: set[tuple[str, str]] = set()  # 已排队 (key, url) 去重
         self._pf_futures: set = set()
         self._pf_pool = None
+        self._pf_pool_workers: int | None = None
         self._pf_lock = threading.Lock()
         self._pf_cancel = threading.Event()
         self._pf_cancelled_urls: dict[str, threading.Event] = {}
         self._pf_responses: dict[str, object] = {}
+        self._pf_generation = 0
         self._pf_failures = 0
         self._pf_disabled = False
         self._start_idle_watch()
@@ -1051,26 +1053,78 @@ class MediaProxy:
             self._seg_pos[cache_key] = {u: i for i, u in enumerate(segs)}
 
     def _ensure_pf_pool(self):
+        old_pool = None
         with self._pf_lock:
-            if self._pf_pool is None:
+            workers = self._pf_cfg["workers"]
+            if (self._pf_pool is None
+                    or self._pf_pool_workers != workers):
+                old_pool, self._pf_pool = self._pf_pool, None
                 from concurrent.futures import ThreadPoolExecutor
                 self._pf_pool = ThreadPoolExecutor(
-                    max_workers=self._pf_cfg["workers"],
+                    max_workers=workers,
                     thread_name_prefix="claw-pf")
-            return self._pf_pool
+                self._pf_pool_workers = workers
+            pool = self._pf_pool
+        if old_pool is not None:
+            # 线程池不能动态修改 max_workers；取消尚未开始的旧源任务，
+            # 已运行任务仍由其取消事件/超时自然收尾，不阻塞播放线程。
+            try:
+                old_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        return pool
 
     def configure_prefetch(self, enabled: bool, depth: int = 16, workers: int = 3) -> None:
-        self._pf_cfg["enabled"] = bool(enabled)
-        self._pf_cfg["depth"] = max(1, min(int(depth), _PREFETCH_MAX_DEPTH))
-        self._pf_cfg["workers"] = max(1, min(int(workers), _PREFETCH_MAX_WORKERS))
+        # 播放会话按源隔离：上一个源的 403/429 熔断不能让新源永久失去预取。
+        try:
+            depth = int(depth)
+        except (TypeError, ValueError):
+            depth = 16
+        try:
+            workers = int(workers)
+        except (TypeError, ValueError):
+            workers = 3
+        old_pool = None
+        responses = []
+        with self._pf_lock:
+            self._pf_generation += 1
+            self._pf_cfg["enabled"] = bool(enabled)
+            self._pf_cfg["depth"] = max(1, min(depth, _PREFETCH_MAX_DEPTH))
+            self._pf_cfg["workers"] = max(1, min(workers, _PREFETCH_MAX_WORKERS))
+            self._pf_failures = 0
+            self._pf_disabled = False
+            # 切源/重播时取消旧窗口，防止迟到分片写进新会话；未开始的任务
+            # 由 shutdown 取消，正在读取的任务通过逐 URL event 收尾。
+            for event in self._pf_cancelled_urls.values():
+                event.set()
+            responses = list(self._pf_responses.values())
+            old_pool, self._pf_pool = self._pf_pool, None
+            self._pf_pool_workers = None
+            self._pf_cancelled_urls.clear()
+            self._pf_scheduled.clear()
+            self._seg_order.clear()
+            self._seg_pos.clear()
+        for response in responses:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if old_pool is not None:
+            try:
+                old_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     def _prefetch_enabled(self) -> bool:
         return bool(self._pf_cfg.get("enabled")) and not self._pf_disabled
 
-    def _prefetch_url_cancelled(self, canonical: str) -> bool:
+    def _prefetch_url_cancelled(self, canonical: str,
+                                generation: int | None = None) -> bool:
         with self._pf_lock:
             event = self._pf_cancelled_urls.get(canonical)
-        return self._pf_cancel.is_set() or (event is not None and event.is_set())
+            stale = (generation is not None
+                     and generation != self._pf_generation)
+        return stale or self._pf_cancel.is_set() or (event is not None and event.is_set())
 
     def _cancel_prefetch_url(self, url: str) -> None:
         cache = self._cache_obj()
@@ -1116,6 +1170,8 @@ class MediaProxy:
         with self._lock:
             ctx = self._cache_ctx.get(cache_key)
             pos = self._seg_pos.get(cache_key)
+        with self._pf_lock:
+            generation = self._pf_generation
         if ctx is None or not pos:
             return
         idx = pos.get(full_url)
@@ -1141,7 +1197,8 @@ class MediaProxy:
                 self._pf_cancelled_urls[canonical] = threading.Event()
             try:
                 fut = self._ensure_pf_pool().submit(
-                    self._prefetch_one, cache_key, u, dict(headers), force_proxy)
+                    self._prefetch_one, cache_key, u, dict(headers), force_proxy,
+                    generation)
             except RuntimeError:
                 return
             with self._pf_lock:
@@ -1153,10 +1210,13 @@ class MediaProxy:
             self._pf_futures.discard(future)
 
     def _prefetch_one(self, cache_key: str, url: str, headers: dict,
-                      force_proxy: bool) -> None:
+                      force_proxy: bool, generation: int | None = None) -> None:
         cache = self._cache_obj()
         if cache is None:
             return
+        if generation is None:
+            with self._pf_lock:
+                generation = self._pf_generation
         canonical = cache.key_of(url)
         resp = None
         lock = cache.path_lock(url)
@@ -1168,7 +1228,8 @@ class MediaProxy:
                 return
             final = cache.hls_segment_final(cache_key, url)
             for attempt in range(2):
-                if (self._prefetch_url_cancelled(canonical) or self._pf_disabled
+                if (self._prefetch_url_cancelled(canonical, generation)
+                        or self._pf_disabled
                         or final.is_file()):
                     return
                 remaining = deadline - time.monotonic()
@@ -1202,7 +1263,7 @@ class MediaProxy:
                     if not tee.start():
                         return
                     while True:
-                        if self._prefetch_url_cancelled(canonical):
+                        if self._prefetch_url_cancelled(canonical, generation):
                             return
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
@@ -1214,7 +1275,7 @@ class MediaProxy:
                         tee.write(chunk)
                     if tee.written != total:
                         raise requests.ConnectionError("incomplete prefetch body")
-                    if self._prefetch_url_cancelled(canonical):
+                    if self._prefetch_url_cancelled(canonical, generation):
                         return
                     tee.finish()
                     if not tee.aborted:
@@ -1261,6 +1322,7 @@ class MediaProxy:
     def _shutdown_prefetch(self) -> None:
         from concurrent.futures import wait as _cf_wait
         with self._pf_lock:
+            self._pf_generation += 1
             self._pf_cancel.set()
             pool, self._pf_pool = self._pf_pool, None
             futures = set(self._pf_futures)

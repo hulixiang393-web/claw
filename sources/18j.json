@@ -144,6 +144,20 @@
       "output_format": "mp4"
     }
   },
+  "ad_block": {
+    "enabled": true,
+    "hls_rules": {
+      "drop_leading_block": {
+        "enabled": true,
+        "max_duration": 30,
+        "max_ratio": 0.25,
+        "require_discontinuity": true,
+        "require_host_change": true,
+        "require_encryption_transition": true,
+        "encryption_transition": "unencrypted_to_encrypted"
+      }
+    }
+  },
   "constraints": {
     "search": { "max_pages": 5, "max_results": 200 },
     "detail": { "max_pages": 1 },

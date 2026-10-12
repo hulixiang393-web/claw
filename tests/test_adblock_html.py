@@ -177,6 +177,101 @@ class TestM3u8StreamAds:
         out = eng.filter_m3u8(m3u8, "https://cdn.example.com/play/list.m3u8")
         assert out == m3u8
 
+    def test_configured_leading_block_requires_host_and_key_transition(self):
+        class FakeSource:
+            raw = {
+                "ad_block": {
+                    "enabled": True,
+                    "hls_rules": {
+                        "drop_leading_block": {
+                            "max_duration": 30,
+                            "max_ratio": 0.25,
+                            "require_discontinuity": True,
+                            "require_host_change": True,
+                            "require_encryption_transition": True,
+                            "encryption_transition": "unencrypted_to_encrypted",
+                        }
+                    },
+                }
+            }
+
+        eng = AdblockEngine(FakeSource())
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n"
+            "#EXTINF:3.0,\nhttps://intro.example/intro0.ts\n"
+            "#EXTINF:1.5,\nhttps://intro.example/intro1.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"/key\"\n"
+            "#EXTINF:10.0,\nhttps://main.example/video0.ts\n"
+            "#EXTINF:10.0,\nhttps://main.example/video1.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        ads, out = eng.detect_m3u8_ads(m3u8, "https://main.example/index.m3u8")
+        assert ads == [0, 1]
+        assert "intro0.ts" not in out and "intro1.ts" not in out
+        assert "video0.ts" in out and "#EXT-X-KEY:METHOD=AES-128" in out
+        assert out.count("#EXTINF:") == 2
+        assert "#EXT-X-DISCONTINUITY" not in out
+
+    def test_configured_leading_block_keeps_content_when_one_signal_is_missing(self):
+        class FakeSource:
+            raw = {
+                "ad_block": {
+                    "enabled": True,
+                    "hls_rules": {
+                        "drop_leading_block": {
+                            "max_duration": 30,
+                            "max_ratio": 0.25,
+                            "require_discontinuity": True,
+                            "require_host_change": True,
+                            "require_encryption_transition": True,
+                            "encryption_transition": "unencrypted_to_encrypted",
+                        }
+                    },
+                }
+            }
+
+        eng = AdblockEngine(FakeSource())
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:3.0,\nhttps://intro.example/intro0.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"/key\"\n"
+            "#EXTINF:10.0,\nhttps://intro.example/video0.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        ads, out = eng.detect_m3u8_ads(m3u8, "https://main.example/index.m3u8")
+        assert ads == []
+        assert out == m3u8
+
+    def test_source_url_rule_removes_ikanpp_baofeng_adjumps(self):
+        class FakeSource:
+            raw = {
+                "ad_block": {
+                    "enabled": True,
+                    "block_url_regex": [r"/video/adjump(?:/|$)"],
+                }
+            }
+
+        eng = AdblockEngine(FakeSource())
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+            "#EXTINF:4.0,\n0000000.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:3.0,\nhttps://fengbao13.com/video/adjump/time/ad0.ts\n"
+            "#EXTINF:3.0,\nhttps://fengbao13.com/video/adjump/time/ad1.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:4.0,\n0000001.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        ads, out = eng.detect_m3u8_ads(m3u8, "https://fengbao13.com/video/show/index.m3u8")
+        assert ads == [1, 2]
+        assert "adjump" not in out
+        assert "0000000.ts" in out and "0000001.ts" in out
+        assert out.count("#EXTINF:") == 2
+        # 中插广告移除后保留一个 PTS 边界，避免音视频时间戳直接拼接抖动。
+        assert out.count("#EXT-X-DISCONTINUITY") == 1
+
 
 class TestBackwardCompat:
     def test_is_ad_url_still_works(self):

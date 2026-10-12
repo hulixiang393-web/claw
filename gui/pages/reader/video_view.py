@@ -1721,6 +1721,9 @@ class VideoView(QWidget):
             hdrs = _rh() or {}
         from framework.external_player import open_with_player
         from framework.media_proxy import MediaProxy, trusted_media_context
+        # ikanpp 的部分 CDN 对单连接限速；播放前按源配置开启有限 HLS 预取，
+        # 让代理提前落盘后续分片，避免 VLC 在下一片到达前反复卡住。
+        self._configure_playback_prefetch(video)
         # 源 ad_block 配置：播放代理转发 m3u8 时过滤广告段（下载已有过滤）
         ad_block = {}
         try:
@@ -1783,6 +1786,53 @@ class VideoView(QWidget):
             return dict(tuning) if isinstance(tuning, dict) else {}
         except Exception:
             return {}
+
+    def _source_hls_prefetch(self) -> dict:
+        """读取本地播放用的源级 HLS 预取配置。"""
+        try:
+            media = (getattr(self._source, "raw", None) or {}).get("media") or {}
+            hls = media.get("hls") or {}
+            prefetch = hls.get("prefetch") or {}
+            return dict(prefetch) if isinstance(prefetch, dict) else {}
+        except Exception:
+            return {}
+
+    def _configure_playback_prefetch(self, video_url: str = "") -> None:
+        """按源配置 HLS 预取；未配置的 m3u8 使用保守通用默认值。
+
+        大多数源不会在 JSON 中重复声明同一套抗抖参数，但实际返回的
+        播放地址仍可能是 HLS。只对真实 m3u8 自动启用，非 HLS 不增加请求。
+        源显式写入 ``prefetch`` 时优先尊重源配置。
+        """
+        try:
+            from framework.media_proxy import MediaProxy
+
+            configure = getattr(MediaProxy.instance(), "configure_prefetch", None)
+            if not callable(configure):
+                return
+            raw = (getattr(self._source, "raw", None) or {})
+            media = raw.get("media") or {}
+            hls = media.get("hls") or {}
+            is_hls = (
+                "m3u8" in str(video_url or "").lower()
+                or str(media.get("format") or "").lower() in {"hls", "m3u8"}
+            )
+            if (is_hls and isinstance(hls, dict)
+                    and isinstance(hls.get("prefetch"), dict)):
+                prefetch = dict(hls["prefetch"])
+            elif is_hls:
+                # 默认仅前瞻 4 片、2 路并发；足够覆盖短时抖动且不放大请求。
+                prefetch = {"enabled": True, "depth": 4, "workers": 2}
+            else:
+                prefetch = {"enabled": False}
+            configure(
+                bool(prefetch.get("enabled", False)),
+                depth=prefetch.get("depth", 4),
+                workers=prefetch.get("workers", 3),
+            )
+        except Exception:
+            # 预取只是抗抖动增强，配置异常不能阻断正常播放。
+            return
 
     def _configure_cast_tuning(self) -> None:
         from framework.media_proxy import MediaProxy, trusted_media_context

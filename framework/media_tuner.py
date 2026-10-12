@@ -51,14 +51,16 @@ def _hint(url: str, hints) -> bool:
 def classify(url: str) -> MediaProfile:
     """按 URL 推断媒体类型与初始缓冲参数。
 
-    - HLS（m3u8）：分片流，网络抖动敏感 → 3500ms
+    - HLS（m3u8）：分片流，网络抖动敏感 → 5000ms
     - DASH（mpd）：分片流，双流合并开销大 → 4000ms
     - 直播（live/flv 无扩展名）：低延迟优先 + 抗抖 → 2500ms
     - MP4/WebM 直链：渐进式下载，靠 Range 拖动 → 1500ms 即可
     - 未知：保守 2500ms
     """
     if _hint(url, _HLS_HINTS):
-        return MediaProfile("hls", 60000, 60000)
+        # 5 秒保证普通源不会因过度缓冲而长时间黑屏；慢 CDN 可由源级
+        # network_caching_ms 覆盖，不能把所有源都按慢源处理。
+        return MediaProfile("hls", 5000, 30000)
     if _hint(url, _DASH_HINTS):
         return MediaProfile("dash", 4000, 8000)
     if _hint(url, _LIVE_HINTS):

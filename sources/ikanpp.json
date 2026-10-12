@@ -150,8 +150,19 @@
     },
     "hls": {
       "workers": 4,
-      "network_caching_ms": 30000
+      "network_caching_ms": 30000,
+      "prefetch": {
+        "enabled": false,
+        "depth": 1,
+        "workers": 1
+      }
     }
+  },
+  "ad_block": {
+    "enabled": true,
+    "block_url_regex": [
+      "/video/adjump(?:/|$)"
+    ]
   },
   "constraints": {
     "search": {

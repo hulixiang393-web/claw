@@ -184,15 +184,28 @@
     "content": {
       "episode": {
         "single_chapter": true,
-        "note": "详情页即单条文章（/archives/{id}），无分集列表。播放地址从详情页 DPlayer JS 配置提取 m3u8（regex 抓 hls 地址，框架自动 \/ -> /）。部分文章纯图文无视频，播放地址为空属正常。",
-        "play_url": {
-          "regex": "\"url\"\\s*:\\s*\"([^\"]*m3u8[^\"]*)\""
+        "note": "详情页即文章；每个 DPlayer[data-config] 作为一集。单视频保持单集，多视频按页面顺序生成选集。纯图文文章没有章节，播放地址为空属正常。",
+        "list": {
+          "root_selector": {
+            "css": ".dplayer[data-config]"
+          },
+          "fields": {
+            "title": {
+              "xpath": "self::*",
+              "attr": "data-video_title"
+            },
+            "url": {
+              "xpath": "self::*",
+              "attr": "data-config",
+              "regex": "\"video\"\\s*:\\s*\\{\\s*\"url\"\\s*:\\s*\"([^\"]+m3u8[^\"]*)\""
+            }
+          }
         }
       }
     }
   },
   "media": {
-    "format": "mp4",
+    "format": "hls",
     "select": {
       "video": {
         "quality": "best"
@@ -213,7 +226,7 @@
     },
     "episode": {
       "max_pages": 1,
-      "max_items": 1
+      "max_items": 100
     }
   },
   "decryption": {

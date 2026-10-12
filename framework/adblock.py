@@ -20,6 +20,9 @@
   （#EXT-X-DISCONTINUITY 分隔 + 段 URL 广告特征/异常短时长），
   重写为无广告段的 m3u8 供播放/下载；单行 EXTINF + 段 URL 不再丢失时长。
 
+源级 HLS 规则还可以声明 `hls_rules.drop_leading_block`，用于需要多个
+独立信号才能确认的片头广告（例如 18j 的主机切换 + 加密切换）。
+
 对应 PROJECT_GUIDE.md §7.8、§10 的广告过滤配置与错误隔离。
 """
 
@@ -285,6 +288,7 @@ class AdblockEngine:
         self._extra_regexes: List[re.Pattern] = []
         self._extra_domains: List[str] = []
         self._extra_css: List[str] = []
+        self._hls_rules: dict = {}
         if source is not None:
             self.configure(source, default_on=default_on)
 
@@ -300,6 +304,7 @@ class AdblockEngine:
         self._extra_regexes = []
         self._extra_domains = []
         self._extra_css = []
+        self._hls_rules = {}
         raw = getattr(source, "raw", None) or {}
         ad = raw.get("ad_block") or {}
         # 源未配置 ad_block → 按 default_on 决定是否启用内置规则
@@ -325,6 +330,10 @@ class AdblockEngine:
             s = str(sel).strip()
             if s:
                 self._extra_css.append(s)
+        # HLS 结构化规则保持在源配置中，避免把单一站点的 CDN 特征写死在引擎。
+        rules = ad.get("hls_rules") or {}
+        if isinstance(rules, dict):
+            self._hls_rules = rules
 
     @property
     def enabled(self) -> bool:
@@ -467,10 +476,16 @@ class AdblockEngine:
 
         # ---- 第一遍：解析段信息 + 统计段 URL 出现次数（重复段检测） ----
         seg_infos: List[tuple] = []  # (joined_url, dur, byte_range)
+        seg_meta: List[dict] = []  # 每段的媒体主机与加密状态
         url_counter: dict = {}
         pending_dur: Optional[float] = None
         pending_range: Optional[str] = None
+        key_method = "NONE"
         for line in lines:
+            if line.startswith("#EXT-X-KEY:"):
+                method = re.search(r"(?:^|[:,])METHOD=([^,\s]+)", line)
+                key_method = method.group(1).upper() if method else ""
+                continue
             m = re.match(r"#EXTINF:\s*([\d.]+)", line)
             if m:
                 pending_dur = float(m.group(1))
@@ -481,6 +496,10 @@ class AdblockEngine:
             if line.strip() and not line.startswith("#"):
                 joined = urljoin(base_url, line) if base_url else line
                 seg_infos.append((joined, pending_dur, pending_range))
+                seg_meta.append({
+                    "host": (urlparse(joined).hostname or "").lower(),
+                    "encrypted": key_method not in ("", "NONE"),
+                })
                 duplicate_key = (joined, pending_range)
                 url_counter[duplicate_key] = url_counter.get(duplicate_key, 0) + 1
                 pending_dur = None
@@ -524,8 +543,12 @@ class AdblockEngine:
                 continue
             if line.startswith("#EXT-X-DISCONTINUITY"):
                 if cur is not None and cur["seg"]:
+                    cur["boundary_after"] = True
                     blocks.append(cur)
-                cur = {"seg": [], "dur": 0.0, "durs": [], "independent": True}
+                cur = {
+                    "seg": [], "dur": 0.0, "durs": [],
+                    "independent": True, "boundary_after": False,
+                }
                 continue
             m = re.match(r"#EXTINF:\s*([\d.]+)", line)
             if m:
@@ -534,7 +557,10 @@ class AdblockEngine:
             if line.strip() and not line.startswith("#"):
                 seg_idx += 1
                 if cur is None:
-                    cur = {"seg": [], "dur": 0.0, "durs": [], "independent": False}
+                    cur = {
+                        "seg": [], "dur": 0.0, "durs": [],
+                        "independent": False, "boundary_after": False,
+                    }
                 dur = pending_dur
                 pending_dur = None
                 cur["seg"].append(seg_idx)
@@ -598,6 +624,59 @@ class AdblockEngine:
             ):
                 ad_set.update(_segs)
 
+        # ---- R5b：源声明的多信号片头规则 ----
+        # 只处理首个连续块，并要求所有配置的信号同时成立。这样不会因为
+        # 普通短视频、首段较短或单独的 DISCONTINUITY 而误删正片开头。
+        leading_rule = (self._hls_rules or {}).get("drop_leading_block")
+        if isinstance(leading_rule, dict) and leading_rule.get("enabled", True):
+            if len(blocks) >= 2 and blocks[0]["seg"] and blocks[0].get("boundary_after"):
+                first = blocks[0]
+                second = blocks[1]
+                first_ids = first["seg"]
+                second_ids = second["seg"]
+                try:
+                    max_duration = float(leading_rule.get("max_duration", 30.0))
+                except (TypeError, ValueError):
+                    max_duration = 30.0
+                try:
+                    max_ratio = float(leading_rule.get("max_ratio", 0.25))
+                except (TypeError, ValueError):
+                    max_ratio = 0.25
+                first_hosts = {
+                    seg_meta[i]["host"] for i in first_ids if i < len(seg_meta)
+                }
+                second_hosts = {
+                    seg_meta[i]["host"] for i in second_ids if i < len(seg_meta)
+                }
+                host_changed = bool(first_hosts and second_hosts and first_hosts != second_hosts)
+                first_encrypted = any(
+                    seg_meta[i]["encrypted"] for i in first_ids if i < len(seg_meta)
+                )
+                second_encrypted = any(
+                    seg_meta[i]["encrypted"] for i in second_ids if i < len(seg_meta)
+                )
+                encryption_changed = first_encrypted != second_encrypted
+                direction = str(
+                    leading_rule.get("encryption_transition", "any")
+                ).lower()
+                if direction in ("off_to_on", "unencrypted_to_encrypted"):
+                    encryption_changed = not first_encrypted and second_encrypted
+                elif direction in ("on_to_off", "encrypted_to_unencrypted"):
+                    encryption_changed = first_encrypted and not second_encrypted
+                valid = True
+                if max_duration > 0 and first["dur"] > max_duration:
+                    valid = False
+                if max_ratio > 0 and total_dur > 0 and first["dur"] > max_ratio * total_dur:
+                    valid = False
+                if leading_rule.get("require_discontinuity", True) and not first.get("boundary_after"):
+                    valid = False
+                if leading_rule.get("require_host_change", False) and not host_changed:
+                    valid = False
+                if leading_rule.get("require_encryption_transition", False) and not encryption_changed:
+                    valid = False
+                if valid:
+                    ad_set.update(first_ids)
+
         # ---- R6：中插离群块（内部块 + 块时长远小于中位数 + 均匀/超短） ----
         block_durs = sorted(_b["dur"] for _b in blocks if _b["seg"])
         if block_durs:
@@ -646,21 +725,35 @@ class AdblockEngine:
                 if seg_idx in ad_set:
                     ad_segs.append(seg_idx)
                     # 回退：删掉刚写入的本段元数据行。只回退属于「当前段」的
-                    # EXTINF / DISCONTINUITY / BYTERANGE / 广告块专用 KEY:NONE；
+                    # EXTINF / BYTERANGE；广告块前的 DISCONTINUITY 不能随意删除，
+                    # 中插广告移除后要保留一个边界，让播放器重置拼接流的 PTS。
                     # 保留带加密信息的 KEY / MAP——它们是后续所有段共用的加密/
                     # 初始化信息，随广告段一并删除会让 key rotation / fMP4 场景
                     # 的后续段解密失败。KEY:METHOD=NONE 是无加密声明，仅广告块
                     # 独有，删广告段时一并清理（xuandm 广告块 KEY:NONE 实测）。
                     while out and (
                         out[-1].startswith("#EXTINF")
-                        or out[-1].startswith("#EXT-X-DISCONTINUITY")
                         or out[-1].startswith("#EXT-X-BYTERANGE")
                     ):
                         out.pop()
                     # 跳过本段及后续紧邻的 DISCONTINUITY
                     i += 1
+                    skipped_boundary = False
                     while i < n and lines[i].startswith("#EXT-X-DISCONTINUITY"):
+                        skipped_boundary = True
                         i += 1
+                    # 中插广告前后的两个边界合并为一个；片头和片尾不保留
+                    # 孤立边界。这样既避免 PTS 连续性破坏，也不制造空块。
+                    has_previous_kept = any(j not in ad_set for j in range(seg_idx))
+                    has_future_kept = any(
+                        j not in ad_set for j in range(seg_idx + 1, len(seg_infos))
+                    )
+                    if skipped_boundary and has_previous_kept and has_future_kept:
+                        # 前面的 DISCONTINUITY 已经在 out 中，保留它作为合并后的边界。
+                        pass
+                    elif skipped_boundary and not has_future_kept:
+                        while out and out[-1].startswith("#EXT-X-DISCONTINUITY"):
+                            out.pop()
                     continue
             out.append(line)
             i += 1

@@ -72,7 +72,7 @@
     "prefetch_ahead": 3,
     "prefetch_behind": 1,
     "show_images": true,
-    "font_size": 0,
+    "font_size": 28,
     "font_family": "yahei",
     "line_spacing": 1.8,
     "content_width": 960,

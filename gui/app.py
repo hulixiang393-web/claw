@@ -303,15 +303,6 @@ class _StartupTask(threading.Thread):
                 library_store=self._library_store,
                 data_dir=base_dir / "data",
             )
-            _run_startup_migration(
-                repository,
-                base_dir / "data" / "reading_progress.json",
-                legacy_shelf,
-                shelf_cache,
-                base_dir,
-            )
-            repository.repair_index()
-
             http = HttpClient(defaults=network_defaults_from_settings(settings))
             parser = Parser()
             checker = StructureChecker(
@@ -371,8 +362,23 @@ class _StartupTask(threading.Thread):
             if self._cancel.is_set():
                 _release_services(services)
                 return
-            _run_deferred_history_cleanup(self._window)
+            # 先发布网络服务，让发现页与启动维护并行。repair_index 会递归扫描
+            # 书架载荷目录，不能再挡住源列表和首个分类请求。
             self._signals.ready.emit(services, self._generation)
+            if self._cancel.is_set():
+                return
+            try:
+                _run_startup_migration(
+                    repository,
+                    base_dir / "data" / "reading_progress.json",
+                    legacy_shelf,
+                    shelf_cache,
+                    base_dir,
+                )
+                repository.repair_index()
+                _run_deferred_history_cleanup(self._window)
+            except Exception:  # noqa: BLE001 -- 维护失败不影响已发布的网络服务
+                log.exception("启动后台维护失败，保留网络服务继续运行")
         except Exception as exc:
             try:
                 repository.close()

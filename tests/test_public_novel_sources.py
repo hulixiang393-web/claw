@@ -104,15 +104,16 @@ def test_bookstack_config_has_low_frequency_discovery_and_search_contract():
         "css": ".result-list li.clearfix"
     }
     assert search["paginator"]["url_template"] == "/search/result?wd={keyword}&tab=book&page={page}"
-    assert source.transports()["interval_ms"] == 1200
+    assert source.transports()["interval_ms"] == 250
     assert source.transports()["retries"] == 1
+    assert source.transports()["headers"]["User-Agent"].startswith("Mozilla/5.0")
     assert source.raw["diagnostics"]["selfcheck"]["strategy"] == "off"
     detail_fields = source.raw["endpoints"]["detail"]["fields"]
     assert detail_fields["title"]["fallback"][0] == {"css": "h1.wd-book-title"}
     assert detail_fields["cover"]["fallback"][0] == {
         "css": ".wd-cover-img", "attr": "src"
     }
-    assert detail["render"] == "playwright"
+    assert detail["render"] == "http"
     assert detail["render_config"]["wait_for"] == (
         "h1.wd-book-title, .m-manual.manual-mode-view .article-menu-detail, "
         "article#page-content"
@@ -124,7 +125,7 @@ def test_bookstack_config_has_low_frequency_discovery_and_search_contract():
         "css": "article.article-body.markdown-body"
     }
     body = source.raw["endpoints"]["content"]["chapter"]["body"]
-    assert body["render"] == "playwright"
+    assert body["render"] == "http"
     assert body["render_config"]["wait_for"] == (
         "article.article-body.markdown-body, article#page-content"
     )

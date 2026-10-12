@@ -139,7 +139,7 @@ def test_bookstack_reader_root_provides_nested_directory_before_summary_fallback
 
         def get_text(self, url, **kwargs):
             calls.append(url)
-            return reader_html if url.endswith("/read/book/demo") else detail_html
+            return reader_html if url.endswith("/read/demo/SUMMARY.md") else detail_html
 
     content = Content(_ReaderHttp(), Parser(), object())
     content._fetch_rendered_html = lambda source, url, config: (rendered.append(url) or reader_html)
@@ -155,27 +155,21 @@ def test_bookstack_reader_root_provides_nested_directory_before_summary_fallback
         ("二级", 1),
         ("三级", 2),
     ]
-    assert calls == []
-    assert rendered == ["https://www.bookstack.cn/read/book/demo"]
+    assert calls == ["https://www.bookstack.cn/read/demo/SUMMARY.md"]
+    assert rendered == []
 
 
-def test_bookstack_rich_fetch_uses_browser_render():
+def test_bookstack_rich_fetch_uses_fast_http_path():
     html = '<article class="article-body markdown-body"><p>浏览器正文</p></article>'
-    http = _Http('<html><body>429</body></html>')
+    http = _Http(html)
     content = Content(http, Parser(), object())
-    rendered = []
-    content._fetch_rendered_html = lambda source, url, config: (rendered.append((url, config)) or html)
 
     result = content.fetch_bookstack_chapter(
         SOURCE, "https://www.bookstack.cn/read/demo/chapter.md"
     )
 
     assert "浏览器正文" in result.text
-    assert http.calls == []
-    assert rendered[0][0].endswith("/read/demo/chapter.md")
-    assert rendered[0][1]["wait_for"] == (
-        "article.article-body.markdown-body, article#page-content"
-    )
+    assert http.calls == ["https://www.bookstack.cn/read/demo/chapter.md"]
 
 
 def test_bookstack_rich_result_preserves_structure_and_image_dom_order():

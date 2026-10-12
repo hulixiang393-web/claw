@@ -468,12 +468,12 @@ class DetailMixin:
             match = _re.search(r"/books/([^/?#]+)", detail_url)
             if match:
                 book_key = match.group(1)
-                # BookStack's current reader is /read/book/{key}; the older
-                # /read/{key} path remains a compatibility fallback.
+                # SUMMARY.md is the canonical server-rendered reader entry and
+                # avoids the redirect used by /read/book/{key}.
                 reader_paths = (
-                    f"/read/book/{book_key}",
-                    f"/read/{book_key}",
                     f"/read/{book_key}/SUMMARY.md",
+                    f"/read/{book_key}",
+                    f"/read/book/{book_key}",
                 )
                 for reader_path in reader_paths:
                     reader_url = self._abs_url(source, reader_path)
