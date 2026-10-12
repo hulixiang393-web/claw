@@ -287,6 +287,9 @@ class DiscoverPage(BasePage):
         sources = self._manager.discoverable_sources()
         if ftype:
             sources = [s for s in sources if s.content_type == ftype]
+        # BookStack is the default fast-start source; keep the remaining source
+        # order unchanged so user-configured ordering is preserved.
+        sources.sort(key=lambda source: getattr(source, "source_id", "") != "bookstack")
         for s in sources:
             label = f"{self._health_icon(s.source_id)} {s.source_name} ({s.content_type})"
             self.source_combo.addItem(label, s)

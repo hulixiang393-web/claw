@@ -1,7 +1,7 @@
 """阅读器主页面（ReaderPage）。
 
 单 Tab 复用：打开一部作品，按 content_type 切换小说/漫画/视频视图。
-对应 ui-reader.md。从发现/搜索详情抽屉「开始阅读」进入。
+对应 PROJECT_GUIDE.md §6.5-§6.6。从发现/搜索详情抽屉「开始阅读」进入。
 
 用法（App 层）：
     reader.open(source_id, book_url, content_type, start_chapter_url="")
@@ -81,7 +81,7 @@ class _SwitchSourceTask(QRunnable):
 
 
 class ReaderPage(BasePage):
-    # 收藏/取消收藏 → App 层写书架收藏库（ui-reader.md #2 通用外壳「收藏」）
+    # 收藏/取消收藏 -> App 层写书架收藏库（PROJECT_GUIDE.md §6.6）
     favorite_requested = Signal(object)
     # 「下载」→ App 层拉详情入下载队列（小说/漫画产 epub，视频产 mp4）
     download_requested = Signal(object)
@@ -161,7 +161,9 @@ class ReaderPage(BasePage):
 
         # ---- 四视图切换 ----
         self.stack = QStackedWidget()
-        self.novel_view = NovelView(content, font_scale=self._font_scale)
+        self.novel_view = NovelView(
+            content, font_scale=self._font_scale, settings=settings
+        )
         if settings is not None:
             self.novel_view.set_show_images(bool(settings.get("reader", "show_images", True)))
         self.comic_view = ComicView(content)
@@ -811,11 +813,29 @@ class ReaderPage(BasePage):
 
     @staticmethod
     def _fg_for(bg: str) -> str:
-        """按背景色取配套前景色（浅色背景配默认前景，夜间黑配浅字）。"""
+        """按背景亮度选择正文颜色，避免自定义深色背景黑字不可读。"""
         key = (bg or "").strip().lower()
+        if not key:
+            return ""
         for b, f in READING_BG_THEMES:
             if b.lower() == key:
-                return f
+                if f:
+                    return f
+                break
+        try:
+            from PySide6.QtGui import QColor
+
+            color = QColor(key)
+            if color.isValid():
+                # Relative luminance approximation is sufficient for UI text.
+                luminance = (
+                    0.2126 * color.red()
+                    + 0.7152 * color.green()
+                    + 0.0722 * color.blue()
+                ) / 255.0
+                return "#E8E8E8" if luminance < 0.48 else "#252525"
+        except Exception:
+            pass
         return ""
 
     def closeEvent(self, event):

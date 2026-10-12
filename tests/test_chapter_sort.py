@@ -98,6 +98,13 @@ def test_sort_unnumbered_tail():
     print("  [PASS] _sort_chapters 无数字章节尾置且保持相对顺序")
 
 
+def test_sort_preface_before_numbered_chapters():
+    chs = [_ch("前言前言"), _ch("第2章你的确不像淫贼"), _ch("第1章寒玉秋")]
+    titles = [c.title for c in _sort_chapters(chs)]
+    assert titles == ["前言前言", "第1章寒玉秋", "第2章你的确不像淫贼"]
+    print("  [PASS] _sort_chapters 前言置于数字章节之前")
+
+
 def test_sort_empty_and_single():
     assert _sort_chapters([]) == []
     titles = [c.title for c in _sort_chapters([_ch("第1章")])]
@@ -125,6 +132,7 @@ def main():
         test_sort_numeric_order,
         test_sort_volume_chapter,
         test_sort_unnumbered_tail,
+        test_sort_preface_before_numbered_chapters,
         test_sort_empty_and_single,
         test_sort_no_volume_before_volume,
     ]

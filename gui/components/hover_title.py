@@ -106,7 +106,7 @@ class HoverTitle(QLabel):
 
     def _stop_marquee(self) -> None:
         """停止滚动并恢复默认省略号/全名显示。"""
-        if not self._marquee_on:
+        if not getattr(self, "_marquee_on", False):
             return
         self._marquee_on = False
         self._timer.stop()

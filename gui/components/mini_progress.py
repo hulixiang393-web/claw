@@ -1,7 +1,7 @@
 """迷你任务进度（MiniProgress）。
 
 订阅 EventBus，显示当前后台任务数量与进度。
-对应 ui-home.md「迷你任务进度」。
+对应 PROJECT_GUIDE.md §6.2「迷你任务进度」。
 """
 
 from __future__ import annotations

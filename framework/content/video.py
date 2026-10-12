@@ -387,6 +387,10 @@ class VideoMixin:
             raise ContentMissingError(
                 f"未解析到播放地址（{episode_url}）", source_id=source.source_id
             )
+        if play.startswith("//"):
+            play = "https:" + play
+        elif not play.startswith(("http://", "https://")):
+            play = urljoin(abs_ep, play)
         # 解密（如 wbi 签名、加密地址）
         if self._decrypter is not None:
             return self._decrypter.decrypt(source, play, "video_url")
@@ -617,7 +621,7 @@ class VideoMixin:
 
         for pattern in (
             r'var\s+now\s*=\s*["\']([^"\']+)',
-            r'<(?:video|source)\b[^>]*\bsrc\s*=\s*["\']([^"\']+)',
+            r'<(?:video|source)\b[^>]*\b(?:src|data-src)\s*=\s*["\']([^"\']+)',
             r'(?<![A-Za-z0-9])((?:https?:)?\/\/[^"\'\s<>]+?\.m3u8(?:\?[^"\'\s<>]*)?)',
         ):
             for match in _re.finditer(pattern, html, _re.I | _re.S):

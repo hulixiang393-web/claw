@@ -1,7 +1,7 @@
 """主题管理（theme_manager.py）。
 
-加载 / 切换 / 预览主题。三个主题的 QSS token 定义在本文件内（对齐 docs/theme.md）。
-对应 ui-home.md「主题切换」+ theme.md「token 调色板」。
+加载 / 切换 / 预览主题。三个主题的 QSS token 定义在本文件内。
+对应 PROJECT_GUIDE.md §6.2、§6.15 的主题切换和 UI 设置。
 
 用法（GUI 层）：
     tm = ThemeManager(settings_manager)
@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-# ---- 主题调色板（来自 theme.md）------------------------------------------- #
+# ---- 主题调色板（对应 PROJECT_GUIDE.md §6.2、§6.15）----------------------- #
 
 THEMES: Dict[str, Dict[str, str]] = {
     "sakura": {

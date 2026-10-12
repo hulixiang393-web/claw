@@ -258,12 +258,16 @@ class _GuiEventBus:
 
 
 class _StartupTask(threading.Thread):
-    def __init__(self, window, base_dir, settings_snapshot, library_store, generation, signals, cancel):
+    def __init__(
+        self, window, base_dir, settings_snapshot, library_store,
+        source_manager, generation, signals, cancel,
+    ):
         super().__init__(daemon=True, name="runtime-startup")
         self._window = window
         self._base_dir = base_dir
         self._library_store = library_store
         self._settings = settings_snapshot
+        self._source_manager = source_manager
         self._generation = generation
         self._cancel = cancel
         self._signals = signals
@@ -279,11 +283,8 @@ class _StartupTask(threading.Thread):
 
             base_dir = self._base_dir
             settings = self._settings
-            source_manager = SourceManager(
-                sources_dir=base_dir / "sources",
-                health_file=base_dir / "data" / "health.json",
-                runtime_settings=settings,
-            )
+            # 源配置在窗口构造阶段已加载；后台只补齐网络/缓存服务，避免重复扫描。
+            source_manager = self._source_manager
             cookie_manager = CookieManager(base_dir / "data")
             source_manager.set_cookie_provider(cookie_manager.to_cookie_header)
             shelf_cache = get_shelf_cache(str(base_dir / "data" / "cache"))
@@ -603,10 +604,20 @@ class MainWindow(QMainWindow):
             base_dir / "data" / "search_history.json", privacy=self.library_store,
             defer_cleanup=True,
         )
-        self.source_manager = _BootstrapSourceManager()
+        # 源 JSON/健康状态是本地轻量数据，先加载它们让首页首帧直接显示真实统计。
+        # 网络客户端、解析器和内容服务仍由后台启动任务创建。
+        self.source_manager = SourceManager(
+            sources_dir=base_dir / "sources",
+            health_file=base_dir / "data" / "health.json",
+            runtime_settings=_SettingsSnapshot(self.settings.as_dict()),
+        )
+        self.source_manager.set_adult_visible(
+            bool(self.settings.get("content", "show_adult_sources", True))
+        )
         self.cookie_manager = None
         self.shelf_cache = None
         self.search_cache = None
+        self.session_cache = None
         self.shelf_cache_repository = None
         self.http = None
         self.parser = None
@@ -686,6 +697,7 @@ class MainWindow(QMainWindow):
             self._base_dir,
             snapshot,
             self.library_store,
+            self.source_manager,
             generation,
             self._runtime_signals,
             self._runtime_cancel,
@@ -713,6 +725,7 @@ class MainWindow(QMainWindow):
         self._runtime_state = "READY"
         for step in (
             self._replace_runtime_placeholders,
+            self._schedule_startup_page_priority,
             self._schedule_source_selection,
             self._replace_pending_navigation,
         ):
@@ -720,6 +733,37 @@ class MainWindow(QMainWindow):
                 step()
             except Exception:  # noqa: BLE001 —— 后置 UI 动作失败不影响已发布服务
                 log.exception("READY 后置动作失败：%s", getattr(step, "__name__", step))
+
+    def _schedule_startup_page_priority(self) -> None:
+        """Warm the startup pages in order without blocking the home page."""
+        generation = self._runtime_generation
+        if getattr(self, "_startup_page_generation", -1) == generation:
+            return
+        self._startup_page_generation = generation
+
+        def alive() -> bool:
+            return not self._closing and self._runtime_state == "READY" and generation == self._runtime_generation
+
+        def build_source() -> None:
+            if not alive():
+                return
+            self._ensure_tab_page(self._tab_index["source"])
+            QTimer.singleShot(0, build_library)
+
+        def build_library() -> None:
+            if not alive():
+                return
+            self._ensure_tab_page(self._tab_index["library"])
+            QTimer.singleShot(0, build_settings)
+
+        def build_settings() -> None:
+            if alive():
+                self._ensure_tab_page(self._tab_index["settings"])
+
+        # DiscoverPage construction starts BookStack's first category request;
+        # subsequent pages are queued on later UI turns to keep the home frame responsive.
+        self._ensure_tab_page(self._tab_index["discover"])
+        QTimer.singleShot(0, build_source)
 
     def _prepare_runtime_services(self, services) -> None:
         """把可失败的绑定/配置做完，最后一次性发布服务引用。
@@ -929,9 +973,9 @@ class MainWindow(QMainWindow):
         builder = self._lazy_tab_builders.get(key)
         if builder is None:
             return self.tabs.widget(idx)
-        # 阅读/下载需要真实服务，未 READY 时保持占位（导航意图由 pending 承接）；
-        # 发现/搜索/书架/源管理/设置可在任意状态构造，READY 后经 rebind 注入真实服务。
-        if key in {"reader", "download"} and self._runtime_state != "READY":
+        # 所有依赖运行时服务的页面都等 READY 后再构造，避免用户在后台初始化
+        # 期间点入页面时拿到 None 服务；设置页是纯本地页面，可立即打开。
+        if key != "settings" and self._runtime_state != "READY":
             return self.tabs.widget(idx)
         selected_idx = self.tabs.currentIndex()
 
@@ -1031,6 +1075,7 @@ class MainWindow(QMainWindow):
 
     def _build_discover(self) -> DiscoverPage:
         from framework.cache_service import get_session_cache
+
         page = DiscoverPage(
             source_manager=self.source_manager,
             discovery=self.discovery,
@@ -1038,6 +1083,7 @@ class MainWindow(QMainWindow):
             bulk_fetch=self.bulk_fetch,
             event_bus=self._gui_bus,
             theme_manager=self.theme_manager,
+            # 仅当前进程复用，首次启动一定为空，不读取历史会话。
             session_cache=get_session_cache(),
             settings=self.settings,
         )
@@ -1792,6 +1838,9 @@ class MainWindow(QMainWindow):
     def _jump_to_search(self, keyword: str) -> None:
         """跳转搜索 Tab + 预填关键词并自动搜索（ui-home #3 最近搜索一键重搜）。"""
         if self.search_history.hidden(keyword):
+            return
+        if self._runtime_state != "READY" or self.search is None:
+            self._queue_navigation("search", lambda: self._jump_to_search(keyword))
             return
         self.tabs.setCurrentIndex(self._tab_index["search"])
         page = self.tabs.widget(self._tab_index["search"])

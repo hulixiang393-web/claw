@@ -20,6 +20,15 @@ from framework.parser import Parser
 FIELDS = {"title": {"css": "a.title"}}
 
 
+def test_fallback_url_selector_keeps_base_resolution():
+    assert parser_mod._selector_attr({
+        "fallback": [
+            {"css": "img", "attr": "data-src"},
+            {"css": "img", "attr": "src"},
+        ]
+    }) == "data-src"
+
+
 def test_parse_items_without_lxml_is_empty_and_logs_error(monkeypatch, caplog):
     monkeypatch.setattr(parser_mod, "_WARNED_FALLBACK", False)
     p = Parser()

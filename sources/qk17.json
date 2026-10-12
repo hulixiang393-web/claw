@@ -5,10 +5,51 @@
   "$name": "17K小说",
   "$enabled": true,
   "$weight": 1.0,
+  "detail_cache_version": 3,
+  "chapter_cache_version": 3,
+  "page_cache_version": 3,
+  "api_endpoints": {
+    "detail": {
+      "url": "https://api.17k.com/ck/book/{id}",
+      "method": "GET",
+      "params": {"appKey": "2406394919"},
+      "field_extractors": {
+        "title": "bookName",
+        "author": "authorPenName",
+        "cover": "bigCoverImg",
+        "status": "bookStatus.name",
+        "summary": "intro"
+      },
+      "chapters": {
+        "api": {
+          "url": "https://api.17k.com/ck/book/{id}/{volume_id}/lists",
+          "volumes_url": "https://api.17k.com/ck/book/{id}/volumes",
+          "volumes_response_path": "data",
+          "volume_id_field": "volumeId",
+          "params": {"appKey": "2406394919"},
+          "response_path": "data",
+          "item_fields": {"title": "chapterName", "chapter_id": "chapterId"},
+          "url_template": "https://www.17k.com/chapter/{id}/{chapter_id}.html",
+          "page_param": "page",
+          "page_size": 0,
+          "max_pages": 500
+        }
+      }
+    }
+  },
+  "decryption": {
+    "targets": {
+      "chapter": {
+        "strategy": "aes_cbc_base64",
+        "key": "4eae35f1b35977a0",
+        "iv": "4eae35f1b35977a0"
+      }
+    }
+  },
   "$metadata": {
     "homepage": "https://www.17k.com",
     "icon": "https://www.17k.com/favicon.ico",
-    "description": "17K小说网（www.17k.com）正版小说站（17K小说网官方，芥子、中文在线旗下老牌原创站，以都市/玄幻/热血作品著称）。目录页 /list/{bookId}.html 单页 SSR 全量章节（5728+ 章），正文页 /chapter/{bookId}/{chapterId}.html 为 SSR 纯文本（免登录可抓全部免费章节，VIP 章仅第一章免费）。搜索必须在 search.17k.com 用 playwright 渲染（反 bot：直接 GET 恒 405；curl 虽 200 但 body 为压缩二进制、JSON API 仅返回侧栏推荐），结果 20 条/页。详情/目录/正文需带浏览器 UA（参考 405），acw_sc__v2 反爬 Cookie 由框架自动解算，免登录直连 200。",
+    "description": "17K小说网（www.17k.com）正版小说站（17K小说网官方，芥子、中文在线旗下老牌原创站，以都市/玄幻/热血作品著称）。目录页 /list/{bookId}.html 单页全量章节，正文页 /chapter/{bookId}/{chapterId}.html 为纯文本（免登录可抓全部免费章节，VIP 章仅第一章免费）。搜索、详情、目录和正文均通过 Playwright 执行阿里云 WAF 挑战后提取 DOM；结果 20 条/页。",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -99,8 +140,15 @@
       }
     },
     "detail": {
+      "render": "playwright",
+      "render_config": {
+        "wait_for": ".Info.Sign h1, #bookInfo, h1.Title, dl.Volume",
+        "wait_until": "domcontentloaded",
+        "timeout_ms": 45000,
+        "extra_delay_ms": 1200
+      },
       "url_pattern": "/book/\\d+\\.html$",
-      "note": "详情页 SSR 元数据齐全，带浏览器 UA 直连免登录可抓（不带 UA 时 book/108821.html 会 405）。title=.Info.Sign h1 a；author 从 <meta property=og:title>（《书名》作者著-17K小说网）正则取（meta[name=Keywords] 的书名,作者,.. 正则兜底）；cover=#bookCover img.book src（cdn.static.17k.com 动态图）；status=.Info.Sign .label a:first-child span（连载=span.green/完本=span.gray）；summary=#bookInfo .cont p.intro（text_content 含作者寄语等纯文本）；tags=table tr.label td a span（如 叶军浪/撒旦/热血；完本 8 个）。update 取自 dl.Tab dt.tit em「更新:2026-09-11 12:30:00」，schema 无 update_time 字段仅作参考。",
+      "note": "详情页经 Playwright 执行 WAF 挑战后元数据齐全。title=.Info.Sign h1 a；author 从 <meta property=og:title>（《书名》作者著-17K小说网）正则取（meta[name=Keywords] 的书名,作者,.. 正则兜底）；cover=#bookCover img.book src（cdn.static.17k.com 动态图）；status=.Info.Sign .label a:first-child span（连载=span.green/完本=span.gray）；summary=#bookInfo .cont p.intro（text_content 含作者寄语等纯文本）；tags=table tr.label td a span（如 叶军浪/撒旦/热血；完本 8 个）。update 取自 dl.Tab dt.tit em「更新:2026-09-11 12:30:00」，schema 无 update_time 字段仅作参考。",
       "fields": {
         "title": {
           "css": ".Info.Sign h1 a"
@@ -139,7 +187,7 @@
           "max_pages": 1
         },
         "list": {
-          "note": "独立目录页 /list/{bookId}.html（SSR 单页全部章节，5728 章/约 1.3MB）：h1.Title 书名 + div.Author 作者 + dl.Volume 卷（作品相关/正文）×2，卷内 dd 平铺 <a href=/chapter/{bookId}/{chapterId}.html><span class=ellipsis>章名</span></a>。root_selector 直接以章节链接 <a> 为根，url 用 xpath=\".\" 取根节点自身 href（框架字段查询相对各根执行）。目录页无需登录。",
+          "note": "独立目录页 /list/{bookId}.html（Playwright 执行 WAF 挑战后返回全量章节，5728 章/约 1.3MB）：h1.Title 书名 + div.Author 作者 + dl.Volume 卷（作品相关/正文）×2，卷内 dd 平铺 <a href=/chapter/{bookId}/{chapterId}.html><span class=ellipsis>章名</span></a>。root_selector 直接以章节链接 <a> 为根，url 用 xpath=\".\" 取根节点自身 href（框架字段查询相对各根执行）。目录页无需登录。",
           "chapters_url": "/list/{id}.html",
           "root_selector": {
             "css": "dl.Volume dd a"
@@ -155,9 +203,26 @@
           }
         },
         "body": {
-          "note": "正文 /chapter/{bookId}/{chapterId}.html SSR 纯文本（UTF-8 无字体混淆），免费章节全文可见；VIP 章免登录仅第一章（约 1-2 段预览后直接结束，框架不支持付费自动化）。容器 #readArea .readAreaBox.content .p 内正文为 <p>，另有页脚广告 p.copy（本书首发来自17K小说网…，text_content 为空）+ div.author-say/qrcode/chapter_text_ad → 用 :not(.copy) 排掉。每章单页无章内分页。章节标题取页面 h1（非目录 span）。",
+          "note": "正文 /chapter/{bookId}/{chapterId}.html 经 Playwright 执行 WAF 挑战后返回纯文本（UTF-8 无字体混淆），免费章节全文可见；VIP 章免登录仅第一章（约 1-2 段预览后直接结束，框架不支持付费自动化）。容器 #readArea .readAreaBox.content .p 内正文为 <p>，另有页脚广告 p.copy（本书首发来自17K小说网…，text_content 为空）+ div.author-say/qrcode/chapter_text_ad → 用 :not(.copy) 排掉。每章单页无章内分页。章节标题取页面 h1（非目录 span）。",
           "selector": {
             "css": "#readArea .readAreaBox.content .p p:not(.copy)"
+          },
+          "api": {
+            "url": "https://api.17k.com/ckv3/book/{id}/chapter/{chapter_id}",
+            "params": {
+              "subAllPrice": "1",
+              "platform": "4",
+              "appKey": "2406394919"
+            },
+            "response_path": "data.content.0.text",
+            "decrypt_target": "chapter"
+          },
+          "render": "playwright",
+          "render_config": {
+            "wait_for": "#readArea .readAreaBox.content, #readArea",
+            "wait_until": "domcontentloaded",
+            "timeout_ms": 45000,
+            "extra_delay_ms": 800
           }
         }
       }
@@ -166,7 +231,7 @@
   "constraints": {
     "max_concurrency": 1,
     "search": {
-      "max_pages": 1,
+      "max_pages": 500,
       "max_results": 30
     },
     "detail": {

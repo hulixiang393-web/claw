@@ -1,6 +1,6 @@
 """搜索界面（SearchPage）。
 
-对应 ui-search.md：
+对应 PROJECT_GUIDE.md §6.4：
 - 关键词输入 + 类型筛选 + 源范围 + 搜索
 - 结果卡片流（复用 WorkCard）
 - 来源角标可筛选
@@ -225,7 +225,7 @@ class _SearchCoverBackfillTask(QRunnable):
 class SearchPage(BasePage):
     search_clicked = Signal(str)  # 搜索触发（首页接）
     open_requested = Signal(str, str, str)  # (source_id, url, content_type) 打开作品
-    # 批量操作（ui-search.md #8）：加入书架 / 加入下载
+    # 批量操作（PROJECT_GUIDE.md §6.4）：加入书架 / 加入下载
     add_to_shelf_requested = Signal(object, str)  # list[SearchResult], folder
     batch_download_requested = Signal(object)  # list[SearchResult]
 
@@ -311,7 +311,7 @@ class SearchPage(BasePage):
         top.addWidget(self.search_btn)
         layout.addLayout(top)
 
-        # ---- 每源状态条（跨源并发进度，ui-search.md #4）----
+        # ---- 每源状态条（跨源并发进度，PROJECT_GUIDE.md §6.4）----
         self.status_bar = QWidget()
         self.status_bar_layout = QHBoxLayout(self.status_bar)
         self.status_bar_layout.setContentsMargins(0, 0, 0, 0)
@@ -379,7 +379,7 @@ class SearchPage(BasePage):
         # 懒加载滚动
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
-        # ---- 批量操作栏（勾选 ≥1 条后显示，ui-search.md #8）----
+        # ---- 批量操作栏（勾选 >=1 条后显示，PROJECT_GUIDE.md §6.4）----
         self.batch_bar = QWidget()
         self.batch_bar.setVisible(False)
         bb = QHBoxLayout(self.batch_bar)
@@ -1079,7 +1079,7 @@ class SearchPage(BasePage):
         self.open_requested.emit(result.source_id, result.url, src.content_type)
 
     # ------------------------------------------------------------------ #
-    # 勾选批量（ui-search.md #8）
+    # 勾选批量（PROJECT_GUIDE.md §6.4）
     # ------------------------------------------------------------------ #
     def _make_card(self, r):
         """创建勾选模式卡片并连接信号。

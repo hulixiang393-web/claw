@@ -1,7 +1,7 @@
 """空状态（EmptyState）。
 
 无源时显示：Q 版插画（占位绘制）+ 二次元台词 + 「去添加源」按钮。
-对应 ui-home.md「空状态」。插画成品资源第二阶段替换。
+对应 PROJECT_GUIDE.md §6.2「首页空状态」。插画成品资源第二阶段替换。
 """
 
 from __future__ import annotations

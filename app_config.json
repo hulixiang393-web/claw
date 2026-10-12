@@ -9,6 +9,7 @@
     "max_bytes_per_image": 5242880,
     "impersonate": null,
     "user_agents": [],
+    "check_links_threads": null,
     "proxy_pool": {
       "file": "data/proxies.json",
       "max_switches": 3
@@ -50,18 +51,32 @@
     "max_videos": 5,
     "max_bytes_mb": 8192
   },
+  "media": {
+    "source_probe": {
+      "enabled": true,
+      "max_sources": 5,
+      "concurrency": 1,
+      "timeout_ms": 30000
+    }
+  },
   "hls_prefetch": {
     "enabled": false,
     "depth": 4,
     "workers": 3
   },
   "content": {
-    "show_adult_sources": true
+    "show_adult_sources": false
   },
   "reader": {
     "prefetch_enabled": true,
     "prefetch_ahead": 3,
-    "prefetch_behind": 1
+    "prefetch_behind": 1,
+    "show_images": true,
+    "font_size": 0,
+    "font_family": "yahei",
+    "line_spacing": 1.8,
+    "content_width": 960,
+    "paragraph_indent": true
   },
   "discover": {
     "preload_pages": 5,
@@ -75,6 +90,8 @@
     "broken_source_warn_interval_hours": 24,
     "auto_disable_after_failures": 3,
     "selfcheck_strategy": "soft",
+    "dead_line_ttl_seconds": 600,
+    "play_url_probe_timeout_cap": 5,
     "sources_selected": true
   }
 }

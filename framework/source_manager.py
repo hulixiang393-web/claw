@@ -5,7 +5,7 @@
 - 隔离坏文件（跳过并记录告警，不中断）；
 - 首页统计：按类型分组、启用数、失效数、健康状态历史。
 
-对应 core.md §源加载模块 + ui-home.md 统计卡片。
+对应 PROJECT_GUIDE.md §4.2、§6.2 的源加载和首页统计。
 """
 
 from __future__ import annotations
@@ -429,13 +429,30 @@ class SourceManager:
             return
         try:
             raw = json.loads(self._health_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
             for sid, data in raw.items():
+                if not isinstance(data, dict):
+                    continue
+                history = data.get("history", [])
+                if not isinstance(history, list):
+                    history = []
+                state = data.get("state", HEALTH_OK)
+                if state not in {HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN}:
+                    state = HEALTH_OK
+                last_error = data.get("last_error", "")
+                if not isinstance(last_error, str):
+                    last_error = ""
                 self._health[sid] = SourceHealth(
-                    state=data.get("state", HEALTH_OK),
-                    last_error=data.get("last_error", ""),
-                    history=list(data.get("history", [])),
+                    state=state,
+                    last_error=last_error,
+                    history=[
+                        item for item in history
+                        if isinstance(item, str)
+                        and item in {HEALTH_OK, HEALTH_WARN, HEALTH_BROKEN}
+                    ],
                 )
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeError, TypeError):
             self._health = {}
 
     def _save_health(self) -> None:

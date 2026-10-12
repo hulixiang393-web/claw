@@ -53,6 +53,7 @@ class ChapterMixin:
         list_cfg = block.get("list") or {}
         root_sel = list_cfg.get("root_selector")
         fields = list_cfg.get("fields") or {}
+        list_page_url = self._abs_url(source, detail_url) if detail_url else source.base_url
         if block.get("single_chapter"):
             if root_sel and fields:
                 try:
@@ -103,6 +104,13 @@ class ChapterMixin:
         if not root_sel and not list_cfg.get("chapters_api"):
             return []
 
+        def _norm_url(url: str) -> str:
+            """归一化 URL：去尾 /、去 fragment、转小写。"""
+            from urllib.parse import urlparse, urlunparse
+
+            parsed = urlparse(url)
+            return urlunparse(parsed._replace(fragment="")).rstrip("/").lower()
+
         # 独立目录页：content.chapter.list.chapters_url 为模板（如 /other/chapters/id/{id}.html），
         # 从详情 URL 提取 book id 并二次抓取，在该页提取完整章节列表。
         # id 来源两级：详情 URL（/{id}/ 段）→ 详情页 HTML 正则（chapters_id_regex，
@@ -128,6 +136,7 @@ class ChapterMixin:
                     )
                     cat_doc = self._parser.parse(cat_html)
                     doc = cat_doc  # 用目录页 doc 提取章节
+                    list_page_url = self._abs_url(source, cat_url)
                 except Exception:
                     pass  # 目录页抓取失败回退详情页
 
@@ -154,15 +163,49 @@ class ChapterMixin:
                 log.warning("[%s] API 目录抓取失败，回退 HTML 解析：%s", source.source_id, exc)
         if items is None:
             items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
+            # 目录页分页必须在统一去重/排序之前全部展开，否则跨页目录会被
+            # 当成一页处理，最终顺序也会随站点的分页方向变化。
+            paginator = list_cfg.get("paginator") or {}
+            next_sel = (paginator.get("next_link") or {}).get("selector")
+            if next_sel:
+                constraints = source.raw.get("constraints") or {}
+                chapter_limit = (constraints.get("chapter") or {}).get("max_pages")
+                max_pages = int(paginator.get("max_pages") or chapter_limit or 20)
+                max_pages = max(1, max_pages)
+                visited_pages = {_norm_url(list_page_url)}
+                current_doc = doc
+                current_url = list_page_url
+                for _ in range(max_pages - 1):
+                    next_url = self._parser.extract_first(
+                        current_doc, next_sel, current_url
+                    )
+                    if not next_url:
+                        break
+                    next_url = self._abs_url(source, next_url)
+                    normalized = _norm_url(next_url)
+                    if not normalized or normalized in visited_pages:
+                        break
+                    visited_pages.add(normalized)
+                    try:
+                        next_html = self._get_detail_html(source, next_url, next_url)
+                        current_doc = self._parser.parse(next_html)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "[%s] 目录分页抓取失败，已保留前面页面：%s",
+                            source.source_id,
+                            exc,
+                        )
+                        break
+                    page_items = self._parser.parse_items(
+                        current_doc, root_sel, fields, source.base_url
+                    )
+                    if not page_items:
+                        break
+                    items.extend(page_items)
+                    current_url = next_url
         chapters: List[Chapter] = []
         seen_norm = {}
         seen_title = set()
-
-        def _norm_url(url: str) -> str:
-            """归一化 URL：去尾 /、去 ?fragment、转小写 scheme-less。"""
-            from urllib.parse import urlparse, urlunparse
-            p = urlparse(url)
-            return urlunparse(p._replace(fragment="")).rstrip("/").lower()
 
         def clean_title(t: str) -> str:
             """从章节标题移除书名 + 清理多余分隔符/后缀词。"""
@@ -191,6 +234,10 @@ class ChapterMixin:
             title = it.get("title", "")
             raw_title = str(title or "").strip()
             title = clean_title(raw_title) if list_cfg.get("title_clean") else raw_title
+            if title and self._decrypter is not None:
+                title = self._decrypter.decrypt(
+                    source, title, target="chapter", html=html
+                )
             nurl = _norm_url(url)
             if nurl in seen_norm:
                 existing = chapters[seen_norm[nurl]]
@@ -261,7 +308,7 @@ class ChapterMixin:
             except Exception:  # noqa: BLE001
                 book_id = ""
         if not book_id:
-            m_id = _re.search(r"/(?:novel|book|comic|detail|bookinfo|program)/(\w+)", detail_url)
+            m_id = _re.search(r"/(?:novel|book|comic|detail|bookinfo|program|shuku)/(\w+)", detail_url)
             book_id = m_id.group(1) if m_id else ""
         if not book_id:
             return None
@@ -278,78 +325,108 @@ class ChapterMixin:
         url_tpl = str(cfg.get("url_template") or "")
         out: List[dict] = []
         seen_url = set()
-        for page in range(1, max_pages + 1):
-            filled = utils.fill_json(body, id=book_id, page=page)
-            resp = None
-            if method == "POST":
-                if encrypt:
-                    # 请求体 JSON 加密为 AES base64，POST {field: 密文}
-                    field = encrypt.get("field") or "data"
-                    enc_body = self._encrypt_request_body(encrypt, filled)
-                    text = self._http.post_form(
-                        abs_url, form_data={field: enc_body}, headers=headers,
-                        timeout=self._timeout(source), retries=self._retries(source),
-                        interval_ms=self._interval_ms(source),
-                        proxy_pool=source.proxy_pool(),
-                    )
-                    import json as _json
-
-                    resp = _json.loads(text) if text else {}
-                else:
-                    body_format = (cfg.get("body_format") or "form").lower()
-                    if body_format == "json":
-                        resp = self._http.post_json(
-                            abs_url, json_body=filled, headers=headers,
-                            timeout=self._timeout(source), retries=self._retries(source),
-                            proxy_pool=source.proxy_pool(),
-                        )
-                    else:
+        volume_ids = cfg.get("volume_ids") or []
+        request_params = dict(cfg.get("params") or {})
+        if cfg.get("volumes_url"):
+            volumes_url = str(cfg["volumes_url"]).replace("{id}", book_id)
+            if request_params:
+                volumes_url += ("&" if "?" in volumes_url else "?") + urlencode(
+                    {k: str(v).replace("{id}", book_id) for k, v in request_params.items()}
+                )
+            volumes_resp = self._http.get_json(
+                urljoin(source.base_url, volumes_url),
+                headers=headers, timeout=self._timeout(source),
+                retries=self._retries(source), proxy_pool=source.proxy_pool(),
+            )
+            volume_node = self._jsonpath(
+                volumes_resp, cfg.get("volumes_response_path") or "data"
+            )
+            if isinstance(volume_node, list):
+                volume_ids = [
+                    item.get(cfg.get("volume_id_field") or "volumeId")
+                    for item in volume_node if isinstance(item, dict)
+                ]
+        for volume_id in (volume_ids or [None]):
+            for page in range(1, max_pages + 1):
+                api_url_for_page = api_url.replace("{volume_id}", str(volume_id or ""))
+                page_abs_url = urljoin(source.base_url, api_url_for_page)
+                filled = dict(request_params)
+                filled.update(utils.fill_json(body, id=book_id, page=page, volume_id=volume_id or ""))
+                filled = utils.fill_json(filled, id=book_id, page=page, volume_id=volume_id or "")
+                # JSON chapter APIs commonly expose page as a query parameter even
+                # when no request body template is configured.
+                if page > 1 or cfg.get("page_param"):
+                    filled.setdefault(str(cfg.get("page_param") or "page"), page)
+                resp = None
+                if method == "POST":
+                    if encrypt:
+                        # 请求体 JSON 加密为 AES base64，POST {field: 密文}
+                        field = encrypt.get("field") or "data"
+                        enc_body = self._encrypt_request_body(encrypt, filled)
                         text = self._http.post_form(
-                            abs_url, form_data=filled, headers=headers,
+                            page_abs_url, form_data={field: enc_body}, headers=headers,
                             timeout=self._timeout(source), retries=self._retries(source),
+                            interval_ms=self._interval_ms(source),
                             proxy_pool=source.proxy_pool(),
                         )
                         import json as _json
 
                         resp = _json.loads(text) if text else {}
-            else:
-                qs = urlencode(filled)
-                page_url = f"{abs_url}&{qs}" if "?" in abs_url else f"{abs_url}?{qs}"
-                resp = self._http.get_json(
-                    page_url, headers=headers,
-                    timeout=self._timeout(source), retries=self._retries(source),
-                    proxy_pool=source.proxy_pool(),
-                )
+                    else:
+                        body_format = (cfg.get("body_format") or "form").lower()
+                        if body_format == "json":
+                            resp = self._http.post_json(
+                                page_abs_url, json_body=filled, headers=headers,
+                                timeout=self._timeout(source), retries=self._retries(source),
+                                proxy_pool=source.proxy_pool(),
+                            )
+                        else:
+                            text = self._http.post_form(
+                                page_abs_url, form_data=filled, headers=headers,
+                                timeout=self._timeout(source), retries=self._retries(source),
+                                proxy_pool=source.proxy_pool(),
+                            )
+                            import json as _json
 
-            node = resp
-            rpath = cfg.get("response_path") or ""
-            if rpath:
-                node = self._jsonpath(resp, rpath)
-            children_path = cfg.get("children_path") or ""
-            raw_items = []
-            if children_path and isinstance(node, list):
-                for sub in node:
-                    if isinstance(sub, dict) and isinstance(sub.get(children_path), list):
-                        raw_items.extend(sub[children_path])
-            elif isinstance(node, list):
-                raw_items = node
-            if not raw_items:
-                break  # 空页：轮询结束
-            for it in raw_items:
-                if not isinstance(it, dict):
-                    continue
-                c_title = str(it.get(title_key) or "").strip()
-                c_url = url_tpl
-                for ph, val in (("{id}", book_id), ("{chapter_id}", str(it.get(cid_key) or ""))):
-                    c_url = c_url.replace(ph, val)
-                c_url = utils.fill_template(c_url, it)
-                if not (c_title and c_url):
-                    continue
-                norm = c_url.rstrip("/").lower()
-                if norm in seen_url:
-                    continue
-                seen_url.add(norm)
-                out.append({"title": c_title, "url": c_url})
+                            resp = _json.loads(text) if text else {}
+                else:
+                    qs = urlencode(filled)
+                    page_url = f"{page_abs_url}&{qs}" if "?" in page_abs_url else f"{page_abs_url}?{qs}"
+                    resp = self._http.get_json(
+                        page_url, headers=headers,
+                        timeout=self._timeout(source), retries=self._retries(source),
+                        proxy_pool=source.proxy_pool(),
+                    )
+
+                node = resp
+                rpath = cfg.get("response_path") or ""
+                if rpath:
+                    node = self._jsonpath(resp, rpath)
+                children_path = cfg.get("children_path") or ""
+                raw_items = []
+                if children_path and isinstance(node, list):
+                    for sub in node:
+                        if isinstance(sub, dict) and isinstance(sub.get(children_path), list):
+                            raw_items.extend(sub[children_path])
+                elif isinstance(node, list):
+                    raw_items = node
+                if not raw_items:
+                    break  # 空页：轮询结束
+                for it in raw_items:
+                    if not isinstance(it, dict):
+                        continue
+                    c_title = str(it.get(title_key) or "").strip()
+                    c_url = url_tpl
+                    for ph, val in (("{id}", book_id), ("{chapter_id}", str(it.get(cid_key) or ""))):
+                        c_url = c_url.replace(ph, val)
+                    c_url = utils.fill_template(c_url, it)
+                    if not (c_title and c_url):
+                        continue
+                    norm = c_url.rstrip("/").lower()
+                    if norm in seen_url:
+                        continue
+                    seen_url.add(norm)
+                    out.append({"title": c_title, "url": c_url})
         return out
 
     def _encrypt_request_body(self, encrypt: dict, filled: dict) -> str:
@@ -389,7 +466,7 @@ class ChapterMixin:
         seen = set()
         max_pages = int(pag_cfg.get("max_pages") or 20)
         # 开头：cached body 命中直接返回（重启后/预加载后免抓）
-        cache_key = f"body:{source.source_id}:{self._abs_url(source, url)}"
+        cache_key = self._chapter_cache_key(source, url)
         cached = self._cache_get(cache_key) if use_cache else None
         if cached is not None:
             return cached
@@ -439,7 +516,11 @@ class ChapterMixin:
         if source.source_id != "bookstack":
             raise ValueError("fetch_bookstack_chapter requires source_id=bookstack")
         self._bg_check(source, self._abs_url(source, url))
-        html = self._get(source, url)
+        body = (self._content_block(source).get("chapter") or {}).get("body") or {}
+        if body.get("render") == "playwright":
+            html = self._fetch_rendered_html(source, url, body.get("render_config") or {})
+        else:
+            html = self._get(source, url)
         doc = self._parser.parse(html)
         block = (self._content_block(source).get("chapter") or {})
         selector = (block.get("body") or {}).get("selector")
@@ -455,12 +536,7 @@ class ChapterMixin:
         for root in roots:
             for node in root.iter():
                 if node.tag == "img":
-                    image_value = ""
-                    for attr in ("data-original", "data-src", "data-lazy-src", "src"):
-                        candidate = (node.get(attr) or "").strip()
-                        if candidate and not candidate.startswith("data:"):
-                            image_value = candidate
-                            break
+                    image_value = self._image_url_from_node(node)
                     if image_value:
                         absolute = urljoin(base_url, image_value)
                         node.set("src", absolute)
@@ -471,6 +547,11 @@ class ChapterMixin:
                 for attr in ("href", "src"):
                     value = (node.get(attr) or "").strip()
                     if not value or value.startswith("data:"):
+                        continue
+                    if attr == "href" and value.startswith("#"):
+                        # Keep Markdown's in-page anchors local to the rich
+                        # document so the reader can scroll instead of loading
+                        # the same chapter again.
                         continue
                     node.set(attr, urljoin(base_url, value))
             parts.append(tostring(root, encoding="unicode"))
@@ -554,8 +635,7 @@ class ChapterMixin:
             url = getattr(ch, "url", "")
             if not url:
                 continue
-            abs_url = self._abs_url(source, url)
-            key = f"body:{source.source_id}:{abs_url}"
+            key = self._chapter_cache_key(source, url)
             if use_cache and self._cache_get(key) is not None:
                 continue  # 已缓存
             try:
@@ -570,6 +650,12 @@ class ChapterMixin:
                 continue
             if text and use_cache:
                 self._cache_set(key, text, ttl=7 * 86400)
+
+    def _chapter_cache_key(self, source: SourceConfig, url: str) -> str:
+        """Build a versioned chapter cache key when a source changes decoding."""
+        version = (source.raw.get("chapter_cache_version") if source else None) or ""
+        marker = f":v{version}" if version else ""
+        return f"body:{source.source_id}{marker}:{self._abs_url(source, url)}"
 
     @staticmethod
     def _image_selector_nodes(parser, doc, selector):
@@ -589,22 +675,23 @@ class ChapterMixin:
         fragments = []
         seen = set()
 
+        block_tags = {
+            "address", "article", "blockquote", "div", "dl", "h1", "h2",
+            "h3", "h4", "h5", "h6", "li", "ol", "p", "pre", "section",
+            "table", "ul",
+        }
+
         def add_text(value):
             value = str(value or "")
-            if value:
+            if value and (value.strip() or value == "\n"):
                 if fragments and fragments[-1].get("type") == "text":
                     fragments[-1]["text"] += value
                 else:
                     fragments.append({"type": "text", "text": value})
 
-        def walk(node):
+        def walk(node, is_root=False):
             if node.tag == "img":
-                raw_url = ""
-                for attr in ("src", "data-src", "data-original", "data-lazy-src"):
-                    candidate = (node.get(attr) or "").strip()
-                    if candidate and not candidate.startswith("data:"):
-                        raw_url = candidate
-                        break
+                raw_url = self._image_url_from_node(node)
                 if raw_url:
                     image_url = urljoin(self._abs_url(source, url), raw_url)
                     if image_url not in seen and not _AD_IMAGE_RE.search(image_url):
@@ -615,9 +702,13 @@ class ChapterMixin:
             for child in node:
                 walk(child)
                 add_text(child.tail)
+            if node.tag in block_tags and not is_root:
+                add_text("\n")
 
         for root in self._image_selector_nodes(self._parser, doc, selector):
-            walk(root)
+            walk(root, is_root=True)
+        if fragments and fragments[-1].get("type") == "text":
+            fragments[-1]["text"] = fragments[-1]["text"].rstrip("\n")
         return fragments
 
     def _extract_body_images(self, source, url, doc, selector):
@@ -626,12 +717,7 @@ class ChapterMixin:
             text_offset = 0
             for node in root.iter():
                 if node.tag == "img":
-                    raw_url = ""
-                    for attr in ("src", "data-src", "data-original", "data-lazy-src"):
-                        candidate = (node.get(attr) or "").strip()
-                        if candidate and not candidate.startswith("data:"):
-                            raw_url = candidate
-                            break
+                    raw_url = self._image_url_from_node(node)
                     if not raw_url:
                         continue
                     image_url = urljoin(self._abs_url(source, url), raw_url)
@@ -645,6 +731,19 @@ class ChapterMixin:
                     text_offset += len(node.tail)
         return entries
 
+    @staticmethod
+    def _image_url_from_node(node) -> str:
+        """Return the real lazy-loaded image URL, not a placeholder src."""
+        for attr in ("data-src", "data-original", "data-lazy-src", "src"):
+            value = (node.get(attr) or "").strip()
+            if not value or value.startswith("data:"):
+                continue
+            lowered = value.lower()
+            if any(token in lowered for token in ("loading", "placeholder", "lazyload", "nopic", "blank.gif")):
+                continue
+            return value
+        return ""
+
     def _fetch_chapter_page(
         self, source: SourceConfig, url: str, pag_enabled: bool = True,
         include_images: bool = False,
@@ -657,10 +756,6 @@ class ChapterMixin:
         3. 再兜底从页面找 _<数字>.html 的分页链接。
         返回的 nxt 是否同章续页由调用方 _chapter_base 判定。
         """
-        self._bg_check(source, self._abs_url(source, url))
-        html = self._get(source, url)
-        doc = self._parser.parse(html)
-
         content_cfg = self._content_block(source)
         if source.content_type == "novel":
             block = content_cfg.get("chapter") or {}
@@ -670,6 +765,24 @@ class ChapterMixin:
             block = content_cfg.get("episode") or {}
         body = block.get("body") or {}
         selector = body.get("selector")
+
+        api_cfg = body.get("api") or {}
+        api_text = ""
+        if api_cfg:
+            api_text = self._fetch_chapter_api_text(source, url, api_cfg)
+            html = api_text
+        elif body.get("render") == "playwright":
+            html = self._fetch_rendered_html(source, url, body.get("render_config") or {})
+        else:
+            self._bg_check(source, self._abs_url(source, url))
+            html = self._get(source, url)
+        doc = self._parser.parse(html)
+
+        # API chapter payloads are already plaintext after decryption; do not
+        # feed the Base64/decoded text through an HTML selector a second time.
+        if api_text:
+            text = self._normalize_para_indent(api_text)
+            return (text, "", []) if include_images else (text, "")
 
         nxt = ""
         if pag_enabled:
@@ -686,31 +799,6 @@ class ChapterMixin:
 
         image_entries = self._extract_body_fragments(source, url, doc, selector) if include_images else []
 
-        # Playwright 渲染正文（SPA 小说站，如 18mh）
-        if body.get("render") == "playwright":
-            rc = body.get("render_config") or {}
-            sel_css = (selector or {}).get("css") if isinstance(selector, dict) else ""
-            from framework.playwright_helper import fetch_rendered_text_sync
-
-            text = fetch_rendered_text_sync(
-                self._abs_url(source, url),
-                sel_css or "",
-                wait_for=rc.get("wait_for") or "",
-                wait_until=rc.get("wait_until") or "domcontentloaded",
-                timeout_ms=int(rc.get("timeout_ms") or 30000),
-                extra_delay_ms=int(rc.get("extra_delay_ms") or 2000),
-                proxy=source.transports().get("proxy"),
-            )
-            if not text:
-                raise ContentMissingError(
-                    f"渲染正文为空（{url}）", source_id=source.source_id
-                )
-            if source.content_type == "novel":
-                text = self._normalize_para_indent(text)
-                if self._decrypter is not None:
-                    text = self._decrypter.decrypt(source, text, "chapter")
-            return (text, nxt, image_entries) if include_images else (text, nxt)
-
         if not selector:
             raise ContentMissingError("源未配置正文选择器", source_id=source.source_id)
 
@@ -725,7 +813,19 @@ class ChapterMixin:
             text = self._normalize_para_indent(text)
             # 字符映射解密（番茄小说字体混淆等）：decryption.targets.chapter.strategy=translit
             if self._decrypter is not None:
-                text = self._decrypter.decrypt(source, text, "chapter", html=html)
+                # Font-face URLs are commonly relative to the chapter page;
+                # resolve them before the font matcher downloads the glyph map.
+                from framework.fanqie_font import extract_font_urls
+
+                font_urls = [
+                    urljoin(self._abs_url(source, url), font_url)
+                    for font_url in extract_font_urls(html)
+                ]
+                targets = (source.raw.get("decryption") or {}).get("targets") or {}
+                text_target = "content" if targets.get("content") else "chapter"
+                text = self._decrypter.decrypt(
+                    source, text, text_target, html=html, font_urls=font_urls
+                )
         image_entries = image_entries if include_images else []
         # 正文广告行过滤（ad_block 引擎：剔除「广告/推广/点击领取」等特征行）
         try:
@@ -737,6 +837,87 @@ class ChapterMixin:
         except Exception:
             pass  # 广告过滤是增强能力，失败不影响正文
         return (text, nxt, image_entries) if include_images else (text, nxt)
+
+    def _fetch_chapter_api_text(self, source, url: str, cfg: dict) -> str:
+        """Fetch and decrypt a JSON chapter payload configured by the source."""
+        from urllib.parse import parse_qs, urlencode, urlsplit
+
+        match = _re.search(
+            r"/(?:novel|book|comic|detail|bookinfo|program|shuku|chapter)/(\w+)",
+            url,
+        )
+        parts = urlsplit(url)
+        book_id = match.group(1) if match else ""
+        chapter_id = parts.path.rstrip("/").split("/")[-1].split(".")[0]
+        api_url = str(cfg.get("url") or "").replace("{id}", book_id).replace("{chapter_id}", chapter_id)
+        params = dict(cfg.get("params") or {})
+        for key, value in parse_qs(parts.query).items():
+            if value:
+                params.setdefault(key, value[0])
+        query = urlencode({k: str(v).replace("{id}", book_id).replace("{chapter_id}", chapter_id) for k, v in params.items()})
+        abs_url = self._abs_url(source, api_url)
+        if query:
+            abs_url += ("&" if "?" in abs_url else "?") + query
+        payload = self._http.get_json(
+            abs_url, headers=self._headers(source), timeout=self._timeout(source),
+            retries=self._retries(source), proxy_pool=source.proxy_pool(),
+        )
+        value = self._jsonpath(payload, cfg.get("response_path") or "data.content.0.text")
+        if not value:
+            raise ContentMissingError("17K 正文接口未返回内容", source_id=source.source_id)
+        text = str(value)
+        if self._decrypter is not None:
+            text = self._decrypter.decrypt(source, text, cfg.get("decrypt_target") or "chapter")
+        return text
+
+    def _fetch_rendered_html(self, source, url: str, render_config: dict) -> str:
+        """Render a page with the same headers/cookies as the HTTP transport."""
+        from framework.playwright_helper import fetch_rendered_html_sync
+
+        headers = source.request_headers()
+        browser_headers = {
+            key: value for key, value in headers.items()
+            if key.lower() not in {
+                "user-agent", "cookie", "referer", "host", "content-length",
+            }
+        }
+        cookies = []
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(source.base_url).hostname or "").lstrip(".")
+        cookie_header = next(
+            (value for key, value in headers.items() if key.lower() == "cookie"),
+            "",
+        )
+        referer = next(
+            (value for key, value in headers.items() if key.lower() == "referer"),
+            "",
+        )
+        if host and cookie_header:
+            for item in cookie_header.split(";"):
+                name, sep, value = item.strip().partition("=")
+                if sep and name and value:
+                    cookies.append({"name": name, "value": value, "domain": host, "path": "/"})
+        rendered = fetch_rendered_html_sync(
+            self._abs_url(source, url),
+            wait_for=render_config.get("wait_for") or "",
+            wait_until=render_config.get("wait_until") or "domcontentloaded",
+            timeout_ms=int(render_config.get("timeout_ms") or 30000),
+            extra_delay_ms=int(
+                render_config["extra_delay_ms"]
+                if "extra_delay_ms" in render_config
+                else 2000
+            ),
+            proxy=source.transports().get("proxy"),
+            cookies=cookies or None,
+            referer=referer,
+            headers=browser_headers,
+        )
+        if not rendered:
+            raise ContentMissingError(
+                f"渲染页面为空（{url}）", source_id=source.source_id
+            )
+        return rendered
 
     @staticmethod
     def _normalize_para_indent(text: str) -> str:

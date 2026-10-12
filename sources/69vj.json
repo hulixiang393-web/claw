@@ -1,0 +1,142 @@
+{
+  "$schema_version": 2,
+  "$id": "69vj",
+  "$type": "video",
+  "$name": "69VJ成人網",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "adult": true,
+    "homepage": "https://69vj.com/",
+    "description": "69VJ 成人视频站。首页、WordPress 分类/主题页提供列表；详情页通过 XVideos iframe 播放，链式提取嵌入页动态 HLS 地址。",
+    "lang": "zh-Hant",
+    "region": "tw",
+    "tags": [
+      "视频",
+      "成人",
+      "自拍",
+      "日本",
+      "按摩",
+      "直播",
+      "动漫",
+      "hls"
+    ]
+  },
+  "transports": {
+    "base_url": "https://69vj.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+      "Referer": "https://69vj.com/",
+      "Upgrade-Insecure-Requests": "1"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 700,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/page/{page}",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          { "title": "最新", "url": "/page/{page}" },
+          { "title": "手機A片", "url": "/mobile-av/page/{page}" },
+          { "title": "自拍素人", "url": "/amateur/page/{page}" },
+          { "title": "成人直播", "url": "/liveshow/page/{page}" },
+          { "title": "亂倫", "url": "/incest-taboo/page/{page}" },
+          { "title": "BDSM調教", "url": "/bdsm/page/{page}" },
+          { "title": "AV女優", "url": "/av-actresses/page/{page}" },
+          { "title": "變性人", "url": "/shemale/page/{page}" },
+          { "title": "真人娃娃", "url": "/sex-doll/page/{page}" },
+          { "title": "3D H動畫", "url": "/3d-hentai/page/{page}" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "div.list-item div.video" },
+        "fields": {
+          "title": { "css": "a.thumb-video", "attr": "title" },
+          "url": { "css": "a.thumb-video", "attr": "href" },
+          "cover": { "css": "img", "attr": "src" },
+          "status": { "css": ".time-desc" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/topic/{keyword}",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "paginator": {
+        "url_template": "/topic/{keyword}/page/{page}"
+      },
+      "item": {
+        "root_selector": { "css": "div.list-item div.video" },
+        "fields": {
+          "title": { "css": "a.thumb-video", "attr": "title" },
+          "url": { "css": "a.thumb-video", "attr": "href" },
+          "cover": { "css": "img", "attr": "src" },
+          "status": { "css": ".time-desc" }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/video/\\d+[^/]*\\.html",
+      "fields": {
+        "title": { "css": "h1.title span[itemprop='name']" },
+        "cover": { "css": "meta[property='og:image']", "attr": "content" },
+        "summary": { "css": "meta[property='og:description']", "attr": "content" },
+        "status": { "css": "meta[property='video:duration']", "attr": "content" },
+        "tags": { "css": "meta[property='video:tag']", "attr": "content" }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页是单个视频，页面内的推荐视频不是分集。播放链为详情 iframe → XVideos embedframe → setVideoHLS 动态 m3u8。",
+        "play_url": {
+          "http_chain": [
+            {
+              "name": "iframe",
+              "regex": "<iframe[^>]+src=[\\\"']([^\\\"']+)[\\\"']",
+              "referer": "episode",
+              "fetch": true
+            },
+            {
+              "name": "hls",
+              "regex": "setVideoHLS\\s*\\(\\s*[\\\"']([^\\\"']+)[\\\"']",
+              "referer": "",
+              "fetch": false
+            }
+          ]
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": { "quality": "best" }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 5, "max_results": 200 },
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 1, "max_items": 1 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": "div.list-item div.video" }
+    }
+  }
+}

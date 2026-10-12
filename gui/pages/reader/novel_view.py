@@ -1,6 +1,6 @@
 """小说阅读视图（NovelView）。
 
-对应 ui-reader.md 小说功能点：
+对应 PROJECT_GUIDE.md §6.7 小说功能点：
 - 正文排版区（字号可调）
 - 目录侧栏（可折叠，点击跳章）
 - 上/下一章导航
@@ -18,7 +18,7 @@ import webbrowser
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, QRunnable, QObject, QUrl
-from PySide6.QtGui import QKeySequence, QShortcut, QTextDocument
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut, QTextDocument
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QToolButton,
+    QMenu,
     QWidget,
 )
 
@@ -47,20 +48,41 @@ from gui.pages.reader.novel_tasks import _LoadChapterSignals, _LoadChapterTask
 class NovelView(AutoScrollMixin, QWidget):
     """小说正文阅读视图。"""
 
+    READER_FONT_FAMILIES = {
+        "system": (
+            "系统默认",
+            "Georgia, 'Times New Roman', 'Noto Serif CJK SC', SimSun, serif",
+        ),
+        "yahei": ("微软雅黑", "'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif"),
+        "song": ("宋体", "SimSun, 'Songti SC', serif"),
+        "hei": ("黑体", "SimHei, 'Heiti SC', sans-serif"),
+        "kai": ("楷体", "KaiTi, 'Kaiti SC', serif"),
+    }
+
     chapter_changed = Signal(object)  # 发出 (detail, chapter_title) 供续读
     position_changed = Signal(object)  # (detail, title, url, position, page) 章内位置续读
     fullscreen_requested = Signal()  # 工具条 ⛶ → ReaderPage 切主窗全屏
     background_cycle_requested = Signal()  # 「背景」按钮 → ReaderPage 循环切换护眼背景色
 
-    def __init__(self, content: Content, font_scale: float = 1.0, parent=None):
+    def __init__(
+        self, content: Content, font_scale: float = 1.0, parent=None, settings=None
+    ):
         super().__init__(parent)
         self._content = content
+        self._settings = settings
+        self._font_scale = float(font_scale or 1.0)
         self._source = None
         self._detail: Detail | None = None
         self._chapters = []
         self._current_idx = -1
         self._font_delta = 0
-        self._base_font = self._clamp_font(round(17 * float(font_scale or 1.0)))
+        self._base_font = self._clamp_font(round(17 * self._font_scale))
+        self._reader_font_size = 0
+        self._reader_font_family = "system"
+        self._line_spacing = 1.8
+        self._content_width = 960
+        self._paragraph_indent = True
+        self._displayed_plain_text = ""
         self._reading_bg = ""  # 阅读区独立背景色（ui-reader #12，空=透明跟随主题）
         self._reading_fg = ""  # 夜间黑等深色背景下的正文前景色（空=跟随主题）
         self._auto_loading = False  # 翻页边界跳章锁，防重复触发
@@ -92,6 +114,8 @@ class NovelView(AutoScrollMixin, QWidget):
         self._restore_cancel_token = 0
         self._auto_scrolling = False  # 自动滚动开关（状态机由 AutoScrollMixin 接管）
         self._auto_pos = 0.0  # 自动滚动记住的位置（浮点，按速度递增，重排不打断）
+        self._mode = "scroll"  # scroll / pager
+        self._load_reader_options()
         # 自动滚动定时器（interval=35ms，高频小步进平滑滚动）
         self._build_auto_scroll_timer()
 
@@ -100,7 +124,14 @@ class NovelView(AutoScrollMixin, QWidget):
         layout.setSpacing(0)
 
         # ---- 工具栏 ----
-        toolbar = QHBoxLayout()
+        toolbar_host = QWidget()
+        toolbar_host.setObjectName("readerToolbar")
+        toolbar_host.setStyleSheet(
+            "QPushButton, QToolButton { min-height: 30px; padding: 4px 10px; }"
+        )
+        toolbar = QHBoxLayout(toolbar_host)
+        toolbar.setContentsMargins(4, 2, 4, 2)
+        toolbar.setSpacing(6)
         self.toc_btn = QToolButton()
         self.toc_btn.setText("☰ 目录")
         self.toc_btn.clicked.connect(self._toggle_toc)
@@ -108,32 +139,35 @@ class NovelView(AutoScrollMixin, QWidget):
 
         self.font_down = QPushButton("A-")
         self.font_up = QPushButton("A+")
-        self.font_down.setFixedWidth(40)
-        self.font_up.setFixedWidth(40)
         self.font_down.clicked.connect(lambda: self._adjust_font(-1))
         self.font_up.clicked.connect(lambda: self._adjust_font(1))
         toolbar.addWidget(self.font_down)
         toolbar.addWidget(self.font_up)
 
         self.mode_btn = QPushButton("翻页模式")
-        self.mode_btn.setFixedWidth(90)
         self.mode_btn.clicked.connect(self._toggle_mode)
         toolbar.addWidget(self.mode_btn)
 
         self.bg_btn = QPushButton("背景")
-        self.bg_btn.setFixedWidth(50)
         self.bg_btn.setToolTip("切换阅读背景色（白/米黄/护眼绿/夜间黑）")
         self.bg_btn.clicked.connect(self.background_cycle_requested.emit)
         toolbar.addWidget(self.bg_btn)
 
+        self.settings_btn = QToolButton()
+        self.settings_btn.setText("⚙")
+        self.settings_btn.setToolTip("阅读设置")
+        self._settings_menu = QMenu(self)
+        self._build_settings_menu()
+        self.settings_btn.setMenu(self._settings_menu)
+        self.settings_btn.setPopupMode(QToolButton.InstantPopup)
+        toolbar.addWidget(self.settings_btn)
+
         self.fullscreen_btn = QPushButton("⛶")
-        self.fullscreen_btn.setFixedWidth(40)
         self.fullscreen_btn.setToolTip("全屏阅读")
         self.fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
         toolbar.addWidget(self.fullscreen_btn)
 
         self.auto_scroll_btn = QPushButton("▶ 自动滚动")
-        self.auto_scroll_btn.setFixedWidth(90)
         self.auto_scroll_btn.setToolTip("开启/关闭自动滚动（空格键）")
         self.auto_scroll_btn.clicked.connect(self._toggle_auto_scroll)
         toolbar.addWidget(self.auto_scroll_btn)
@@ -158,7 +192,31 @@ class NovelView(AutoScrollMixin, QWidget):
         toolbar.addStretch(1)
         self.progress_label = QLabel("")
         toolbar.addWidget(self.progress_label)
-        layout.addLayout(toolbar)
+        layout.addWidget(toolbar_host)
+
+        # Keep the work title and current chapter visible while the body scrolls.
+        self.reader_header = QWidget()
+        header_layout = QVBoxLayout(self.reader_header)
+        self._reader_header_layout = header_layout
+        header_layout.setContentsMargins(12, 6, 12, 6)
+        header_layout.setSpacing(2)
+        self.book_title_label = QLabel("未命名作品")
+        self.book_title_label.setObjectName("readerBookTitle")
+        self.book_title_label.setStyleSheet("font-size: 18px; font-weight: 600; color: palette(text);")
+        self.book_title_label.setWordWrap(True)
+        self.book_title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.book_title_label.setToolTip("")
+        self.chapter_title_label = QLabel("")
+        self.chapter_title_label.setObjectName("readerChapterTitle")
+        self.chapter_title_label.setStyleSheet("font-size: 13px; color: palette(mid);")
+        self.chapter_title_label.setWordWrap(True)
+        self.chapter_title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        header_layout.addWidget(self.book_title_label)
+        header_layout.addWidget(self.chapter_title_label)
+        # Do not fix this height: long book/chapter titles must be allowed to
+        # wrap, otherwise the second line is clipped and appears misaligned.
+        self.reader_header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        layout.addWidget(self.reader_header)
 
         # ---- 目录 + 正文 ----
         body = QHBoxLayout()
@@ -202,7 +260,7 @@ class NovelView(AutoScrollMixin, QWidget):
         self._rich_body = QTextBrowser()
         self._rich_body.setObjectName("bookstackBody")
         self._rich_body.setMinimumWidth(0)
-        self._rich_body.setMaximumWidth(960)
+        self._rich_body.setMaximumWidth(self._content_width)
         self._rich_body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self._rich_body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._rich_body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -261,7 +319,6 @@ class NovelView(AutoScrollMixin, QWidget):
         nav.addWidget(self.next_btn)
         layout.addLayout(nav)
 
-        self._mode = "scroll"  # scroll / pager
         self._pages = [""]
         self._page_count = 1
         self._current_page = 0
@@ -288,6 +345,203 @@ class NovelView(AutoScrollMixin, QWidget):
         self.scroll.verticalScrollBar().sliderPressed.connect(self._on_scrollbar_user_interaction)
 
     # ------------------------------------------------------------------ #
+    def _load_reader_options(self) -> None:
+        """Load only the small set of options that affect novel layout."""
+        if self._settings is None:
+            return
+        get = self._settings.get
+        try:
+            size = int(get("reader", "font_size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        self._reader_font_size = max(0, min(48, size))
+        if self._reader_font_size:
+            self._base_font = self._clamp_font(self._reader_font_size)
+        family = str(get("reader", "font_family", "system") or "system")
+        self._reader_font_family = (
+            family if family in self.READER_FONT_FAMILIES else "system"
+        )
+        try:
+            spacing = float(get("reader", "line_spacing", 1.8) or 1.8)
+        except (TypeError, ValueError):
+            spacing = 1.8
+        self._line_spacing = max(1.4, min(2.4, spacing))
+        try:
+            width = int(get("reader", "content_width", 960) or 960)
+        except (TypeError, ValueError):
+            width = 960
+        self._content_width = max(640, min(1200, width))
+        self._paragraph_indent = bool(get("reader", "paragraph_indent", True))
+        self._show_images = bool(get("reader", "show_images", True))
+
+    def _persist_reader_options(self) -> None:
+        if self._settings is None:
+            return
+        self._settings.set("reader", "font_size", self._reader_font_size)
+        self._settings.set("reader", "font_family", self._reader_font_family)
+        self._settings.set("reader", "line_spacing", self._line_spacing)
+        self._settings.set("reader", "content_width", self._content_width)
+        self._settings.set("reader", "paragraph_indent", self._paragraph_indent)
+        self._settings.save()
+
+    def _build_settings_menu(self) -> None:
+        menu = self._settings_menu
+
+        font_menu = menu.addMenu("字号")
+        self._font_group = QActionGroup(font_menu)
+        self._font_group.setExclusive(True)
+        self._font_actions = {}
+        for size in (14, 16, 18, 20, 24, 28):
+            action = QAction(f"{size}px", font_menu, checkable=True)
+            action.setData(size)
+            action.triggered.connect(lambda _checked, value=size: self._set_reader_font_size(value))
+            self._font_group.addAction(action)
+            font_menu.addAction(action)
+            self._font_actions[size] = action
+        custom = QAction("跟随全局设置", font_menu, checkable=True)
+        custom.setData(0)
+        custom.triggered.connect(lambda: self._set_reader_font_size(0))
+        self._font_group.addAction(custom)
+        font_menu.addAction(custom)
+        self._font_actions[0] = custom
+
+        family_menu = menu.addMenu("字体样式")
+        self._font_family_group = QActionGroup(family_menu)
+        self._font_family_group.setExclusive(True)
+        self._font_family_actions = {}
+        for family, (label, _css) in self.READER_FONT_FAMILIES.items():
+            action = QAction(label, family_menu, checkable=True)
+            action.setData(family)
+            action.triggered.connect(
+                lambda _checked, value=family: self._set_reader_font_family(value)
+            )
+            self._font_family_group.addAction(action)
+            family_menu.addAction(action)
+            self._font_family_actions[family] = action
+
+        spacing_menu = menu.addMenu("行距")
+        self._spacing_group = QActionGroup(spacing_menu)
+        self._spacing_group.setExclusive(True)
+        self._spacing_actions = {}
+        for spacing, label in ((1.5, "紧凑"), (1.8, "标准"), (2.1, "宽松")):
+            action = QAction(label, spacing_menu, checkable=True)
+            action.setData(spacing)
+            action.triggered.connect(
+                lambda _checked, value=spacing: self._set_line_spacing(value)
+            )
+            self._spacing_group.addAction(action)
+            spacing_menu.addAction(action)
+            self._spacing_actions[spacing] = action
+
+        width_menu = menu.addMenu("版心宽度")
+        self._width_group = QActionGroup(width_menu)
+        self._width_group.setExclusive(True)
+        self._width_actions = {}
+        for width, label in ((680, "窄"), (820, "适中"), (960, "标准"), (1100, "宽")):
+            action = QAction(label, width_menu, checkable=True)
+            action.setData(width)
+            action.triggered.connect(
+                lambda _checked, value=width: self._set_content_width(value)
+            )
+            self._width_group.addAction(action)
+            width_menu.addAction(action)
+            self._width_actions[width] = action
+
+        mode_menu = menu.addMenu("阅读方式")
+        self._mode_group = QActionGroup(mode_menu)
+        self._mode_group.setExclusive(True)
+        self._mode_actions = {}
+        for mode, label in (("scroll", "上下滚动"), ("pager", "翻页阅读")):
+            action = QAction(label, mode_menu, checkable=True)
+            action.setData(mode)
+            action.triggered.connect(
+                lambda _checked, value=mode: self._set_mode(value)
+            )
+            self._mode_group.addAction(action)
+            mode_menu.addAction(action)
+            self._mode_actions[mode] = action
+
+        self.indent_action = QAction("段首缩进", menu, checkable=True)
+        self.indent_action.toggled.connect(self._set_paragraph_indent)
+        menu.addAction(self.indent_action)
+        self.images_action = QAction("显示正文图片", menu, checkable=True)
+        self.images_action.toggled.connect(self.set_show_images)
+        menu.addAction(self.images_action)
+        menu.addSeparator()
+        self.reset_reader_action = QAction("恢复阅读默认设置", menu)
+        self.reset_reader_action.triggered.connect(self._reset_reader_options)
+        menu.addAction(self.reset_reader_action)
+        self._sync_settings_actions()
+
+    def _sync_settings_actions(self) -> None:
+        current_size = self._reader_font_size
+        for size, action in self._font_actions.items():
+            action.setChecked(size == current_size)
+        for family, action in self._font_family_actions.items():
+            action.setChecked(family == self._reader_font_family)
+        spacing = min(self._spacing_actions, key=lambda value: abs(value - self._line_spacing))
+        for value, action in self._spacing_actions.items():
+            action.setChecked(value == spacing)
+        width = min(self._width_actions, key=lambda value: abs(value - self._content_width))
+        for value, action in self._width_actions.items():
+            action.setChecked(value == width)
+        for mode, action in self._mode_actions.items():
+            action.setChecked(mode == self._mode)
+        self.indent_action.setChecked(self._paragraph_indent)
+        self.images_action.setChecked(self._show_images)
+
+    def _set_reader_font_size(self, size: int) -> None:
+        self._reader_font_size = max(0, min(48, int(size)))
+        self._font_delta = 0
+        self._base_font = (
+            self._clamp_font(self._reader_font_size)
+            if self._reader_font_size
+            else self._clamp_font(round(17 * self._font_scale))
+        )
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    def _set_reader_font_family(self, family: str) -> None:
+        if family not in self.READER_FONT_FAMILIES:
+            return
+        self._reader_font_family = family
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    def _set_line_spacing(self, spacing: float) -> None:
+        self._line_spacing = max(1.4, min(2.4, float(spacing)))
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    def _set_content_width(self, width: int) -> None:
+        self._content_width = max(640, min(1200, int(width)))
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    def _set_paragraph_indent(self, enabled: bool) -> None:
+        self._paragraph_indent = bool(enabled)
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    def _reset_reader_options(self) -> None:
+        self._reader_font_size = 0
+        self._font_delta = 0
+        self._base_font = self._clamp_font(round(17 * self._font_scale))
+        self._reader_font_family = "system"
+        self._line_spacing = 1.8
+        self._content_width = 960
+        self._paragraph_indent = True
+        self.set_show_images(True)
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    # ------------------------------------------------------------------ #
     def load(
         self,
         source,
@@ -304,10 +558,12 @@ class NovelView(AutoScrollMixin, QWidget):
         """
         self._source = source
         self._detail = detail
+        self._chapters = detail.chapters
+        self._current_idx = -1
+        self._update_reader_header()
         self._restore_generation += 1
         self._restore_cancel_token += 1
         self._load_generation += 1
-        self._chapters = detail.chapters
         # 换书：无条件清零续读位置——旧书若章节还在后台加载，本次 load() 的
         # 首章显示会消费到「上一本书残留的 _pending_restore」，把新书滚动条
         # 错滚到旧书位置（跨书串位置的 bug 根因）。清零后再按新书记录设置。
@@ -396,12 +652,14 @@ class NovelView(AutoScrollMixin, QWidget):
         self._image_generation += 1
         self._clear_images()
         self._current_idx = idx
+        self._displayed_plain_text = ""
         if getattr(self._source, "source_id", "") == "bookstack":
             if 0 <= idx < len(self._toc_items):
                 self.toc_tree.setCurrentItem(self._toc_items[idx])
         elif idx < self.toc_list.count():
             self.toc_list.setCurrentRow(idx)
         ch = self._chapters[idx]
+        self._update_reader_header(ch)
 
         self._scroll_on_load = getattr(self, "_scroll_on_load", 0)  # 0=顶部; 1=底部
         self._scroll_on_load = 1 if scroll_to_end else 0
@@ -435,13 +693,14 @@ class NovelView(AutoScrollMixin, QWidget):
         """正文前加章节编号行（如「第12章」），不含标题文字。"""
         from framework.content import chapter_label
         label = chapter_label(ch.title) or f"第{self._current_idx + 1}章"
+        self._update_reader_header(ch, label)
         full = f"【{label}】\n\n{text}"
         self._current_chapter_url = ch.url
         rich = getattr(ch, "_cached_rich_content", None)
         self._clear_images()
         self._bookstack_image_pixmaps.clear()
         if getattr(self._source, "source_id", "") == "bookstack":
-            self._rich_body.setMaximumWidth(960)
+            self._rich_body.setMaximumWidth(self._content_width)
         else:
             self.scroll_body.setStyleSheet("")
             self._rich_body.setStyleSheet("")
@@ -457,7 +716,8 @@ class NovelView(AutoScrollMixin, QWidget):
                 lambda c=ch, l=label, r=rich, g=render_generation: self._render_bookstack_body(c, l, r, g),
             )
         else:
-            self.text.setText(full)
+            self._displayed_plain_text = full
+            self._set_reader_text(self.text, full)
             self.text.setMinimumHeight(self.text.sizeHint().height())
             self._rich_body.setVisible(False)
         entries = getattr(ch, "_cached_image_urls", []) or []
@@ -474,14 +734,25 @@ class NovelView(AutoScrollMixin, QWidget):
         if self._mode == "scroll" and self._show_images and fragments:
             self.text.setVisible(False)
             generation = self._image_generation
+            title_widget = QLabel(f"【{label}】")
+            title_widget.setObjectName("readerBody")
+            title_widget.setWordWrap(True)
+            title_widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            title_widget.setStyleSheet(self._plain_body_css())
+            title_widget.setMaximumWidth(self._content_width)
+            self.scroll_layout.insertWidget(
+                self.scroll_layout.count() - 1, title_widget, alignment=Qt.AlignHCenter
+            )
             for fragment in fragments:
                 if fragment.get("type") == "text":
-                    segment = QLabel(str(fragment.get("text") or ""))
+                    segment = QLabel(
+                        self._format_reader_text(str(fragment.get("text") or ""), has_title=False)
+                    )
                     segment.setObjectName("readerBody")
                     segment.setWordWrap(True)
                     segment.setTextInteractionFlags(Qt.TextSelectableByMouse)
                     segment.setStyleSheet(self._plain_body_css())
-                    segment.setMaximumWidth(960)
+                    segment.setMaximumWidth(self._content_width)
                     self.scroll_layout.insertWidget(
                         self.scroll_layout.count() - 1, segment, alignment=Qt.AlignHCenter
                     )
@@ -566,9 +837,10 @@ class NovelView(AutoScrollMixin, QWidget):
 
     def _bookstack_css(self) -> str:
         size = self._clamp_font(self._base_font + self._font_delta)
+        family = self.READER_FONT_FAMILIES[self._reader_font_family][1]
         return f"""
             body {{ margin: 0; background: transparent; color: #222222; }}
-            .bookstack-reader {{ color: #222222; font-family: \"Segoe UI\", \"Microsoft YaHei\", sans-serif; }}
+            .bookstack-reader {{ color: #222222; font-family: {family}; }}
             .bookstack-title {{ margin: 0 0 18px; color: #262626; font-size: 30px; font-weight: 700; line-height: 1.35; text-align: center; }}
             .bookstack-meta {{ margin: 0 0 28px; padding: 0 0 14px; border-bottom: 1px dashed #d7d7d7; color: #666666; font-size: 12px; line-height: 1.5; text-align: center; }}
             .markdown-body {{ color: #222222; font-size: {size}px; line-height: 1.8; }}
@@ -640,10 +912,23 @@ class NovelView(AutoScrollMixin, QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        # QLabel's wrapped height is calculated after its parent width changes.
+        # Refresh after the layout pass so the body starts below the full header.
+        QTimer.singleShot(0, self._refresh_reader_header_geometry)
         if getattr(self._source, "source_id", "") == "bookstack" and self._rich_body.isVisible():
             QTimer.singleShot(0, self._apply_bookstack_style)
             QTimer.singleShot(0, self._apply_bookstack_image_resources)
             QTimer.singleShot(0, self._resize_bookstack_body)
+
+    def _refresh_reader_header_geometry(self) -> None:
+        """Recalculate wrapped title rows after text or window width changes."""
+        if not hasattr(self, "reader_header"):
+            return
+        self.book_title_label.updateGeometry()
+        self.chapter_title_label.updateGeometry()
+        self._reader_header_layout.activate()
+        self.reader_header.setMinimumHeight(self._reader_header_layout.sizeHint().height())
+        self.reader_header.updateGeometry()
 
     @staticmethod
     def _normalize_anchor_text(text: str) -> str:
@@ -703,7 +988,7 @@ class NovelView(AutoScrollMixin, QWidget):
         vbar = self.scroll.verticalScrollBar()
         chapter_url = self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else ""
         valid_location = location if self._location_matches_chapter(location, chapter_url) else None
-        target = self._resolve_location_scroll(self.text.text(), valid_location, vbar.maximum()) if valid_location else None
+        target = self._resolve_location_scroll(self._displayed_plain_text, valid_location, vbar.maximum()) if valid_location else None
         if target is None and pos is not None:
             target = round(float(pos) * vbar.maximum())
         if target is not None and vbar.maximum() > 0:
@@ -722,7 +1007,7 @@ class NovelView(AutoScrollMixin, QWidget):
         pos, _ = self.position_snapshot()
         vbar = self.scroll.verticalScrollBar()
         chapter_url = self._chapters[self._current_idx].url if 0 <= self._current_idx < len(self._chapters) else ""
-        return self._build_location_snapshot(self.text.text(), pos, vbar.value(), vbar.maximum(), chapter_url)
+        return self._build_location_snapshot(self._displayed_plain_text, pos, vbar.value(), vbar.maximum(), chapter_url)
 
     def _restore_scroll(self, pos: float) -> None:
         """按 0~1 比例恢复滚动位置（打开书续读）。"""
@@ -763,6 +1048,9 @@ class NovelView(AutoScrollMixin, QWidget):
         if enabled == self._show_images:
             return
         self._show_images = enabled
+        if self._settings is not None:
+            self._settings.set("reader", "show_images", enabled)
+            self._settings.save()
         self._image_generation += 1
         if getattr(self._source, "source_id", "") == "bookstack":
             self._bookstack_image_pixmaps.clear()
@@ -789,6 +1077,8 @@ class NovelView(AutoScrollMixin, QWidget):
         if getattr(self._source, "source_id", "") != "bookstack" and not self._rich_body.isVisible():
             label = QLabel("加载中...")
             label.setAlignment(Qt.AlignCenter)
+            label.setMaximumWidth(self._content_width)
+            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             label.setProperty("image_url", image_url)
             self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, label)
         CoverLoader.instance().load(
@@ -822,7 +1112,16 @@ class NovelView(AutoScrollMixin, QWidget):
         for i in range(self.scroll_layout.count()):
             widget = self.scroll_layout.itemAt(i).widget()
             if widget is not None and widget.property("image_url") == image_url:
-                widget.setPixmap(pixmap.scaledToWidth(max(100, self.scroll.width() - 20), Qt.SmoothTransformation))
+                width = min(
+                    self._content_width,
+                    max(100, self.scroll.viewport().width() - 20),
+                )
+                scaled = pixmap
+                if pixmap.width() > width:
+                    scaled = pixmap.scaledToWidth(width, Qt.SmoothTransformation)
+                widget.setText("")
+                widget.setAlignment(Qt.AlignHCenter)
+                widget.setPixmap(scaled)
                 return True
         return False
 
@@ -832,6 +1131,7 @@ class NovelView(AutoScrollMixin, QWidget):
         if err:
             self._auto_loading = False  # 加载失败也要解锁，防死锁
             self._auto_prev_loading = False
+            self._displayed_plain_text = ""
             self.text.setText(f"加载失败：{err}")
             return
         ch._cached_text = text
@@ -976,8 +1276,11 @@ class NovelView(AutoScrollMixin, QWidget):
     def set_font_scale(self, scale: float) -> None:
         """外部设置字体缩放（设置页实时生效）。"""
         self._font_delta = 0
-        self._base_font = self._clamp_font(round(17 * float(scale or 1.0)))
+        self._font_scale = float(scale or 1.0)
+        self._reader_font_size = 0
+        self._base_font = self._clamp_font(round(17 * self._font_scale))
         self._apply_font()
+        self._sync_settings_actions()
 
     def _adjust_font(self, delta: int) -> None:
         self._font_delta += delta
@@ -987,16 +1290,26 @@ class NovelView(AutoScrollMixin, QWidget):
         size = self._clamp_font(self._base_font + self._font_delta)
         bg = self._reading_bg
         bg_css = f" background-color: {bg};" if bg else " background: transparent;"
-        fg_css = f" color: {self._reading_fg};" if self._reading_fg else ""
+        # Keep a concrete foreground color when a reading background is set;
+        # otherwise Qt's palette handles light/dark application themes.
+        fg_css = f" color: {self._reading_fg or 'palette(text)'};"
+        family_css = self.READER_FONT_FAMILIES[self._reader_font_family][1]
         return (
-            "font-family: Georgia, 'Times New Roman', 'Noto Serif CJK SC', SimSun, serif; "
-            f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;"
-            " text-indent: 2em; margin-bottom: 0.9em;"
+            f"font-family: {family_css}; "
+            f"font-size: {size}px; line-height: {self._line_spacing}; padding: 12px 20px;"
+            # Indentation is materialized as exactly two ideographic spaces
+            # below; CSS text-indent would double-indent fetched text.
+            f" text-indent: 0; margin-bottom: 0.9em;"
             f"{bg_css}{fg_css}"
         )
 
     def _apply_plain_body_style(self) -> None:
         css = self._plain_body_css()
+        # The settings menu is built before the body widgets. QAction.setChecked
+        # can emit toggled during construction, so style application must be
+        # harmless until the reader body exists.
+        if not hasattr(self, "text") or not hasattr(self, "paged_label"):
+            return
         widgets = [self.text, self.paged_label]
         widgets.extend(self.scroll_body.findChildren(QLabel, "readerBody"))
         seen = set()
@@ -1005,16 +1318,70 @@ class NovelView(AutoScrollMixin, QWidget):
                 continue
             seen.add(id(widget))
             widget.setStyleSheet(css)
-            widget.setMaximumWidth(960)
+            widget.setMaximumWidth(self._content_width)
         self.scroll_layout.setAlignment(self.text, Qt.AlignHCenter)
 
+    def _rich_text_enabled(self) -> bool:
+        return self._line_spacing != 1.8 or not self._paragraph_indent
+
+    def _qk17_reader_html(self, text: str, has_title: bool = True) -> str:
+        """Render 17K's single-newline paragraphs as real block elements."""
+        lines = self._format_reader_text(text, has_title=has_title).split("\n")
+        blocks = []
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            content = escape(line)
+            if has_title and index == 0:
+                blocks.append(f'<div class="chapter-marker">{content}</div>')
+            else:
+                blocks.append(f'<p style="margin:0 0 0.8em 0;">{content}</p>')
+        return '<div class="qk17-reader-body">' + "".join(blocks) + '</div>'
+
+    def _set_reader_text(self, widget, text: str, has_title: bool = True) -> None:
+        """Render plain text directly unless a layout option needs rich text."""
+        if getattr(self._source, "source_id", "") == "qk17":
+            widget.setText(self._qk17_reader_html(text, has_title=has_title))
+            return
+        text = self._format_reader_text(text, has_title=has_title)
+        if not self._rich_text_enabled():
+            # 调字号/背景只改样式时，避免再次复制整章正文。
+            if widget.text() != text:
+                widget.setText(text)
+            return
+        body = escape(text).replace("\n", "<br/>")
+        size = self._clamp_font(self._base_font + self._font_delta)
+        family = escape(self.READER_FONT_FAMILIES[self._reader_font_family][1], quote=True)
+        widget.setText(
+            f'<div style="font-family:{family}; font-size:{size}px; line-height:{self._line_spacing}; '
+            f'white-space:pre-wrap;">{body}</div>'
+        )
+
+    def _format_reader_text(self, text: str, has_title: bool = True) -> str:
+        """Normalize fetched leading whitespace and apply one two-character indent."""
+        lines = str(text or "").split("\n")
+        out = []
+        for index, line in enumerate(lines):
+            stripped = line.lstrip(" \t　")
+            if stripped and self._paragraph_indent and (not has_title or index > 0):
+                stripped = "　　" + stripped
+            out.append(stripped)
+        return "\n".join(out)
+
     def _apply_font(self) -> None:
+        if not hasattr(self, "text") or not hasattr(self, "paged_label"):
+            return
         self._apply_plain_body_style()
+        self._rich_body.setMaximumWidth(self._content_width)
         if getattr(self._source, "source_id", "") == "bookstack":
             self._apply_bookstack_style()
             self._resize_bookstack_body()
         self._repaginate()
-        self._pager_show_page(self._current_page)
+        if self._mode == "pager":
+            self._pager_show_page(self._current_page)
+        if self._displayed_plain_text and self.text.isVisible():
+            if self._rich_text_enabled():
+                self._set_reader_text(self.text, self._displayed_plain_text)
 
     def set_reading_style(self, bg: str = "", font_size: int = 0, fg: str = "") -> None:
         """设置阅读区独立背景色/字号/前景色（ui-reader #12）。
@@ -1031,21 +1398,31 @@ class NovelView(AutoScrollMixin, QWidget):
         self._apply_font()
 
     # ------------------------------------------------------------------ #
-    def _toggle_mode(self) -> None:
-        """滚动 / 翻页 模式切换。"""
+    def _set_mode(self, mode: str) -> None:
+        """切换滚动/翻页阅读方式，并同步工具栏与设置菜单状态。"""
+        if mode not in {"scroll", "pager"}:
+            return
         self._stop_auto_scroll()
-        if self._mode == "scroll":
-            self._mode = "pager"
+        if mode == self._mode:
+            self._sync_settings_actions()
+            self._update_auto_scroll_slider_state()
+            return
+        self._mode = mode
+        if mode == "pager":
             self.mode_btn.setText("滚动模式")
             self.body_stack.setCurrentWidget(self.pager_widget)
             self._repaginate()
             self._pager_show_page(self._current_page)
         else:
-            self._mode = "scroll"
             self.mode_btn.setText("翻页模式")
             self.body_stack.setCurrentWidget(self.scroll)
             self.scroll.verticalScrollBar().setValue(0)
+        self._sync_settings_actions()
         self._update_auto_scroll_slider_state()
+
+    def _toggle_mode(self) -> None:
+        """滚动 / 翻页 模式切换。"""
+        self._set_mode("pager" if self._mode == "scroll" else "scroll")
 
     def _repaginate(self):
         """按字数把正文拆成多页（每页约 CHARS_PER_PAGE 字）。
@@ -1087,7 +1464,9 @@ class NovelView(AutoScrollMixin, QWidget):
         if page < 0 or page >= self._page_count:
             return
         self._current_page = page
-        self.paged_label.setText(self._pages[page])
+        self._set_reader_text(
+            self.paged_label, self._pages[page], has_title=(page == 0)
+        )
         self.paged_scroll.verticalScrollBar().setValue(0)
         self.pager_indicator.setText(f"{page + 1} / {self._page_count} 页")
         # 翻页后节流存盘位置（精准到页）
@@ -1122,9 +1501,29 @@ class NovelView(AutoScrollMixin, QWidget):
             self._load_chapter(self._current_idx - 1, scroll_to_end=True)
 
 
+    def _update_reader_header(self, chapter=None, label: str = "") -> None:
+        """Update the fixed reader header without rebuilding the reading body."""
+        detail_title = getattr(self._detail, "title", "") if self._detail is not None else ""
+        self.book_title_label.setText(str(detail_title or "未命名作品"))
+        self.book_title_label.setToolTip(str(detail_title or ""))
+        if chapter is None and 0 <= self._current_idx < len(self._chapters):
+            chapter = self._chapters[self._current_idx]
+        chapter_title = str(getattr(chapter, "title", "") or "") if chapter is not None else ""
+        if not label:
+            from framework.content import chapter_label
+
+            label = chapter_label(chapter_title) if chapter_title else ""
+        display = chapter_title or label or (
+            f"第{self._current_idx + 1}章" if self._current_idx >= 0 else ""
+        )
+        self.chapter_title_label.setText(f"当前章节：{display}" if display else "")
+        self.chapter_title_label.setToolTip(display)
+        self._refresh_reader_header_geometry()
+
     def _update_progress(self) -> None:
         total = len(self._chapters)
         self.progress_label.setText(f"第{self._current_idx + 1}/{total}章")
+        self._update_reader_header()
 
     # ------------------------------------------------------------------ #
     def keyPressEvent(self, event) -> None:  # noqa: N802

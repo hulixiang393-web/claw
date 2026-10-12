@@ -1,6 +1,6 @@
 """首页 / 仪表盘（HomePage）。
 
-对应 ui-home.md 全部功能点：
+对应 PROJECT_GUIDE.md §6.2 首页功能点：
 - 顶部栏（logo + 三态吉祥物 + 主题切换 + 设置入口）
 - 统计卡片区（小说/漫画/视频/启用/失效红点）
 - 最近搜索（20条，点击重搜）
@@ -40,6 +40,47 @@ from gui.components import (
 from .base_page import BasePage
 
 
+class _PlaybackRow(QWidget):
+    """Clickable history row with an independent delete action."""
+
+    clicked = Signal(object)
+
+    def __init__(self, record: dict, parent=None):
+        super().__init__(parent)
+        self._record = record
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        label = QLabel("")
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        layout.addWidget(label, stretch=1)
+        self.delete_btn = QPushButton("删除")
+        self.delete_btn.setFixedWidth(50)
+        self.delete_btn.setFixedHeight(26)
+        layout.addWidget(self.delete_btn)
+
+    def set_label(self, text: str) -> None:
+        self.layout().itemAt(0).widget().setText(text)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self._record)
+        super().mousePressEvent(event)
+
+
+def _open_playback_record(home, record) -> None:
+    """Open a history record; kept as a function for lightweight test doubles."""
+    from framework.reading_progress import history_active
+
+    progress = getattr(home, "_reading_progress", None)
+    if progress is not None:
+        record = progress.all().get((record or {}).get("book_url"))
+    if not record or not history_active(record):
+        return
+    if not (getattr(home, "_privacy", None)
+            and home._privacy.playback_history_hidden(record)):
+        home.playback_requested.emit(record)
+
+
 class _BrokenSourcesCard(QWidget):
     """不可用源列表卡片：列出不可用的源及其原因（无不可用时隐藏）。"""
 
@@ -52,7 +93,7 @@ class _BrokenSourcesCard(QWidget):
 
         header = QHBoxLayout()
         self.title = QLabel("⚠ 不可用源")
-        self.title.setStyleSheet("font-size: 14px; font-weight: bold; color: palette(text);")
+        self.title.setStyleSheet("font-size: 14px; font-weight: bold; color: #000000;")
         header.addWidget(self.title)
         header.addStretch(1)
         layout.addLayout(header)
@@ -60,7 +101,7 @@ class _BrokenSourcesCard(QWidget):
         self.list_label = QLabel("")
         self.list_label.setWordWrap(True)
         self.list_label.setStyleSheet(
-            "color: palette(text2); font-size: 12px; line-height: 1.6;"
+            "color: #000000; font-size: 12px; line-height: 1.6;"
         )
         layout.addWidget(self.list_label)
 
@@ -213,7 +254,7 @@ class BatchUpdateCard(QWidget):
                 f"发现 {total_new} 部新作品：{'，'.join(p for p in parts if '部新' in p)}"
             )
             self.hint.setStyleSheet(
-                "color: palette(success); font-weight: bold;"
+                "color: #000000; font-weight: bold;"
             )
         else:
             self.hint.setText("各源暂无新作品")
@@ -243,6 +284,8 @@ class HomePage(BasePage):
         privacy=None,
     ):
         super().__init__(parent)
+        # Keep dashboard copy readable when a dark global theme is selected.
+        self.setStyleSheet("QWidget { color: #000000; }")
         self._manager = source_manager
         self._bus = event_bus
         self._theme_manager = theme_manager
@@ -284,9 +327,17 @@ class HomePage(BasePage):
         self.recent = RecentSearches(history)
         layout.addWidget(self.recent)
         self.recent.search_clicked.connect(self._on_recent_clicked)
+        self.recent.changed.connect(self.refresh)
 
+        playback_header = QHBoxLayout()
         self.playback_title = QLabel("最近播放（0）")
-        layout.addWidget(self.playback_title)
+        playback_header.addWidget(self.playback_title)
+        playback_header.addStretch(1)
+        self.clear_playback_btn = QPushButton("清空")
+        self.clear_playback_btn.setFixedHeight(26)
+        self.clear_playback_btn.clicked.connect(self._clear_playback_history)
+        playback_header.addWidget(self.clear_playback_btn)
+        layout.addLayout(playback_header)
         self.playback_list = QListWidget()
         self.playback_list.setMaximumHeight(180)
         self.playback_list.itemClicked.connect(self._on_playback_clicked)
@@ -366,6 +417,17 @@ class HomePage(BasePage):
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, record)
             self.playback_list.addItem(item)
+            # Keep QListWidgetItem text/data for keyboard and existing callers;
+            # the delete action is supplied by a lightweight row widget.
+            row = _PlaybackRow(record)
+            row.set_label(label)
+            delete_btn = row.delete_btn
+            book_url = record.get("book_url", "")
+            delete_btn.clicked.connect(
+                lambda _, url=book_url: self._remove_playback_history(url)
+            )
+            row.clicked.connect(self._on_playback_record)
+            self.playback_list.setItemWidget(item, row)
 
     def _update_empty_state(self) -> None:
         has_sources = len(self._manager.all()) > 0
@@ -382,16 +444,21 @@ class HomePage(BasePage):
             self.search_requested.emit(keyword)
 
     def _on_playback_clicked(self, item):
-        from framework.reading_progress import history_active
+        _open_playback_record(self, item.data(Qt.UserRole))
 
-        record = item.data(Qt.UserRole)
-        progress = getattr(self, "_reading_progress", None)
-        if progress is not None:
-            record = progress.all().get((record or {}).get("book_url"))
-        if not record or not history_active(record):
-            return
-        if record and not (self._privacy and self._privacy.playback_history_hidden(record)):
-            self.playback_requested.emit(record)
+    def _on_playback_record(self, record):
+        _open_playback_record(self, record)
+
+    def _remove_playback_history(self, book_url: str) -> None:
+        if self._reading_progress and self._reading_progress.remove(book_url):
+            self._history_snapshot = None
+            self._refresh_history()
+
+    def _clear_playback_history(self) -> None:
+        if self._reading_progress:
+            self._reading_progress.clear_videos()
+            self._history_snapshot = None
+            self._refresh_history()
 
     def showEvent(self, event):
         super().showEvent(event)

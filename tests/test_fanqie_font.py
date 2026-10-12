@@ -18,6 +18,7 @@ from framework import fanqie_font
 from framework.config import SourceConfig
 from framework.decrypter import Decrypter
 from framework.http import HttpClient
+from framework.search import Search
 
 PUA = "\ue3ea"  # 静态表：→ 主
 
@@ -106,6 +107,20 @@ def test_translit_without_html_keeps_static_behavior():
     assert out == "剑主来"
 
 
+def test_translit_static_map_wins_when_dynamic_font_is_present(monkeypatch):
+    """A fuzzy font match must not replace the verified bundled glyph table."""
+    src = SourceConfig.from_dict(dict(_SOURCE), "<test>")
+    dec = Decrypter(_FakeHttp())
+
+    monkeypatch.setattr(
+        fanqie_font,
+        "resolve_urls",
+        lambda urls, text: (text.replace(PUA, "错"), {PUA: "错"}),
+    )
+    out = dec.decrypt(src, f"剑{PUA}来", target="title", font_urls=["font.woff2"])
+    assert out == "剑主来"
+
+
 def test_translit_plain_source_unchanged():
     src = SourceConfig.from_dict(dict(_SOURCE), "<test>")
     plain = dict(_SOURCE)
@@ -115,3 +130,39 @@ def test_translit_plain_source_unchanged():
         SourceConfig.from_dict(plain, "<test>"), "剑\ue3ea来", target="title", html="<html/>"
     )
     assert out == "剑\ue3ea来"
+
+
+def test_search_uses_fanqie_search_table():
+    """官网搜索页使用 _search 表，不能套用正文表。"""
+    source = dict(_SOURCE)
+    source["decryption"] = {
+        "targets": {
+            "search_title": {
+                "strategy": "translit",
+                "map_module": "framework.fanqie_search_glyph_map",
+                "map_attr": "FANQIE_SEARCH_GLYPH_MAP",
+            }
+        }
+    }
+    src = SourceConfig.from_dict(source, "<test>")
+    out = Decrypter(_FakeHttp()).decrypt(src, "\ue3eb", target="search_title")
+    assert out == "作"
+
+
+def test_search_decrypter_enables_search_only_tables():
+    """只有搜索专用策略时，HTML 搜索引擎也必须启用解密。"""
+    source = dict(_SOURCE)
+    source["decryption"] = {
+        "targets": {
+            "search_title": {
+                "strategy": "translit",
+                "map_module": "framework.fanqie_search_glyph_map",
+                "map_attr": "FANQIE_SEARCH_GLYPH_MAP",
+            }
+        }
+    }
+    src = SourceConfig.from_dict(source, "<test>")
+    search = Search(_FakeHttp(), None)
+    dec = search._search_decrypter(src)
+    assert dec is not None
+    assert dec.decrypt(src, "\ue3eb", target="search_title") == "作"

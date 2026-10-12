@@ -198,6 +198,39 @@ def test_mainwindow_bootstrap_construction_is_read_only(_qapp, monkeypatch, tmp_
     window.close()
 
 
+def test_mainwindow_loads_source_configs_before_runtime_services(
+    _qapp, monkeypatch, tmp_path
+):
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    (sources / "local.json").write_text(json.dumps({
+        "$schema_version": 2,
+        "$id": "local",
+        "$name": "本地源",
+        "$type": "novel",
+        "transports": {"base_url": "https://example.test"},
+        "endpoints": {"search": {"base_url": "/search", "method": "GET"}},
+    }), encoding="utf-8")
+    (sources / "broken.json").write_bytes(b"\xff\xfe")
+    monkeypatch.setattr("gui.app._app_base_dir", lambda: Path(tmp_path))
+    monkeypatch.setattr(MainWindow, "_schedule_source_selection", lambda self: None)
+
+    class _Task:
+        def __init__(self, *args):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("gui.app._StartupTask", _Task)
+    window = MainWindow()
+
+    assert [source.source_id for source in window.source_manager.all()] == ["local"]
+    assert window.home_page.stats_row._manager is window.source_manager
+    assert window.home_page.empty_state.isHidden()
+    window.close()
+
+
 def test_deferred_history_cleanup_rewrites_only_from_background_thread(tmp_path):
     import threading
     from types import SimpleNamespace

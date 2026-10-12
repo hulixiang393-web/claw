@@ -178,6 +178,23 @@ class ContentBase:
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         return utils.abs_url(source.base_url, url)
 
+    def _detail_cache_key(self, source: SourceConfig, url: str) -> str:
+        """Allow a source to invalidate stale detail/TOC HTML after a redesign."""
+        absolute = self._abs_url(source, url)
+        version = (source.raw.get("detail_cache_version") if source else None) or ""
+        if version:
+            separator = "&" if "?" in absolute else "?"
+            absolute = f"{absolute}{separator}__cache_version={version}"
+        return f"detail:{source.source_id}:{absolute}"
+
+    def _page_cache_key(self, source: SourceConfig, abs_url: str) -> str:
+        """Build the persistent HTML-page key, including redesign versions."""
+        version = (source.raw.get("page_cache_version") if source else None) or ""
+        if version:
+            separator = "&" if "?" in abs_url else "?"
+            abs_url = f"{abs_url}{separator}__cache_version={version}"
+        return f"page:{source.source_id}:{abs_url}"
+
     @staticmethod
     def _repository_cache_parts(key: str, book_key: str | None = None) -> tuple[str, str]:
         parts = key.split(":", 3)
@@ -330,13 +347,19 @@ class ContentBase:
             return hit[1]
         # Redis 二级：详情/目录页永久（重启后/预加载后免抓）
         redis = self._cache
-        redis_key = f"page:{source.source_id}:{abs_url}"
+        redis_key = self._page_cache_key(source, abs_url)
         if redis is not None:
             cached = redis.get(redis_key)
             if cached is not None:
                 self._detail_html_cache[key] = (time.time() + self._detail_html_ttl, cached)
                 return cached
-        html = self._get(source, url, deadline=deadline, context=context)
+        detail_cfg = source.get_detail_config()
+        if detail_cfg.get("render") == "playwright":
+            html = self._fetch_rendered_html(
+                source, url, detail_cfg.get("render_config") or {}
+            )
+        else:
+            html = self._get(source, url, deadline=deadline, context=context)
         self._detail_html_cache[key] = (time.time() + self._detail_html_ttl, html)
         if len(self._detail_html_cache) > self._detail_html_max:
             # dict 保持插入序：弹出最先插入的一条（近似 LRU）
@@ -378,7 +401,7 @@ class ContentBase:
         """强制刷新详情和章节正文缓存，保留缓存优先的普通打开路径。"""
         self.invalidate_video_stream_cache(source)
         abs_url = self._abs_url(source, url)
-        detail_key = f"detail:{source.source_id}:{abs_url}"
+        detail_key = self._detail_cache_key(source, abs_url)
         def _delete(key: str) -> None:
             if self._cache is None:
                 return
@@ -391,9 +414,16 @@ class ContentBase:
 
         if self._cache is not None:
             _delete(detail_key)
+            _delete(self._page_cache_key(source, abs_url))
+            # Remove the unversioned key left by older source definitions too.
             _delete(f"page:{source.source_id}:{abs_url}")
             if current_chapter_url:
-                _delete(f"body:{source.source_id}:{self._abs_url(source, current_chapter_url)}")
+                chapter_key = (
+                    self._chapter_cache_key(source, current_chapter_url)
+                    if hasattr(self, "_chapter_cache_key")
+                    else f"body:{source.source_id}:{self._abs_url(source, current_chapter_url)}"
+                )
+                _delete(chapter_key)
         getattr(self, "_detail_html_cache", {}).pop((source.source_id, abs_url), None)
         getattr(self, "_video_html_cache", {}).pop((source.source_id, abs_url), None)
         detail = self.fetch_detail(source, url)
@@ -423,7 +453,7 @@ class ContentBase:
         """
         context = self._stream_context(context, deadline)
         self._check_stream_context(context, deadline)
-        cache_key = f"detail:{source.source_id}:{self._abs_url(source, url)}"
+        cache_key = self._detail_cache_key(source, url)
         cached = self._cache_get_detail(cache_key)
         if cached is not None and not any(
             self._looks_like_direct_media(ch.url) for ch in (cached.chapters or [])
@@ -452,7 +482,7 @@ class ContentBase:
                 url = path + suffix + ("?" + query if query else "")
 
         abs_url = self._abs_url(source, url)
-        cache_key = f"detail:{source.source_id}:{abs_url}"
+        cache_key = self._detail_cache_key(source, abs_url)
         cached = self._cache_get_detail(cache_key)
         if cached is not None:
             return cached
@@ -501,13 +531,28 @@ class ContentBase:
         # 还原；解密配置与 discovery 列表同源：decryption.targets.title/author）。
         # 未配置解密策略的源 Decrypter 原样返回，零影响。
         if self._decrypter is not None:
+            from urllib.parse import urljoin
+            from framework.fanqie_font import extract_font_urls
+
+            font_urls = [
+                urljoin(abs_url, font_url) for font_url in extract_font_urls(html)
+            ]
             if detail.title:
-                detail.title = self._decrypter.decrypt(source, detail.title, target="title", html=html)
+                detail.title = self._decrypter.decrypt(
+                    source, detail.title, target="title", html=html,
+                    font_urls=font_urls,
+                )
             if detail.author:
-                detail.author = self._decrypter.decrypt(source, detail.author, target="author", html=html)
+                detail.author = self._decrypter.decrypt(
+                    source, detail.author, target="author", html=html,
+                    font_urls=font_urls,
+                )
             # 简介繁简转换（繁体源，如 CZBooks：detail 简介也需随正文转简体）
             if detail.summary:
-                detail.summary = self._decrypter.decrypt(source, detail.summary, target="summary", html=html)
+                detail.summary = self._decrypter.decrypt(
+                    source, detail.summary, target="summary", html=html,
+                    font_urls=font_urls,
+                )
         # 标签（可空）
         tags = self._parser.extract(doc, fields.get("tags"))
         detail.tags = tags

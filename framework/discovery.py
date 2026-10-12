@@ -199,6 +199,34 @@ class Discovery:
     def _headers(self, source: SourceConfig) -> dict:
         return source.request_headers()
 
+    @staticmethod
+    def _playwright_cookies(source: SourceConfig) -> list:
+        """Convert the source's merged Cookie header for rendered pages.
+
+        HTTP requests already receive cookies through SourceConfig. The browser
+        path needs the same session explicitly, otherwise a JS challenge can
+        return an empty shell even though the normal request is authenticated.
+        """
+        from urllib.parse import urlsplit
+
+        header = source.request_headers().get("Cookie", "")
+        host = (urlsplit(source.base_url).hostname or "").lstrip(".")
+        if not header or not host:
+            return []
+        cookies = []
+        for item in header.split(";"):
+            name, sep, value = item.strip().partition("=")
+            if not sep or not name or not value:
+                continue
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": host,
+                "path": "/",
+                "secure": source.base_url.lower().startswith("https://"),
+            })
+        return cookies
+
     def _timeout(self, source: SourceConfig) -> float:
         return float(source.transports().get("timeout") or self._http.defaults.timeout)
 
@@ -340,24 +368,47 @@ class Discovery:
             return self._list_works_api(source, url, page)
 
         fetch_url = self._build_page_url(source, url, page)
-        # 自检移后台线程（不阻塞作品抓取）
-        self._bg_check(source, self._abs_url(source, fetch_url))
-        html = self._get(source, fetch_url)
+        html = ""
+        render_mode = disc_html.get("render")
+        if render_mode == "playwright_fallback":
+            # Most pages are ordinary HTML; only pay the browser startup cost
+            # when the fast request is blocked or returns no usable cards.
+            try:
+                html = self._get(source, fetch_url)
+                probe = disc_html.get("works_list_item") or {}
+                probe_root = probe.get("root_selector")
+                probe_fields = probe.get("fields") or {}
+                if not probe_root or not self._parser.parse_items(
+                    self._parser.parse(html), probe_root, probe_fields, source.base_url
+                ):
+                    html = ""
+            except Exception:  # noqa: BLE001
+                html = ""
         # SPA 站发现页（SvelteKit/React 等）：首屏 HTML 为空壳，列表由 JS
         # 渲染进 DOM。源配置 discovery.render == "playwright" 时先渲染再解析，
         # 复用下方 works_list_item 的 CSS 选择器（不改变纯 HTTP 源行为）。
-        if disc_html.get("render") == "playwright":
+        if render_mode in ("playwright", "playwright_fallback") and not html:
             try:
                 from .playwright_helper import fetch_rendered_html_sync
 
                 rc = disc_html.get("render_config") or {}
+                request_headers = source.request_headers()
+                browser_headers = {
+                    key: value for key, value in request_headers.items()
+                    if key.lower() not in {
+                        "user-agent", "cookie", "referer", "host", "content-length",
+                    }
+                }
                 rendered = fetch_rendered_html_sync(
                     self._abs_url(source, fetch_url),
                     wait_for=rc.get("wait_for", ""),
                     wait_until=rc.get("wait_until", "networkidle"),
                     timeout_ms=int(rc.get("timeout_ms") or 30000),
-                    extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
+                    extra_delay_ms=int(rc["extra_delay_ms"] if "extra_delay_ms" in rc else 2500),
                     proxy=source.transports().get("proxy"),
+                    cookies=self._playwright_cookies(source),
+                    referer=source.request_headers().get("Referer", ""),
+                    headers=browser_headers,
                     scroll_to_bottom=bool(rc.get("scroll_to_bottom", False)),
                     scroll_step_px=int(rc.get("scroll_step_px", 800)),
                     scroll_stale_rounds=int(rc.get("scroll_stale_rounds", 4)),
@@ -366,6 +417,10 @@ class Discovery:
                     html = rendered
             except Exception as exc:  # noqa: BLE001 —— 渲染失败降级用原始 HTML
                 log.warning("[%s] 发现页 Playwright 渲染失败：%s", source.source_id, exc)
+        if not html and render_mode != "playwright_fallback":
+            # 自检移后台线程（不阻塞作品抓取）；纯 HTTP 是渲染不可用时的降级链。
+            self._bg_check(source, self._abs_url(source, fetch_url))
+            html = self._get(source, fetch_url)
         doc = self._parser.parse(html)
 
         # 作品项选择器：优先 works_list_item（专属作品列表），

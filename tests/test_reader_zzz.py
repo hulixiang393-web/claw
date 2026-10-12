@@ -118,7 +118,7 @@ def test_plain_novel_style_is_serif_and_width_limited(_qapp):
     view = NovelView(object())
     css = view._plain_body_css()
     assert "Georgia" in css
-    assert "text-indent: 2em" in css
+    assert "text-indent: 0" in css
     assert "margin-bottom: 0.9em" in css
     assert view.text.maximumWidth() == 960
     assert view.paged_label.maximumWidth() == 960

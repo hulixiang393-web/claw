@@ -1,6 +1,6 @@
 """漫画阅读视图（ComicView）。
 
-对应 ui-reader.md 漫画功能点：
+对应 PROJECT_GUIDE.md §6.8 漫画功能点：
 - 图片逐页加载 + 预加载
 - 滚动画廊（默认）/ 横向翻页可切换
 - 图片缩放（点击放大/双击还原）
@@ -120,7 +120,8 @@ class ComicView(AutoScrollMixin, QWidget):
         toolbar.addWidget(self.mode_btn)
 
         self.bg_btn = QPushButton("背景")
-        self.bg_btn.setFixedWidth(50)
+        self.bg_btn.setMinimumWidth(72)
+        self.bg_btn.setMinimumHeight(30)
         self.bg_btn.setToolTip("切换阅读背景色（白/米黄/护眼绿/夜间黑）")
         self.bg_btn.clicked.connect(self.background_cycle_requested.emit)
         toolbar.addWidget(self.bg_btn)
@@ -133,13 +134,14 @@ class ComicView(AutoScrollMixin, QWidget):
         toolbar.addWidget(self.next_btn)
 
         self.fullscreen_btn = QPushButton("⛶")
-        self.fullscreen_btn.setFixedWidth(40)
+        self.fullscreen_btn.setMinimumWidth(52)
+        self.fullscreen_btn.setMinimumHeight(30)
         self.fullscreen_btn.setToolTip("全屏阅读")
         self.fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
         toolbar.addWidget(self.fullscreen_btn)
 
         self.auto_scroll_btn = QPushButton("▶ 自动滚动")
-        self.auto_scroll_btn.setFixedWidth(90)
+        self.auto_scroll_btn.setMinimumWidth(104)
         self.auto_scroll_btn.setToolTip("开启/关闭自动滚动（空格键）")
         self.auto_scroll_btn.clicked.connect(self._toggle_auto_scroll)
         toolbar.addWidget(self.auto_scroll_btn)

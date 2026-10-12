@@ -1,7 +1,7 @@
 """打包脚本：PyInstaller 构建 claw.exe + 复制运行资源。
 
 用法：在项目根目录运行  python build.py
-产物：dist/claw/claw.exe（自动携带 sources/data/docs/app_config.json）
+产物：dist/claw/claw.exe（自动携带 sources/data/PROJECT_GUIDE.md/app_config.json）
 需求：已安装 PyInstaller（pip install pyinstaller）
 """
 
@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist" / "claw"
 # 需随 exe 携带的资源（目录或文件）
-RESOURCES = ["sources", "data", "docs", "app_config.json"]
+RESOURCES = ["sources", "data", "PROJECT_GUIDE.md", "app_config.json"]
 
 
 def run_pyinstaller() -> None:
@@ -34,7 +34,7 @@ def run_pyinstaller() -> None:
 
 
 def copy_resources() -> None:
-    """把源配置/数据/文档复制到 exe 旁（运行时从 exe 目录读资源）。"""
+    """把源配置/数据/项目说明复制到 exe 旁。"""
     print(">>> 复制资源到", DIST)
     DIST.mkdir(parents=True, exist_ok=True)
     for name in RESOURCES:

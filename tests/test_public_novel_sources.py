@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -58,6 +59,16 @@ def _content(http: _FakeHttp) -> Content:
     return Content(http, Parser(), object())
 
 
+def _without_browser_render(source: SourceConfig) -> SourceConfig:
+    """Use fixture HTML directly; browser behavior has its own regression test."""
+    raw = copy.deepcopy(source.raw)
+    raw["endpoints"]["discovery"].pop("render", None)
+    raw["endpoints"]["search"].pop("render", None)
+    raw["endpoints"]["detail"].pop("render", None)
+    raw["endpoints"]["content"]["chapter"]["body"].pop("render", None)
+    return SourceConfig.from_dict(raw, source.source_path)
+
+
 def test_public_sources_load_through_source_manager():
     manager = SourceManager(SOURCES)
 
@@ -74,15 +85,20 @@ def test_bookstack_config_has_low_frequency_discovery_and_search_contract():
     source = _source("bookstack")
     discovery = source.get_discovery_config()
     search = source.get_search_config()
+    detail = source.get_detail_config()
 
     assert source.base_url == "https://www.bookstack.cn"
     assert discovery["list_url"] == "/explore?tab=latest&lang="
+    assert discovery["render"] == "playwright"
+    assert discovery["render_config"]["wait_for"] == "dl.manual-item-standard"
     assert discovery["works_list_item"]["root_selector"] == {
         "css": "dl.manual-item-standard"
     }
     assert search["base_url"] == "/search/result"
     assert search["method"] == "GET"
     assert search["keyword_param"] == "wd"
+    assert search["render"] == "playwright"
+    assert search["item"]["render_config"]["wait_for"] == ".result-list li.clearfix"
     assert search["extra_params"] == {"tab": "book"}
     assert search["item"]["root_selector"] == {
         "css": ".result-list li.clearfix"
@@ -91,10 +107,31 @@ def test_bookstack_config_has_low_frequency_discovery_and_search_contract():
     assert source.transports()["interval_ms"] == 1200
     assert source.transports()["retries"] == 1
     assert source.raw["diagnostics"]["selfcheck"]["strategy"] == "off"
+    detail_fields = source.raw["endpoints"]["detail"]["fields"]
+    assert detail_fields["title"]["fallback"][0] == {"css": "h1.wd-book-title"}
+    assert detail_fields["cover"]["fallback"][0] == {
+        "css": ".wd-cover-img", "attr": "src"
+    }
+    assert detail["render"] == "playwright"
+    assert detail["render_config"]["wait_for"] == (
+        "h1.wd-book-title, .m-manual.manual-mode-view .article-menu-detail, "
+        "article#page-content"
+    )
+    assert source.raw["detail_cache_version"] == 3
+    assert source.raw["chapter_cache_version"] == 3
+    assert source.raw["page_cache_version"] == 3
+    assert source.raw["endpoints"]["content"]["chapter"]["body"]["selector"]["fallback"][0] == {
+        "css": "article.article-body.markdown-body"
+    }
+    body = source.raw["endpoints"]["content"]["chapter"]["body"]
+    assert body["render"] == "playwright"
+    assert body["render_config"]["wait_for"] == (
+        "article.article-body.markdown-body, article#page-content"
+    )
 
 
 def test_bookstack_discovery_search_detail_chapters_and_body():
-    source = _source("bookstack")
+    source = _without_browser_render(_source("bookstack"))
     http = _FakeHttp(
         [
             (
@@ -150,6 +187,16 @@ def test_bookstack_discovery_search_detail_chapters_and_body():
     body = content.fetch_chapter(source, detail.chapters[0].url)
     assert "安装 Python" in body
     assert "开始编写代码" in body
+
+
+def test_18mh_novel_chapters_keep_site_number_for_common_sorting():
+    source = _source("18mh-novel")
+    chapter_list = source.raw["endpoints"]["content"]["chapter"]["list"]
+
+    assert chapter_list["chapter_order"] == "asc"
+    assert chapter_list["fields"]["title"] == {
+        "css": ".detail-page__catalog-left"
+    }
 
 
 def test_shuyous_config_has_discovery_detail_toc_body_and_same_chapter_rule():

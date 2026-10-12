@@ -265,7 +265,7 @@ ANTI_SCRAPE_STATUSES = frozenset({403, 405, 429})
 ANTI_SCRAPE_KEYWORDS = (
     "captcha", "geetest", "g-recaptcha", "verify you are human",
     "you have been blocked", "access denied", "access is denied",
-    "forbidden", "anti-bot", "riskcontrol", "waf",
+    "anti-bot", "riskcontrol", "waf",
     "acw_sc__v2", "aliyunwaf", "var arg1=",
     "验证码", "人机验证", "滑动验证", "拖动验证",
     "访问过于频繁", "访问频率过高", "请求过于频繁",

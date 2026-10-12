@@ -35,7 +35,10 @@ class Decrypter:
         self._http = http
 
     # ------------------------------------------------------------------ #
-    def decrypt(self, source: SourceConfig, content: str, target: str = "content", html: str = "") -> str:
+    def decrypt(
+        self, source: SourceConfig, content: str, target: str = "content",
+        html: str = "", font_urls=None,
+    ) -> str:
         """按源配置的 decryption 策略解密内容。
 
         :param source: 源配置
@@ -46,12 +49,18 @@ class Decrypter:
         dec_cfg = source.raw.get("decryption") or {}
         targets = dec_cfg.get("targets") or {}
         cfg = targets.get(target) or {}
+        if not cfg and target.startswith("search_"):
+            # 搜索页可使用与正文不同的字体码表；没有专用配置时
+            # 兼容旧源，回退到 title/author 的同名策略。
+            cfg = targets.get(target[7:]) or {}
         strategy = cfg.get("strategy") or ""
         # 未配置解密策略 → 原样返回（与 decrypt_bytes 一致，避免误 base64 解码）
         if not strategy:
             return content
         if strategy == "base64_decode":
             return self._base64_decode(content)
+        if strategy == "aes_cbc_base64":
+            return self._aes_cbc_base64(content, cfg)
         if strategy == "maccms_url":
             return self._maccms_url(content)
         if strategy == "custom_endpoint":
@@ -60,7 +69,13 @@ class Decrypter:
             cfg = dict(cfg or {})
             if html:
                 cfg["html"] = html
-            return self._translit(content, cfg)
+            if font_urls:
+                cfg["font_urls"] = list(font_urls)
+            try:
+                cfg["font_headers"] = source.request_headers()
+            except Exception:
+                pass
+            return self._translit(content, cfg, target=target)
         if strategy == "js_custom":
             return self._js_custom(cfg, content)
         if strategy == "zh_convert":
@@ -139,6 +154,13 @@ class Decrypter:
             if 1 <= pad_len <= 16 and plain[-pad_len:] == bytes([pad_len]) * pad_len:
                 plain = plain[:-pad_len]
         return plain
+
+    def _aes_cbc_base64(self, content: str, cfg: dict) -> str:
+        """Decrypt a base64 AES-CBC text payload (CryptoJS-compatible)."""
+        try:
+            return self._aes_cbc_bytes(cfg, base64.b64decode(content)).decode("utf-8")
+        except Exception as exc:
+            raise DecryptError(f"AES-CBC 文本解密失败：{exc}") from exc
 
     def _aes_ecb_bytes(self, cfg: dict, data: bytes) -> bytes:
         """AES-ECB 字节解密（无 IV）。"""
@@ -267,7 +289,7 @@ class Decrypter:
         except Exception:
             return content
 
-    def _translit(self, content: str, cfg: dict) -> str:
+    def _translit(self, content: str, cfg: dict, target: str = "content") -> str:
         """字符映射解密（如番茄小说字体混淆：PUA 码位 → 汉字）。
 
         映射表由 cfg["map_module"] 指定（默认 framework.data.fanqie_glyph_map），
@@ -278,22 +300,59 @@ class Decrypter:
         """
         if not content:
             return content
-        # 动态字体解析（增量优先）：有源页面 HTML（含 @font-face 混淆字体）时用
-        html = cfg.get("html") or ""
-        if html and any(0xE000 <= ord(c) <= 0xF8FF for c in content[:2000]):
-            try:
-                from . import fanqie_font
-
-                resolved, _ = fanqie_font.resolve_html(html, content)
-                if resolved is not None and resolved != content:
-                    return resolved
-            except Exception:  # noqa: BLE001
-                pass
+        # Keep the verified bundled table first. Dynamic outline matching only
+        # fills glyphs introduced by newer page-specific fonts.
         try:
             mod_name = cfg.get("map_module") or "framework.data.fanqie_glyph_map"
             import importlib
 
-            table = getattr(importlib.import_module(mod_name), "FANQIE_GLYPH_MAP", None)
+            table = getattr(
+                importlib.import_module(mod_name),
+                cfg.get("map_attr") or "FANQIE_GLYPH_MAP",
+                None,
+            )
+            if isinstance(table, dict) and table:
+                content = content.translate({ord(k): v for k, v in table.items()})
+        except Exception:  # noqa: BLE001
+            pass
+        # 动态字体解析（增量优先）：有源页面 HTML（含 @font-face 混淆字体）时用
+        html = cfg.get("html") or ""
+        has_pua = any(0xE000 <= ord(c) <= 0xF8FF for c in content)
+        font_urls = cfg.get("font_urls") or []
+        if html and has_pua and not font_urls:
+            try:
+                from . import fanqie_font
+
+                resolved, _ = fanqie_font.resolve_html(
+                    html, content, headers=cfg.get("font_headers")
+                )
+                if resolved is not None and resolved != content:
+                    content = resolved
+            except Exception:  # noqa: BLE001
+                pass
+        # 动态字体可能已覆盖全部密文；此时不要再次下载同一批字体。
+        has_pua = any(0xE000 <= ord(c) <= 0xF8FF for c in content)
+        if font_urls and has_pua:
+            try:
+                from . import fanqie_font
+
+                resolved, _ = fanqie_font.resolve_urls(
+                    font_urls, content, headers=cfg.get("font_headers")
+                )
+                if resolved is not None and resolved != content:
+                    content = resolved
+            except Exception:  # noqa: BLE001
+                pass
+        # 页面字体不可访问时保留旧表作为离线/兼容兜底。
+        try:
+            mod_name = cfg.get("map_module") or "framework.data.fanqie_glyph_map"
+            import importlib
+
+            table = getattr(
+                importlib.import_module(mod_name),
+                cfg.get("map_attr") or "FANQIE_GLYPH_MAP",
+                None,
+            )
             if isinstance(table, dict) and table:
                 # str.translate 只接受 ord(int) 作 key，字符 key 不生效（实测静默失败）
                 return content.translate({ord(k): v for k, v in table.items()})

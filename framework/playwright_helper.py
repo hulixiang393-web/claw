@@ -325,7 +325,12 @@ def _sync_browser(proxy: Optional[str] = None):
 
 
 @contextlib.contextmanager
-def _sync_page(browser, viewport: Optional[dict] = None, extra_cookies: Optional[list] = None):
+def _sync_page(
+    browser,
+    viewport: Optional[dict] = None,
+    extra_cookies: Optional[list] = None,
+    extra_headers: Optional[dict] = None,
+):
     """在复用浏览器上开新 page，退出时自动关闭 page + context。
 
     复用常驻浏览器时若只关 page 不关 context，上下文会累积泄漏内存；
@@ -339,6 +344,7 @@ def _sync_page(browser, viewport: Optional[dict] = None, extra_cookies: Optional
         viewport=viewport or {"width": 1366, "height": 768},
         ua=_default_user_agent(),
         cookies=(_context_cookies_for(None) or []) + (extra_cookies or []),
+        extra_headers=extra_headers,
     )
     page = context.new_page()
     try:
@@ -630,13 +636,17 @@ def _context_cookies_for(urls) -> List[dict]:
     return out
 
 
-def _new_browser_context(browser, viewport, ua=None, cookies=None, proxy=None):
+def _new_browser_context(
+    browser, viewport, ua=None, cookies=None, proxy=None, extra_headers=None
+):
     """新建 sync Playwright context：统一加反指纹脚本 + 注入 CF cookie。
 
     所有 sync 渲染链路都走这里建 context，保证补丁/注入不遗漏；viewport/UA/
     代理由调用方按自身默认传入（_sync_page 默认 1366x768）。
     """
     opts = {"user_agent": ua or _default_user_agent(), "viewport": viewport}
+    if extra_headers:
+        opts["extra_http_headers"] = dict(extra_headers)
     if proxy:
         opts["proxy"] = {"server": proxy}
     context = browser.new_context(**opts)
@@ -1477,6 +1487,7 @@ def fetch_search_response_json(
     warm_up_url: Optional[str] = None,
     pages: int = 1,
     page_item_selector: str = "li.byte-pagination-item",
+    capture_font_urls: bool = False,
 ) -> str:
     """打开页面并监听某接口的响应，返回其 JSON 文本。
 
@@ -1505,12 +1516,21 @@ def fetch_search_response_json(
     with _sync_browser(proxy) as (_p, browser):
         with _sync_page(browser, extra_cookies=cookies) as page:
             bodies_by_page: dict = {}
+            font_urls: list[str] = []
+            capture_fonts = False
 
             def _on_response(resp) -> None:
                 try:
                     resp_url = resp.url or ""
                 except Exception:  # noqa: BLE001
                     return
+                if (
+                    capture_font_urls and capture_fonts
+                    and re.search(r"\.(?:woff2?|otf)(?:[?#]|$)", resp_url, re.I)
+                    and not re.search(r"-\d+\.(?:woff2?|otf)(?:[?#]|$)", resp_url, re.I)
+                    and resp_url not in font_urls
+                ):
+                    font_urls.append(resp_url)
                 if response_url_sub and response_url_sub in resp_url:
                     idx = 0
                     try:
@@ -1538,6 +1558,7 @@ def fetch_search_response_json(
                     page.wait_for_timeout(1400)
                 except Exception:  # noqa: BLE001
                     pass
+            capture_fonts = bool(capture_font_urls)
             try:
                 page.goto(url, timeout=timeout_ms, wait_until=wait_until)
             except Exception:  # noqa: BLE001
@@ -1585,7 +1606,8 @@ def fetch_search_response_json(
                     else:
                         page.wait_for_timeout(600)
             page.wait_for_timeout(int(extra_delay_ms))
-            return _merge_response_pages(bodies_by_page)
+            body = _merge_response_pages(bodies_by_page)
+            return (body, font_urls) if capture_font_urls else body
 
 
 def _merge_response_pages(bodies_by_page: dict) -> str:
@@ -1703,6 +1725,8 @@ def fetch_rendered_html_sync(
     scroll_to_bottom: bool = False,
     scroll_step_px: int = 800,
     scroll_stale_rounds: int = 4,
+    referer: str = "",
+    headers: Optional[dict] = None,
 ) -> str:
     """用 Playwright 渲染页面后返回渲染完成的 HTML 源码。
 
@@ -1711,8 +1735,15 @@ def fetch_rendered_html_sync(
     Discovery 的 works_list_item 规则）。失败返回 ""。
     """
     with _sync_browser(proxy) as (p, browser):
-        with _sync_page(browser, extra_cookies=cookies) as page:
-            page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+        with _sync_page(
+            browser,
+            extra_cookies=cookies,
+            extra_headers=headers,
+        ) as page:
+            goto_kwargs = {"timeout": timeout_ms, "wait_until": wait_until}
+            if referer:
+                goto_kwargs["referer"] = referer
+            page.goto(url, **goto_kwargs)
             if wait_for:
                 try:
                     page.wait_for_selector(wait_for, timeout=min(timeout_ms, 20000))
@@ -1765,7 +1796,10 @@ def fetch_rendered_search_sync(
     with _sync_browser(proxy) as (p, browser):
         with _sync_page(browser, extra_cookies=cookies) as page:
             page.goto(home_url, timeout=timeout_ms, wait_until="domcontentloaded")
-            page.wait_for_timeout(1200)
+            try:
+                page.wait_for_selector(input_selector, timeout=min(timeout_ms, 5000))
+            except Exception:
+                pass
             # 输入关键词并提交
             try:
                 page.fill(input_selector, keyword)
@@ -1776,6 +1810,11 @@ def fetch_rendered_search_sync(
 
                 page.goto(home_url.rstrip("/") + f"/search?wd={quote(keyword)}",
                           timeout=timeout_ms, wait_until=wait_until)
+            if result_selector:
+                try:
+                    page.wait_for_selector(result_selector, timeout=min(timeout_ms, 15000))
+                except Exception:
+                    pass
             page.wait_for_timeout(extra_delay_ms)
             # 提取结果
             roots = page.query_selector_all(result_selector) if result_selector else page.query_selector_all("a[href]")

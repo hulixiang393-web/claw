@@ -20,7 +20,7 @@
   （#EXT-X-DISCONTINUITY 分隔 + 段 URL 广告特征/异常短时长），
   重写为无广告段的 m3u8 供播放/下载；单行 EXTINF + 段 URL 不再丢失时长。
 
-对应 core.md「广告过滤规则体系」与 source-schema-v2 §7.5 ad_block。
+对应 PROJECT_GUIDE.md §7.8、§10 的广告过滤配置与错误隔离。
 """
 
 from __future__ import annotations

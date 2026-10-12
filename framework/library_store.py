@@ -4,7 +4,7 @@
 不依赖文件是否还在（文件删了收藏仍在，可重新下载）。
 
 支持收藏夹：收藏可归入命名收藏夹，空夹也持久化保留。
-对应 ui-library.md 功能点 #2 收藏 + 收藏夹。
+对应 PROJECT_GUIDE.md §6.12 的收藏与收藏夹能力。
 """
 
 from __future__ import annotations

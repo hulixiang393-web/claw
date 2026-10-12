@@ -4,7 +4,7 @@
 首页统计只需顶层字段（$id/$type/$name/$enabled/$weight/$metadata）；
 完整 endpoints 解析后续业务模块实现时再扩展。
 
-对应 source-schema-v2.md §1 顶层字段。
+对应 PROJECT_GUIDE.md §7 源配置规范。
 """
 
 from __future__ import annotations
@@ -279,7 +279,7 @@ def load_source(path: str | Path) -> SourceConfig:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ConfigError(f"{path.name} 不是合法 JSON：{exc.msg}") from exc
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ConfigError(f"{path.name} 读取失败：{exc}") from exc
     return SourceConfig.from_dict(raw, path=str(path))
 

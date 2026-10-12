@@ -75,7 +75,7 @@ class _Section(QWidget):
         row.addWidget(widget)
         if hint:
             h = QLabel(hint)
-            h.setStyleSheet("color: palette(mid); font-size: 11px;")
+            h.setStyleSheet("color: #000000; font-size: 11px;")
             row.addWidget(h)
         row.addStretch(1)
         self._form.addRow(label, row)
@@ -104,7 +104,7 @@ class _Section(QWidget):
         row.addWidget(btn)
         if hint:
             h = QLabel(hint)
-            h.setStyleSheet("color: palette(mid); font-size: 11px;")
+            h.setStyleSheet("color: #000000; font-size: 11px;")
             row.addWidget(h)
         row.addStretch(1)
         self._form.addRow(label, row)
@@ -161,6 +161,7 @@ class SettingsPage(BasePage):
 
     def __init__(self, settings, theme_manager, parent=None):
         super().__init__(parent)
+        self.setStyleSheet("QWidget { color: #000000; }")
         self._sm = settings
         self._tm = theme_manager
 
@@ -236,7 +237,7 @@ class SettingsPage(BasePage):
         self._cache_clear_btn.clicked.connect(self._on_cache_clear)
         row.addWidget(self._cache_clear_btn)
         hint = QLabel("清除封面内存缓存与临时合成图")
-        hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        hint.setStyleSheet("color: #000000; font-size: 11px;")
         row.addWidget(hint)
         row.addStretch(1)
         sec._form.addRow("缓存", row)
@@ -272,7 +273,7 @@ class SettingsPage(BasePage):
         btn_row.addWidget(self._cache_clear_shelf_btn)
         btn_row.addWidget(self._cache_clear_search_btn)
         hint2 = QLabel("书架：封面/详情/章节；搜索&发现：搜索结果/首页列表")
-        hint2.setStyleSheet("color: palette(mid); font-size: 11px;")
+        hint2.setStyleSheet("color: #000000; font-size: 11px;")
         btn_row.addWidget(hint2)
         btn_row.addStretch(1)
         sec._form.addRow("缓存清除", btn_row)
@@ -284,7 +285,7 @@ class SettingsPage(BasePage):
         self._source_select_btn.clicked.connect(self._on_source_select)
         src_row.addWidget(self._source_select_btn)
         src_hint = QLabel("重新勾选要启用的源，未勾选的源从发现/搜索页隐藏")
-        src_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        src_hint.setStyleSheet("color: #000000; font-size: 11px;")
         src_row.addWidget(src_hint)
         src_row.addStretch(1)
         sec._form.addRow("源选择", src_row)

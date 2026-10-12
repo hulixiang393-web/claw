@@ -200,6 +200,8 @@ class DetailMixin:
         _sp = urlsplit(url)
         m_bv = _re.search(r"(BV[0-9A-Za-z]+)", _sp.path)
         bvid = m_bv.group(1) if m_bv else _sp.path.rstrip("/").split("/")[-1] or url
+        if bvid.lower().endswith(".html"):
+            bvid = bvid[:-5]
         _ph = {"id": bvid, "bvid": bvid}
         if _sp.query:
             _ph.update({k: v[0] for k, v in parse_qs(_sp.query).items()})
@@ -303,6 +305,18 @@ class DetailMixin:
                 if not isinstance(provider, str):
                     provider = ""
                 detail.chapters.append(Chapter(title=c_title, url=c_url, provider=provider))
+        chapters_api = chapters_cfg.get("api") or {}
+        if chapters_api and hasattr(self, "_fetch_chapters_api"):
+            try:
+                api_items = self._fetch_chapters_api(source, chapters_api, url, "")
+                if api_items is not None:
+                    detail.chapters = [
+                        Chapter(title=item["title"], url=item["url"])
+                        for item in api_items
+                        if item.get("title") and item.get("url")
+                    ]
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] API 目录抓取失败：%s", source.source_id, exc)
         return detail
 
     @staticmethod
@@ -454,7 +468,10 @@ class DetailMixin:
             match = _re.search(r"/books/([^/?#]+)", detail_url)
             if match:
                 book_key = match.group(1)
+                # BookStack's current reader is /read/book/{key}; the older
+                # /read/{key} path remains a compatibility fallback.
                 reader_paths = (
+                    f"/read/book/{book_key}",
                     f"/read/{book_key}",
                     f"/read/{book_key}/SUMMARY.md",
                 )
@@ -463,12 +480,27 @@ class DetailMixin:
                     try:
                         reader_html = self._get_detail_html(source, reader_url, reader_url)
                         reader_doc = self._parser.parse(reader_html)
-                        reader_roots = self._parser._query(
-                            reader_doc, ".article-menu-detail > ul", None
-                        )
+                        reader_roots = []
+                        for menu_selector in (
+                            {
+                                "xpath": (
+                                    "//*[contains(concat(' ', normalize-space(@class), ' '), "
+                                    "' article-menu-detail ')]/ul"
+                                )
+                            },
+                            {"css": ".m-manual.manual-mode-view .article-menu-detail > ul"},
+                            {"css": ".article-menu-detail ul"},
+                        ):
+                            reader_roots = self._parser._query(
+                                reader_doc,
+                                menu_selector.get("css"),
+                                menu_selector.get("xpath"),
+                            )
+                            if reader_roots:
+                                break
                         if reader_roots:
                             doc = reader_doc
-                            root_selector = {"css": ".article-menu-detail > ul"}
+                            root_selector = menu_selector
                             break
                     except Exception:
                         continue
@@ -484,6 +516,11 @@ class DetailMixin:
                 href = (link[0].get("href") or "").strip()
                 title = link[0].text_content().strip()
                 absolute = self._abs_url(source, href)
+                # Sidebar links can contain fragment anchors for headings;
+                # those are not separate chapters and must deduplicate.
+                from urllib.parse import urldefrag
+
+                absolute, _fragment = urldefrag(absolute)
                 key = absolute.rstrip("/").lower()
                 if href and title and key not in seen:
                     seen.add(key)

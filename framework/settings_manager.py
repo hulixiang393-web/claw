@@ -106,6 +106,11 @@ DEFAULTS: dict = {
         "prefetch_ahead": 1,
         "prefetch_behind": 0,
         "show_images": True,
+        "font_size": 0,
+        "font_family": "system",
+        "line_spacing": 1.8,
+        "content_width": 960,
+        "paragraph_indent": True,
     },
     "discover": {
         "preload_pages": 1,

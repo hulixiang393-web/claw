@@ -11,7 +11,7 @@
     DOWNLOAD_PROGRESS  payload={"task_id","done","total","speed_mbs","title"}
     DOWNLOAD_COMPLETED payload={"task_id","title","done","total"}
     DOWNLOAD_FAILED    payload={"task_id","title","error"}
-对应 core.md「download_queue.py 下载队列」与 ui-download.md。
+对应 PROJECT_GUIDE.md §6.11 的下载队列与任务状态。
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ class DownloadTask:
 
     @property
     def remaining_s(self) -> float:
-        """剩余时间估算：剩余章节 × (已用/已下)。ui-download.md 公式。"""
+        """剩余时间估算：剩余章节 × (已用/已下)。见 PROJECT_GUIDE.md §6.11。"""
         if self.done <= 0 or self.total <= 0:
             return 0.0
         return max(0.0, (self.total - self.done) * self.elapsed / self.done)

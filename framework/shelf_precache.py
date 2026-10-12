@@ -78,7 +78,8 @@ class ShelfPrecacheJob(QRunnable):
             if not url:
                 continue
             abs_url = self._content._abs_url(self._source, url)
-            key = f"body:{self._source.source_id}:{abs_url}"
+            key_builder = getattr(self._content, "_chapter_cache_key", None)
+            key = key_builder(self._source, url) if callable(key_builder) else f"body:{self._source.source_id}:{abs_url}"
             try:
                 text = self._content._cache_get(key, book_key=self._book_key)
                 if text is None:

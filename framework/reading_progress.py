@@ -4,7 +4,7 @@
 仅供"当天续读"使用：打开某部作品时定位到最后阅读章节。
 
 存储：data/reading_progress.json，按 book_url 归一，一本一条。
-对应 ui-reader.md「退出/续读」与 ui-library.md 书架（书架未实现前先用本模块）。
+对应 PROJECT_GUIDE.md §6.7、§6.12 的阅读器续读与书架能力。
 
 用法：
     rp = ReadingProgress("data/reading_progress.json")
@@ -317,6 +317,28 @@ class ReadingProgress:
     def clear(self) -> None:
         self._data = {}
         self._save()
+
+    @_synchronized
+    def remove(self, book_url: str) -> bool:
+        """Remove one history entry by its normalized book URL."""
+        if not book_url or book_url not in self._data:
+            return False
+        self._data.pop(book_url, None)
+        self._save()
+        return True
+
+    @_synchronized
+    def clear_videos(self) -> int:
+        """Clear only the video history shown on the home page."""
+        urls = [
+            url for url, record in self._data.items()
+            if record.get("content_type") == "video"
+        ]
+        for url in urls:
+            self._data.pop(url, None)
+        if urls:
+            self._save()
+        return len(urls)
 class PositionSnapshot:
     @staticmethod
     def make_position_snapshot(view) -> tuple:

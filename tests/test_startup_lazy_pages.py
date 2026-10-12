@@ -70,6 +70,9 @@ def test_startup_keeps_lazy_pages_unbuilt_and_does_not_schedule_diagnostics(
     assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == [
         label for label, _ in TABS
     ]
+    window._jump_to_search("claw")
+    assert window._pending_navigation[0] == "search"
+    assert "search" not in built
     _qapp.processEvents()
     window.close()
 
@@ -80,6 +83,7 @@ def test_selecting_library_builds_once_and_reuses_the_same_page(
     built = _stub_page_builders(monkeypatch)
     window = _window(monkeypatch, tmp_path)
     assert "library" not in built
+    window._runtime_state = "READY"
 
     library_idx = next(i for i, (_, key) in enumerate(TABS) if key == "library")
     window.tabs.setCurrentIndex(library_idx)
@@ -98,6 +102,7 @@ def test_replacing_library_page_preserves_selected_tab_without_reentrant_builds(
 ):
     built = _stub_page_builders(monkeypatch)
     window = _window(monkeypatch, tmp_path)
+    window._runtime_state = "READY"
 
     library_idx = next(i for i, (_, key) in enumerate(TABS) if key == "library")
     window.tabs.setCurrentIndex(library_idx)
@@ -115,6 +120,7 @@ def test_replacing_discover_page_preserves_selected_tab_without_reentrant_builds
 ):
     built = _stub_page_builders(monkeypatch)
     window = _window(monkeypatch, tmp_path)
+    window._runtime_state = "READY"
 
     discover_idx = next(i for i, (_, key) in enumerate(TABS) if key == "discover")
     window.tabs.setCurrentIndex(discover_idx)
@@ -155,6 +161,7 @@ def test_library_first_tab_and_reentry_scan_once_discover_stays_unbuilt(
     assert "library" not in built
     assert "discover" not in built
     library_idx = next(i for i, (_, key) in enumerate(TABS) if key == "library")
+    window._runtime_state = "READY"
     window.tabs.setCurrentIndex(library_idx)
     scan_tasks = [task for task in tasks if isinstance(task, _ScanTask)]
     assert len(scan_tasks) == 1
@@ -165,4 +172,22 @@ def test_library_first_tab_and_reentry_scan_once_discover_stays_unbuilt(
     assert built.count("library") == 1
     assert "discover" not in built
     _qapp.processEvents()
+    window.close()
+
+
+def test_ready_startup_page_priority_is_discover_source_library_settings(
+    _qapp, monkeypatch, tmp_path
+):
+    built = _stub_page_builders(monkeypatch)
+    window = _window(monkeypatch, tmp_path)
+    window._runtime_state = "READY"
+    monkeypatch.setattr(
+        app_module.QTimer,
+        "singleShot",
+        lambda _delay, callback: callback(),
+    )
+
+    window._schedule_startup_page_priority()
+
+    assert built[1:] == ["discover", "source", "library", "settings"]
     window.close()

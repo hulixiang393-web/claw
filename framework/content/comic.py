@@ -111,7 +111,9 @@ class ComicMixin:
                     wait_for=rc.get("wait_for", "canvas"),
                     wait_until=rc.get("wait_until", "domcontentloaded"),
                     timeout_ms=int(rc.get("timeout_ms") or 30000),
-                    extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
+                    extra_delay_ms=int(
+                        rc["extra_delay_ms"] if "extra_delay_ms" in rc else 2500
+                    ),
                     click_selector=rc.get("click_selector"),
                     scroll_to_bottom=rc.get("scroll_to_bottom", False),
                     extract_mode=rc.get("extract_mode", "canvas"),
@@ -596,7 +598,11 @@ class ComicMixin:
                     wait_for=render_cfg.get("wait_for") or "img",
                     wait_until=render_cfg.get("wait_until") or "domcontentloaded",
                     timeout_ms=int(render_cfg.get("timeout_ms") or 30000),
-                    extra_delay_ms=int(render_cfg.get("extra_delay_ms") or 1500),
+                    extra_delay_ms=int(
+                        render_cfg["extra_delay_ms"]
+                        if "extra_delay_ms" in render_cfg
+                        else 1500
+                    ),
                     extract_mode=render_cfg.get("extract_mode") or "img",
                     img_selector=render_cfg.get("img_selector"),
                     proxy=(None if source.transports().get("direct")

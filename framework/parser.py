@@ -40,6 +40,21 @@ def _normalize_selector(sel: dict) -> Optional[dict]:
     return sel
 
 
+def _selector_attr(sel: dict | list | None) -> str:
+    """Find the effective attribute when a selector uses a fallback chain."""
+    sel = _normalize_selector(sel)
+    if not sel:
+        return ""
+    attr = sel.get("attr")
+    if attr:
+        return str(attr)
+    for nested in sel.get("fallback") or []:
+        attr = _selector_attr(nested)
+        if attr:
+            return attr
+    return ""
+
+
 class Parser:
     def __init__(self) -> None:
         self._lxml = _LXML
@@ -245,7 +260,9 @@ class Parser:
                 continue
             # 仅 URL 类 attr 才做绝对化拼接（含懒加载属性 data-*，
             # 否则封面等返回相对路径 GUI 加载不出）
-            attr = sel.get("attr")
+            # A top-level fallback has no own ``attr`` key, but its selected
+            # branch may be a URL attribute that still needs base resolution.
+            attr = _selector_attr(sel)
             use_base = base_url if attr in (
                 "href", "src", "srcset", "data-src", "data-original", "data-lazy-src"
             ) else ""

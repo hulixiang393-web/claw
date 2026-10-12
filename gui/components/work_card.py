@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QSizePolicy,
     QVBoxLayout,
 )
 
@@ -81,6 +82,8 @@ class WorkCard(QFrame):
         self.work = work
         self.setObjectName("workCard")
         self.setCursor(Qt.PointingHandCursor)
+        # Keep asynchronous cover pixmaps from changing the card's size hint.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         # 弹性宽度：由网格列数决定，不固定，避免窗口窄时横向溢出
         self.setMinimumWidth(120)
         # 固定卡片高度：封面 180 + 标题 2 行 + 作者 + 来源，保证网格每行等高
@@ -104,6 +107,7 @@ class WorkCard(QFrame):
         cover = QLabel("🖼")
         cover.setAlignment(Qt.AlignCenter)
         cover.setFixedHeight(COVER_HEIGHT)
+        cover.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         cover.setStyleSheet("background: palette(midlight); border-radius: 8px; font-size: 36px;")
         cover_row.addWidget(cover, stretch=1)  # 铺满剩余宽度，封面更大更整齐
         self._cover = cover
@@ -122,13 +126,13 @@ class WorkCard(QFrame):
         # 标题：固定单行省略；一行放不下时悬停卡片滑出完整标题（HoverTitle）
         title = HoverTitle(work.title or "无标题", parent_card=self)
         title.setFixedHeight(TITLE_HEIGHT)
-        title.setStyleSheet("font-size: 13px; font-weight: bold; color: palette(text);")
+        title.setStyleSheet("font-size: 13px; font-weight: bold; color: #000000;")
         layout.addWidget(title)
         self._title = title
 
         # 作者：一行省略；无作者不渲染空标签
         self._author_label = QLabel(work.author or "")
-        self._author_label.setStyleSheet("font-size: 11px; color: palette(mid);")
+        self._author_label.setStyleSheet("font-size: 11px; color: #000000;")
         if not work.author:
             self._author_label.hide()
         layout.addWidget(self._author_label)
@@ -138,7 +142,7 @@ class WorkCard(QFrame):
         self._source_label = None
         self._update_label = None
         self._meta_label = QLabel("")
-        self._meta_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+        self._meta_label.setStyleSheet("color: #000000; font-size: 10px;")
 
         source_name = work.source_name or ""
         update_text = work.update or ""
@@ -146,7 +150,7 @@ class WorkCard(QFrame):
         if source_filterable and source_name:
             self._source_label = QLabel(source_name)
             self._source_label.setStyleSheet(
-                "color: palette(dark); font-size: 10px;"
+                "color: #000000; font-size: 10px;"
             )
             self._source_label.setCursor(Qt.PointingHandCursor)
             self._source_label.setToolTip("点击仅看此来源")
@@ -154,7 +158,7 @@ class WorkCard(QFrame):
             layout.addWidget(self._source_label)
             if update_text:
                 self._update_label = QLabel(f" · {update_text}")
-                self._update_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+                self._update_label.setStyleSheet("color: #000000; font-size: 10px;")
                 layout.addWidget(self._update_label)
         else:
             meta_text = " · ".join(p for p in (source_name, update_text) if p)
@@ -256,11 +260,11 @@ class WorkCard(QFrame):
         if src_label is not None and obj is src_label:
             if event.type() == event.Type.Enter:
                 self._source_label.setStyleSheet(
-                    "color: palette(highlight); font-size: 10px; font-weight: bold;"
+                    "color: #000000; font-size: 10px; font-weight: bold;"
                 )
             elif event.type() == event.Type.Leave:
                 self._source_label.setStyleSheet(
-                    "color: palette(dark); font-size: 10px;"
+                    "color: #000000; font-size: 10px;"
                 )
             elif event.type() == event.Type.MouseButtonPress:
                 self.source_clicked.emit(self.work.source_id)
@@ -296,7 +300,7 @@ class WorkCard(QFrame):
                 self._meta_label.hide()
             self._source_label = QLabel(source_name)
             self._source_label.setStyleSheet(
-                "color: palette(dark); font-size: 10px;"
+                "color: #000000; font-size: 10px;"
             )
             self._source_label.setCursor(Qt.PointingHandCursor)
             self._source_label.setToolTip("点击仅看此来源")
@@ -304,7 +308,7 @@ class WorkCard(QFrame):
             layout.addWidget(self._source_label)
             if update_text:
                 self._update_label = QLabel(f" · {update_text}")
-                self._update_label.setStyleSheet("color: palette(dark); font-size: 10px;")
+                self._update_label.setStyleSheet("color: #000000; font-size: 10px;")
                 layout.addWidget(self._update_label)
         elif not enabled:
             # 恢复原有 _meta_label

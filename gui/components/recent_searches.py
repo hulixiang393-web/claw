@@ -1,7 +1,7 @@
 """最近搜索（RecentSearches）。
 
 最多 20 条，点击一键重搜（信号 → 切 Tab 搜）。
-对应 ui-home.md「最近搜索」。
+对应 PROJECT_GUIDE.md §6.2「最近搜索」。
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ class RecentSearches(QWidget):
     """最近搜索列表（最近 20 条）。"""
 
     search_clicked = Signal(str)  # 点击词条时发信号，GUI 层接
+    changed = Signal()
 
     def __init__(self, history: SearchHistory, parent=None):
         super().__init__(parent)
@@ -51,9 +52,16 @@ class RecentSearches(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
+        title_row = QHBoxLayout()
         title = QLabel("最近搜索")
         title.setObjectName("statsLabel")
-        outer.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self.clear_btn = QPushButton("清空")
+        self.clear_btn.setFixedHeight(26)
+        self.clear_btn.clicked.connect(self._clear_history)
+        title_row.addWidget(self.clear_btn)
+        outer.addLayout(title_row)
 
         self._list_widget = QWidget()
         self._list_layout = QVBoxLayout(self._list_widget)
@@ -95,6 +103,12 @@ class RecentSearches(QWidget):
             btn.clicked.connect(lambda _, w=word: self.search_clicked.emit(w))
             row.addWidget(btn, alignment=Qt.AlignRight)
 
+            delete_btn = QPushButton("删除")
+            delete_btn.setFixedWidth(50)
+            delete_btn.setFixedHeight(26)
+            delete_btn.clicked.connect(lambda _, w=word: self._remove_word(w))
+            row.addWidget(delete_btn, alignment=Qt.AlignRight)
+
             container = _ClickableRow(word)
             container.setLayout(row)
             container.setStyleSheet("border-radius: 6px; padding: 2px 6px;")
@@ -103,3 +117,15 @@ class RecentSearches(QWidget):
             self._list_layout.addWidget(container)
 
         self._list_layout.addStretch(1)
+
+    def _remove_word(self, word: str) -> None:
+        if self._history.remove(word):
+            self.reload()
+            self.changed.emit()
+
+    def _clear_history(self) -> None:
+        if not self._history.recent():
+            return
+        self._history.clear()
+        self.reload()
+        self.changed.emit()

@@ -11,6 +11,11 @@ try:
 except Exception:  # noqa: BLE001 —— 未安装时降级为 no-op
     _zhconv_convert = None
 
+try:
+    from opencc import OpenCC as _OpenCC
+except Exception:  # noqa: BLE001 —— 可选后端
+    _OpenCC = None
+
 
 # zhconv 的区域码：zh-cn=简体，zh-tw/zh-hk=繁体
 _SIMPLE = {"zh-cn", "zh-hans", "cn", "hans", "s", "simplified", "简体", "简体中文"}
@@ -45,14 +50,20 @@ def to_simplified(text: str) -> str:
 
 
 def convert(text: str, locale: str = "zh-cn") -> str:
-    """按目标 locale 转换（默认简体）。zhconv 缺失时原样返回。"""
-    if not text or _zhconv_convert is None:
+    """按目标 locale 转换（默认简体），优先使用 zhconv，兼容 OpenCC。"""
+    if not text:
         return text
     try:
-        return _zhconv_convert(text, normalize_locale(locale))
+        normalized = normalize_locale(locale)
+        if _zhconv_convert is not None:
+            return _zhconv_convert(text, normalized)
+        if _OpenCC is not None:
+            profile = "t2s" if normalized == "zh-cn" else "s2t"
+            return _OpenCC(profile).convert(text)
     except Exception:  # noqa: BLE001
-        return text
+        pass
+    return text
 
 
 def available() -> bool:
-    return _zhconv_convert is not None
+    return _zhconv_convert is not None or _OpenCC is not None

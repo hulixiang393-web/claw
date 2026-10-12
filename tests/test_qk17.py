@@ -11,11 +11,12 @@
   不含水文特征行）
 
 说明与线上差异：
-- 线上 search 走 playwright 渲染（search.17k.com 对 HTTP 直连恒 405）；
+- 线上 search、详情/目录和正文走 playwright 渲染（站点页面由阿里云 WAF
+  挑战保护，HTTP 直连可能只返回挑战页）；
 - 渲染引擎按 root 节点提取 title=a[title]|img[alt]、href、src、text，与
   本离线测试用 parse_items(img[alt], a[href], img[src]) 等价（root 为 .textleft，
   其内只有封面 a>img，a 无 title 属性）。
-- 正文离线 lxml text_content 与线上 HTML 管线同源，无渲染差异（body 未配 render）。
+- 正文离线 lxml text_content 与线上 HTML 管线同源，渲染只负责通过 WAF 挑战。
 """
 import json
 import os
@@ -60,6 +61,26 @@ def test_source_config_loads():
     assert src.base_url == _BASE
 
 
+def test_api_detail_and_chapter_contract():
+    src = _source()
+    detail = src.raw["api_endpoints"]["detail"]
+    chapter = src.raw["endpoints"]["content"]["chapter"]
+    assert detail["url"].startswith("https://api.17k.com/ck/book/")
+    assert detail["chapters"]["api"]["volumes_url"].startswith(
+        "https://api.17k.com/ck/book/"
+    )
+    assert detail["chapters"]["api"]["page_param"] == "page"
+    assert chapter["body"]["api"]["url"].startswith(
+        "https://api.17k.com/ckv3/book/"
+    )
+    assert chapter["body"]["api"]["decrypt_target"] == "chapter"
+    assert src.raw["decryption"]["targets"]["chapter"] == {
+        "strategy": "aes_cbc_base64",
+        "key": "4eae35f1b35977a0",
+        "iv": "4eae35f1b35977a0",
+    }
+
+
 def test_search_render_layout():
     """搜索必须走 playwright（search.17k.com 对 HTTP 直连恒 405）。"""
     src = _source()
@@ -89,6 +110,8 @@ def test_detail_fields_configured():
     assert author.get("fallback")
     assert fields.get("status", {}).get("css") == ".Info.Sign .label a:first-child span"
     assert fields.get("tags", {}).get("css") == "table tr.label td a span"
+    assert detail.get("render") == "playwright"
+    assert detail.get("render_config", {}).get("wait_for") == ".Info.Sign h1, #bookInfo, h1.Title, dl.Volume"
 
 
 def test_toc_list_configured():
@@ -103,14 +126,22 @@ def test_toc_list_configured():
     assert lst.get("fields", {}).get("url", {}).get("attr") == "href"
 
 
-def test_body_selector_is_ssr_no_render():
+def test_body_selector_uses_render():
     src = _source()
     body = (
         (src.raw.get("endpoints") or {}).get("content") or {}
     ).get("chapter", {}).get("body") or {}
-    # 正文不配 render（17K 正文 SSR 纯文本直连可抓）
-    assert "render" not in body
+    # 正文需由浏览器执行 WAF 挑战后再提取
+    assert body.get("render") == "playwright"
+    assert body.get("render_config", {}).get("wait_for") == "#readArea .readAreaBox.content, #readArea"
     assert body.get("selector", {}).get("css") == "#readArea .readAreaBox.content .p p:not(.copy)"
+
+
+def test_page_cache_versions_bust_waf_html():
+    src = _source()
+    assert src.raw.get("detail_cache_version")
+    assert src.raw.get("chapter_cache_version")
+    assert src.raw.get("page_cache_version")
 
 
 # --------------------------------------------------------------------------- #

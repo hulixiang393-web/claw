@@ -1,0 +1,147 @@
+{
+  "$schema_version": 2,
+  "$id": "jptt",
+  "$type": "video",
+  "$name": "JPTT.TV",
+  "$enabled": true,
+  "$weight": 0.8,
+  "$metadata": {
+    "adult": true,
+    "homepage": "https://jptt.tv/tag",
+    "description": "JPTT.TV 视频源（HTTP 列表与详情解析）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "成人"]
+  },
+  "transports": {
+    "base_url": "https://jptt.tv",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://jptt.tv/",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-User": "?1",
+      "Sec-Fetch-Dest": "document"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "render": "playwright_fallback",
+      "render_config": {
+        "wait_until": "domcontentloaded",
+        "extra_delay_ms": 0,
+        "timeout_ms": 12000
+      },
+      "list_url": "/",
+      "list_item": {
+        "categories": [
+          {"title": "最新", "url": "/"},
+          {"title": "标签", "url": "/tag"}
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "ul.dx-video-list > li"
+        },
+        "fields": {
+          "title": {
+            "css": "img.index_video_cover",
+            "attr": "alt"
+          },
+          "url": {
+            "css": "a[href*='/video/']",
+            "attr": "href"
+          },
+          "cover": {
+            "fallback": [
+              {"css": "img.index_video_cover", "attr": "data-src"},
+              {"css": "img.index_video_cover", "attr": "data-original"},
+              {"css": "img.index_video_cover", "attr": "src"}
+            ]
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search?kw={keyword}",
+      "method": "GET",
+      "paginator": {
+        "url_template": "/search?kw={keyword}&page={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "ul.dx-video-list > li"
+        },
+        "fields": {
+          "title": {
+            "css": "img.index_video_cover",
+            "attr": "alt"
+          },
+          "url": {
+            "css": "a[href*='/video/']",
+            "attr": "href"
+          },
+          "cover": {
+            "fallback": [
+              {"css": "img.index_video_cover", "attr": "data-src"},
+              {"css": "img.index_video_cover", "attr": "data-original"},
+              {"css": "img.index_video_cover", "attr": "src"}
+            ]
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "fallback": [
+            {"css": "meta[property='og:title']", "attr": "content"},
+            {"css": "h1"}
+          ]
+        },
+        "cover": {
+          "fallback": [
+            {"css": "meta[property='og:image']", "attr": "content"},
+            {"css": "video[poster]", "attr": "poster"},
+            {"css": "img", "attr": "src"}
+          ]
+        },
+        "summary": {
+          "fallback": [
+            {"css": "meta[name='description']", "attr": "content"},
+            {"css": "meta[property='og:description']", "attr": "content"}
+          ]
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "play_url": {
+          "selector": {
+            "fallback": [
+              {"css": "video source[data-src]", "attr": "data-src"},
+              {"css": "video source[src]", "attr": "src"},
+              {"css": "video[data-src]", "attr": "data-src"},
+              {"css": "video[src]", "attr": "src"}
+            ]
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {"max_pages": 20, "max_results": 400},
+    "detail": {"max_pages": 1},
+    "episode": {"max_pages": 1, "max_items": 1}
+  },
+  "diagnostics": {
+    "selfcheck": {"strategy": "soft"}
+  }
+}

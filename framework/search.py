@@ -5,7 +5,7 @@
 - 跨源并发 search_type
 - 统一 SearchResult 输出
 
-对应 ui-search.md 与 core.md「search.py」。
+对应 PROJECT_GUIDE.md §6.4、§4.2 的多源搜索编排。
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ class SearchResult:
     cover: str = ""
     author: str = ""
     update: str = ""
-    # 合并相似结果时：该结果的其它源版本（ui-search.md #7）
+    # 合并相似结果时：该结果的其它源版本（PROJECT_GUIDE.md §6.4）
     variants: "list[SearchResult]" = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -124,15 +124,15 @@ class Search:
 
     # ------------------------------------------------------------------ #
     def _search_decrypter(self, source: SourceConfig, http: Optional[HttpClient] = None):
-        """源配置了 decryption.targets.title/author 解密策略时返回 Decrypter，否则 None。
+        """源配置了搜索标题/作者解密策略时返回 Decrypter，否则 None。
 
         与 discovery.list_works 的列表解密同源（番茄 rank 榜/搜索/详情书名作者被
         PUA 字体混淆，translit 还原）；未配置的源返回 None，零开销、行为不变。
         """
         dec_cfg = (source.raw.get("decryption") or {}).get("targets") or {}
-        if not (
-            dec_cfg.get("title", {}).get("strategy")
-            or dec_cfg.get("author", {}).get("strategy")
+        if not any(
+            (dec_cfg.get(key) or {}).get("strategy")
+            for key in ("search_title", "search_author", "title", "author")
         ):
             return None
         from .decrypter import Decrypter
@@ -196,6 +196,7 @@ class Search:
         source: SourceConfig,
         results: List[SearchResult],
         http: Optional[HttpClient] = None,
+        font_urls=None,
     ) -> List[SearchResult]:
         """按源 decryption 配置批量还原搜索结果 title/author（原地写回）。
 
@@ -206,8 +207,8 @@ class Search:
         if dec is None:
             return results
         for r in results:
-            r.title = dec.decrypt(source, r.title, target="title")
-            r.author = dec.decrypt(source, r.author, target="author")
+            r.title = dec.decrypt(source, r.title, target="search_title", font_urls=font_urls)
+            r.author = dec.decrypt(source, r.author, target="search_author", font_urls=font_urls)
         return results
 
     # ------------------------------------------------------------------ #
@@ -364,7 +365,7 @@ class Search:
                 http,
             )
 
-        # 标题/作者字体混淆解密（番茄等）：decryption.targets.title/author → 逐条还原
+        # 标题/作者字体混淆解密（番茄等）：优先使用搜索页专用码表。
         dec = self._search_decrypter(source, http)
         # 搜索前置安全验证（omofuna 等：无验证时 /search/ 只回验证页空壳）
         self._verify_search(source, http)
@@ -486,7 +487,7 @@ class Search:
                         continue  # URL 去重（trtag 等站搜索页 DOM 有重复节点）
                     seen_urls.add(url)
                     if dec is not None:
-                        title = dec.decrypt(source, title, target="title")
+                        title = dec.decrypt(source, title, target="search_title")
                     results.append(
                         SearchResult(
                             title=title,
@@ -495,7 +496,7 @@ class Search:
                             source_name=source.source_name,
                             cover=Search._clean_cover(it.get("cover", "")),
                             author=(
-                                dec.decrypt(source, it.get("author", ""), target="author")
+                                dec.decrypt(source, it.get("author", ""), target="search_author")
                                 if dec is not None
                                 else it.get("author", "")
                             ),
@@ -630,6 +631,7 @@ class Search:
         )
 
         rc = item_cfg.get("render_config") or {}
+        font_urls = []
         # 登录态 cookie 注入：GUI 登录弹窗保存的 data/cookies/<source_id>.json。
         # 需要登录的站才注入；无需登录的源（如番茄普通搜索）不引 cookie。
         cookies = None
@@ -645,18 +647,23 @@ class Search:
         if rc.get("response_json_url"):
             # 响应监听模式：结果由前端调 JSON 接口异步返回（番茄类 SPA）。
             # DOM 渲染常被自定义字体混淆/渲染异常，接口数据最可靠。
-            raw = fetch_search_response_json(
+            captured = fetch_search_response_json(
                 abs_url,
                 rc.get("response_json_url"),
                 wait_until=rc.get("wait_until") or "domcontentloaded",
                 timeout_ms=int(rc.get("timeout_ms") or 30000),
-                extra_delay_ms=int(rc.get("extra_delay_ms") or 2000),
+                extra_delay_ms=int(rc["extra_delay_ms"] if "extra_delay_ms" in rc else 2000),
                 proxy=(None if source.transports().get("direct")
                        else source.transports().get("proxy")),
                 cookies=cookies,
                 warm_up_url=rc.get("response_warm_up_url") or source.base_url,
                 pages=_response_pages(rc, source),
+                capture_font_urls=bool(rc.get("capture_font_urls")),
             )
+            if isinstance(captured, tuple):
+                raw, font_urls = captured
+            else:
+                raw = captured
             items = self._items_from_response_json(raw, rc, source)
         elif rc.get("interact"):
             # 交互式搜索：访问首页 → 填搜索框 → 提交（JS 加载真实结果）
@@ -668,7 +675,7 @@ class Search:
                 result_selector=_sel(item_cfg.get("root_selector")),
                 wait_until=rc.get("wait_until") or "networkidle",
                 timeout_ms=int(rc.get("timeout_ms") or 30000),
-                extra_delay_ms=int(rc.get("extra_delay_ms") or 3000),
+                extra_delay_ms=int(rc["extra_delay_ms"] if "extra_delay_ms" in rc else 3000),
                 proxy=(None if source.transports().get("direct")
                        else source.transports().get("proxy")),
                 cookies=cookies,
@@ -686,7 +693,7 @@ class Search:
                     wait_for=rc.get("wait_for") or "",
                     wait_until=rc.get("wait_until") or "networkidle",
                     timeout_ms=int(rc.get("timeout_ms") or 30000),
-                    extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
+                    extra_delay_ms=int(rc["extra_delay_ms"] if "extra_delay_ms" in rc else 2500),
                     proxy=(None if source.transports().get("direct")
                            else source.transports().get("proxy")),
                     cookies=cookies,
@@ -715,7 +722,7 @@ class Search:
                     wait_for=rc.get("wait_for") or "",
                     wait_until=rc.get("wait_until") or "networkidle",
                     timeout_ms=int(rc.get("timeout_ms") or 30000),
-                    extra_delay_ms=int(rc.get("extra_delay_ms") or 2500),
+                    extra_delay_ms=int(rc["extra_delay_ms"] if "extra_delay_ms" in rc else 2500),
                     proxy=(None if source.transports().get("direct")
                            else source.transports().get("proxy")),
                     cookies=cookies,
@@ -768,6 +775,8 @@ class Search:
                     f"「{source.source_name}」搜索需登录，请在「源管理 → 登录」"
                     " 完成登录（保存 Cookie）后再搜索"
                 )
+        if font_urls:
+            results = self._decrypt_results(source, results, self._http, font_urls=font_urls)
         return results
 
     # ------------------------------------------------------------------ #
@@ -1207,7 +1216,7 @@ class Search:
 
     @staticmethod
     def merge_similar(results: "List[SearchResult]") -> "List[SearchResult]":
-        """合并相似搜索结果（ui-search.md #7）。
+        """合并相似搜索结果（PROJECT_GUIDE.md §6.4）。
 
         按「书名规范化 + 作者」模糊匹配：书名去标点/空格/括号内容，作者一致则视为同书。
         合并后保留第一个结果作为代表，其余各源版本挂到 `variants` 属性。

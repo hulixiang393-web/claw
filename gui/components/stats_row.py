@@ -1,7 +1,7 @@
 """统计卡片区（StatsRow）。
 
 显示：小说/漫画/视频源数、已启用、失效源（红点）。
-数据来自 SourceManager。对应 ui-home.md「统计卡片区」。
+数据来自 SourceManager。对应 PROJECT_GUIDE.md §6.2「统计卡片区」。
 """
 
 from __future__ import annotations

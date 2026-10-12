@@ -24,7 +24,12 @@
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "zh-CN,zh;q=0.9",
-      "Referer": "https://18mh.net/"
+      "Referer": "https://18mh.net/",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-User": "?1",
+      "Sec-Fetch-Dest": "document"
     },
     "timeout": 10,
     "retries": 2,
@@ -83,19 +88,22 @@
       },
       "works_list_item": {
         "root_selector": {
-          "css": "ul.dx-novel-list li"
+            "css": "ul.dx-novel-list li, ul.dx-novel-list > li, .novel-list li, .book-list li"
         },
         "fields": {
           "title": {
-            "css": "h2"
+            "css": "h2, h3, .title, .book-title"
           },
           "url": {
             "css": "a[href*='/novel/detail/']",
             "attr": "href"
           },
           "cover": {
-            "css": "img",
-            "attr": "data-src"
+            "fallback": [
+              {"css": "img", "attr": "data-src"},
+              {"css": "img", "attr": "data-original"},
+              {"css": "img", "attr": "src"}
+            ]
           }
         }
       }
@@ -109,7 +117,7 @@
       },
       "item": {
         "root_selector": {
-          "css": "ul.dx-novel-list li"
+            "css": "ul.dx-novel-list li, ul.dx-novel-list > li, .novel-list li, .book-list li"
         },
         "fields": {
           "title": {
@@ -120,8 +128,11 @@
             "attr": "href"
           },
           "cover": {
-            "css": "img",
-            "attr": "data-src"
+            "fallback": [
+              {"css": "img", "attr": "data-src"},
+              {"css": "img", "attr": "data-original"},
+              {"css": "img", "attr": "src"}
+            ]
           }
         }
       }
@@ -149,9 +160,10 @@
           "root_selector": {
             "css": "a.detail-page__catalog-item"
           },
+          "chapter_order": "asc",
           "fields": {
             "title": {
-              "css": ".detail-page__chapter-title"
+              "css": ".detail-page__catalog-left"
             },
             "url": {
               "css": "a.detail-page__catalog-item",

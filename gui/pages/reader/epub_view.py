@@ -252,8 +252,8 @@ class EpubView(QWidget):
 
         self.font_down = QPushButton("A-")
         self.font_up = QPushButton("A+")
-        self.font_down.setFixedWidth(40)
-        self.font_up.setFixedWidth(40)
+        self.font_down.setMinimumWidth(46)
+        self.font_up.setMinimumWidth(46)
         self.font_down.clicked.connect(lambda: self._adjust_font(-1))
         self.font_up.clicked.connect(lambda: self._adjust_font(1))
         toolbar.addWidget(self.font_down)
@@ -261,21 +261,23 @@ class EpubView(QWidget):
 
         self.prev_btn = QPushButton("上一章")
         self.next_btn = QPushButton("下一章")
-        self.prev_btn.setFixedWidth(70)
-        self.next_btn.setFixedWidth(70)
+        self.prev_btn.setMinimumWidth(82)
+        self.next_btn.setMinimumWidth(82)
         self.prev_btn.clicked.connect(lambda: self._jump_relative(-1))
         self.next_btn.clicked.connect(lambda: self._jump_relative(1))
         toolbar.addWidget(self.prev_btn)
         toolbar.addWidget(self.next_btn)
 
         self.bg_btn = QPushButton("背景")
-        self.bg_btn.setFixedWidth(50)
+        self.bg_btn.setMinimumWidth(72)
+        self.bg_btn.setMinimumHeight(30)
         self.bg_btn.setToolTip("切换阅读背景色（白/米黄/护眼绿/夜间黑）")
         self.bg_btn.clicked.connect(self.background_cycle_requested.emit)
         toolbar.addWidget(self.bg_btn)
 
         self.fullscreen_btn = QPushButton("⛶")
-        self.fullscreen_btn.setFixedWidth(40)
+        self.fullscreen_btn.setMinimumWidth(52)
+        self.fullscreen_btn.setMinimumHeight(30)
         self.fullscreen_btn.setToolTip("全屏阅读")
         self.fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
         toolbar.addWidget(self.fullscreen_btn)
@@ -720,7 +722,7 @@ class EpubView(QWidget):
         size = self._clamp_font(self._base_font + self._font_delta)
         bg = self._reading_bg
         bg_css = f" background-color: {bg};" if bg else ""
-        fg_css = f" color: {self._reading_fg};" if self._reading_fg else ""
+        fg_css = f" color: {self._reading_fg or 'palette(text)'};"
         return (
             "font-family: Georgia, 'Times New Roman', 'Noto Serif CJK SC', SimSun, serif; "
             f"font-size: {size}px; line-height: 1.8; padding: 12px 20px;"

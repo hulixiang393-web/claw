@@ -5,7 +5,7 @@ Q 版小猫角色，由 QPainter 精细绘制，三态差异明显：
 - 运行 running：睁眼 + 猫爪忙碌转圈（爪子围绕身体转）
 - 报错 error ：哭脸 + 泪滴落下
 
-对应 ui-home.md「吉祥物三态联动」+ theme.md 三态吉祥物。
+对应 PROJECT_GUIDE.md §6.2 的首页状态联动；主题颜色由 ThemeManager 提供。
 由 EventBus 事件驱动状态。插画成品资源第二阶段替换（换资源不改逻辑）。
 """
 

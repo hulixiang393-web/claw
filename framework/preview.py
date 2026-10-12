@@ -1,7 +1,7 @@
 """源编辑器预览（preview.py）。
 
 对源配置的选择器/搜索/详情做实时验证，供源编辑器实时预览用。
-对应 ui-editor.md #2/#3/#4 与 core.md「preview.py」。
+对应 PROJECT_GUIDE.md §6.14 的源编辑器预览和校验流程。
 
 用法：
     pv = Preview(http, parser)

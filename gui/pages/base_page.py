@@ -1,7 +1,7 @@
 """页面基类（BasePage）。
 
 所有 Tab 页共用：统一页面生命周期 + 事件订阅接口。
-对应 ui-home.md「页基类」。
+对应 PROJECT_GUIDE.md §6.1 的页面生命周期约定。
 """
 
 from __future__ import annotations

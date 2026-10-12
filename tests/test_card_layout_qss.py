@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 
 from PySide6.QtCore import QPoint
+from PySide6.QtWidgets import QSizePolicy
 
 from framework.search import SearchResult
 from framework.theme_manager import ThemeManager
@@ -92,6 +93,13 @@ def test_workcard_internal_labels_padding_zero(themed_app):
     """卡片内标签不受全局 QFrame padding 影响：作者行高与字号一致（~11px）。"""
     card = _show(themed_app, _make_work())
     assert card._author_label.height() <= 14
+
+
+def test_workcard_cover_policy_does_not_reflow_on_pixmap(themed_app):
+    card = _show(themed_app, _make_work())
+    assert card.sizePolicy().horizontalPolicy() == QSizePolicy.Expanding
+    assert card.sizePolicy().verticalPolicy() == QSizePolicy.Fixed
+    assert card._cover.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
 
 
 def test_shelfcard_title_not_overlapping_cover(themed_app):

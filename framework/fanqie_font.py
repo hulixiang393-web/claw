@@ -29,7 +29,7 @@ _SZ = 64
 _CANVAS = 140
 _COARSE = 16  # 粗筛网格
 
-_CACHE_VERSION = "v2:"  # 匹配算法版本，升级后旧表失效
+_CACHE_VERSION = "v3:"  # 匹配算法版本，升级后旧表失效
 
 _SYS_FONTS = [
     "C:/Windows/Fonts/msyh.ttc",
@@ -39,7 +39,7 @@ _SYS_FONTS = [
     "C:/Windows/Fonts/simkai.ttf",
 ]
 
-_FONT_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+\.woff2?)\1\s*\)", re.I)
+_FONT_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)", re.I)
 
 _PUNCT_DIGITS = list("，。：！？、；【】（）·“”‘’…—`~!@#$%^&*-_=+<>,.?/\\|\"'（）《》　0123456789%")
 
@@ -55,9 +55,13 @@ def extract_font_urls(html: str) -> list:
     """从 HTML 提取 @font-face src url 列表（woff/woff2，绝对化）。"""
     urls = []
     for m in _FONT_RE.findall(html or ""):
-        u = m[1]
+        u = m[1].replace(r"\u002F", "/").replace(r"\/", "/")
         if u.startswith("//"):
             u = "https:" + u
+        if u.startswith("data:") or not re.search(
+            r"\.(?:woff2?|ttf|otf)(?:[?#]|$)", u, re.I
+        ):
+            continue
         if re.search(r"[\-\s]?\d{3}(?:px)|\b(?:italic|bold|oblique)\b", u):
             continue
         if u not in urls:
@@ -132,14 +136,16 @@ def _std_masks():
     return _STD_KEYS
 
 
-def build_map(font_url: str) -> dict:
+def build_map(font_url: str, needed_codes=None, headers=None) -> dict:
     """下载字体并逐码点匹配，返回 {PUA字符: 汉字}（低置信不采）。
 
     匹配策略：全部候选先做 _COARSE 网格粗筛取 top-k，再精算全分辨率
     IoU，避免对数千候选逐个全分辨率求交（提速数十倍）。
     """
     now = time.time()
-    cached = _CACHE.get(_CACHE_VERSION + font_url)
+    requested = tuple(sorted({int(code) for code in (needed_codes or ())}))
+    cache_key = _CACHE_VERSION + font_url + ":" + ",".join(map(str, requested))
+    cached = _CACHE.get(cache_key)
     if cached and cached[0] > now:
         return cached[1]
     std = _std_masks()
@@ -149,17 +155,30 @@ def build_map(font_url: str) -> dict:
     B = std["__stack__"]  # (N,64,64) bool
     S = std["__small__"]  # (N,16,16) bool
 
-    req = urllib.request.Request(
-        font_url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://fanqienovel.com/",
-        },
-    )
+    request_headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://fanqienovel.com/",
+    }
+    request_headers.update({k: v for k, v in (headers or {}).items() if v})
+    req = urllib.request.Request(font_url, headers=request_headers)
     raw = urllib.request.urlopen(req, timeout=25).read()
+    glyph_codes = None
+    try:
+        from fontTools.ttLib import TTFont
+
+        cmap = TTFont(io.BytesIO(raw), lazy=False).getBestCmap() or {}
+        glyph_codes = [
+            code for code in cmap
+            if 0xE000 <= code <= 0xF8FF
+        ]
+    except Exception:
+        pass
     font = ImageFont.truetype(io.BytesIO(raw), 96)
     mapping = {}
-    for code in range(0xE000, 0xF900):
+    if requested:
+        wanted = set(requested)
+        glyph_codes = [code for code in (glyph_codes or wanted) if code in wanted]
+    for code in glyph_codes or range(0xE000, 0xF900):
         ch = chr(code)
         try:
             a = _mask(font, ch)
@@ -177,18 +196,19 @@ def build_map(font_url: str) -> dict:
         hits = (S & small).sum(axis=(1, 2))
         denom = S.sum(axis=(1, 2)) + int(small.sum())
         topk = np.argsort(hits / np.maximum(denom, 1))[-24:][::-1]
-        # 精算 top-k 全分辨率 IoU
-        inter = int((B & am).sum(axis=(1, 2)))
-        uni = B.sum(axis=(1, 2)) + int(am.sum()) - inter
+        # 精算 top-k 全分辨率 IoU；不要为所有候选字形计算全尺寸交集。
+        top_masks = B[topk]
+        inter = (top_masks & am).sum(axis=(1, 2))
+        uni = top_masks.sum(axis=(1, 2)) + int(am.sum()) - inter
         score = inter / np.maximum(uni, 1)
         best_s, best_c = 0.0, ""
-        for idx in topk:
-            s = float(score[idx])
+        for idx, s in zip(topk, score):
+            s = float(s)
             if s > best_s:
                 best_s, best_c = s, chars[idx]
         if best_s >= _CONFIDENCE:
             mapping[ch] = best_c
-    _CACHE[_CACHE_VERSION + font_url] = (now + _CACHE_TTL, mapping)
+    _CACHE[cache_key] = (now + _CACHE_TTL, mapping)
     log.info(
         "fanqie_font: %s -> %d glyphs (%.1fs)",
         font_url.rsplit("/", 1)[-1],
@@ -205,7 +225,7 @@ def _decode_text(text: str, mapping: dict) -> str:
     return "".join(out)
 
 
-def resolve_html(html: str, text: str):
+def resolve_html(html: str, text: str, headers=None):
     """用页面字体解析密文文本。无字体/全部低置信 → 返回 (None, mapping)。
 
     返回 (resolved_text, mapping_by_font)。调用方按需采纳或走 fallback。
@@ -216,26 +236,38 @@ def resolve_html(html: str, text: str):
     pua_total = sum(1 for c in text if 0xE000 <= ord(c) <= 0xF8FF)
     if pua_total == 0:
         return text, {}
-    urls = extract_font_urls(html)
+    return resolve_urls(extract_font_urls(html), text, headers=headers)
+
+
+def resolve_urls(urls: list, text: str, headers=None):
+    """Resolve text with already captured @font-face URLs."""
+    if not text:
+        return None, {}
+    pua_total = sum(1 for c in text if 0xE000 <= ord(c) <= 0xF8FF)
+    if pua_total == 0:
+        return text, {}
+    urls = [str(u).replace(r"\u002F", "/").replace(r"\/", "/") for u in (urls or [])]
     if not urls:
         return None, {}
-    best_resolved = None
-    best_map = {}
-    best_hit = -1
+    needed_codes = {
+        ord(c) for c in text if 0xE000 <= ord(c) <= 0xF8FF
+    }
+    combined_map = {}
     for u in urls:
         try:
-            mapping = build_map(u)
+            # 只匹配当前正文实际出现的 PUA 码位；旧实现会扫描字体中的
+            # 全部私用区字形，首次打开一章可能耗时几十秒。
+            remaining_codes = needed_codes.difference(combined_map)
+            if not remaining_codes:
+                break
+            mapping = build_map(u, remaining_codes, headers=headers)
         except Exception as exc:
             log.info("fanqie_font: 字体加载失败 %s (%s)", u, exc)
             continue
-        resolved = _decode_text(text, mapping)
-        hits = sum(1 for c in text if 0xE000 <= ord(c) <= 0xF8FF and c in mapping)
-        if hits > best_hit:
-            best_hit = hits
-            best_resolved = resolved
-            best_map = mapping
-            if hits == pua_total:
-                break
-    if best_hit > 0:
-        return best_resolved, best_map
+        for code, char in mapping.items():
+            combined_map.setdefault(code, char)
+        if sum(1 for c in text if 0xE000 <= ord(c) <= 0xF8FF and c in combined_map) == pua_total:
+            break
+    if combined_map:
+        return _decode_text(text, combined_map), combined_map
     return None, {}

@@ -226,7 +226,7 @@ def _sort_chapters(chapters: List[_SortableChapter]) -> List[_SortableChapter]:
 
     - 有数字的章节按序号排序（倒序/先最新后顺序/反爬乱序都能恢复正序）
     - 特别篇/特別篇无论是否有编号，都排在所有其他章节之后，并保持原相对顺序
-    - 预告/序章/楔子与数字章节的先后，遵循原始顺序中的首个相关条目
+    - 预告/前言/序章/楔子与数字章节的先后，遵循原始顺序中的首个相关条目
     - 其他无数字章节保持原相对顺序，排在数字/前置桶之后
     """
     regular = [(idx, ch) for idx, ch in enumerate(chapters)
@@ -240,7 +240,7 @@ def _sort_chapters(chapters: List[_SortableChapter]) -> List[_SortableChapter]:
     ]
     unnumbered = [(idx, ch) for idx, ch in regular
                   if _extract_chapter_number(ch.title) is None]
-    prelude = [item for item in unnumbered if _re.search(r"预告|序章|楔子", item[1].title or "")]
+    prelude = [item for item in unnumbered if _re.search(r"预告|序章|楔子|前言", item[1].title or "")]
     tail = [item for item in unnumbered if item not in prelude]
     numbered.sort(key=lambda t: (t[0], t[1]))
 

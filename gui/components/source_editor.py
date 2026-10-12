@@ -1,6 +1,6 @@
 """源编辑器对话框（source_editor.py）。
 
-对应 ui-editor.md 功能点：
+对应 PROJECT_GUIDE.md §6.14 源编辑器功能点：
 - 字段分组表单（按 $type 动态显示）
 - 保存不变量（SourceConfig.from_dict 严格校验）
 - 允许残缺保存（草稿，$enabled=false）

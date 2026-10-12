@@ -210,6 +210,7 @@ def _stub_pages(monkeypatch):
 def test_ready_rebinds_already_built_pages(_qapp, monkeypatch, tmp_path):
     _stub_pages(monkeypatch)
     window = _make_window(monkeypatch, tmp_path)
+    window._runtime_state = "READY"
 
     for key in ("discover", "search", "source", "library"):
         window.tabs.setCurrentIndex(window._tab_index[key])

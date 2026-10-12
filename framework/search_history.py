@@ -123,3 +123,17 @@ class SearchHistory:
     def clear(self) -> None:
         self._items = []
         self._save()
+
+    @_synchronized
+    def remove(self, keyword: str) -> bool:
+        """Remove one search term and report whether it existed."""
+        keyword = str(keyword or "").strip()
+        old_len = len(self._items)
+        self._items = [
+            item for item in self._items
+            if not isinstance(item, dict) or item.get("keyword") != keyword
+        ]
+        if len(self._items) == old_len:
+            return False
+        self._save()
+        return True

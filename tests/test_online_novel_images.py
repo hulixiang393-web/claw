@@ -52,6 +52,7 @@ def test_fetch_chapter_with_images_scopes_urls_and_preserves_old_api(monkeypatch
       <img data-src='two.jpg'>
       <img data-original='https://img.example/three.jpg'>
       <img data-lazy-src='two.jpg'>
+      <img src='/loading.gif' data-src='/real.jpg'>
       <img src='data:image/png;base64,abc'>
       <img src='/ads/banner.jpg'>
     </article>
@@ -66,6 +67,7 @@ def test_fetch_chapter_with_images_scopes_urls_and_preserves_old_api(monkeypatch
         "https://example.com/one.jpg",
         "https://example.com/two.jpg",
         "https://img.example/three.jpg",
+        "https://example.com/real.jpg",
     ]
 
 
@@ -103,9 +105,13 @@ def test_playwright_path_extracts_images_from_static_body_html(monkeypatch):
     content = Content(object(), Parser(), object())
     monkeypatch.setattr(content, "_get", lambda source, url: "<div class='content'><p>static</p><img src='/static.jpg'></div>")
     monkeypatch.setattr(content, "_bg_check", lambda *args: None)
-    monkeypatch.setattr("framework.playwright_helper.fetch_rendered_text_sync", lambda *args, **kwargs: "rendered")
+    monkeypatch.setattr(
+        content,
+        "_fetch_rendered_html",
+        lambda source, url, config: "<div class='content'><p>static</p><img src='/static.jpg'></div>",
+    )
     text, images = content.fetch_chapter_with_images(source, "/chapter.html")
-    assert text == "rendered"
+    assert text == "static"
     assert [entry["url"] for entry in images if entry.get("type") == "image"] == ["https://example.com/static.jpg"]
 
 
@@ -252,7 +258,7 @@ def test_novel_mixed_text_segments_follow_font_style(_qapp, monkeypatch):
     initial_style = segment.styleSheet()
     assert "font-family: Georgia" in initial_style
     assert "font-size: 17px" in initial_style
-    assert "text-indent: 2em" in initial_style
+    assert "text-indent: 0" in initial_style
     assert "margin-bottom: 0.9em" in initial_style
     assert segment.maximumWidth() == 960
     view._adjust_font(3)

@@ -357,12 +357,19 @@ def _configure_search(data_dir: Optional[str] = None) -> RedisLikeStore:
 
 
 def _configure_session(data_dir: Optional[str] = None) -> RedisLikeStore:
-    """按传入目录独立构建会话级缓存池（发现页快照，最多保留最近 5 个源）。"""
+    """构建进程内会话缓存池（发现页快照，最多保留最近 5 个源）。"""
     global _session_singleton
-    base = data_dir or _DEFAULT_DATA_DIR
+    # 清理旧版本留下的持久化快照；当前会话缓存只存在于进程内。
+    stale_path = os.path.join(data_dir or _DEFAULT_DATA_DIR, "redis_session.gz")
+    try:
+        if os.path.isfile(stale_path):
+            os.remove(stale_path)
+    except OSError:
+        log.debug("[cache] 清理旧会话缓存失败: %s", stale_path, exc_info=True)
     _session_singleton = RedisLikeStore(
         quota=2 * 1024 * 1024 * 1024,
-        persist_path=os.path.join(base, "redis_session.gz"),
+        # 会话快照不能跨应用启动恢复；搜索/正文缓存仍使用持久化池。
+        persist_path=None,
         source_lru_prefix=("snap:", "disc:"),
         source_lru_limit=5,
     )
@@ -407,7 +414,7 @@ def get_search_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]
 def get_session_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]:
     """获取会话级缓存池（发现页快照用）。
 
-    快照落盘到 redis_session.gz，重启后可恢复；缓存损坏时静默降级为空。
+    快照只在当前进程有效，重启后从空缓存开始。
     初始化失败返回 None → 调用方功能降级禁用。
     """
     global _session_singleton

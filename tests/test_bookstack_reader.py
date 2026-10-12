@@ -34,7 +34,11 @@ class _Http:
 
 
 def _content(html):
-    return Content(_Http(html), Parser(), object())
+    http = _Http(html)
+    content = Content(http, Parser(), object())
+    # Offline fixtures represent the HTML after the real browser click.
+    content._fetch_rendered_html = lambda source, url, config: html
+    return content
 
 
 def test_bookstack_chapters_walk_nested_lists_in_dom_order():
@@ -74,14 +78,16 @@ def test_bookstack_chapters_load_multilevel_summary_sidebar():
     </ul></div>
     """
     summary_html = """
-    <div class="article-menu-detail"><ul>
+    <div class="m-manual manual-mode-view manual-reader">
+      <div class="article-menu-detail collapse-menu"><ul>
       <li><a href="/read/demo/SUMMARY.md">目录</a><ul></ul></li>
       <li class="collapse-node"><a href="/read/demo/part.md">第一部分</a><ul>
         <li><a href="/read/demo/part-one.md">第一节</a><ul>
           <li><a href="/read/demo/part-one-deep.md">深层小节</a><ul></ul></li>
         </ul></li>
       </ul></li>
-    </ul></div>
+      </ul></div>
+    </div>
     """
 
     class _SummaryHttp:
@@ -94,6 +100,7 @@ def test_bookstack_chapters_load_multilevel_summary_sidebar():
 
     source = SOURCE
     content = Content(_SummaryHttp(), Parser(), object())
+    content._fetch_rendered_html = lambda source, url, config: summary_html
     chapters = content._fetch_chapters(
         source,
         content._parser.parse(detail_html),
@@ -113,24 +120,29 @@ def test_bookstack_chapters_load_multilevel_summary_sidebar():
 def test_bookstack_reader_root_provides_nested_directory_before_summary_fallback():
     detail_html = '<div class="wd-tab-content"><ul class="none-listyle"><li><a href="/read/demo/top.md">顶层</a></li></ul></div>'
     reader_html = """
-    <div class="article-menu-detail"><ul>
+    <div class="m-manual manual-mode-view manual-reader">
+      <div class="article-menu-detail"><ul>
       <li><a href="/read/demo/one.md">一级</a><ul>
+        <li><a href="/read/demo/one.md#section">一级锚点</a></li>
         <li><a href="/read/demo/two.md">二级</a><ul>
           <li><a href="/read/demo/three.md">三级</a></li>
         </ul></li>
       </ul></li>
-    </ul></div>
+      </ul></div>
+    </div>
     """
     calls = []
+    rendered = []
 
     class _ReaderHttp:
         defaults = SimpleNamespace(timeout=10, retries=0, interval_ms=0)
 
         def get_text(self, url, **kwargs):
             calls.append(url)
-            return reader_html if url.endswith("/read/demo") else detail_html
+            return reader_html if url.endswith("/read/book/demo") else detail_html
 
     content = Content(_ReaderHttp(), Parser(), object())
+    content._fetch_rendered_html = lambda source, url, config: (rendered.append(url) or reader_html)
     chapters = content._fetch_chapters(
         SOURCE,
         content._parser.parse(detail_html),
@@ -143,13 +155,33 @@ def test_bookstack_reader_root_provides_nested_directory_before_summary_fallback
         ("二级", 1),
         ("三级", 2),
     ]
-    assert calls == ["https://www.bookstack.cn/read/demo"]
+    assert calls == []
+    assert rendered == ["https://www.bookstack.cn/read/book/demo"]
+
+
+def test_bookstack_rich_fetch_uses_browser_render():
+    html = '<article class="article-body markdown-body"><p>浏览器正文</p></article>'
+    http = _Http('<html><body>429</body></html>')
+    content = Content(http, Parser(), object())
+    rendered = []
+    content._fetch_rendered_html = lambda source, url, config: (rendered.append((url, config)) or html)
+
+    result = content.fetch_bookstack_chapter(
+        SOURCE, "https://www.bookstack.cn/read/demo/chapter.md"
+    )
+
+    assert "浏览器正文" in result.text
+    assert http.calls == []
+    assert rendered[0][0].endswith("/read/demo/chapter.md")
+    assert rendered[0][1]["wait_for"] == (
+        "article.article-body.markdown-body, article#page-content"
+    )
 
 
 def test_bookstack_rich_result_preserves_structure_and_image_dom_order():
     html = """
     <article class="article-body markdown-body">
-      <h2>标题</h2><p>前文 <a href="/docs/link">链接</a></p>
+      <h2>标题</h2><p>前文 <a href="/docs/link">链接</a> <a href="#section">本页</a></p>
       <img src="/images/one.png"><blockquote>引用</blockquote>
       <pre><code>print(1)</code></pre><table><tr><td>单元格</td></tr></table>
       <img data-src="images/two.png"><ul><li>列表</li></ul>
@@ -167,6 +199,7 @@ def test_bookstack_rich_result_preserves_structure_and_image_dom_order():
     assert "<pre><code>print(1)</code></pre>" in result.body_html
     assert "<table>" in result.body_html
     assert 'href="https://www.bookstack.cn/docs/link"' in result.body_html
+    assert 'href="#section"' in result.body_html
     assert 'src="https://www.bookstack.cn/images/one.png"' in result.body_html
     assert 'src="https://www.bookstack.cn/books/demo/images/two.png"' in result.body_html
     assert result.image_urls == [

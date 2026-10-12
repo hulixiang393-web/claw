@@ -1,6 +1,6 @@
 """下载管理页（DownloadPage）。
 
-对应 ui-download.md 全部 10 个功能点：
+对应 PROJECT_GUIDE.md §6.11 下载页功能点：
 1. 任务队列列表（书名/进度/状态/速度）
 2. 续传（skip_existing，下载器侧已实现）
 3. 并发可调（顶栏 [-][N][+]）
@@ -291,7 +291,7 @@ class DownloadPage(BasePage):
         self._bus = event_bus
         self._queue = queue
         self._tray = None
-        # 下载完成通知开关（ui-download.md #10，设置页 download.show_notification）
+        # 下载完成通知开关（PROJECT_GUIDE.md §6.11）
         try:
             self._notify_enabled = bool(
                 settings.get("download", "show_notification", True)
@@ -640,7 +640,7 @@ class DownloadPage(BasePage):
         self._full_rebuild()
 
     # ------------------------------------------------------------------ #
-    # 任务本地文件操作（ui-download.md #7 已完成区：删除本地文件）
+    # 任务本地文件操作（PROJECT_GUIDE.md §6.11 已完成区）
     # ------------------------------------------------------------------ #
     def _delete_local_files(self, task_id: str) -> None:
         """删除下载任务已落盘的本地文件（书目录），弹确认框。"""

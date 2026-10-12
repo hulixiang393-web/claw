@@ -146,7 +146,7 @@ class SourceRow(QWidget):
 
         # 名称（flex 自动占满剩余空间；固定控件已收窄，长名不会挤掉操作按钮）
         self.name_label = QLabel(source.source_name)
-        self.name_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        self.name_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #000000;")
         self.name_label.setToolTip(f"{source.source_name}\n{source.source_id}")
         self.name_label.setAlignment(Qt.AlignVCenter)
         self.name_label.setMinimumWidth(60)
@@ -299,6 +299,9 @@ class SourcePage(BasePage):
     def __init__(self, source_manager: SourceManager, checker: StructureChecker,
                  sources_dir, cookie_manager=None, parent=None, event_bus=None):
         super().__init__(parent)
+        # Source management is intentionally monochrome; health/type colors are
+        # set directly on their dedicated widgets below.
+        self.setStyleSheet("QWidget { color: #000000; }")
         self._manager = source_manager
         self._checker = checker
         self._sources_dir = Path(sources_dir)
@@ -318,7 +321,7 @@ class SourcePage(BasePage):
         # 诊断进度
         self.progress_label = QLabel("")
         self.progress_label.setVisible(False)
-        self.progress_label.setStyleSheet("color: palette(mid); font-size: 12px;")
+        self.progress_label.setStyleSheet("color: #000000; font-size: 12px;")
         layout.addWidget(self.progress_label)
 
         # 源列表
@@ -379,7 +382,7 @@ class SourcePage(BasePage):
         # 版本信息（右侧，防挤压：允许收缩时省略，不参与 stretch）
         self.version_label = QLabel("")
         self.version_label.setStyleSheet(
-            "color: palette(mid); font-size: 11px; padding-right: 8px;"
+            "color: #000000; font-size: 11px; padding-right: 8px;"
         )
         self.version_label.setAlignment(Qt.AlignVCenter)
         self._toolbar.addWidget(self.version_label)
