@@ -352,6 +352,48 @@ class Search:
         if not root_sel:
             return []
 
+        # playwright_fallback：先走 HTTP（包含项目的自动代理池），只有页面无结果
+        # 时才启动浏览器；普通 playwright 源保持原有行为。
+        if search_cfg.get("render") == "playwright_fallback":
+            abs_url = self._build_page_url(
+                source=source, base_url=base_url, keyword=keyword,
+                kw_param=kw_param, page=1, page_param=page_param,
+                url_template=url_template, keyword_replace=keyword_replace,
+            )
+            try:
+                text = self._http_get(source, abs_url, http=http)
+                parsed = self._parser.parse_items(
+                    self._parser.parse(text), root_sel, fields, source.base_url
+                )
+                if parsed:
+                    results = []
+                    seen = set()
+                    for item in parsed:
+                        href = item.get("url") or ""
+                        if not href:
+                            continue
+                        href = urljoin(source.base_url, href)
+                        title = str(item.get("title") or "").strip()
+                        if not title or href in seen:
+                            continue
+                        seen.add(href)
+                        results.append(SearchResult(
+                            title=title, url=href,
+                            source_id=source.source_id,
+                            source_name=source.source_name,
+                            cover=Search._clean_cover(item.get("cover", "")),
+                            author=str(item.get("author") or ""),
+                        ))
+                    if results:
+                        return self._decrypt_results(source, results, http)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("[%s] HTTP 搜索失败，回退 Playwright：%s", source.source_id, exc)
+            return self._decrypt_results(
+                source,
+                self._search_html_rendered(source, abs_url, item_cfg, keyword),
+                http,
+            )
+
         # render: "playwright" → 反爬 SPA 站（结果 JS 渲染），交互式只搜第一页
         if search_cfg.get("render") == "playwright":
             abs_url = self._build_page_url(

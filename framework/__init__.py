@@ -2,3 +2,7 @@
 
 配置驱动：规则全外置在 sources/*.json，框架只做通用能力。
 """
+
+from .runtime import configure_runtime_environment
+
+configure_runtime_environment()

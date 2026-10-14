@@ -33,7 +33,11 @@ _DETECTED_PROXY = None
 
 def _ensure_vlc_on_path() -> None:
     """libvlc 找不到时，把 VLC 安装目录加进 PATH 兜底。"""
+    from .runtime import bundled_path, configure_runtime_environment
+
+    configure_runtime_environment()
     for base in (
+        str(bundled_path("vlc")),
         r"C:\Program Files\VideoLAN\VLC",
         r"C:\Program Files (x86)\VideoLAN\VLC",
     ):

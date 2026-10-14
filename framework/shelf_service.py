@@ -153,14 +153,25 @@ class ShelfService:
             (self.scan_local(), self.favorites()), content_type, tag, folder, keyword, sort
         )
 
-    def metadata_snapshot(self, cancel=None):
+    def metadata_snapshot(self, cancel=None, include_progress=False):
+        """Return the cheap shelf snapshot used for the first card render.
+
+        Progress is deliberately opt-in here.  Reading it for every item made
+        entering the shelf compete with discovery/network work and blocked the
+        first useful frame.
+        """
         with self._lock:
             self._generation += 1
             generation = self._generation
-        locals_ = self.scan_local(metadata_only=True, cancel=cancel, generation=generation)
+        locals_ = self.scan_local(
+            metadata_only=True,
+            cancel=cancel,
+            generation=generation,
+            include_progress=include_progress,
+        )
         if locals_ is None or (cancel is not None and cancel.is_set()):
             return None
-        return locals_, self.favorites()
+        return locals_, self.favorites(include_progress=include_progress)
 
     def refresh_metadata(self, snapshot):
         locals_ = []
@@ -281,7 +292,13 @@ class ShelfService:
     # ------------------------------------------------------------------ #
     # 本地扫描
     # ------------------------------------------------------------------ #
-    def scan_local(self, metadata_only=False, cancel=None, generation=None) -> list[ShelfItem] | None:
+    def scan_local(
+        self,
+        metadata_only=False,
+        cancel=None,
+        generation=None,
+        include_progress=True,
+    ) -> list[ShelfItem] | None:
         """扫描本地已下载目录（epub + 视频目录），排除隐藏名单。
 
         - {书名}/*.epub → 小说/漫画（类型走缓存检测），记录大小/mtime
@@ -338,7 +355,7 @@ class ShelfService:
         if _stale():
             return None
         # 补续读位置（本地=epub 路径 key；视频=目录路径 key）
-        if self._progress is not None:
+        if include_progress and self._progress is not None:
             for it in items:
                 pres = self._progress.summary(it.key)
                 if pres:
@@ -420,7 +437,7 @@ class ShelfService:
     # ------------------------------------------------------------------ #
     # 收藏
     # ------------------------------------------------------------------ #
-    def favorites(self, folder: str = "全部") -> list[ShelfItem]:
+    def favorites(self, folder: str = "全部", include_progress=True) -> list[ShelfItem]:
         """在线收藏条目（按收藏时间倒序），可选收藏夹过滤。"""
         items: list[ShelfItem] = []
         if self._store is None:
@@ -442,7 +459,7 @@ class ShelfService:
                 updated_at=fav.get("favorited_at", ""),
                 reading_status=fav.get("reading_status", "reading"),
             )
-            if self._progress is not None:
+            if include_progress and self._progress is not None:
                 pres = self._progress.summary(it.key)
                 if pres:
                     it.resume_title = pres.get("chapter_title", "")

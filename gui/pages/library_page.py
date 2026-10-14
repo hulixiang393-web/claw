@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 import threading
 
-from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal
+from PySide6.QtCore import Qt, QThreadPool, QRunnable, QObject, Signal, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -42,6 +42,37 @@ from .base_page import BasePage
 
 class _ScanSignals(QObject):
     done = Signal(object, object, object)
+
+
+class _MetadataSignals(QObject):
+    finished = Signal(object, object, object)
+
+
+class _MetadataTask(QRunnable):
+    """Fill progress metadata after the shelf cards are already visible."""
+
+    def __init__(self, service, snapshot, generation):
+        super().__init__()
+        self.signals = _MetadataSignals()
+        self._service = service
+        self._snapshot = snapshot
+        self._generation = generation
+        self.cancel = threading.Event()
+
+    def run(self) -> None:
+        if self.cancel.is_set():
+            return
+        result = None
+        try:
+            result = self._service.refresh_metadata(self._snapshot)
+        except Exception:
+            result = None
+        if self.cancel.is_set():
+            return
+        try:
+            self.signals.finished.emit(self._generation, self._snapshot, result)
+        except RuntimeError:
+            pass
 
 
 class _DetailLoadSignals(QObject):
@@ -88,7 +119,13 @@ class _ScanTask(QRunnable):
             return
         try:
             if hasattr(self._service, "metadata_snapshot"):
-                snapshot = self._service.metadata_snapshot(cancel=self.cancel)
+                try:
+                    snapshot = self._service.metadata_snapshot(
+                        cancel=self.cancel, include_progress=False
+                    )
+                except TypeError:
+                    # Keep compatibility with small/test ShelfService adapters.
+                    snapshot = self._service.metadata_snapshot(cancel=self.cancel)
             else:
                 snapshot = ([], self._service.list_items())
         except Exception:
@@ -328,6 +365,7 @@ class LibraryPage(BasePage):
     open_online_requested = Signal(object)    # 收藏在线书 (source_id, url, content_type) → reader.open
     download_requested = Signal(object)       # 收藏在线书 (source_id, url, content_type) → 下载队列
     play_local_video_requested = Signal(object)  # 本地视频书 rec → 弹集选择播本地 mp4
+    cards_ready = Signal()  # 首批书架卡片已显示，允许启动低优先级后续页面
 
     def __init__(
         self,
@@ -371,6 +409,9 @@ class LibraryPage(BasePage):
         self._scan_task = None
         self._scan_generation = 0
         self._metadata_snapshot = None
+        self._metadata_task = None
+        self._metadata_enriched = False
+        self._cards_ready_generation = -1
         # 缺封面收藏后台补写回调（App 层注入：内容层 fetch_cover → store.set_cover）
         self._cover_backfiller = cover_backfiller
 
@@ -552,12 +593,41 @@ class LibraryPage(BasePage):
             return
         self._scan_task = None
         self._metadata_snapshot = snapshot or ([], [])
+        self._metadata_enriched = False
+        self._rebuild()
+        if self._cards_ready_generation != generation:
+            self._cards_ready_generation = generation
+            self.cards_ready.emit()
+        self._queue_metadata_refresh()
+
+    def _queue_metadata_refresh(self) -> None:
+        """Refresh progress/cache labels after the first useful shelf frame."""
+        if self._metadata_snapshot is None or self._metadata_task is not None:
+            return
+        task = _MetadataTask(self._shelf, self._metadata_snapshot, self._scan_generation)
+        task.signals.finished.connect(self._on_metadata_ready)
+        self._metadata_task = task
+
+        def start() -> None:
+            if self._metadata_task is task and not task.cancel.is_set():
+                QThreadPool.globalInstance().start(task)
+
+        QTimer.singleShot(0, start)
+
+    def _on_metadata_ready(self, generation, snapshot, enriched) -> None:
+        if (self._metadata_task is None or generation != self._scan_generation
+                or snapshot is not self._metadata_snapshot):
+            return
+        self._metadata_task = None
+        if enriched is None:
+            return
+        self._metadata_snapshot = enriched
+        self._metadata_enriched = True
         self._rebuild()
 
     def activate(self) -> None:
-        if self._metadata_snapshot is not None and hasattr(self._shelf, "refresh_metadata"):
-            self._metadata_snapshot = self._shelf.refresh_metadata(self._metadata_snapshot)
         self._rebuild()
+        self._queue_metadata_refresh()
 
     def _sync_combos(self) -> None:
         """刷新收藏夹下拉（保持当前选择）。"""
@@ -764,7 +834,7 @@ class LibraryPage(BasePage):
             book_key = rec.get("url") or rec.get("key") or ""
             if rec.get("kind") == "favorite" and book_key:
                 self._cards_by_key[book_key] = card
-                if rec.get("content_type") != "video":
+                if self._metadata_enriched and rec.get("content_type") != "video":
                     card._badge_label.setText(self._cached_badge(book_key))
             # clicked 信号携带 rec 参数 → 首参吞掉它，闭包 it=item 才能拿到条目
             card.clicked.connect(
@@ -1709,7 +1779,11 @@ class LibraryPage(BasePage):
             self._scan_task.cancel.set()
         self._scan_generation += 1
         self._scan_task = None
+        if self._metadata_task is not None:
+            self._metadata_task.cancel.set()
+        self._metadata_task = None
         self._metadata_snapshot = None
+        self._metadata_enriched = False
         self.cancel_precache_jobs()
         self._rebuild()
 

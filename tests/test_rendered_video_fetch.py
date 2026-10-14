@@ -41,6 +41,20 @@ class _FakeRequest:
     def __init__(self, url):
         self.url = url
 
+    def is_navigation_request(self):
+        return False
+
+    @property
+    def frame(self):
+        return None
+
+
+class _FakeResponse:
+    def __init__(self, url, content_type="video/mp4", status=200):
+        self.request = _FakeRequest(url)
+        self.headers = {"content-type": content_type}
+        self.status = status
+
 
 class _FakePage:
     """wait_for_timeout 推进「时间」；on_after_wait 钩子模拟 JS 延迟注入。"""
@@ -79,7 +93,8 @@ class _FakePage:
                 self.frames[0]._videos[0]._src = src
 
 
-def _run(page, extra_delay_ms=2500, slow_fallback_rounds=3, context=None, **options):
+def _run(page, extra_delay_ms=2500, slow_fallback_rounds=3, context=None,
+         capture_media_responses=False, **options):
     import contextlib
 
     @contextlib.contextmanager
@@ -98,7 +113,8 @@ def _run(page, extra_delay_ms=2500, slow_fallback_rounds=3, context=None, **opti
         return pw.fetch_rendered_video_sync(
             "http://x/play", wait_until="domcontentloaded",
             timeout_ms=5000, extra_delay_ms=extra_delay_ms,
-            slow_fallback_rounds=slow_fallback_rounds, context=context, **options)
+            slow_fallback_rounds=slow_fallback_rounds, context=context,
+            capture_media_responses=capture_media_responses, **options)
     finally:
         pw._sync_browser = pw_orig
         pw._sync_page = pg_orig
@@ -223,6 +239,29 @@ def test_media_hit_request_returned_when_video_src_stays_blob():
                      hits_after=[(3, "https://cdn/master.m3u8")])
     assert _run(page) == "https://cdn/master.m3u8"
     assert page.waited == 750        # 第 3 次 wait 后命中
+
+
+def test_extensionless_video_response_is_returned_when_src_is_blob():
+    """AGE CDN 的 MP4 地址没有扩展名，必须按响应类型捕获而不是猜后缀。"""
+    page = _FakePage(videos=[_FakeVideo("blob:http://x/player")])
+
+    def goto(url, **kwargs):
+        page._events["response"](_FakeResponse("https://cdn.example/video-token"))
+
+    page.goto = goto
+    assert _run(page, capture_media_responses=True) == "https://cdn.example/video-token"
+    assert page.waited == 0
+
+
+def test_extensionless_video_response_is_ignored_by_default():
+    """其他源保持旧行为：默认不从响应 Content-Type 猜取媒体地址。"""
+    page = _FakePage(videos=[_FakeVideo("blob:http://x/player")])
+
+    def goto(url, **kwargs):
+        page._events["response"](_FakeResponse("https://cdn.example/video-token"))
+
+    page.goto = goto
+    assert _run(page, extra_delay_ms=0, slow_fallback_rounds=0) == ""
 
 
 def test_can_disable_slow_fallback_for_fast_sources():

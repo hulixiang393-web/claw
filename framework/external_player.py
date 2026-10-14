@@ -98,7 +98,13 @@ def _locate_vlc() -> str | None:
     global _found_vlc
     if _found_vlc is not None:
         return _found_vlc or None
-    for c in _VLC_CANDIDATES:
+    from .runtime import configure_runtime_environment, find_bundled_tool
+
+    configure_runtime_environment()
+    candidates = [find_bundled_tool("vlc", "vlc.exe"), *_VLC_CANDIDATES]
+    for c in candidates:
+        if not c:
+            continue
         if os.path.isfile(c):
             _found_vlc = c
             return c

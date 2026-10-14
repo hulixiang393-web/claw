@@ -122,7 +122,10 @@ class SourceManager:
         except KeyError:
             raise SourceNotFoundError(f"未找到数据源：{source_id}", source_id=source_id)
 
-    def all(self) -> List[SourceConfig]:
+    def all(self, include_adult: bool = False) -> List[SourceConfig]:
+        """Return visible sources; management UIs can explicitly include adults."""
+        if include_adult:
+            return list(self._sources.values())
         return self._visible(self._sources.values())
 
     def set_adult_visible(self, visible: bool) -> None:

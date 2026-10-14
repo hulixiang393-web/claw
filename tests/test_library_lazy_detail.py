@@ -172,6 +172,31 @@ def test_render_does_not_fetch_detail_chapter_or_body():
     assert content.body_calls == []
 
 
+def test_activate_does_not_refresh_progress_synchronously(monkeypatch):
+    from gui.pages import library_page as module
+
+    tasks = []
+    monkeypatch.setattr(module.QThreadPool, "globalInstance",
+                        lambda: SimpleNamespace(start=tasks.append))
+
+    class _Shelf(_FakeShelf):
+        def __init__(self):
+            self.refresh_calls = 0
+
+        def refresh_metadata(self, snapshot):
+            self.refresh_calls += 1
+            return snapshot
+
+    shelf = _Shelf()
+    page = _page(shelf=shelf)
+    assert tasks
+    tasks[0].run()
+    QApplication.processEvents()
+
+    page.activate()
+    assert shelf.refresh_calls == 0
+
+
 def test_online_click_loads_detail_before_emitting_open():
     content = _ControlledContent()
     page = _page(content)

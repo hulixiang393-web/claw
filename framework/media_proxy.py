@@ -885,7 +885,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         proxy._touch()
         proxy._begin()  # 活动请求计数：长连接流式期间看门狗不停止、不移除 token
         try:
-            path = unquote(self.path.split("?", 1)[0])
+            # /c/<cache-key>/<upstream-url> keeps the upstream query string
+            # visible so HLS players still see a normal `.ts?auth=...` URL.
+            # Preserve it for the cache route instead of dropping it while
+            # dispatching by path.
+            raw_path, query_sep, raw_query = self.path.partition("?")
+            path = unquote(raw_path)
+            if path.startswith("/c/") and query_sep:
+                path += "?" + raw_query
             if path.startswith("/c/"):
                 try:
                     proxy._serve_cache(self, path, public_base)
@@ -2810,7 +2817,11 @@ unquote 即得上游原 URL，直接取回/落盘（文件存名由 _safe_seg_na
         full = urljoin(base, uri)
         cache = self._ensure_cache() if cache_on else None
         if cache_on and cache is not None and cache_key is not None:
-            name = quote(full, safe="/:@")
+            # Keep `?query` outside the escaped path. FFmpeg/VLC reject
+            # `segment.ts%3Ftoken=...` as a segment URL because it no longer
+            # has the `.ts` extension. The cache route preserves the query
+            # from the HTTP request and reconstructs the same upstream URL.
+            name = quote(full, safe="/:@?&=%")
             if full.lower().split("?", 1)[0].endswith(".m3u8"):
                 child_key = _manifest_cache_key(
                     cache, full, ad_block, force_proxy, source_id

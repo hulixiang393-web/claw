@@ -50,6 +50,34 @@ def test_missing_output_dir_returns_empty(base: Path):
     assert svc.scan_local() == []
 
 
+def test_metadata_snapshot_skips_progress_until_deferred_refresh(base: Path):
+    make_epub(base / "dl" / "书A" / "书A.epub")
+
+    class _Progress:
+        def __init__(self):
+            self.calls = 0
+
+        def summary(self, _key):
+            self.calls += 1
+            return {"chapter_title": "第二章", "updated_at": "2026-10-14T00:00:00"}
+
+    progress = _Progress()
+    svc = ShelfService(
+        output_dir=base / "dl",
+        data_dir=base / "data",
+        reading_progress=progress,
+        epub_detector=lambda _path: "novel",
+    )
+
+    snapshot = svc.metadata_snapshot()
+    assert progress.calls == 0
+    assert snapshot[0][0].resume_title == ""
+
+    enriched = svc.refresh_metadata(snapshot)
+    assert progress.calls == 1
+    assert enriched[0][0].resume_title == "第二章"
+
+
 def test_epub_type_cache_reuses_detector(base: Path):
     epub = base / "dl" / "书A" / "书A.epub"
     make_epub(epub)

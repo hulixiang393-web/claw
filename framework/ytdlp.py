@@ -31,6 +31,12 @@ class YtdlpError(RuntimeError):
 
 
 def _find_ytdlp() -> str:
+    from .runtime import configure_runtime_environment, find_bundled_tool
+
+    configure_runtime_environment()
+    bundled = find_bundled_tool("yt-dlp", "yt-dlp.exe")
+    if bundled:
+        return bundled
     path = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
     if path:
         return path

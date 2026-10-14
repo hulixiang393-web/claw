@@ -65,18 +65,19 @@
     "workers": 3
   },
   "content": {
-    "show_adult_sources": false
+    "show_adult_sources": true
   },
   "reader": {
     "prefetch_enabled": true,
     "prefetch_ahead": 3,
     "prefetch_behind": 1,
     "show_images": true,
-    "font_size": 28,
-    "font_family": "yahei",
+    "font_size": 0,
+    "font_family": "system",
     "line_spacing": 1.8,
     "content_width": 960,
-    "paragraph_indent": true
+    "paragraph_indent": true,
+    "language": "zh-cn"
   },
   "discover": {
     "preload_pages": 5,

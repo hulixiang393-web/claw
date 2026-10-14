@@ -230,6 +230,27 @@ def _on_render_thread(fn: Callable) -> Callable:
     return wrapper
 
 
+def _system_chromium_executable(chromium) -> Optional[str]:
+    """托管浏览器缺失时，返回可复用的本机 Chromium 可执行文件。"""
+    try:
+        if Path(chromium.executable_path).is_file():
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    candidates = [
+        _os.environ.get("CLAW_PLAYWRIGHT_EXECUTABLE", ""),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            log.warning("Playwright 托管浏览器缺失，回退本机浏览器：%s", candidate)
+            return candidate
+    return None
+
+
 @atexit.register
 def _close_sync_browser() -> None:
     """进程退出时通知每个渲染 worker 关闭常驻浏览器，join 等待自清。
@@ -296,9 +317,11 @@ def _sync_browser(proxy: Optional[str] = None):
             pw = None
             try:
                 pw = sync_playwright().start()
-                browser = pw.chromium.launch(
-                    headless=True, args=["--no-sandbox"]
-                )
+                launch = {"headless": True, "args": ["--no-sandbox"]}
+                executable = _system_chromium_executable(pw.chromium)
+                if executable:
+                    launch["executable_path"] = executable
+                browser = pw.chromium.launch(**launch)
             except Exception:
                 if pw is not None:
                     try:
@@ -309,9 +332,15 @@ def _sync_browser(proxy: Optional[str] = None):
             entry = (pw, browser)
             _SYNC_REGS[tid] = entry
     if proxy:
+        launch = {
+            "headless": True,
+            "args": ["--no-sandbox", f"--proxy-server={proxy}"],
+        }
+        executable = _system_chromium_executable(entry[0].chromium)
+        if executable:
+            launch["executable_path"] = executable
         proxy_browser = entry[0].chromium.launch(
-            headless=True,
-            args=["--no-sandbox", f"--proxy-server={proxy}"],
+            **launch,
         )
         try:
             yield entry[0], proxy_browser
@@ -1717,6 +1746,7 @@ def fetch_rendered_items_sync(
 def fetch_rendered_html_sync(
     url: str,
     wait_for: str = "",
+    wait_for_function: str = "",
     wait_until: str = "networkidle",
     timeout_ms: int = 30000,
     extra_delay_ms: int = 2500,
@@ -1727,6 +1757,7 @@ def fetch_rendered_html_sync(
     scroll_stale_rounds: int = 4,
     referer: str = "",
     headers: Optional[dict] = None,
+    api_content: Optional[dict] = None,
 ) -> str:
     """用 Playwright 渲染页面后返回渲染完成的 HTML 源码。
 
@@ -1744,9 +1775,41 @@ def fetch_rendered_html_sync(
             if referer:
                 goto_kwargs["referer"] = referer
             page.goto(url, **goto_kwargs)
+            if api_content:
+                page.evaluate(
+                    """async ({config}) => {
+                        const path = location.pathname.split('/').filter(Boolean);
+                        const chapter = (path[path.length - 1] || '').replace(/\\.[^.]+$/, '');
+                        const endpoint = String(config.url || '')
+                            .replaceAll('{book_id}', path[0] || '')
+                            .replaceAll('{chapter_id}', chapter);
+                        const response = await fetch(endpoint, {credentials: 'same-origin'});
+                        if (!response.ok) throw new Error('chapter API ' + response.status);
+                        const payload = await response.json();
+                        const value = payload[config.response_field || 'content'];
+                        if (typeof value !== 'string' || !value.trim()) {
+                            throw new Error('chapter API content is empty');
+                        }
+                        const root = document.querySelector(config.selector);
+                        if (!root) throw new Error('chapter API target is missing');
+                        root.replaceChildren(...value.split(/\\r?\\n/).map(line => {
+                            const paragraph = document.createElement('p');
+                            paragraph.textContent = line;
+                            return paragraph;
+                        }));
+                    }""",
+                    {"config": api_content},
+                )
             if wait_for:
                 try:
                     page.wait_for_selector(wait_for, timeout=min(timeout_ms, 20000))
+                except Exception:
+                    pass
+            if wait_for_function:
+                try:
+                    page.wait_for_function(
+                        wait_for_function, timeout=min(timeout_ms, 10000)
+                    )
                 except Exception:
                     pass
             if scroll_to_bottom:
@@ -1856,6 +1919,8 @@ def fetch_rendered_video_sync(
     timeout_ms: int = 45000,
     extra_delay_ms: int = 8000,
     proxy: Optional[str] = None,
+    referer: str = "",
+    capture_media_responses: bool = False,
     slow_fallback_rounds: int = 3,
     context=None,
     recover_navigation_timeout: bool = False,
@@ -1910,17 +1975,37 @@ def fetch_rendered_video_sync(
                     if request.is_navigation_request() and request.frame == page.main_frame:
                         navigation["status"] = response.status
                         navigation["committed"] = False
+                    try:
+                        content_type = str(
+                            (response.headers or {}).get("content-type", "")
+                        ).lower()
+                        is_media = capture_media_responses and (
+                            content_type.startswith(("video/", "audio/"))
+                            or "mpegurl" in content_type
+                            or "dash+xml" in content_type
+                        )
+                        if is_media and 200 <= int(response.status) < 400:
+                            media_hits.append(request.url)
+                    except Exception:
+                        pass
 
                 def _on_frame_navigated(frame):
                     if frame == page.main_frame and frame.url.startswith(("http://", "https://")):
                         navigation["committed"] = True
 
                 page.on("request", _on_request)
-                if recover_navigation_timeout:
+                if recover_navigation_timeout or capture_media_responses:
                     page.on("response", _on_response)
+                if recover_navigation_timeout:
                     page.on("framenavigated", _on_frame_navigated)
                 try:
-                    response = page.goto(url, timeout=bounded_ms(timeout_ms), wait_until=wait_until)
+                    goto_kwargs = {
+                        "timeout": bounded_ms(timeout_ms),
+                        "wait_until": wait_until,
+                    }
+                    if referer:
+                        goto_kwargs["referer"] = referer
+                    response = page.goto(url, **goto_kwargs)
                 except PlaywrightTimeoutError:
                     check()
                     status = navigation["status"]

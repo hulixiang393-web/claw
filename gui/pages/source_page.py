@@ -406,7 +406,7 @@ class SourcePage(BasePage):
                 child.widget().deleteLater()
         self._rows = []
 
-        sources = self._manager.all()
+        sources = self._manager.all(include_adult=True)
         # 版本信息：源总数 + 各类型数量
         self._update_version_label(sources)
         for source in sources:
@@ -437,7 +437,7 @@ class SourcePage(BasePage):
         self._rebuild_rows()
 
     def _update_empty_state(self) -> None:
-        has_sources = len(self._manager.all()) > 0
+        has_sources = len(self._manager.all(include_adult=True)) > 0
         self.scroll.setVisible(has_sources)
         self.empty_state.setVisible(not has_sources)
 
@@ -490,7 +490,7 @@ class SourcePage(BasePage):
     # ---------- 启停 / 诊断 ------------------------------------------- #
     def _visible_sources(self):
         """当前应显示的所有源（软删除的源在 manager.all() 已不含）。"""
-        return self._manager.all()
+        return self._manager.all(include_adult=True)
 
     def _on_enable_all(self) -> None:
         for s in self._visible_sources():

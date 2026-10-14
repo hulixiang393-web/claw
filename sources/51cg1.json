@@ -18,7 +18,7 @@
       "成人",
       "hls"
     ],
-    "last_verified": "2026-08-14"
+    "last_verified": "2026-10-14"
   },
   "transports": {
     "base_url": "https://51cg1.com",
@@ -197,7 +197,7 @@
             "url": {
               "xpath": "self::*",
               "attr": "data-config",
-              "regex": "\"video\"\\s*:\\s*\\{\\s*\"url\"\\s*:\\s*\"([^\"]+m3u8[^\"]*)\""
+              "regex": "\"(?:video|video_h265)\"\\s*:\\s*\\{\\s*\"url\"\\s*:\\s*\"([^\"]+m3u8[^\"]*)\""
             }
           }
         }

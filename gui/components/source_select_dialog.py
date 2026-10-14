@@ -117,7 +117,7 @@ class SourceSelectDialog(QDialog):
     def _build_list(self) -> None:
         """按类型分组列出所有源（含禁用源，可重新勾选启用）。"""
         sources = sorted(
-            self._manager.all(),
+            self._manager.all(include_adult=True),
             key=lambda s: (s.content_type, s.source_name or s.source_id),
         )
         current_type = None

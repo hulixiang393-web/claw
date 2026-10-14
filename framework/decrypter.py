@@ -79,10 +79,12 @@ class Decrypter:
         if strategy == "js_custom":
             return self._js_custom(cfg, content)
         if strategy == "zh_convert":
-            # 繁简转换（繁体源阅读界面显示简体）。cfg.to 指定目标（默认 zh-cn）。
+            # 繁简转换，cfg.to/cfg.locale 可选 zh-cn 或 zh-tw。
             from . import zh_convert
 
-            return zh_convert.convert(content, cfg.get("to") or cfg.get("locale") or "zh-cn")
+            return zh_convert.convert(
+                content, cfg.get("to") or cfg.get("locale") or "zh-cn"
+            )
         # 默认原样返回
         return content
 

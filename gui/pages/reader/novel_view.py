@@ -79,6 +79,7 @@ class NovelView(AutoScrollMixin, QWidget):
         self._base_font = self._clamp_font(round(17 * self._font_scale))
         self._reader_font_size = 0
         self._reader_font_family = "system"
+        self._reader_language = "zh-cn"
         self._line_spacing = 1.8
         self._content_width = 960
         self._paragraph_indent = True
@@ -152,6 +153,12 @@ class NovelView(AutoScrollMixin, QWidget):
         self.bg_btn.setToolTip("切换阅读背景色（白/米黄/护眼绿/夜间黑）")
         self.bg_btn.clicked.connect(self.background_cycle_requested.emit)
         toolbar.addWidget(self.bg_btn)
+
+        self.language_btn = QPushButton("简体")
+        self.language_btn.setToolTip("切换正文语言：简体中文 / 繁体中文")
+        self.language_btn.clicked.connect(self._toggle_reader_language)
+        self._sync_language_button()
+        toolbar.addWidget(self.language_btn)
 
         self.settings_btn = QToolButton()
         self.settings_btn.setText("⚙")
@@ -361,6 +368,8 @@ class NovelView(AutoScrollMixin, QWidget):
         self._reader_font_family = (
             family if family in self.READER_FONT_FAMILIES else "system"
         )
+        language = str(get("reader", "language", "zh-cn") or "zh-cn").lower()
+        self._reader_language = language if language in {"zh-cn", "zh-tw"} else "zh-cn"
         try:
             spacing = float(get("reader", "line_spacing", 1.8) or 1.8)
         except (TypeError, ValueError):
@@ -379,6 +388,7 @@ class NovelView(AutoScrollMixin, QWidget):
             return
         self._settings.set("reader", "font_size", self._reader_font_size)
         self._settings.set("reader", "font_family", self._reader_font_family)
+        self._settings.set("reader", "language", self._reader_language)
         self._settings.set("reader", "line_spacing", self._line_spacing)
         self._settings.set("reader", "content_width", self._content_width)
         self._settings.set("reader", "paragraph_indent", self._paragraph_indent)
@@ -533,13 +543,64 @@ class NovelView(AutoScrollMixin, QWidget):
         self._font_delta = 0
         self._base_font = self._clamp_font(round(17 * self._font_scale))
         self._reader_font_family = "system"
+        self._reader_language = "zh-cn"
         self._line_spacing = 1.8
         self._content_width = 960
         self._paragraph_indent = True
         self.set_show_images(True)
         self._apply_font()
         self._persist_reader_options()
+        self._sync_language_button()
         self._sync_settings_actions()
+
+    def _reader_convert_text(self, text: str) -> str:
+        """Convert display text without changing the cached source text."""
+        from framework.zh_convert import convert
+
+        return convert(str(text or ""), self._reader_language)
+
+    def _sync_language_button(self) -> None:
+        if not hasattr(self, "language_btn"):
+            return
+        label = "简体" if self._reader_language == "zh-cn" else "繁体"
+        target = "繁体中文" if self._reader_language == "zh-cn" else "简体中文"
+        self.language_btn.setText(label)
+        self.language_btn.setToolTip(f"当前：{label}，点击切换为{target}")
+
+    def _refresh_toc_language(self) -> None:
+        for index, chapter in enumerate(self._chapters):
+            title = self._reader_convert_text(getattr(chapter, "title", "") or f"第{index + 1}章")
+            if getattr(self._source, "source_id", "") == "bookstack":
+                if index < len(self._toc_items):
+                    self._toc_items[index].setText(0, title)
+            elif index < self.toc_list.count():
+                self.toc_list.item(index).setText(title)
+
+    def _set_reader_language(self, language: str) -> None:
+        language = str(language or "").lower()
+        if language not in {"zh-cn", "zh-tw"} or language == self._reader_language:
+            self._sync_language_button()
+            return
+        position, page = self.position_snapshot()
+        self._reader_language = language
+        self._persist_reader_options()
+        self._sync_language_button()
+        self._refresh_toc_language()
+        self._update_reader_header()
+        if not (0 <= self._current_idx < len(self._chapters)):
+            return
+        chapter = self._chapters[self._current_idx]
+        source_text = getattr(chapter, "_cached_text", "") or ""
+        if not source_text:
+            return
+        self._display_chapter(chapter, source_text)
+        if self._mode == "pager":
+            QTimer.singleShot(0, lambda p=page: self._pager_show_page(min(p or 0, self._page_count - 1)))
+        else:
+            QTimer.singleShot(0, lambda p=position: self._restore_scroll(p))
+
+    def _toggle_reader_language(self) -> None:
+        self._set_reader_language("zh-tw" if self._reader_language == "zh-cn" else "zh-cn")
 
     # ------------------------------------------------------------------ #
     def load(
@@ -559,6 +620,10 @@ class NovelView(AutoScrollMixin, QWidget):
         self._source = source
         self._detail = detail
         self._chapters = detail.chapters
+        self.language_btn.setEnabled(
+            getattr(source, "content_type", "novel") == "novel"
+            and getattr(source, "source_id", "") != "bookstack"
+        )
         self._current_idx = -1
         self._update_reader_header()
         self._restore_generation += 1
@@ -694,7 +759,8 @@ class NovelView(AutoScrollMixin, QWidget):
         from framework.content import chapter_label
         label = chapter_label(ch.title) or f"第{self._current_idx + 1}章"
         self._update_reader_header(ch, label)
-        full = f"【{label}】\n\n{text}"
+        display_text = self._prepare_reader_body(ch, text)
+        full = f"【{self._reader_convert_text(label)}】\n\n{display_text}"
         self._current_chapter_url = ch.url
         rich = getattr(ch, "_cached_rich_content", None)
         self._clear_images()
@@ -746,7 +812,10 @@ class NovelView(AutoScrollMixin, QWidget):
             for fragment in fragments:
                 if fragment.get("type") == "text":
                     segment = QLabel(
-                        self._format_reader_text(str(fragment.get("text") or ""), has_title=False)
+                        self._format_reader_text(
+                            self._reader_convert_text(str(fragment.get("text") or "")),
+                            has_title=False,
+                        )
                     )
                     segment.setObjectName("readerBody")
                     segment.setWordWrap(True)
@@ -1343,6 +1412,9 @@ class NovelView(AutoScrollMixin, QWidget):
         if getattr(self._source, "source_id", "") == "qk17":
             widget.setText(self._qk17_reader_html(text, has_title=has_title))
             return
+        if getattr(self._source, "source_id", "") == "timotxt":
+            widget.setText(self._timotxt_reader_html(text, has_title=has_title))
+            return
         text = self._format_reader_text(text, has_title=has_title)
         if not self._rich_text_enabled():
             # 调字号/背景只改样式时，避免再次复制整章正文。
@@ -1360,6 +1432,11 @@ class NovelView(AutoScrollMixin, QWidget):
     def _format_reader_text(self, text: str, has_title: bool = True) -> str:
         """Normalize fetched leading whitespace and apply one two-character indent."""
         lines = str(text or "").split("\n")
+        if getattr(self._source, "source_id", "") == "timotxt":
+            lines = [
+                line for line in lines
+                if not re.fullmatch(r"[_=\-]{4,}", line.strip())
+            ]
         out = []
         for index, line in enumerate(lines):
             stripped = line.lstrip(" \t　")
@@ -1367,6 +1444,51 @@ class NovelView(AutoScrollMixin, QWidget):
                 stripped = "　　" + stripped
             out.append(stripped)
         return "\n".join(out)
+
+    def _prepare_reader_body(self, chapter, text: str) -> str:
+        """Normalize TimoTXT's one-line-per-paragraph response for display."""
+        converted = self._reader_convert_text(text)
+        if getattr(self._source, "source_id", "") != "timotxt":
+            return converted
+        lines = str(converted or "").splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        chapter_title = self._reader_convert_text(getattr(chapter, "title", "") or "")
+        first = lines[0].strip() if lines else ""
+        if chapter_title and first == chapter_title.strip():
+            lines.pop(0)
+        elif lines and re.match(r"^第\s*\d+\s*章(?:\s|$)", first):
+            lines.pop(0)
+        lines = [
+            line for line in lines
+            if not re.fullmatch(r"[_=\-]{4,}", line.strip())
+        ]
+        return "\n".join(lines)
+
+    def _timotxt_reader_html(self, text: str, has_title: bool = True) -> str:
+        """Render TimoTXT paragraphs with deliberate spacing and line height."""
+        lines = self._format_reader_text(text, has_title=has_title).splitlines()
+        blocks = []
+        size = self._clamp_font(self._base_font + self._font_delta)
+        family = escape(self.READER_FONT_FAMILIES[self._reader_font_family][1], quote=True)
+        line_height = self._line_spacing if self._line_spacing != 1.8 else 2.0
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            content = escape(line)
+            if has_title and index == 0:
+                blocks.append(f'<div class="chapter-marker">{content}</div>')
+            else:
+                blocks.append(
+                    f'<p style="margin:0 0 0.95em 0; line-height:{line_height};">'
+                    f"{content}</p>"
+                )
+        return (
+            f'<div style="font-family:{family}; font-size:{size}px; '
+            f'line-height:{line_height}; white-space:pre-wrap;">'
+            + "".join(blocks)
+            + "</div>"
+        )
 
     def _apply_font(self) -> None:
         if not hasattr(self, "text") or not hasattr(self, "paged_label"):
@@ -1504,16 +1626,18 @@ class NovelView(AutoScrollMixin, QWidget):
     def _update_reader_header(self, chapter=None, label: str = "") -> None:
         """Update the fixed reader header without rebuilding the reading body."""
         detail_title = getattr(self._detail, "title", "") if self._detail is not None else ""
+        detail_title = self._reader_convert_text(detail_title)
         self.book_title_label.setText(str(detail_title or "未命名作品"))
         self.book_title_label.setToolTip(str(detail_title or ""))
         if chapter is None and 0 <= self._current_idx < len(self._chapters):
             chapter = self._chapters[self._current_idx]
         chapter_title = str(getattr(chapter, "title", "") or "") if chapter is not None else ""
+        chapter_title = self._reader_convert_text(chapter_title)
         if not label:
             from framework.content import chapter_label
 
             label = chapter_label(chapter_title) if chapter_title else ""
-        display = chapter_title or label or (
+        display = chapter_title or self._reader_convert_text(label) or (
             f"第{self._current_idx + 1}章" if self._current_idx >= 0 else ""
         )
         self.chapter_title_label.setText(f"当前章节：{display}" if display else "")

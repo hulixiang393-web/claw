@@ -477,6 +477,15 @@ class Discovery:
                     source_name=source.source_name,
                 )
             )
+        # 部分 SSR 首页把多个内容区一次性输出（18AV 当前每页约 120 条），
+        # 首屏全部建卡和排队封面会拖慢发现页。源可声明 page_item_limit，
+        # 后续页仍按滚动懒加载，不改变其他源默认行为。
+        try:
+            page_item_limit = int(works_list_item.get("page_item_limit") or 0)
+        except (TypeError, ValueError):
+            page_item_limit = 0
+        if page_item_limit > 0:
+            works = works[:page_item_limit]
         # 封面加密站（18mh 类 AES 解密）或需 Playwright 渲染的源：
         # 不再同步解密封面（阻塞列表返回），改为标记，由 GUI 层异步恢复
         # （discover_page._start_cover_recovery），列表秒开、封面后补。

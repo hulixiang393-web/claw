@@ -5,19 +5,17 @@
   "$name": "TimoTXT",
   "$enabled": true,
   "$weight": 1.0,
+  "detail_cache_version": 2,
+  "chapter_cache_version": 3,
   "$metadata": {
     "homepage": "https://www.timotxt.com/",
-    "description": "TimoTXT 免费小说站。站点启用 Cloudflare 防护，发现、搜索、详情和正文统一使用 Playwright；正文繁体自动转换为简体。",
+    "description": "TimoTXT 免费小说站。优先 HTTP/代理，必要时回退 Playwright；正文繁体自动转换为简体。",
     "icon": "https://www.timotxt.com/favicon.ico",
     "lang": "zh-CN",
     "region": "tw",
-    "tags": [
-      "小说",
-      "免费",
-      "简体转换",
-      "Playwright"
-    ],
-    "last_verified": "2026-10-12"
+    "tags": ["小说", "免费", "简体转换", "HTTP优先"],
+    "last_verified": "2026-10-12",
+    "adult": false
   },
   "transports": {
     "base_url": "https://www.timotxt.com",
@@ -35,16 +33,20 @@
   "endpoints": {
     "discovery": {
       "list_url": "/",
-      "render": "playwright",
+      "render": "playwright_fallback",
       "render_config": {
         "wait_for": "ul.flex.list > li",
         "wait_until": "domcontentloaded",
-        "timeout_ms": 45000,
-        "extra_delay_ms": 300
+        "timeout_ms": 12000,
+        "extra_delay_ms": 0,
+        "http_probe": "ul.flex.list > li"
       },
       "list_item": {
         "categories": [
-          { "title": "最新小说", "url": "/" }
+          {
+            "title": "最新小说",
+            "url": "/"
+          }
         ]
       },
       "works_list_item": {
@@ -61,69 +63,127 @@
           },
           "cover": {
             "fallback": [
-              { "css": "img", "attr": "data-src" },
-              { "css": "img", "attr": "data-original" },
-              { "css": "img", "attr": "src" }
+              {
+                "css": "img",
+                "attr": "data-src"
+              },
+              {
+                "css": "img",
+                "attr": "data-original"
+              },
+              {
+                "css": "img",
+                "attr": "src"
+              }
             ]
           },
           "author": {
             "css": "p.author"
           }
         }
+      },
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 20
       }
     },
     "search": {
       "base_url": "/",
       "method": "GET",
       "keyword_param": "keyword",
-      "render": "playwright",
+      "render": "playwright_fallback",
       "item": {
         "root_selector": {
-          "css": "ul.flex.list > li"
+          "css": "ul.list.flex > li.row"
+        },
+        "fields": {
+          "title": {"css": "h3 a"},
+          "url": {"css": "h3 a", "attr": "href"},
+          "cover": {"fallback": [
+            {"css": "img", "attr": "data-src"},
+            {"css": "img", "attr": "data-original"},
+            {"css": "img", "attr": "src"}
+          ]},
+          "author": {"css": "span.author"}
         },
         "render_config": {
-          "interact": true,
-          "home_url": "https://www.timotxt.com/",
-          "input_selector": "input[name='searchkey'], input[name='keyword'], input[type='search']",
+          "wait_for": "ul.list.flex > li.row",
           "wait_until": "domcontentloaded",
-          "timeout_ms": 45000,
-          "extra_delay_ms": 300,
+          "timeout_ms": 12000,
+          "extra_delay_ms": 0,
           "filter_keyword": true
         }
-      }
+      },
+      "paginator": {"url_template": "/search/{keyword}"}
     },
     "detail": {
-      "render": "playwright",
+      "render": "playwright_fallback",
       "render_config": {
-        "wait_for": "body#read, #chapterWarp",
+        "wait_for": ".detail, .chaplist",
         "wait_until": "domcontentloaded",
-        "timeout_ms": 45000,
-        "extra_delay_ms": 300
+        "timeout_ms": 12000,
+        "extra_delay_ms": 0,
+        "http_probe": ".detail, .chaplist"
       },
       "fields": {
         "title": {
           "fallback": [
-            { "css": "h1.book-title" },
-            { "css": "h1.imgtext" },
-            { "css": "title" }
+            {
+              "css": "h1.title"
+            },
+            {
+              "css": "h1.book-title"
+            },
+            {
+              "css": "h1.imgtext"
+            },
+            {
+              "css": "title"
+            }
           ]
         },
         "author": {
           "fallback": [
-            { "css": "p.author" },
-            { "css": ".author" }
+            {
+              "css": ".col.info .author"
+            },
+            {
+              "css": "p.author"
+            },
+            {
+              "css": ".author"
+            }
           ]
         },
         "cover": {
           "fallback": [
-            { "css": ".book-cover img", "attr": "src" },
-            { "css": "meta[property='og:image']", "attr": "content" }
+            {
+              "css": ".col.cover img",
+              "attr": "src"
+            },
+            {
+              "css": ".book-cover img",
+              "attr": "src"
+            },
+            {
+              "css": "meta[property='og:image']",
+              "attr": "content"
+            }
           ]
         },
         "summary": {
           "fallback": [
-            { "css": ".book-intro" },
-            { "css": "meta[name='description']", "attr": "content" }
+            {
+              "css": ".col.info .mod"
+            },
+            {
+              "css": ".book-intro"
+            },
+            {
+              "css": "meta[name='description']",
+              "attr": "content"
+            }
           ]
         },
         "tags": {
@@ -137,9 +197,12 @@
           "enabled": false
         },
         "list": {
+          "chapters_url": "/{id}/dir",
+          "chapters_id_regex": "/(\\d{10})/",
           "chapter_order": "asc",
+          "dedupe_titles": false,
           "root_selector": {
-            "css": "a[href$='.html']"
+            "css": ".chaplist > ul.all a"
           },
           "fields": {
             "title": {
@@ -153,36 +216,75 @@
         },
         "body": {
           "selector": {
-            "css": "div.chapter-content div.content"
+            "css": "#chapterWarp .chapter-content .content > p"
+          },
+          "image_selector": {
+            "css": "#chapterWarp .chapter-content .content > p, #chapterWarp .chapter-content .content > figure"
           },
           "render": "playwright",
           "render_config": {
-            "wait_for": "body#read, #chapterWarp, div.chapter-content div.content",
+            "wait_for": "#chapterWarp .chapter-content .content",
             "wait_until": "domcontentloaded",
-            "timeout_ms": 45000,
-            "extra_delay_ms": 300
+            "timeout_ms": 12000,
+            "extra_delay_ms": 0,
+            "api_content": {
+              "url": "/chapter/transcode.html?bid={book_id}&cid={chapter_id}&sid=0",
+              "response_field": "content",
+              "selector": "#chapterWarp .chapter-content .content"
+            }
           }
         }
       }
     }
   },
   "constraints": {
-    "search": { "max_pages": 1, "max_results": 30 },
-    "detail": { "max_pages": 1 },
-    "chapter": { "max_pages": 100, "max_items": 5000 }
+    "search": {
+      "max_pages": 1,
+      "max_results": 30
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 100,
+      "max_items": 5000
+    }
   },
   "decryption": {
     "targets": {
-      "title": { "strategy": "zh_convert", "to": "zh-cn" },
-      "search_title": { "strategy": "zh_convert", "to": "zh-cn" },
-      "author": { "strategy": "zh_convert", "to": "zh-cn" },
-      "search_author": { "strategy": "zh_convert", "to": "zh-cn" },
-      "chapter": { "strategy": "zh_convert", "to": "zh-cn" },
-      "content": { "strategy": "zh_convert", "to": "zh-cn" },
-      "summary": { "strategy": "zh_convert", "to": "zh-cn" }
+      "title": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "search_title": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "author": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "search_author": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "summary": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "content": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      },
+      "chapter": {
+        "strategy": "zh_convert",
+        "to": "zh-cn"
+      }
     }
   },
   "diagnostics": {
-    "selfcheck": { "strategy": "off" }
+    "selfcheck": {
+      "strategy": "off"
+    }
   }
 }

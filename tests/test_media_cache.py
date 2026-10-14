@@ -614,6 +614,32 @@ def test_hls_segments_cached(source, proxy_ctx):
         assert _FakeSource.hits.get(f"/hls/seg{i}.ts", 0) == c_hits[f"/hls/seg{i}.ts"]
 
 
+def test_hls_cached_segment_query_stays_after_media_extension(source, proxy_ctx):
+    """Signed HLS segments must remain `.ts?token`, not `.ts%3Ftoken`.
+
+    FFmpeg/VLC validate the segment extension before requesting it; encoding
+    the query separator into the path makes the same URL fail in a player even
+    though requests can still fetch it.
+    """
+    proxy, cache = proxy_ctx
+    manifest = _url(source, "/hls/index.m3u8")
+    cache_key = cache.key_of(manifest)
+    cache.mark_hls(cache_key, 0)
+    proxy._register_cache_ctx(cache_key, manifest, {}, None)
+    proxy._ensure_server()
+
+    local = proxy._rewrite_cache_or_token(
+        "/hls/seg0.ts?auth_key=test",
+        manifest,
+        {},
+        None,
+        True,
+        cache_key,
+    )
+    assert "/seg0.ts?auth_key=test" in local
+    assert "%3F" not in local
+
+
 def _abs(server, path):
     if path.startswith("http"):
         return path

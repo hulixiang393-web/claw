@@ -61,3 +61,32 @@ def test_reader_mode_menu_and_toolbar_stay_in_sync(_qapp):
     assert view._mode_actions["scroll"].isChecked()
     assert view.mode_btn.text() == "翻页模式"
     view.deleteLater()
+
+
+def test_reader_language_button_toggles_and_persists(_qapp, tmp_path):
+    settings = SettingsManager(tmp_path / "settings.json")
+    view = NovelView(object(), settings=settings)
+
+    assert view._reader_language == "zh-cn"
+    assert view.language_btn.text() == "简体"
+
+    view._set_reader_language("zh-tw")
+
+    assert view._reader_language == "zh-tw"
+    assert view.language_btn.text() == "繁体"
+    saved = SettingsManager(tmp_path / "settings.json")
+    assert saved.get("reader", "language") == "zh-tw"
+    view.deleteLater()
+
+
+def test_reader_language_conversion_does_not_change_cached_text(_qapp):
+    view = NovelView(object())
+    source = "繁體小說內容：這是一段測試文字。"
+
+    view._reader_language = "zh-cn"
+    simplified = view._reader_convert_text(source)
+    view._reader_language = "zh-tw"
+
+    assert simplified == "繁体小说内容：这是一段测试文字。"
+    assert view._reader_convert_text(simplified) == source
+    view.deleteLater()

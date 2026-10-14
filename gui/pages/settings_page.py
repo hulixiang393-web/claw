@@ -385,7 +385,7 @@ class SettingsPage(BasePage):
     def _build_content(self) -> None:
         sec = _Section()
         self._content_adult = sec._check(
-            "显示 18+ 内容源", "show_adult_sources", "关闭后成人源在发现/搜索/源管理中隐藏"
+            "显示 18+ 内容源", "show_adult_sources", "关闭后成人源在发现和搜索中隐藏；源管理仍可编辑标记"
         )
         self.tabs.addTab(sec, "内容")
 

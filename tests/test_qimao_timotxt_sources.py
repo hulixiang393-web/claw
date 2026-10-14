@@ -6,6 +6,7 @@ from pathlib import Path
 from framework.config import SourceConfig
 from framework.content import Content
 from framework.parser import Parser
+from framework.source_manager import SourceManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,14 +68,72 @@ def test_qimao_api_directory_builds_ordered_chapter_urls():
     ]
 
 
-def test_timotxt_uses_rendered_pages_and_simplified_chinese():
+def test_timotxt_prefers_http_and_falls_back_to_rendered_pages():
     source = _source("timotxt")
-    assert source.raw["endpoints"]["discovery"]["render"] == "playwright"
-    assert source.raw["endpoints"]["detail"]["render"] == "playwright"
+    assert source.raw["endpoints"]["discovery"]["render"] == "playwright_fallback"
+    assert source.raw["endpoints"]["search"]["render"] == "playwright_fallback"
+    assert source.raw["endpoints"]["detail"]["render"] == "playwright_fallback"
+    assert source.raw["endpoints"]["content"]["chapter"]["list"]["chapters_url"] == "/{id}/dir"
+    assert source.raw["endpoints"]["content"]["chapter"]["list"]["dedupe_titles"] is False
+    detail = source.raw["endpoints"]["detail"]["fields"]
+    assert detail["title"]["fallback"][0]["css"] == "h1.title"
+    assert detail["cover"]["fallback"][0]["css"] == ".col.cover img"
     body = source.raw["endpoints"]["content"]["chapter"]["body"]
     assert body["render"] == "playwright"
-    assert body["selector"]["css"] == "div.chapter-content div.content"
+    assert body["selector"]["css"] == "#chapterWarp .chapter-content .content > p"
+    assert body["image_selector"]["css"].endswith("> figure")
+    assert body["render_config"]["api_content"] == {
+        "url": "/chapter/transcode.html?bid={book_id}&cid={chapter_id}&sid=0",
+        "response_field": "content",
+        "selector": "#chapterWarp .chapter-content .content",
+    }
     assert source.raw["decryption"]["targets"]["content"]["to"] == "zh-cn"
+
+
+def test_timotxt_search_uses_site_search_path():
+    source = _source("timotxt")
+    search = source.raw["endpoints"]["search"]
+    assert search["paginator"]["url_template"] == "/search/{keyword}"
+    assert search["item"]["render_config"]["wait_for"] == "ul.list.flex > li.row"
+
+
+def test_timotxt_conversion_is_configured_for_cached_content_invalidation():
+    source = _source("timotxt")
+    assert source.raw["detail_cache_version"] == 2
+    assert source.raw["chapter_cache_version"] == 3
+    assert source.raw["decryption"]["targets"]["content"]["strategy"] == "zh_convert"
+
+
+def test_timotxt_supports_both_conversion_directions():
+    from framework.decrypter import Decrypter
+    from framework.zh_convert import to_simplified, to_traditional
+
+    traditional = "繁體小說內容：這是一段測試文字。"
+    simplified = to_simplified(traditional)
+    assert simplified == "繁体小说内容：这是一段测试文字。"
+    assert to_traditional(simplified) == traditional
+
+    class _Http:
+        defaults = type("D", (), {"timeout": 10, "retries": 0, "interval_ms": 0})()
+
+    source = _source("timotxt")
+    assert Decrypter(_Http()).decrypt(
+        source, traditional, target="content"
+    ) == simplified
+
+
+def test_adult_metadata_string_false_is_not_filtered():
+    raw = {
+        "$id": "timo", "$type": "novel", "$name": "Timo",
+        "$metadata": {"adult": "false"},
+        "transports": {"base_url": "https://example.com"},
+    }
+    source = SourceConfig.from_dict(raw)
+    assert source.adult is False
+    manager = SourceManager()
+    manager.add(source)
+    manager.set_adult_visible(False)
+    assert [item.source_id for item in manager.all()] == ["timo"]
 
 
 def test_chapter_directory_pagination_expands_before_sorting():
@@ -169,3 +228,43 @@ def test_chapter_body_uses_content_conversion_target_when_configured():
     assert text == "简体正文"
     assert next_url == ""
     assert decrypter.targets == ["content"]
+
+
+def test_timotxt_chapter_body_uses_configured_conversion():
+    from framework.decrypter import Decrypter
+
+    class _Parser:
+        def parse(self, html):
+            return html
+
+        def extract(self, doc, selector):
+            return ["繁體正文：這是一段測試文字。"]
+
+        def extract_first(self, doc, selector, base_url=""):
+            return ""
+
+    class _Http:
+        defaults = type("D", (), {"timeout": 10, "retries": 0, "interval_ms": 0})()
+
+        def get_text(self, url, **kwargs):
+            return "<p>繁體正文：這是一段測試文字。</p>"
+
+    raw = {
+        "$id": "verified-convert", "$type": "novel", "$name": "Verified",
+        "transports": {"base_url": "https://example.com"},
+        "endpoints": {"content": {"chapter": {
+            "body": {"selector": {"css": ".content"}},
+        }}},
+        "decryption": {"targets": {
+            "content": {
+                "strategy": "zh_convert", "to": "zh-cn",
+            },
+        }},
+    }
+    source = SourceConfig.from_dict(raw, "<verified-convert>")
+    content = Content(_Http(), _Parser(), object(), Decrypter(_Http()))
+    text, next_url = content._fetch_chapter_page(source, "/chapter/1", pag_enabled=False)
+
+    assert next_url == ""
+    assert "繁體" not in text
+    assert "這是" not in text

@@ -354,7 +354,17 @@ class ContentBase:
                 self._detail_html_cache[key] = (time.time() + self._detail_html_ttl, cached)
                 return cached
         detail_cfg = source.get_detail_config()
-        if detail_cfg.get("render") == "playwright":
+        render_mode = detail_cfg.get("render")
+        if render_mode == "playwright_fallback":
+            render_cfg = detail_cfg.get("render_config") or {}
+            try:
+                html = self._get(source, url, deadline=deadline, context=context)
+                probe = render_cfg.get("http_probe")
+                if probe and not self._parser.extract(self._parser.parse(html), {"css": probe}):
+                    raise ContentMissingError("HTTP 详情页未命中结构", source_id=source.source_id)
+            except Exception:
+                html = self._fetch_rendered_html(source, url, render_cfg)
+        elif render_mode == "playwright":
             html = self._fetch_rendered_html(
                 source, url, detail_cfg.get("render_config") or {}
             )

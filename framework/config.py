@@ -43,6 +43,20 @@ def _safe_weight(val) -> float:
         return 1.0
 
 
+def as_bool(value, default: bool = False) -> bool:
+    """Parse JSON/UI boolean values without treating ``"false"`` as true."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off", ""}:
+            return False
+        return default
+    if value is None:
+        return default
+    return bool(value)
+
+
 @dataclass
 class SourceConfig:
     """一个数据源（对应一份 sources/*.json）。"""
@@ -98,7 +112,7 @@ class SourceConfig:
             icon=str(meta.get("icon") or ""),
             description=str(meta.get("description") or ""),
             tags=list(meta.get("tags") or []),
-            adult=bool(meta.get("adult", False)),
+            adult=as_bool(meta.get("adult", False)),
             raw=data,
             source_path=path,
         )

@@ -248,10 +248,11 @@ class StreamResolver:
     def _resolve_uncached(self, source, episode_url, quality, merged, context, key,
                           source_lock=False):
         context.check()
-        direct = self._direct_candidates(episode_url)
+        normalize_urls = getattr(source, "source_id", "") == "51cg1"
+        direct = self._direct_candidates(episode_url, normalize_urls=normalize_urls)
         if direct:
             context.check()
-            return self._normalize_candidate(direct[0])
+            return self._normalize_candidate(direct[0], normalize_urls=normalize_urls)
         candidates = self._load_candidates(
             source, episode_url, quality, merged, context, key, source_lock
         )
@@ -259,7 +260,7 @@ class StreamResolver:
         unique = []
         seen = set()
         for candidate in candidates:
-            candidate_key = self._candidate_key(candidate)
+            candidate_key = self._candidate_key(candidate, normalize_urls=normalize_urls)
             if candidate_key in seen:
                 continue
             seen.add(candidate_key)
@@ -268,7 +269,9 @@ class StreamResolver:
                 break
         for candidate in unique:
             context.check()
-            pair = self._resolve_candidate(candidate, context, key)
+            pair = self._resolve_candidate(
+                candidate, context, key, normalize_urls=normalize_urls
+            )
             if pair is not None:
                 context.check()
                 return pair
@@ -288,7 +291,7 @@ class StreamResolver:
                 context.check()
                 return True
 
-    def _resolve_candidate(self, candidate, context, key):
+    def _resolve_candidate(self, candidate, context, key, normalize_urls=False):
         timeout = self._candidate_timeout
         if isinstance(candidate, dict) and callable(candidate.get("resolver")):
             if candidate.get("budget") == "pipeline":
@@ -329,15 +332,15 @@ class StreamResolver:
                 return None
             context.check()
             candidate = result[0] if result else None
-        return self._normalize_candidate(candidate)
+        return self._normalize_candidate(candidate, normalize_urls=normalize_urls)
 
     @staticmethod
-    def _candidate_key(candidate):
+    def _candidate_key(candidate, normalize_urls=False):
         if isinstance(candidate, dict) and callable(candidate.get("resolver")):
             return ("callback", id(candidate["resolver"]), candidate.get("budget"))
         if callable(candidate):
             return ("callback", id(candidate))
-        pair = StreamResolver._normalize_candidate(candidate)
+        pair = StreamResolver._normalize_candidate(candidate, normalize_urls=normalize_urls)
         return ("value", pair)
 
     def _load_candidates(self, source, episode_url, quality, merged, context, key,
@@ -394,22 +397,37 @@ class StreamResolver:
         return result
 
     @staticmethod
-    def _normalize_candidate(candidate):
+    def _normalize_candidate(candidate, normalize_urls=False):
+        def normalize(value):
+            return StreamResolver._normalize_url(value) if normalize_urls else value
+
         if isinstance(candidate, str):
-            return candidate, ""
+            return normalize(candidate), ""
         if isinstance(candidate, (tuple, list)) and candidate:
-            video = candidate[0] or ""
-            audio = candidate[1] if len(candidate) > 1 else ""
+            video = normalize(candidate[0] or "")
+            audio = normalize(candidate[1] if len(candidate) > 1 else "")
             return video, audio or ""
         if isinstance(candidate, dict):
-            return candidate.get("video", "") or "", candidate.get("audio", "") or ""
+            return (
+                normalize(candidate.get("video", "") or ""),
+                normalize(candidate.get("audio", "") or ""),
+            )
         return None
 
     @staticmethod
-    def _direct_candidates(url):
+    def _direct_candidates(url, normalize_urls=False):
+        if normalize_urls:
+            url = StreamResolver._normalize_url(url)
         path = urlsplit(url).path.lower()
         suffixes = (".m3u8", ".mpd", ".mp4", ".flv", ".webm", ".mkv", ".mov", ".ts", ".m4a")
         return [(url, "")] if path.endswith(suffixes) else []
+
+    @staticmethod
+    def _normalize_url(value):
+        """Restore URLs embedded in JSON/HTML attributes before media use."""
+        if not isinstance(value, str):
+            return value
+        return value.replace("\\\\/", "/").replace("\\/", "/").replace('\\"', '"')
 
 
 def stream_resolver_defaults(settings_manager=None) -> dict:

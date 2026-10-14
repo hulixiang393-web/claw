@@ -245,7 +245,7 @@ class ChapterMixin:
                     existing.title = title
                 continue
             title_key = _re.sub(r"\s+", " ", title.strip().lower())
-            if title_key and title_key in seen_title:
+            if list_cfg.get("dedupe_titles", True) and title_key and title_key in seen_title:
                 continue
             if title_key:
                 seen_title.add(title_key)
@@ -771,6 +771,15 @@ class ChapterMixin:
         if api_cfg:
             api_text = self._fetch_chapter_api_text(source, url, api_cfg)
             html = api_text
+        elif body.get("render") == "playwright_fallback":
+            render_cfg = body.get("render_config") or {}
+            try:
+                html = self._get(source, url)
+                probe = render_cfg.get("http_probe")
+                if probe and not self._parser.extract(self._parser.parse(html), {"css": probe}):
+                    raise ContentMissingError("HTTP 正文页未命中结构", source_id=source.source_id)
+            except Exception:
+                html = self._fetch_rendered_html(source, url, render_cfg)
         elif body.get("render") == "playwright":
             html = self._fetch_rendered_html(source, url, body.get("render_config") or {})
         else:
@@ -797,7 +806,11 @@ class ChapterMixin:
             if nxt:
                 nxt = self._abs_url(source, nxt)
 
-        image_entries = self._extract_body_fragments(source, url, doc, selector) if include_images else []
+        image_selector = body.get("image_selector") or selector
+        image_entries = (
+            self._extract_body_fragments(source, url, doc, image_selector)
+            if include_images else []
+        )
 
         if not selector:
             raise ContentMissingError("源未配置正文选择器", source_id=source.source_id)
@@ -912,6 +925,7 @@ class ChapterMixin:
             cookies=cookies or None,
             referer=referer,
             headers=browser_headers,
+            api_content=render_config.get("api_content"),
         )
         if not rendered:
             raise ContentMissingError(

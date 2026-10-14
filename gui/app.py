@@ -90,7 +90,7 @@ class _BootstrapSourceManager:
     任何写操作（set_event_bus 等）都是无副作用的空实现。
     """
 
-    def all(self):
+    def all(self, include_adult=False):
         return []
 
     def list_broken(self):
@@ -1404,7 +1404,17 @@ class MainWindow(QMainWindow):
         self.library_page.download_requested.connect(self._download_from_shelf)
         # 点本地视频书 → 弹集选择播本地 mp4（离线）
         self.library_page.play_local_video_requested.connect(self._play_local_video)
+        self.library_page.cards_ready.connect(self._on_library_cards_ready)
         return self.library_page
+
+    def _on_library_cards_ready(self) -> None:
+        """Only construct search after the shelf has painted its first cards."""
+        if self._runtime_state != "READY":
+            return
+        idx = self._tab_index.get("search")
+        if idx is None or idx not in range(self.tabs.count()):
+            return
+        QTimer.singleShot(0, lambda: self._ensure_tab_page(idx))
 
     def _backfill_favorite_covers(self, recs) -> None:
         """书架渲染后：对封面无效的收藏记录后台补详情封面（失败静默，不阻塞书架）。

@@ -25,6 +25,12 @@ class MergePaused(RuntimeError):
 
 def _find_ffmpeg() -> str:
     """定位 ffmpeg 可执行文件（PATH 或常见安装路径）。"""
+    from .runtime import configure_runtime_environment, find_bundled_tool
+
+    configure_runtime_environment()
+    bundled = find_bundled_tool("ffmpeg", "ffmpeg.exe")
+    if bundled:
+        return bundled
     path = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if path:
         return path

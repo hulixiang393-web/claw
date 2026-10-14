@@ -66,3 +66,24 @@ def test_qk17_reader_renders_each_line_as_a_paragraph(_qapp):
     assert "第二段" in html
     assert "chapter-marker" in html
     view.deleteLater()
+
+
+def test_timotxt_reader_removes_separator_and_uses_paragraph_layout(_qapp):
+    view = NovelView(object())
+    view._source = SimpleNamespace(source_id="timotxt")
+    chapter = SimpleNamespace(title="第一章")
+    body = view._prepare_reader_body(
+        chapter, "第一章\n_______________\n第一段\n第二段"
+    )
+    assert body == "第一段\n第二段"
+
+    view._set_reader_text(
+        view.text,
+        f"【第一章】\n\n{body}",
+    )
+
+    html = view.text.text()
+    assert "_______________" not in html
+    assert html.count("<p ") == 2
+    assert "line-height:2.0" in html
+    view.deleteLater()

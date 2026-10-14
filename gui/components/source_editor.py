@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 from gui.components.editor_grids import KeyValueGrid, SelectorGrid
 from gui.components import source_presets
 
-from framework.config import SourceConfig, load_source, ConfigError
+from framework.config import SourceConfig, as_bool, load_source, ConfigError
 
 # 内容类型与对应正文块名
 TYPE_CONTENT_BLOCK = {
@@ -1707,7 +1707,7 @@ class SourceEditor(QDialog):
         self._f_icon.setText(_deep_get(raw, "$metadata.icon", ""))
         self._f_lang.setText(_deep_get(raw, "$metadata.lang", ""))
         self._f_region.setText(_deep_get(raw, "$metadata.region", ""))
-        self._f_adult.setChecked(bool(_deep_get(raw, "$metadata.adult", False)))
+        self._f_adult.setChecked(as_bool(_deep_get(raw, "$metadata.adult", False)))
         self._f_weight.setValue(float(_deep_get(raw, "$weight", 1.0)))
 
         # 网络

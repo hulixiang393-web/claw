@@ -99,10 +99,17 @@ def test_render_recovery_is_age_opt_in(source, monkeypatch, source_id, opt_in):
                         lambda *a, **k: calls.append(k) or "https://cdn/video.m3u8")
     assert content.fetch_video_episode(source, "/play/20190042/2/1", source_lock=True) == "https://cdn/video.m3u8"
     assert len(calls) == 1
-    if source_id == "agedm" and opt_in:
-        assert calls[0]["recover_navigation_timeout"] is True
+    if source_id == "agedm":
+        if opt_in:
+            assert calls[0]["recover_navigation_timeout"] is True
+        else:
+            assert "recover_navigation_timeout" not in calls[0]
+        assert calls[0]["referer"] == "https://www.agedm.io/play/20190042/2/1"
+        assert calls[0]["capture_media_responses"] is True
     else:
         assert "recover_navigation_timeout" not in calls[0]
+        assert calls[0]["referer"] == ""
+        assert calls[0]["capture_media_responses"] is False
 
 
 def test_age_config_opts_into_pipeline_budget(source):
@@ -130,3 +137,5 @@ def test_age_render_uses_bounded_commit_wait(source, monkeypatch):
     assert options["extra_delay_ms"] == 12000
     assert options["slow_fallback_rounds"] == 0
     assert options["recover_navigation_timeout"] is True
+    assert options["referer"] == "https://www.agedm.io/play/20190042/2/1"
+    assert options["capture_media_responses"] is True

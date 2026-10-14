@@ -214,9 +214,13 @@ class VideoMixin:
         # 且此类 URL 被当前置 HTML 解析会误抓二进制/列表文本。仅无
         # api_endpoints.episode 的源生效（episode API 源的分集 URL 是内容页）。
         api = source.raw.get("api_endpoints") or {}
-        if not api.get("episode") and self._looks_like_direct_media(episode_url):
-            # 页面内嵌 JSON 常把 URL 写成 `https:\/\/...`，交给播放器前还原。
-            return episode_url.replace("\\/", "/")
+        if not api.get("episode"):
+            direct_url = episode_url
+            if source.source_id == "51cg1":
+                # 51cg1 页面内嵌 JSON 常把 URL 写成 `https:\/\/...`，仅该源还原。
+                direct_url = str(episode_url or "").replace("\\/", "/").replace('\\"', '"')
+            if self._looks_like_direct_media(direct_url):
+                return direct_url
         # JSON API 播放地址（api_endpoints.episode）
         episode_api = api.get("episode") or {}
         if episode_api:
@@ -271,6 +275,13 @@ class VideoMixin:
         play_cfg = block.get("play_url") or {}
         switch_cfg = block.get("source_switch") or {}
 
+        # 18AV 的主播放器参数只在浏览器执行 content_mv_protect.js 后写入
+        # mvarr；详情页里的 video[data-src] 是 9 秒预览，不能作为主流。
+        if source.source_id == "18av":
+            return self._fetch_18av_player_stream(
+                source, episode_url, deadline=deadline, context=context
+            )
+
         # Playwright 渲染播放页 → iframe 解析站 → video src（agedm 类嵌套 iframe 站）。
         # 渲染分支不消费播放页 HTML：URL 交给 Playwright 即可，跳过此前的纯 HTTP
         # 抓取（同 URL 会抓两次，实测 dm84 每次多耗 1.6-1.9s）。
@@ -290,7 +301,8 @@ class VideoMixin:
                     raise ContentMissingError("未获取到播放 iframe", source_id=source.source_id)
                 render_url = iframe_url
             recovery_options = {}
-            if source.source_id == "agedm" and rc.get("recover_navigation_timeout") is True:
+            is_agedm = source.source_id == "agedm"
+            if is_agedm and rc.get("recover_navigation_timeout") is True:
                 recovery_options["recover_navigation_timeout"] = True
             vurl = fetch_rendered_video_sync(
                 render_url,
@@ -299,6 +311,8 @@ class VideoMixin:
                 timeout_ms=timeout_ms,
                 extra_delay_ms=extra_delay_ms,
                 proxy=source.transports().get("proxy"),
+                referer=abs_ep if is_agedm else "",
+                capture_media_responses=is_agedm,
                 slow_fallback_rounds=int(rc.get("slow_fallback_rounds", 3)),
                 context=context,
             )
@@ -331,6 +345,10 @@ class VideoMixin:
         #   - fetch=true 或出现 referer 时：把提取到的串当 URL 请求其页面
         #   - force_mp4_0: URL 里 mp4= 值强制为 0（取 HLS 变体）
         #   - decode: caesar_unquote = Caesar 移位(自动测3~5)+URL 解码
+        #   - decode: base64_shift_json = Base64 字节逐位移位后解析 JSON；
+        #     shift_regex 从当前文本提取移位值（Rou.video）
+        #   - rewrite: [{"regex": "...", "replacement": "..."}] 对提取值
+        #     做声明式 URL 重写；replacement 支持 {1} 等捕获组引用
         #   - 最后一步提取出的串即播放地址（http 开头）
         chain_cfg = play_cfg.get("http_chain")
         if chain_cfg:
@@ -397,6 +415,283 @@ class VideoMixin:
             return self._decrypter.decrypt(source, play, "video_url")
         return play
 
+    def _fetch_18av_player_stream(
+        self, source: SourceConfig, episode_url: str, deadline=None, context=None
+    ) -> str:
+        """解密 18AV 的受保护播放器并返回真实 HLS 主流。
+
+        18AV 的静态 HTML 不包含 mvarr，content_mv_protect.js 在浏览器运行时
+        才把加密参数写入页面。参数按页面当前 radix/分隔符/XOR 还原后，再按
+        页面动态 AES-CBC-PKCS7 密钥解出 play.php 的 id，最后从 play.php 的
+        videoSources 提取 m3u8。此分支严格按 source_id 隔离，避免影响其他源。
+        """
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
+        from framework.playwright_helper import fetch_rendered_html_sync
+
+        abs_ep = self._abs_url(source, episode_url)
+        headers = source.request_headers()
+        render_kwargs = {
+            "timeout_ms": min(45000, int(self._timeout(source) * 1000)),
+            "proxy": source.transports().get("proxy"),
+            "referer": source.transports().get("headers", {}).get("Referer", ""),
+            "headers": headers,
+        }
+        try:
+            # 18AV 只需要播放器脚本生成 mvarr；等到该状态出现即可，
+            # 不必等待页面所有资源完成。
+            rendered = fetch_rendered_html_sync(
+                abs_ep,
+                wait_until="commit",
+                wait_for_function=(
+                    "() => window.mvarr && window.mvarr['10_1'] "
+                    "&& window.mvarr['10_1'].length > 0"
+                ),
+                extra_delay_ms=50,
+                **render_kwargs,
+            )
+        except Exception:
+            rendered = ""
+        if not rendered or ("mvarr" not in rendered and "play.php" not in rendered):
+            # 页面偶发连接重置或脚本加载慢时保留兼容回退，避免快速路径
+            # 把瞬时网络波动变成“无播放地址”。
+            rendered = fetch_rendered_html_sync(
+                abs_ep,
+                wait_until="domcontentloaded",
+                extra_delay_ms=250,
+                **render_kwargs,
+            )
+        self._check_stream_context(context, deadline)
+        if not rendered:
+            raise ContentMissingError("18AV 浏览器渲染详情页为空", source_id="18av")
+
+        import base64 as _base64
+        import html as _html
+        from urllib.parse import urljoin as _urljoin
+
+        def _fetch_player_stream(player_url):
+            timeout = self._timeout(source)
+            if context is not None:
+                timeout = min(timeout, context.remaining())
+            player_html = self._http.get_text(
+                player_url,
+                headers={**headers, "Referer": abs_ep},
+                timeout=timeout,
+                retries=0 if context is not None else self._retries(source),
+                interval_ms=0 if context is not None else self._interval_ms(source),
+                encoding=source.transports().get("charset"),
+                proxy_pool=source.proxy_pool(),
+            )
+            self._check_stream_context(context, deadline)
+            streams = _re.findall(
+                r"(?:videoSources|sources)\s*=\s*\[.*?['\"]?src['\"]?\s*:\s*"
+                r"['\"](https?://[^'\"]+\.(?:m3u8|mp4)(?:\?[^'\"]*)?)",
+                player_html,
+                _re.IGNORECASE | _re.DOTALL,
+            )
+            if not streams:
+                streams = _re.findall(
+                    r"['\"](https?://[^'\"]+\.(?:m3u8|mp4)(?:\?[^'\"]*)?)['\"]",
+                    player_html,
+                    _re.IGNORECASE,
+                )
+            stream = next((url for url in streams if ".m3u8" in url.lower()), "")
+            if not stream:
+                raise ContentMissingError(
+                    "18AV play.php 未返回 HLS 主流", source_id="18av"
+                )
+            return stream
+
+        def _js_scalar(pattern, default=None):
+            match = _re.search(pattern, rendered, _re.IGNORECASE)
+            return match.group(1) if match else default
+
+        # These values are intentionally read from the rendered detail page.
+        # 18AV rotates them and also derives the payload separator from the
+        # radix; hard-coding either value eventually produces a false
+        # "stream not found" result.
+        crypto_key = _js_scalar(
+            r"\b(?:argdeqweqweqwe|hdddedd252)\s*=\s*['\"]([0-9a-f]{16})['\"]"
+        )
+        crypto_iv = _js_scalar(
+            r"\b(?:argdeqweqweqww|hdddedg252)\s*=\s*['\"]([0-9a-f]{16})['\"]"
+        )
+        configured_xor = _js_scalar(r"\bhadeedg252\s*=\s*(\d+)")
+        configured_radix = _js_scalar(r"\bhcdeedg252\s*=\s*(\d+)")
+        try:
+            configured_xor = int(configured_xor) if configured_xor is not None else None
+            configured_radix = (
+                int(configured_radix) if configured_radix is not None else None
+            )
+        except ValueError:
+            configured_xor = configured_radix = None
+
+        def _read_js_string(text: str, pos: int):
+            """读取一个 JS 引号字符串，保留转义序列供后续解码。"""
+            while pos < len(text) and text[pos].isspace():
+                pos += 1
+            if pos >= len(text) or text[pos] not in "'\"":
+                return None, pos
+            quote = text[pos]
+            pos += 1
+            chars = []
+            while pos < len(text):
+                char = text[pos]
+                if char == "\\" and pos + 1 < len(text):
+                    chars.extend((char, text[pos + 1]))
+                    pos += 2
+                    continue
+                if char == quote:
+                    return "".join(chars), pos + 1
+                chars.append(char)
+                pos += 1
+            return None, pos
+
+        # 某些页面变体会在脚本报错前直接留下已生成的播放器 iframe，
+        # 此时没有可读的 mvarr，但 iframe 的 play.php id 仍可正常取流。
+        direct_player = _re.search(
+            r"(?:src|data-src)\s*=\s*['\"]((?:https?:)?//[^'\"]*/js/player/play\.php\?[^'\"]*\bid=[^'\"]+)['\"]",
+            rendered,
+            _re.IGNORECASE,
+        )
+        if direct_player:
+            player_url = _html.unescape(direct_player.group(1)).replace("\\/", "/")
+            if player_url.startswith("//"):
+                player_url = "https:" + player_url
+            return _fetch_player_stream(_urljoin(abs_ep, player_url))
+
+        marker = _re.search(
+            r"mvarr\s*\[\s*['\"]10_1['\"]\s*\]\s*=\s*\[\s*\[",
+            rendered,
+            _re.IGNORECASE,
+        )
+        fields = []
+        if marker:
+            pos = marker.end()
+            for index in range(6):
+                value, pos = _read_js_string(rendered, pos)
+                if value is None:
+                    fields = []
+                    break
+                fields.append(value)
+                while pos < len(rendered) and rendered[pos].isspace():
+                    pos += 1
+                if index < 5:
+                    if pos >= len(rendered) or rendered[pos] != ",":
+                        fields = []
+                        break
+                    pos += 1
+        if len(fields) < 6:
+            raise ContentMissingError(
+                "18AV 浏览器页面未生成 mvarr 主播放器参数", source_id="18av"
+            )
+
+        def _js_string(value: str) -> str:
+            def _replace(match):
+                token = match.group(1)
+                if token.startswith("u") and len(token) == 5:
+                    try:
+                        return chr(int(token[1:], 16))
+                    except ValueError:
+                        return token
+                if token.startswith("x") and len(token) == 3:
+                    try:
+                        return chr(int(token[1:], 16))
+                    except ValueError:
+                        return token
+                return {
+                    "b": "\\b", "f": "\\f", "n": "\\n", "r": "\\r",
+                    "t": "\\t", "v": "\\v", "0": "\\0",
+                }.get(token, token)
+
+            return _re.sub(r"\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)", _replace, value)
+
+        # mvarr item: [iframe_id, encrypted, iframe_attrs, player_prefix,
+        #              player_suffix, iframe_html_suffix]. The sixth field is
+        #              only HTML appended around the iframe, never part of URL.
+        encrypted = _js_string(fields[1])
+        prefix = _js_string(fields[3])
+        suffix = _js_string(fields[4])
+        if not encrypted or not prefix:
+            raise ContentMissingError("18AV 主播放器参数不完整", source_id="18av")
+
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives import padding
+
+            player_id = ""
+            # 站点脚本会随版本改变分隔符和 radix。分隔符实际是
+            # String.fromCharCode(radix + 97)，例如 radix=21 -> "v"。
+            configs = []
+            if crypto_key and crypto_iv:
+                configs.append((crypto_key.encode(), crypto_iv.encode()))
+            configs.append((b"0e4de3a7c8020b9d", b"f86d5f74468c3ab5"))
+            unique_configs = []
+            for item in configs:
+                if item not in unique_configs:
+                    unique_configs.append(item)
+            configs = unique_configs
+            radices = [configured_radix] if configured_radix else []
+            radices.extend(range(2, 37))
+            radices = list(dict.fromkeys(radices))
+            xor_keys = [configured_xor] if configured_xor is not None else []
+            xor_keys.extend(range(32))
+            xor_keys = list(dict.fromkeys(xor_keys))
+            delimiters = []
+            for radix in radices:
+                if 2 <= radix <= 25:
+                    delimiters.append(chr(radix + 97))
+            delimiters.extend(("n", "r"))
+            delimiters.extend(
+                char for char in set(encrypted) if not char.isalnum() and char not in delimiters
+            )
+            delimiters = list(dict.fromkeys(delimiters))
+            for delimiter in delimiters:
+                parts = encrypted.split(delimiter)
+                if len(parts) < 2 or any(not part for part in parts):
+                    continue
+                for radix in radices:
+                    try:
+                        values = [int(part, radix) for part in parts]
+                    except ValueError:
+                        continue
+                    if any(value > 255 for value in values):
+                        continue
+                    for xor_key in xor_keys:
+                        try:
+                            decoded = bytes(value ^ xor_key for value in values)
+                            for key, iv in configs:
+                                cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+                                decryptor = cipher.decryptor()
+                                padded = decryptor.update(
+                                    _base64.b64decode(decoded, validate=True)
+                                )
+                                padded += decryptor.finalize()
+                                unpadder = padding.PKCS7(128).unpadder()
+                                candidate = unpadder.update(padded) + unpadder.finalize()
+                                player_id = candidate.decode("utf-8")
+                                if player_id:
+                                    break
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if player_id:
+                            break
+                    if player_id:
+                        break
+                if player_id:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            raise ContentMissingError(
+                f"18AV 主播放器 AES 解密失败: {exc}", source_id="18av"
+            ) from exc
+        if not player_id:
+            raise ContentMissingError("18AV 主播放器解密结果为空", source_id="18av")
+
+        player_url = _html.unescape(
+            _urljoin(abs_ep, prefix + player_id + suffix)
+        )
+        return _fetch_player_stream(player_url)
+
     # ------------------------------------------------------------------ #
     def _fetch_http_chain(
         self, source: SourceConfig, episode_url: str,
@@ -460,6 +755,57 @@ class VideoMixin:
                         # 解码后 JS 内 `\"` 还原为 `"`（供后续 <source src="..."> 匹配）
                         val = dec.replace('\\"', '"')
                         break
+            elif decode == "base64_shift_json":
+                import base64 as _b64
+
+                shift = step.get("shift")
+                shift_regex = step.get("shift_regex")
+                if shift is None and shift_regex:
+                    shift_match = _re.search(
+                        str(shift_regex), cur_text, _re.IGNORECASE | _re.DOTALL
+                    )
+                    if shift_match:
+                        shift = shift_match.group(1) if shift_match.groups() else shift_match.group(0)
+                try:
+                    shift = int(shift)
+                    encoded = str(val).replace("-", "+").replace("_", "/")
+                    raw = _b64.b64decode(encoded + "=" * (-len(encoded) % 4))
+                    decoded = bytes((byte - shift) & 0xFF for byte in raw).decode("utf-8")
+                    # Parsing here catches a stale/partial SSR payload before the
+                    # next chain step turns it into a misleading relative URL.
+                    val = json.dumps(json.loads(decoded), ensure_ascii=False, separators=(",", ":"))
+                except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise ContentMissingError(
+                        f"http_chain 第{i}步 Base64 移位 JSON 解码失败: {exc}",
+                        source_id=source.source_id,
+                    ) from exc
+
+            rewrite_rules = step.get("rewrite") or []
+            if rewrite_rules:
+                rewritten = val
+                matched = False
+                for rule in rewrite_rules:
+                    if not isinstance(rule, dict) or not rule.get("regex"):
+                        continue
+                    match = _re.search(str(rule["regex"]), str(rewritten), _re.IGNORECASE)
+                    if not match:
+                        continue
+                    replacement = str(rule.get("replacement") or "")
+                    for group in range(1, len(match.groups()) + 1):
+                        replacement = replacement.replace(
+                            "{%d}" % group, match.group(group) or ""
+                        )
+                    rewritten = _re.sub(
+                        str(rule["regex"]), replacement, str(rewritten), count=1,
+                        flags=_re.IGNORECASE,
+                    )
+                    matched = True
+                    break
+                if step.get("require_rewrite") and not matched:
+                    raise ContentMissingError(
+                        f"http_chain 第{i}步 URL 重写未匹配", source_id=source.source_id
+                    )
+                val = rewritten
 
             name = step.get("name") or f"s{i}"
             results[name] = val
