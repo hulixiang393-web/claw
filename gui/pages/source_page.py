@@ -1,0 +1,753 @@
+"""源管理界面（source_page.py）。
+
+对应 ui-source.md 全部功能点：
+- 工具栏：全启用 / 全禁用 / 全部诊断 / ＋添加源
+- 源列表（行式）：名称、类型徽章、启用开关、健康灯、健康历史、权重、操作
+- 单源操作：诊断 / 编辑 / 删除（二次确认：软删除或删文件）
+- 诊断视图：失效源展开错误详情
+- 空状态：无源时显示「去添加源」
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool, QRunnable, QObject
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QDoubleSpinBox,
+    QFrame,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+
+from framework.source_manager import (
+    SourceManager,
+    SourceHealth,
+    HEALTH_OK,
+    HEALTH_WARN,
+    HEALTH_BROKEN,
+)
+from framework.config import SourceConfig, ConfigError
+from framework.events import EVENT_SOURCE_VISIBILITY_CHANGED
+from framework.selfcheck import StructureChecker
+
+from gui.components import EmptyState
+from .base_page import BasePage
+
+# 类型徽章展示名
+TYPE_LABEL = {"novel": "小说", "comic": "漫画", "video": "视频"}
+# 健康历史最多展示的点数
+HISTORY_DOTS = 6
+# 源行分批构建：每帧最多构造的行数，避免源多时（几十~上百个）在 _rebuild_rows
+# 里一次性 new 几百个 QWidget 卡住 UI 线程（实测 ~50 源即 ~390ms 掉帧）。单个
+# QDoubleSpinBox 等小部件构造也有固定成本，分批跨事件循环 tick 摊开。
+ROW_BUILD_BATCH = 8
+
+# 健康灯颜色（绿/黄/红）
+_HEALTH_COLORS = {
+    HEALTH_OK: "#4CAF50",
+    HEALTH_WARN: "#FF9800",
+    HEALTH_BROKEN: "#F44336",
+}
+
+# 类型徽章配色
+_TYPE_BADGE = {
+    "novel": "#FF8AA5",
+    "comic": "#6FA8FF",
+    "video": "#5FCF8A",
+}
+
+
+class _DiagWorkerSignals(QObject):
+    """诊断任务信号。"""
+
+    finished = Signal(str, bool, str)  # (source_id, ok, error)
+
+
+class _DiagTask(QRunnable):
+    """后台对单个源跑一次自检。"""
+
+    def __init__(self, checker, source, url):
+        super().__init__()
+        self.signals = _DiagWorkerSignals()
+        self._checker = checker
+        self._source = source
+        self._url = url
+
+    def run(self) -> None:
+        ok, err = False, ""
+        try:
+            ok = self._checker.check(self._source, self._url)
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+        try:
+            self.signals.finished.emit(self._source.source_id, ok, err)
+        except RuntimeError:
+            pass  # 页面已销毁
+
+
+def diagnose_url(source) -> str:
+    """构造自检目标 URL：优先 discovery 列表入口，否则 base_url 或 homepage。
+
+    返回绝对 URL。供诊断按钮 & 全量诊断调用。
+    """
+    from urllib.parse import urljoin
+
+    raw = source.raw
+    endpoints = raw.get("endpoints") or {}
+    discovery = endpoints.get("discovery") or {}
+    rel = (
+        discovery.get("works_list_url")
+        or discovery.get("list_url")
+        or discovery.get("list_categories_url")
+    )
+    base = source.base_url or source.homepage
+    if not base:
+        return ""
+    if rel:
+        url = rel if rel.startswith("http") else urljoin(base, rel)
+        # 列表 URL 模板占位符：{page} → 第一页；其余占位符清空
+        url = re.sub(r"\{page\}", "1", url, flags=re.I)
+        url = re.sub(r"\{[^{}]*\}", "", url)
+        return url
+    return base
+
+
+class SourceRow(QWidget):
+    """单个源行：名称 / 类型徽章 / 启用开关 / 健康灯 / 历史 / 权重 / 操作。"""
+
+    edit_clicked = Signal(str)  # source_id → 开编辑器
+    login_clicked = Signal(object)  # source → 打开登录弹窗
+
+    def __init__(self, source, health: SourceHealth, parent=None):
+        super().__init__(parent)
+        self._source = source
+        self._source_id = source.source_id
+        self._type = source.content_type
+        self._health = health
+        self._enabled_cb = None
+        self._weight_cb = None
+        self._diag_btn_cb = None
+        self._delete_cb = None
+
+        self.setObjectName("sourceRow")
+        # 行最小高度保证行距舒适（内容超高时自适应增高，不锁死）
+        self.setMinimumHeight(46)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.setSpacing(8)
+
+        # 名称（flex 自动占满剩余空间；固定控件已收窄，长名不会挤掉操作按钮）
+        self.name_label = QLabel(source.source_name)
+        self.name_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #000000;")
+        self.name_label.setToolTip(f"{source.source_name}\n{source.source_id}")
+        self.name_label.setAlignment(Qt.AlignVCenter)
+        self.name_label.setMinimumWidth(60)
+        layout.addWidget(self.name_label, stretch=1)
+
+        # 类型徽章
+        self.badge = QLabel(TYPE_LABEL.get(self._type, self._type))
+        self.badge.setStyleSheet(
+            "font-size: 11px; border-radius: 8px; padding: 1px 10px;"
+            " color: white; background: %s;" % _TYPE_BADGE.get(self._type, "#9E9E9E")
+        )
+        layout.addWidget(self.badge)
+
+        # 启用开关
+        self.enabled_box = QCheckBox("启用")
+        self.enabled_box.setChecked(source.enabled)
+        self.enabled_box.toggled.connect(self._on_enabled_toggled)
+        layout.addWidget(self.enabled_box)
+
+        # 健康灯
+        self.health_dot = QLabel("●")
+        self.health_dot.setFixedWidth(16)
+        layout.addWidget(self.health_dot)
+
+        # 健康历史（最多 HISTORY_DOTS 个点）
+        self.history_label = QLabel("")
+        self.history_label.setFixedWidth(HISTORY_DOTS * 9)
+        layout.addWidget(self.history_label)
+
+        # 权重
+        self.weight_spin = QDoubleSpinBox()
+        self.weight_spin.setRange(0.0, 10.0)
+        self.weight_spin.setDecimals(1)
+        self.weight_spin.setSingleStep(0.1)
+        self.weight_spin.setValue(source.weight)
+        self.weight_spin.setFixedWidth(50)
+        self.weight_spin.setToolTip("搜索排序权重")
+        self.weight_spin.valueChanged.connect(self._on_weight_changed)
+        layout.addWidget(self.weight_spin)
+
+        # 操作按钮（统一窄宽+清晰字号，保证一行放下且文字不裁剪）
+        # 字号/内边距由列表容器统一下发（见 SourcePage.__init__），避免每行重复设置样式
+        # 登录按钮：仅需要登录的源显示（无 auth 配置默认隐藏，省空间）
+        has_auth = bool((source.raw.get("auth") or {}).get("login_url"))
+        self.login_btn = QPushButton("登录")
+        self.login_btn.setFixedWidth(46)
+        self.login_btn.setToolTip("登录该源站点并保存 Cookie（需要登录的源）")
+        self.login_btn.setVisible(has_auth)
+        self.login_btn.clicked.connect(lambda: self.login_clicked.emit(self._source))
+        layout.addWidget(self.login_btn)
+
+        self.diag_btn = QPushButton("诊断")
+        self.diag_btn.setFixedWidth(46)
+        self.diag_btn.clicked.connect(self._on_diag)
+        layout.addWidget(self.diag_btn)
+
+        self.edit_btn = QPushButton("编辑")
+        self.edit_btn.setFixedWidth(46)
+        self.edit_btn.clicked.connect(lambda: self.edit_clicked.emit(self._source_id))
+        layout.addWidget(self.edit_btn)
+
+        self.del_btn = QPushButton("删除")
+        self.del_btn.setFixedWidth(46)
+        self.del_btn.clicked.connect(self._on_delete)
+        layout.addWidget(self.del_btn)
+
+        self._update_health(health)
+
+    # ------------------------------------------------------------------ #
+    def source(self):
+        return self._source
+
+    # 注入回调（SourcePage 统一管理写入，SourceRow 不直接依赖 manager）
+    def set_enabled_cb(self, cb) -> None:
+        self._enabled_cb = cb
+
+    def set_weight_cb(self, cb) -> None:
+        self._weight_cb = cb
+
+    def set_diag_cb(self, cb) -> None:
+        self._diag_btn_cb = cb
+
+    def set_delete_cb(self, cb) -> None:
+        self._delete_cb = cb
+
+    # ------------------------------------------------------------------ #
+    def _on_enabled_toggled(self, checked: bool) -> None:
+        if self._enabled_cb:
+            self._enabled_cb(self._source_id, checked)
+
+    def _on_weight_changed(self, value: float) -> None:
+        if self._weight_cb:
+            self._weight_cb(self._source_id, value)
+
+    def _on_diag(self) -> None:
+        if self._diag_btn_cb:
+            self._diag_btn_cb(self._source, self)
+
+    def _on_delete(self) -> None:
+        if self._delete_cb:
+            self._delete_cb(self._source)
+
+    # ------------------------------------------------------------------ #
+    def set_enabled_state(self, enabled: bool) -> None:
+        """同步勾选状态（不触发回调）。"""
+        self.enabled_box.blockSignals(True)
+        self.enabled_box.setChecked(enabled)
+        self.enabled_box.blockSignals(False)
+
+    def _update_health(self, health: SourceHealth) -> None:
+        """刷新健康灯与历史点。"""
+        state = health.state
+        color = _HEALTH_COLORS.get(state, _HEALTH_COLORS[HEALTH_OK])
+        self.health_dot.setStyleSheet("color: %s; font-size: 14px;" % color)
+        self.health_dot.setToolTip(
+            {"ok": "正常", "warn": "自检软失败", "broken": "失效"}.get(state, state)
+        )
+        history = health.history[-HISTORY_DOTS:]
+        if history:
+            dots = []
+            for h in history:
+                c = _HEALTH_COLORS.get(h, "#CCCCCC")
+                dots.append('<span style="color:%s">●</span>' % c)
+            self.history_label.setText("".join(dots))
+        else:
+            self.history_label.setText("")
+
+    def set_health(self, health: SourceHealth) -> None:
+        self._health = health
+        self._update_health(health)
+
+    def set_error(self, err: str) -> None:
+        """显示/隐藏错误详情。err 为空 → 隐藏。"""
+        self.setToolTip(err if err else "")
+
+    def on_theme_changed(self) -> None:
+        self.update()
+
+
+class SourcePage(BasePage):
+    """源管理列表页。"""
+
+    # 对外信号：编辑某源 → App 层开编辑器（source_id="" 表示新建）
+    edit_requested = Signal(str)
+
+    def __init__(self, source_manager: SourceManager, checker: StructureChecker,
+                 sources_dir, cookie_manager=None, parent=None, event_bus=None):
+        super().__init__(parent)
+        # Source management is intentionally monochrome; health/type colors are
+        # set directly on their dedicated widgets below.
+        self.setStyleSheet("QWidget { color: #000000; }")
+        self._manager = source_manager
+        self._checker = checker
+        self._sources_dir = Path(sources_dir)
+        self._cookie_manager = cookie_manager
+        self._bus = event_bus
+        self._rows: list = []
+        self._diag_count = {"total": 0, "done": 0}
+        # 源行分批构建（见 _rebuild_rows）：跨事件循环 tick 摊开构造开销，
+        # 避免大量源时一次性 new 数百个 QWidget 卡死 UI 线程。
+        self._row_build_timer = QTimer(self)
+        self._row_build_timer.setSingleShot(True)
+        self._row_build_timer.timeout.connect(self._pump_rows)
+        self._row_build_queue = []      # 待构建的 (source, health)
+        self._row_build_filter = ""     # 构建完成后要套用的过滤词
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(10)
+
+        # 工具栏
+        self._build_toolbar()
+        layout.addLayout(self._toolbar)
+
+        # 诊断进度
+        self.progress_label = QLabel("")
+        self.progress_label.setVisible(False)
+        self.progress_label.setStyleSheet("color: #000000; font-size: 12px;")
+        layout.addWidget(self.progress_label)
+
+        # 源列表
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(self.scroll, stretch=1)
+
+        self.list_container = QWidget()
+        self.list_layout = QVBoxLayout(self.list_container)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setSpacing(4)
+        # 行内按钮样式统一由容器下发（Qt 样式表级联到子控件），
+        # 避免 50 行 × 4 按钮逐个 setStyleSheet（构造期测得约占一半耗时）。
+        self.list_container.setStyleSheet(
+            "QPushButton { font-size: 12px; padding: 3px 6px; }"
+        )
+        self.scroll.setWidget(self.list_container)
+
+        # 空状态（默认隐藏）
+        self.empty_state = EmptyState()
+        self.empty_state.add_source_clicked.connect(self._on_add_source)
+        layout.addWidget(self.empty_state, stretch=1)
+
+        if self._bus is not None:
+            self._bus.subscribe(self._on_visibility_changed)
+        self.refresh()
+
+    def _on_visibility_changed(self, event) -> None:
+        if getattr(event, "type", "") == EVENT_SOURCE_VISIBILITY_CHANGED:
+            self.refresh()
+
+    # ------------------------------------------------------------------ #
+    def _build_toolbar(self) -> None:
+        self._toolbar = QHBoxLayout()
+        self._toolbar.setSpacing(8)
+
+        self.enable_all_btn = QPushButton("全启用")
+        self.enable_all_btn.setFixedWidth(72)
+        self.enable_all_btn.clicked.connect(self._on_enable_all)
+        self._toolbar.addWidget(self.enable_all_btn)
+
+        self.disable_all_btn = QPushButton("全禁用")
+        self.disable_all_btn.setFixedWidth(72)
+        self.disable_all_btn.clicked.connect(self._on_disable_all)
+        self._toolbar.addWidget(self.disable_all_btn)
+
+        self.diag_all_btn = QPushButton("全部诊断")
+        self.diag_all_btn.setFixedWidth(88)
+        self.diag_all_btn.clicked.connect(self._on_diagnose_all)
+        self._toolbar.addWidget(self.diag_all_btn)
+
+        # 搜索/过滤：实时按名称 / ID / 类型隐藏不匹配的源行（仅改可见性）
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("搜索源名称 / ID...")
+        self._search_input.setFixedWidth(200)
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.textChanged.connect(self._apply_source_filter)
+        self._toolbar.addWidget(self._search_input)
+
+        self._toolbar.addStretch(1)
+
+        # 版本信息（右侧，防挤压：允许收缩时省略，不参与 stretch）
+        self.version_label = QLabel("")
+        self.version_label.setStyleSheet(
+            "color: #000000; font-size: 11px; padding-right: 8px;"
+        )
+        self.version_label.setAlignment(Qt.AlignVCenter)
+        self._toolbar.addWidget(self.version_label)
+
+        self.add_btn = QPushButton("＋添加源")
+        self.add_btn.setFixedWidth(90)
+        self.add_btn.clicked.connect(self._on_add_source)
+        self._toolbar.addWidget(self.add_btn)
+
+        self.import_btn = QPushButton("导入 JSON")
+        self.import_btn.setFixedWidth(90)
+        self.import_btn.clicked.connect(self._on_import_json)
+        self._toolbar.addWidget(self.import_btn)
+
+    # ------------------------------------------------------------------ #
+    def _rebuild_rows(self) -> None:
+        """从 SourceManager 清空并重建所有源行。
+
+        源可能几十上百个，逐行 new QWidget 一次性做会卡 UI 线程（实测 ~390ms
+        掉帧）。改为分批：先清空并统计总数，再启动一个 singleShot 定时器，每帧
+        只构造 ROW_BUILD_BATCH 行，跨事件循环 tick 摊开，单帧不再超限。
+        """
+        self._row_build_timer.stop()
+        self._row_build_queue = []
+        while self.list_layout.count():
+            child = self.list_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self._rows = []
+        self._update_empty_state()
+
+        sources = self._manager.all(include_adult=True)
+        # 版本信息：源总数 + 各类型数量
+        self._update_version_label(sources)
+        self._row_build_filter = self._search_input.text()
+        self._row_build_queue = [
+            (s, self._manager.get_health(s.source_id)) for s in sources
+        ]
+        if not self._row_build_queue:
+            # 无源：仍需把 stretch 与空状态处理掉，无需分批。
+            self.list_layout.addStretch(1)
+            self._update_empty_state()
+            self._apply_source_filter(self._row_build_filter)
+            return
+        # 首帧立即开工（不等多余一拍），剩余交给定时器。
+        self._pump_rows()
+
+    def _pump_rows(self) -> None:
+        """分批构造源行：每调用一次最多构造 ROW_BUILD_BATCH 行。"""
+        if not self._row_build_queue:
+            # 全部完成：收尾（stretch + 空状态 + 套用过滤词）。
+            self.list_layout.addStretch(1)
+            self._update_empty_state()
+            self._apply_source_filter(self._row_build_filter)
+            return
+        for _ in range(ROW_BUILD_BATCH):
+            if not self._row_build_queue:
+                break
+            source, health = self._row_build_queue.pop(0)
+            row = SourceRow(source, health)
+            row.set_enabled_cb(self._on_set_enabled)
+            row.set_weight_cb(self._on_set_weight)
+            row.set_diag_cb(self._on_diag_one)
+            row.set_delete_cb(self._on_delete_source)
+            row.login_clicked.connect(self._on_login)
+            row.edit_clicked.connect(self.edit_requested)
+            self.list_layout.addWidget(row)
+            self._rows.append(row)
+        if self._row_build_queue:
+            # 还有剩余：让出当前帧，下一 tick 继续（不阻塞 UI 线程）。
+            self._row_build_timer.start(0)
+        else:
+            self.list_layout.addStretch(1)
+            self._update_empty_state()
+            self._apply_source_filter(self._row_build_filter)
+
+    def rebind_runtime(self, source_manager, checker, cookie_manager=None) -> None:
+        """运行时就绪后注入真实服务并重建源行（构造期可能持有占位/None 服务）。"""
+        self._manager = source_manager
+        self._checker = checker
+        if cookie_manager is not None:
+            self._cookie_manager = cookie_manager
+        self.refresh()
+
+    def refresh(self) -> None:
+        self._rebuild_rows()
+
+    def _update_empty_state(self) -> None:
+        has_sources = len(self._manager.all(include_adult=True)) > 0
+        self.scroll.setVisible(has_sources)
+        self.empty_state.setVisible(not has_sources)
+
+    def _update_version_label(self, sources: list) -> None:
+        """工具栏版本信息：Schema 版本 + 源总数 + 类型分布。"""
+        total = len(sources)
+        counts = {}
+        for s in sources:
+            counts[s.content_type] = counts.get(s.content_type, 0) + 1
+        parts = []
+        for k in ("novel", "comic", "video"):
+            if k in counts:
+                parts.append(f"{TYPE_LABEL.get(k, k)} {counts[k]}")
+        txt = f"Schema v2 · 共 {total} 个源"
+        if parts:
+            txt += " · " + " · ".join(parts)
+        self.version_label.setText(txt)
+        self.version_label.setToolTip(txt)
+
+    # ------------------------------------------------------------------ #
+    def _apply_source_filter(self, text: str) -> None:
+        """实时过滤源行可见性：名称 / ID / 类型（中英文）大小写不敏感子串匹配。
+
+        仅调用 row.setVisible(...)，不触碰启用 / 健康 / 权重等任何状态，
+        也不重建行（保留滚动位置，避免闪烁）。
+        """
+        needle = (text or "").strip().lower()
+        for row in self._rows:
+            if not needle:
+                row.setVisible(True)
+                continue
+            src = row.source()
+            ctype = getattr(src, "content_type", "") or ""
+            haystack = " ".join((
+                str(getattr(src, "source_name", "") or ""),
+                str(getattr(src, "source_id", "") or ""),
+                str(ctype),
+                TYPE_LABEL.get(ctype, ""),
+            )).lower()
+            row.setVisible(needle in haystack)
+
+
+    # ------------------------------------------------------------------ #
+    def _on_set_enabled(self, source_id: str, enabled: bool) -> None:
+        self._manager.set_enabled(source_id, enabled)
+
+    def _on_set_weight(self, source_id: str, weight: float) -> None:
+        self._manager.set_weight(source_id, weight)
+
+    # ---------- 启停 / 诊断 ------------------------------------------- #
+    def _visible_sources(self):
+        """当前应显示的所有源（软删除的源在 manager.all() 已不含）。"""
+        return self._manager.all(include_adult=True)
+
+    def _on_enable_all(self) -> None:
+        for s in self._visible_sources():
+            self._manager.set_enabled(s.source_id, True)
+        self._sync_row_enabled()
+
+    def _on_disable_all(self) -> None:
+        for s in self._visible_sources():
+            self._manager.set_enabled(s.source_id, False)
+        self._sync_row_enabled()
+
+    def _sync_row_enabled(self) -> None:
+        for s in self._visible_sources():
+            for row in self._rows:
+                if row.source().source_id == s.source_id:
+                    row.set_enabled_state(s.enabled)
+                    break
+
+    def _on_diagnose_all(self) -> None:
+        """全部诊断：后台逐个跑 selfcheck，更新健康灯。"""
+        sources = [s for s in self._visible_sources() if s.enabled]
+        if not sources:
+            return
+        for s in sources:
+            self._run_diag(s)
+        self.progress_label.setText(f"正在诊断 (0/{len(sources)})...")
+        self.progress_label.setVisible(True)
+        self._diag_count = {"total": len(sources), "done": 0}
+        self.diag_all_btn.setEnabled(False)
+
+    def _run_diag(self, source) -> None:
+        """后台跑单源自检，完成后更新健康 + 刷新对应行。"""
+        url = diagnose_url(source)
+        if not url:
+            self._on_diag_done(source.source_id, False, "缺少可自检的 URL")
+            return
+        task = _DiagTask(self._checker, source, url)
+        task.signals.finished.connect(self._on_diag_done)
+        self._diag_task = task  # 防 GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_diag_one(self, source, row) -> None:
+        """单源诊断：跑自检，完成后刷新该行健康灯。"""
+        self._diag_count = {"total": 1, "done": 0}
+        self.progress_label.setVisible(False)
+        self._run_diag(source)
+
+    def _on_diag_done(self, source_id: str, ok: bool, err: str) -> None:
+        """诊断完成：更新 SourceManager 健康状态 + 刷新行。
+
+        状态映射：
+        - 自检通过 → 绿（ok）
+        - 软失败（check 返回 False，无异常）→ 黄（warn）
+        - 硬失败（strict 抛 StructureChangedError / 其他异常）→ 红（broken）
+        """
+        if len(err) > 80:
+            err = err[:80] + "..."
+        if ok:
+            state = HEALTH_OK
+        elif err:
+            state = HEALTH_BROKEN
+        else:
+            state = HEALTH_WARN
+        self._manager.update_health(source_id, state, err)
+        for row in self._rows:
+            if row.source().source_id == source_id:
+                health = self._manager.get_health(source_id)
+                row.set_health(health)
+                row.set_error(err if not ok else "")
+                break
+        # 进度
+        self._diag_count["done"] += 1
+        done, total = self._diag_count["done"], self._diag_count["total"]
+        if done >= total:
+            self.progress_label.setText("诊断完成")
+            self.diag_all_btn.setEnabled(True)
+            self._schedule_progress_hide()
+        else:
+            self.progress_label.setText(f"正在诊断 ({done}/{total})...")
+
+    def _schedule_progress_hide(self) -> None:
+        from PySide6.QtCore import QTimer
+
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.timeout.connect(lambda: self.progress_label.setVisible(False))
+        t.start(3000)
+
+    # ---------- 添加 / 编辑 / 删除 ------------------------------------ #
+    def _on_add_source(self) -> None:
+        self.edit_requested.emit("")
+
+    def _on_import_json(self) -> None:
+        """导入本地 JSON 配置文件为一个新源（校验通过后直接落盘）。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入源 JSON", "", "JSON 文件 (*.json);;所有文件 (*)",
+        )
+        if not path:
+            return
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            QMessageBox.critical(self, "导入失败", f"无法解析 JSON 文件：\n{exc}")
+            return
+        if not isinstance(raw, dict):
+            QMessageBox.critical(self, "导入失败", "JSON 顶层必须是对象（源配置）")
+            return
+        try:
+            cfg = SourceConfig.from_dict(raw, path=path)
+        except ConfigError as exc:
+            QMessageBox.critical(self, "导入失败", f"配置不合法，无法导入：\n{exc.message}")
+            return
+        sid = cfg.source_id
+        dest = self._sources_dir / f"{sid}.json"
+        if dest.exists():
+            resp = QMessageBox.question(
+                self,
+                "已存在",
+                f"源「{sid}」已存在（{dest.name}），是否覆盖？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+        try:
+            dest.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "保存失败", f"写入失败：{exc}")
+            return
+        self._manager.load_dir(self._sources_dir)
+        self.refresh()
+        QMessageBox.information(self, "导入成功", f"源「{cfg.source_name}」已导入并启用。")
+
+    def _on_login(self, source) -> None:
+        """打开登录弹窗：内嵌浏览器登录源站点，保存 Cookie。"""
+        if self._cookie_manager is None:
+            from PySide6.QtWidgets import QMessageBox
+
+            QMessageBox.information(self, "登录", "Cookie 管理器未初始化")
+            return
+        from gui.components.login_dialog import LoginDialog
+
+        # 登录 URL：优先 auth.login_url，否则 homepage / base_url
+        auth = (source.raw.get("auth") or {})
+        login_url = (
+            auth.get("login_url")
+            or source.homepage
+            or source.base_url
+        )
+        if not login_url:
+            from PySide6.QtWidgets import QMessageBox
+
+            QMessageBox.information(self, "登录", "该源未配置登录地址")
+            return
+        markers = list(auth.get("login_success_markers") or [])
+        dlg = LoginDialog(
+            source.source_id,
+            login_url,
+            cookie_manager=self._cookie_manager,
+            success_markers=markers or None,
+            parent=self,
+        )
+        dlg.logged_in.connect(self._on_login_saved)
+        dlg.exec()
+
+    def _on_login_saved(self, source_id: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.information(self, "登录", f"「{source_id}」Cookie 已保存，请求将自动附带")
+
+    def _on_delete_source(self, source) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        name = source.source_name or source.source_id
+        msg = QMessageBox(self)
+        msg.setWindowTitle("删除源")
+        msg.setText(f"确认删除「{name}」？")
+        msg.setInformativeText(
+            "默认软删除（禁用该源并从此列表移除，配置文件保留可恢复）。也可同时删除配置文件（不可恢复）。"
+        )
+        soft_btn = msg.addButton("软删除", QMessageBox.AcceptRole)
+        hard_btn = msg.addButton("同时删除文件", QMessageBox.DestructiveRole)
+        cancel_btn = msg.addButton("取消", QMessageBox.RejectRole)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == soft_btn:
+            self._manager.soft_delete(source.source_id)
+            self.refresh()
+        elif clicked == hard_btn:
+            self._confirm_hard_delete(source)
+
+    def _confirm_hard_delete(self, source) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        resp = QMessageBox.warning(
+            self,
+            "永久删除",
+            f"配置文件 {source.source_path} 将被永久删除，此操作不可恢复。确定吗？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        try:
+            Path(source.source_path).unlink(missing_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "删除失败", f"配置文件删除失败：{exc}")
+            return
+        # 从内存移除并重建列表
+        self._manager.load_dir(self._sources_dir)
+        self.refresh()
+
+    # ------------------------------------------------------------------ #
+    def on_theme_changed(self, theme: str) -> None:
+        for row in self._rows:
+            row.on_theme_changed()

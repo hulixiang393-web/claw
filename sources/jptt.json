@@ -1,0 +1,181 @@
+{
+  "$schema_version": 2,
+  "$id": "jptt",
+  "$type": "video",
+  "$name": "JPTT.TV",
+  "$enabled": true,
+  "$weight": 0.8,
+  "$metadata": {
+    "adult": true,
+    "homepage": "https://jptt.tv/tag",
+    "description": "JPTT.TV 视频源（HTTP 列表与详情解析）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "成人"]
+  },
+  "transports": {
+    "base_url": "https://jptt.tv",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://jptt.tv/",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-User": "?1",
+      "Sec-Fetch-Dest": "document"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 500
+  },
+  "endpoints": {
+    "discovery": {
+      "render": "playwright_fallback",
+      "render_config": {
+        "wait_until": "domcontentloaded",
+        "extra_delay_ms": 0,
+        "timeout_ms": 12000
+      },
+      "list_url": "/",
+      "works_list_url": "/list",
+      "list_paginator": {
+        "type": "increment",
+        "param": "idx",
+        "first_page_without_param": true
+      },
+      "list_item": {
+        "categories": [
+          {"title": "最新", "url": "/"},
+          {"title": "片商:瑪丹娜", "url": "/tag_list?fid=93"},
+          {"title": "片商:SOD", "url": "/tag_list?fid=1"},
+          {"title": "片商:MOODYZ", "url": "/tag_list?fid=31"},
+          {"title": "片商:FC2高清版", "url": "/tag_list?fid=1203"},
+          {"title": "片商:HMN WORKS", "url": "/tag_list?fid=2"},
+          {"title": "720p", "url": "/tag_list?tid=7"},
+          {"title": "巨乳", "url": "/tag_list?tid=15"},
+          {"title": "AV女優片", "url": "/tag_list?tid=3"},
+          {"title": "中出", "url": "/tag_list?tid=2"},
+          {"title": "HD", "url": "/tag_list?tid=21"},
+          {"title": "HD高畫質", "url": "/tag_list?tid=471"},
+          {"title": "素人", "url": "/tag_list?tid=9"},
+          {"title": "中文", "url": "/tag_list?tid=278"},
+          {"title": "人妻", "url": "/tag_list?tid=16"},
+          {"title": "無碼片", "url": "/tag_list?tid=212"},
+          {"title": "熟女", "url": "/tag_list?tid=95"},
+          {"title": "口交", "url": "/tag_list?tid=34"}
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.oneVideo"
+        },
+        "fields": {
+          "title": {
+            "fallback": [
+              {"css": "img.index_video_cover", "attr": "alt"},
+              {"css": "img.card-img-top", "attr": "alt"},
+              {"css": "h3"}
+            ]
+          },
+          "url": {
+            "css": "a[href*='/video/']",
+            "attr": "href"
+          },
+          "cover": {
+            "fallback": [
+              {"css": "img.index_video_cover", "attr": "data-src"},
+              {"css": "img.index_video_cover", "attr": "data-original"},
+              {"css": "img.index_video_cover", "attr": "src"},
+              {"css": "img.card-img-top", "attr": "data-src"},
+              {"css": "img.card-img-top", "attr": "data-original"},
+              {"css": "img.card-img-top", "attr": "src"}
+            ]
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search?kw={keyword}",
+      "method": "GET",
+      "paginator": {
+        "url_template": "/search?kw={keyword}&idx={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "div.oneVideo"
+        },
+        "fields": {
+          "title": {
+            "fallback": [
+              {"css": "img.index_video_cover", "attr": "alt"},
+              {"css": "img.card-img-top", "attr": "alt"},
+              {"css": "h3"}
+            ]
+          },
+          "url": {
+            "css": "a[href*='/video/']",
+            "attr": "href"
+          },
+          "cover": {
+            "fallback": [
+              {"css": "img.index_video_cover", "attr": "data-src"},
+              {"css": "img.index_video_cover", "attr": "data-original"},
+              {"css": "img.index_video_cover", "attr": "src"},
+              {"css": "img.card-img-top", "attr": "data-src"},
+              {"css": "img.card-img-top", "attr": "data-original"},
+              {"css": "img.card-img-top", "attr": "src"}
+            ]
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "fallback": [
+            {"css": "meta[property='og:title']", "attr": "content"},
+            {"css": "h1"}
+          ]
+        },
+        "cover": {
+          "fallback": [
+            {"css": "meta[property='og:image']", "attr": "content"},
+            {"css": "video[poster]", "attr": "poster"},
+            {"css": "img", "attr": "src"}
+          ]
+        },
+        "summary": {
+          "fallback": [
+            {"css": "meta[name='description']", "attr": "content"},
+            {"css": "meta[property='og:description']", "attr": "content"}
+          ]
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "play_url": {
+          "selector": {
+            "fallback": [
+              {"css": "video source[data-src]", "attr": "data-src"},
+              {"css": "video source[src]", "attr": "src"},
+              {"css": "video[data-src]", "attr": "data-src"},
+              {"css": "video[src]", "attr": "src"}
+            ]
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {"max_pages": 20, "max_results": 400},
+    "detail": {"max_pages": 1},
+    "episode": {"max_pages": 1, "max_items": 1}
+  },
+  "diagnostics": {
+    "selfcheck": {"strategy": "soft", "selector": {"css": "div.oneVideo"}}
+  }
+}

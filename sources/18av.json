@@ -1,0 +1,122 @@
+{
+  "$schema_version": 2,
+  "$id": "18av",
+  "$type": "video",
+  "$name": "18AV",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "adult": true,
+    "homepage": "https://18av.mm-cg.com/zh/",
+    "description": "18AV 中文字幕及成人视频源。详情页主播放器由浏览器脚本生成，按站点 AES 逻辑解密并提取 play.php 返回的 HLS 主流，不采集相关推荐预览视频。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "成人", "中文字幕", "有码", "无码", "国产", "日本", "欧美", "业余", "动漫", "写真", "小说", "HLS", "MP4"]
+  },
+  "transports": {
+    "base_url": "https://18av.mm-cg.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://18av.mm-cg.com/zh/",
+      "Upgrade-Insecure-Requests": "1"
+    },
+    "timeout": 10,
+    "retries": 1,
+    "interval_ms": 1,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/zh/",
+      "list_paginator": {
+        "type": "increment"
+      },
+      "list_item": {
+        "categories": [
+          {"title": "首页", "url": "/zh/"},
+          {"title": "中文字幕", "url": "/zh/chinese_list/all/{page}.html"},
+          {"title": "有码AV", "url": "/zh/censored_list/all/{page}.html"},
+          {"title": "无码AV", "url": "/zh/uncensored_list/all/{page}.html"},
+          {"title": "素人AV", "url": "/zh/amateurjav_list/all/{page}.html"},
+          {"title": "无码破解", "url": "/zh/reducing-mosaic_list/all/{page}.html"},
+          {"title": "H动画", "url": "/zh/animation_list/all/{page}.html"},
+          {"title": "H有码动画", "url": "/zh/CensoredAnimation_list/all/{page}.html"},
+          {"title": "H无码动画", "url": "/zh/UncensoredAnimation_list/all/{page}.html"},
+          {"title": "H_3D动画", "url": "/zh/tdAnimation_list/all/{page}.html"},
+          {"title": "国产自拍", "url": "/zh/dt_list/all/{page}.html"}
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {"css": ".post.video_9s"},
+        "page_item_limit": 30,
+        "fields": {
+          "title": {"css": ".con h3 a"},
+          "url": {"css": ".con h3 a", "attr": "href"},
+          "cover": {"css": "figure img.thumb", "attr": "src"},
+          "status": {"css": ".con .meta"}
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/zh/[^/]+_content/",
+      "fields": {
+        "title": {"css": ".archive-title h1 b"},
+        "cover": {
+          "css": "script[type='application/ld+json']",
+          "regex": "\\\"thumbnailUrl\\\"\\s*:\\s*\\\"([^\\\"]+)\\\""
+        },
+        "summary": {"css": "meta[name='description']", "attr": "content"},
+        "status": {
+          "css": "script[type='application/ld+json']",
+          "regex": "\\\"uploadDate\\\"\\s*:\\s*\\\"([^\\\"]+)\\\""
+        },
+        "tags": {
+          "fallback": [
+            {"css": "meta[property='article:tag']", "attr": "content"},
+            {"css": "meta[name='keywords']", "attr": "content"}
+          ]
+        }
+      }
+    },
+    "search": {
+      "base_url": "/zh/fc_search/all/{keyword}/1.html",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "paginator": {
+        "url_template": "/zh/fc_search/all/{keyword}/{page}.html"
+      },
+      "item": {
+        "root_selector": {"css": ".post.video_9s"},
+        "fields": {
+          "title": {"css": ".con h3 a"},
+          "url": {"css": ".con h3 a", "attr": "href"},
+          "cover": {"css": "figure img.thumb", "attr": "src"},
+          "author": {"css": ".con .meta"}
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "protected_player": true,
+        "play_url": {
+          "protected_player": true
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {"video": {"quality": "best"}}
+  },
+  "constraints": {
+      "search": {"max_pages": 30, "max_results": 0},
+    "detail": {"max_pages": 1},
+    "episode": {"max_pages": 1, "max_items": 1}
+  },
+  "diagnostics": {
+    "selfcheck": {"strategy": "soft", "selector": {"css": ".post.video_9s"}}
+  }
+}

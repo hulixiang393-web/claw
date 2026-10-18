@@ -1,0 +1,310 @@
+"""ffmpeg dash 合并器（ffmpeg_merger.py）。
+
+用系统 ffmpeg 把 dash 音视频双流（B 站分离的音视频轨）实时拉流合并成单 mp4。
+
+- 优先系统 PATH 找 ffmpeg；找不到则回退常见安装路径
+- 视频轨 + 音频轨（可选）→ 单 .mp4（视频流 copy、音频 aac）
+- 支持 -t 截取秒数（测试用）；正常下载不设限
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Optional
+
+
+class MergeCancelled(RuntimeError):
+    """合并被用户取消（点「取消」按钮时抛出）。"""
+
+
+class MergePaused(RuntimeError):
+    """合并被用户暂停（点「暂停」按钮时抛出）。合并已终止，可恢复后重下。"""
+
+
+def _find_ffmpeg() -> str:
+    """定位 ffmpeg 可执行文件（PATH 或常见安装路径）。"""
+    from .runtime import configure_runtime_environment, find_bundled_tool
+
+    configure_runtime_environment()
+    bundled = find_bundled_tool("ffmpeg", "ffmpeg.exe")
+    if bundled:
+        return bundled
+    path = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if path:
+        return path
+    # WinGet 装 Gyan.FFmpeg 的常见位置
+    import glob
+    import os
+
+    if os.name == "nt":
+        patterns = [
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\*ffmpeg*\*\ffmpeg.exe"),
+        ]
+        for p in patterns:
+            for c in glob.glob(p):
+                if os.path.isfile(c):
+                    return c
+    return "ffmpeg"  # 兜底交给系统找
+
+
+class FFmpegMerger:
+    """封装 ffmpeg 将 dash 双流合并为 mp4。
+
+    merge(video_url, audio_url, output) → 真实落盘的 mp4 路径。
+    """
+
+    UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self, ffmpeg_path: Optional[str] = None, headers: Optional[dict] = None):
+        self._ffmpeg = ffmpeg_path or _find_ffmpeg()
+        # 通用请求头：由调用方从源配置传入（transports.headers + cookie 合并后的
+        # request_headers()）。CDN 校验 Referer/UA/Cookie 的源（B站、HLS 站等）
+        # 都靠它通过校验；缺 UA 时兜底用内置 UA。
+        h = dict(headers or {})
+        if not h.get("User-Agent"):
+            h["User-Agent"] = self.UA
+        self._header_str = "\r\n".join(
+            f"{k}: {v}" for k, v in h.items() if v
+        ) + "\r\n"
+
+    def merge(
+        self,
+        video_url: str,
+        audio_url: str,
+        out_path: str | Path,
+        progress_cb=None,
+        cancel_evt=None,
+        pause_evt=None,
+    ) -> Path:
+        """合并 dash 双流为 mp4。out_path 为输出目标。返回实际文件 Path。
+
+        progress_cb: 可选回调 (bytes_written: int) → None，每 0.5s 报告
+                     已输出文件大小，供下载 UI 显示合并进度。
+        cancel_evt:  可选 threading.Event；设置时立即终止 ffmpeg（用户点取消）。
+                     返回时抛 MergeCancelled。
+        pause_evt:   可选 threading.Event；设置时立即终止 ffmpeg（用户点暂停）。
+                     返回时抛 MergePaused。
+
+        视频热爱（copy 不重编）+ 音频转 aac（保持兼容）。仅视频轨可用时只存视频。
+        """
+        import os
+        import subprocess
+
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        is_remote = video_url.startswith(("http://", "https://"))
+        # HLS 多连接提速：http_multiple/http_persistent 是 HLS demuxer 选项，
+        # 仅 m3u8 输入有效（直接 mp4/flv 传了会报 "Option not found" → 合并失败）。
+        # 多连接分段并发拉取，CDN 支持时显著提速（avgood 等实测 ~1.5x）。
+        is_hls = ".m3u8" in video_url.lower() or "m3u8" in video_url.lower()
+        # 通用请求头串（源配置传入；无则仅 UA）
+        headers = self._header_str
+        hls_opts = ["-http_multiple", "1", "-http_persistent", "1"] if (is_remote and is_hls) else []
+
+        # 远程 URL 才加 -headers（本地文件路径加了会报 Option headers not found）
+        cmd = [self._ffmpeg, "-y"]
+        # 允许 https/http 协议：本地 m3u8（广告过滤重写）引用的段/AES-key 是远程 https，
+        # ffmpeg 默认白名单 file,crypto,data 不含网络协议，会拒绝 → 显式放行。
+        if not is_remote:
+            cmd += ["-protocol_whitelist", "file,crypto,data,http,https,tcp,tls"]
+        if is_remote:
+            cmd += ["-headers", headers]
+        cmd += hls_opts
+        cmd += ["-i", video_url]
+        if audio_url:
+            if is_remote:
+                cmd += ["-headers", headers] + hls_opts
+            cmd += ["-i", audio_url]
+        cmd += ["-c:v", "copy", "-c:a", "aac", "-shortest", str(out_path)]
+        if not audio_url:
+            # 单流（无分离音轨）：完整文件自带音轨（hanime1/avgood 等），
+            # -c copy 保留全部流——若加 -an 会把内置音频丢光（下载无声）。
+            # 源是纯视频轨时 -c copy 也只复制视频，行为一致。
+            cmd = [self._ffmpeg, "-y"]
+            if not is_remote:
+                cmd += ["-protocol_whitelist", "file,crypto,data,http,https,tcp,tls"]
+            if is_remote:
+                cmd += ["-headers", headers] + hls_opts
+            cmd += ["-i", video_url, "-c", "copy", str(out_path)]
+
+        try:
+            # capture_output=True 在 Windows 有管道缓冲死锁：ffmpeg stderr 持续输出
+            # 超过管道缓冲（~64KB）后阻塞写，父进程 communicate() 也在等 → 死锁。
+            # 改用临时文件重定向 stdout/stderr，彻底消除该问题（视频越大越安全）。
+            import tempfile
+            import threading
+
+            with tempfile.NamedTemporaryFile(
+                mode="w+", suffix=".log", delete=False
+            ) as tf:
+                log_path = tf.name
+
+            # 用 Popen + 轮询输出文件大小，实时上报合并进度（否则 UI 全程 0）
+            out_path = Path(out_path)
+            stop = threading.Event()
+
+            def _check_cancel():
+                if cancel_evt is not None and cancel_evt.is_set():
+                    stop.set()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise MergeCancelled("合并已取消")
+                if pause_evt is not None and pause_evt.is_set():
+                    stop.set()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise MergePaused("合并已暂停")
+
+            def _monitor_progress(proc):
+                """后台线程：每 0.3s 报告已输出文件大小 + 检查取消。"""
+                try:
+                    while proc.poll() is None and not stop.is_set():
+                        _check_cancel()
+                        if progress_cb is not None:
+                            try:
+                                size = (
+                                    out_path.stat().st_size
+                                    if out_path.exists() else 0
+                                )
+                                progress_cb(size)
+                            except Exception:
+                                pass
+                        import time as _t
+                        _t.sleep(0.3)
+                    # 结束前补最后一口
+                    if progress_cb is not None and proc.poll() is None:
+                        try:
+                            progress_cb(out_path.stat().st_size if out_path.exists() else 0)
+                        except Exception:
+                            pass
+                except MergeCancelled:
+                    return
+                except MergePaused:
+                    return
+                except Exception:
+                    pass
+
+            from .subprocess_no_window import no_window_kwargs
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=open(log_path, "w"),
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                **no_window_kwargs(),  # Windows 静默，不弹控制台窗口
+            )
+            monitor = threading.Thread(
+                target=_monitor_progress, args=(proc,), daemon=True
+            )
+            monitor.start()
+            try:
+                # 轮询等待：取消/暂停时立即终止，不阻塞到 ffmpeg 结束
+                import time as _t
+                while proc.poll() is None:
+                    if cancel_evt is not None and cancel_evt.is_set():
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        stop.set()
+                        raise MergeCancelled("合并已取消")
+                    if pause_evt is not None and pause_evt.is_set():
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        stop.set()
+                        raise MergePaused("合并已暂停")
+                    _t.sleep(0.2)
+                # 进程已结束，等待清理
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+            except MergeCancelled:
+                if out_path.exists():
+                    try:
+                        out_path.unlink()
+                    except OSError:
+                        pass
+                raise
+            except MergePaused:
+                if out_path.exists():
+                    try:
+                        out_path.unlink()
+                    except OSError:
+                        pass
+                raise
+            except subprocess.TimeoutExpired:
+                stop.set()
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                if out_path.exists():
+                    try:
+                        out_path.unlink()
+                    except OSError:
+                        pass
+                raise RuntimeError("ffmpeg 合并超时")
+            finally:
+                stop.set()
+                monitor.join(timeout=2)
+
+            # 读取合并日志（错误诊断用）
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    run_log = f.read()
+            except OSError:
+                run_log = ""
+            finally:
+                try:
+                    import os
+
+                    os.unlink(log_path)
+                except OSError:
+                    pass
+        except MergeCancelled:
+            raise  # 用户取消：透传给调用方（download_queue 标记 CANCELED）
+        except MergePaused:
+            raise  # 用户暂停：透传给调用方（download_queue 标记 PAUSED）
+        except subprocess.TimeoutExpired:
+            # 超时可能已写入部分文件，清理
+            if out_path.exists():
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError("ffmpeg 合并超时")
+        except Exception as exc:
+            raise RuntimeError(f"ffmpeg 启动失败：{exc}") from exc
+        finally:
+            # 统一清理：任意路径（取消/暂停/超时/成功/异常）都不泄漏临时 log
+            try:
+                import os
+
+                os.unlink(log_path)
+            except OSError:
+                pass
+
+        if proc.returncode != 0:
+            err = run_log[-500:]
+            if out_path.exists():
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError(f"ffmpeg 合并失败（{proc.returncode}）：{err}")
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError("ffmpeg 合并无输出文件")
+        return out_path

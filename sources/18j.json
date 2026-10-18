@@ -1,0 +1,172 @@
+{
+  "$schema_version": 2,
+  "$id": "18j",
+  "$type": "video",
+  "$name": "18J.TV",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "adult": true,
+    "homepage": "https://18j.tv/",
+    "description": "18J.TV 成人视频站。列表、分类、标签搜索为 HTML；详情页为单视频，播放地址从 JSON-LD 或播放器脚本提取 HLS m3u8。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "成人",
+      "国产",
+      "日韩",
+      "欧美",
+      "伦理",
+      "动漫",
+      "自拍",
+      "hls"
+    ]
+  },
+  "transports": {
+    "base_url": "https://18j.tv",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://18j.tv/",
+      "Upgrade-Insecure-Requests": "1"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 500,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/label/hot/by/time/page/{page}",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1
+      },
+      "list_item": {
+        "categories": [
+          { "title": "最新", "url": "/label/hot/by/time/page/{page}" },
+          { "title": "日榜", "url": "/label/hot/by/hits_day/page/{page}" },
+          { "title": "周榜", "url": "/label/hot/by/hits_week/page/{page}" },
+          { "title": "月榜", "url": "/label/hot/by/hits_month/page/{page}" },
+          { "title": "近期点赞", "url": "/label/hot/by/up_day/page/{page}" },
+          { "title": "好评", "url": "/label/hot/by/up_week/page/{page}" },
+          { "title": "成人AI", "url": "/t/9-{page}" },
+          { "title": "国产", "url": "/t/1-{page}" },
+          { "title": "日韩", "url": "/t/2-{page}" },
+          { "title": "欧美", "url": "/t/3-{page}" },
+          { "title": "伦理", "url": "/t/4-{page}" },
+          { "title": "动漫", "url": "/t/5-{page}" },
+          { "title": "另类", "url": "/t/6-{page}" },
+          { "title": "无码中字", "url": "/t/19-{page}" },
+          { "title": "JAV自拍", "url": "/t/20-{page}" },
+          { "title": "中文字幕", "url": "/t/21-{page}" },
+          { "title": "jav无码", "url": "/t/22-{page}" },
+          { "title": "AV解说", "url": "/t/23-{page}" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "ul.list > li" },
+        "fields": {
+          "title": { "css": "a[href^='/v/'][title]", "attr": "title" },
+          "url": { "css": "a[href^='/v/']", "attr": "href" },
+          "cover": {
+            "fallback": [
+              { "css": "img", "attr": "data-original" },
+              { "css": "img", "attr": "src" }
+            ]
+          },
+          "author": { "css": ".vodlist_img span" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/s/wd/{keyword}/",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "paginator": {
+        "url_template": "/s/page/{page}/wd/{keyword}/"
+      },
+      "item": {
+        "root_selector": { "css": "ul.list > li" },
+        "fields": {
+          "title": { "css": "a[href^='/v/'][title]", "attr": "title" },
+          "url": { "css": "a[href^='/v/']", "attr": "href" },
+          "cover": {
+            "fallback": [
+              { "css": "img", "attr": "data-original" },
+              { "css": "img", "attr": "src" }
+            ]
+          },
+          "author": { "css": ".vodlist_img span" }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/v/\\d+-\\d+-\\d+/",
+      "fields": {
+        "title": { "css": "h1.play-title" },
+        "cover": { "css": "meta[property='og:image']", "attr": "content" },
+        "summary": { "css": "meta[property='og:description']", "attr": "content" },
+        "status": { "css": "meta[property='video:release_date']", "attr": "content" },
+        "tags": {
+          "css": "meta[property='video:section'], meta[property='video:tag'], meta[property='video:actor']",
+          "attr": "content"
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页就是单个视频，不把相关推荐误判为分集。播放器脚本和 JSON-LD 都提供带时效的 HLS 地址，每次取流从详情 HTML 重新提取。",
+        "play_url": {
+          "http_chain": [
+            {
+              "name": "hls",
+              "regex": "(?:const\\s+source\\s*=\\s*[\"']|contentUrl[\"']?\\s*:\\s*[\"'])([^\"']+\\.m3u8[^\"']*)",
+              "referer": "",
+              "fetch": false
+            }
+          ]
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": { "quality": "best" }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "ad_block": {
+    "enabled": true,
+    "hls_rules": {
+      "drop_leading_block": {
+        "enabled": true,
+        "max_duration": 30,
+        "max_ratio": 0.25,
+        "require_discontinuity": true,
+        "require_host_change": true,
+        "require_encryption_transition": true,
+        "encryption_transition": "unencrypted_to_encrypted"
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 5, "max_results": 200 },
+    "detail": { "max_pages": 1 },
+    "episode": { "max_pages": 1, "max_items": 1 }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": "ul.list > li" }
+    }
+  }
+}

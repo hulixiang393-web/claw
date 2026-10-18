@@ -1,0 +1,106 @@
+{
+  "$schema_version": 2,
+  "$id": "shuyous",
+  "$type": "novel",
+  "$name": "书友网",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.shuyous.com",
+    "description": "书友网公开小说源。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["小说", "免费"]
+  },
+  "transports": {
+    "base_url": "https://www.shuyous.com",
+    "timeout": 20,
+    "retries": 1,
+    "interval_ms": 1500
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/list-18-1/",
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.list2 ul li"
+        },
+        "fields": {
+          "title": {
+            "css": ".name a"
+          },
+          "url": {
+            "css": ".name a",
+            "attr": "href"
+          },
+          "author": {
+            "css": ".author"
+          },
+          "category": {
+            "css": ".cate"
+          },
+          "update": {
+            "css": ".date"
+          }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/book/",
+      "fields": {
+        "title": {
+          "css": ".book h1"
+        },
+        "author": {
+          "css": ".book .author"
+        },
+        "cover": {
+          "css": ".book img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": ".book .intro"
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "pagination": {
+          "enabled": true,
+          "max_pages": 20,
+          "same_chapter_regex": "(?P<base>/book/\\d+-\\d+)(?:-\\d+)?\\.html$",
+          "same_chapter_replacement": "\\g<base>.html"
+        },
+        "list": {
+          "root_selector": {
+            "css": "div.chapterList div.list ul li"
+          },
+          "fields": {
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": "div.content#content p"
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "chapter": {
+      "max_pages": 20
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

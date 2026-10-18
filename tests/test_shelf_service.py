@@ -1,0 +1,365 @@
+"""ShelfService 单元测试（不依赖 Qt，纯文件系统）。"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from framework.library_store import LibraryStore
+from framework.shelf_service import ShelfService, ShelfItem
+
+
+@pytest.fixture()
+def base(tmp_path: Path):
+    return tmp_path
+
+
+def make_epub(path: Path, content_type: str = "novel") -> None:
+    """造一个假 epub（类型检测器用假探测器，这里仅需文件存在）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"PK\x03\x04fake epub")
+
+
+def test_scan_local_detects_epub_and_video(base: Path):
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    make_epub(base / "dl" / "书B" / "书B.epub")
+    (base / "dl" / "视频C").mkdir(parents=True, exist_ok=True)
+    (base / "dl" / "视频C" / "视频C_001.mp4").write_bytes(b"x")
+    (base / "dl" / "视频C" / "视频C_002.mp4").write_bytes(b"x")
+    (base / "dl" / "无内容目录").mkdir(parents=True)
+
+    svc = ShelfService(
+        output_dir=base / "dl",
+        data_dir=base / "data",
+        epub_detector=lambda p: "comic" if "B" in p else "novel",
+    )
+    items = svc.scan_local()
+    by_title = {i.title: i for i in items}
+    assert set(by_title) == {"书A", "书B", "视频C"}
+    assert by_title["书A"].content_type == "novel"
+    assert by_title["书B"].content_type == "comic"
+    assert by_title["视频C"].content_type == "video"
+    assert by_title["视频C"].episode_count == 2
+    assert all(i.kind == "local" for i in items)
+
+
+def test_missing_output_dir_returns_empty(base: Path):
+    svc = ShelfService(output_dir=base / "不存在", data_dir=base / "data")
+    assert svc.scan_local() == []
+
+
+def test_metadata_snapshot_skips_progress_until_deferred_refresh(base: Path):
+    make_epub(base / "dl" / "书A" / "书A.epub")
+
+    class _Progress:
+        def __init__(self):
+            self.calls = 0
+
+        def summary(self, _key):
+            self.calls += 1
+            return {"chapter_title": "第二章", "updated_at": "2026-10-14T00:00:00"}
+
+    progress = _Progress()
+    svc = ShelfService(
+        output_dir=base / "dl",
+        data_dir=base / "data",
+        reading_progress=progress,
+        epub_detector=lambda _path: "novel",
+    )
+
+    snapshot = svc.metadata_snapshot()
+    assert progress.calls == 0
+    assert snapshot[0][0].resume_title == ""
+
+    enriched = svc.refresh_metadata(snapshot)
+    assert progress.calls == 1
+    assert enriched[0][0].resume_title == "第二章"
+
+
+def test_epub_type_cache_reuses_detector(base: Path):
+    epub = base / "dl" / "书A" / "书A.epub"
+    make_epub(epub)
+    calls = []
+
+    def detector(p):
+        calls.append(p)
+        return "novel"
+
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=detector
+    )
+    assert svc.epub_type(str(epub)) == "novel"
+    assert svc.epub_type(str(epub)) == "novel"
+    assert len(calls) == 1  # 第二次命中缓存
+
+
+def test_epub_type_cache_invalidated_on_mtime_change(base: Path):
+    epub = base / "dl" / "书A" / "书A.epub"
+    make_epub(epub)
+    calls = []
+
+    def detector(p):
+        calls.append(p)
+        return "novel"
+
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=detector
+    )
+    assert svc.epub_type(str(epub)) == "novel"
+    import os
+    import time
+
+    time.sleep(0.01)
+    epub.write_bytes(b"PK\x03\x04changed")
+    os.utime(epub, (time.time() + 1, time.time() + 1))
+    assert svc.epub_type(str(epub)) == "novel"
+    assert len(calls) == 2  # mtime 变化 → 重新检测
+
+
+def test_hidden_local_roundtrip(base: Path):
+    svc = ShelfService(output_dir=base / "dl", data_dir=base / "data")
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    svc.hide_local("书A")
+    assert "书A" in svc.hidden_local()
+    assert svc.scan_local() == []  # 隐藏后不再出现
+    svc.show_local("书A")
+    assert svc.scan_local()[0].title == "书A"
+
+
+def test_local_resume_relative_output_dir_resolved(base: Path, monkeypatch):
+    """相对 output_dir 下本地续读 key 归一为绝对路径（修复：相对/绝对不一致致记忆断链）。
+
+    书架扫描用相对目录时，产出的 key 须与阅读器存的绝对路径一致，
+    否则本地 epub 卡片不显示"读到第X章"、续读匹配不上。
+    """
+    from framework.reading_progress import ReadingProgress
+
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    monkeypatch.chdir(base)  # 相对 output_dir 以 base 为基准解析
+    rp = ReadingProgress(base / "rp.json")
+    # 模拟阅读器以绝对路径存续读（app._open_epub 用 Path.resolve()）
+    abs_key = str((base / "dl" / "书A" / "书A.epub").resolve())
+    rp.save("", abs_key, "epub", abs_key, "第三章", position=0.5)
+    svc = ShelfService(
+        output_dir="dl",  # 相对路径（默认配置形态）
+        data_dir=base / "data",
+        reading_progress=rp,
+        epub_detector=lambda p: "novel",
+    )
+    items = svc.scan_local()
+    assert items and items[0].resume_title == "第三章"
+    assert items[0].key == abs_key  # 扫描 key 已归一为绝对路径
+
+
+def test_merged_video_carries_online_resume(base: Path):
+    """合并视频卡：本地无进度时展示线上收藏的续读（线上看到哪集）。"""
+    from framework.reading_progress import ReadingProgress
+
+    store = LibraryStore(base / "lib.json")
+    (base / "dl" / "视频C").mkdir(parents=True, exist_ok=True)
+    (base / "dl" / "视频C" / "第1集.mp4").write_bytes(b"x")
+    (base / "dl" / "视频C" / "第2集.mp4").write_bytes(b"x")
+    store.add("src", "http://x/vid", "视频C", content_type="video")
+    rp = ReadingProgress(base / "rp.json")
+    rp.save("src", "http://x/vid", "video", "http://x/vid/2", "第2集", position=0.3)
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data",
+        library_store=store, reading_progress=rp,
+    )
+    merged = [i for i in svc.list_items() if i.kind == "local"]
+    assert len(merged) == 1
+    assert merged[0].resume_title == "第2集"  # 本地无进度 → 回退线上收藏进度
+
+
+def test_favorites_merged_with_local(base: Path):
+    store = LibraryStore(base / "lib.json")
+    make_epub(base / "dl" / "本地书" / "本地书.epub")
+    store.add("src", "http://x/1", "在线书", content_type="novel", tags=["免费"])
+
+    svc = ShelfService(
+        output_dir=base / "dl",
+        data_dir=base / "data",
+        library_store=store,
+        epub_detector=lambda p: "novel",
+    )
+    items = svc.list_items()
+    kinds = {i.kind for i in items}
+    assert kinds == {"local", "favorite"}
+    fav = [i for i in items if i.kind == "favorite"][0]
+    assert fav.key == "http://x/1"
+    assert fav.tags == ["免费"]
+
+
+def test_filters(base: Path):
+    store = LibraryStore(base / "lib.json")
+    store.add("src", "http://x/1", "小说1", content_type="novel", tags=["免费"])
+    store.add("src", "http://x/2", "漫画1", content_type="comic", tags=["日更"])
+    svc = ShelfService(
+        output_dir=base / "dl",
+        data_dir=base / "data",
+        library_store=store,
+    )
+    assert len(svc.list_items(content_type="novel")) == 1
+    assert len(svc.list_items(tag="日更")) == 1
+    assert svc.all_tags() == ["免费", "日更"]
+    assert svc.list_items(content_type="novel", tag="日更") == []
+
+
+def test_favorite_folder_filter(base: Path):
+    store = LibraryStore(base / "lib.json")
+    store.add("src", "http://x/1", "夹内书", content_type="novel", folder="玄幻")
+    store.add("src", "http://x/2", "未归类", content_type="novel")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", library_store=store
+    )
+    assert svc.folders() == ["玄幻"]
+    favs = svc.favorites(folder="玄幻")
+    assert len(favs) == 1 and favs[0].title == "夹内书"
+    assert len(svc.favorites(folder="全部")) == 2
+
+
+def test_favorite_crud_proxy(base: Path):
+    store = LibraryStore(base / "lib.json")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", library_store=store
+    )
+    assert not svc.favorite_has("http://x/1")
+    svc.favorite_add("src", "http://x/1", "书", content_type="video")
+    assert svc.favorite_has("http://x/1")
+    svc.favorite_move("http://x/1", "追番")
+    assert svc.favorites(folder="追番")[0].title == "书"
+    svc.favorite_remove("http://x/1")
+    assert not svc.favorite_has("http://x/1")
+
+
+def test_clear_all_favorites_excludes_locked_folders(base: Path):
+    store = LibraryStore(base / "lib.json")
+    store.add("src", "http://x/open", "公开", folder="公开")
+    store.add("src", "http://x/locked", "加密", folder="加密")
+    store.set_folder_lock("加密", True, pw="hash", salt="salt")
+    svc = ShelfService(output_dir=base / "dl", data_dir=base / "data", library_store=store)
+
+    assert svc.clear_all_favorites(exclude_folders={"加密"}) == 1
+    assert not store.has("http://x/open")
+    assert store.has("http://x/locked")
+
+
+def test_delete_folder_moves_favorites_to_uncategorized(base: Path):
+    store = LibraryStore(base / "lib.json")
+    store.add("src", "http://x/1", "书", folder="待读")
+    svc = ShelfService(output_dir=base / "dl", data_dir=base / "data", library_store=store)
+
+    assert svc.delete_folder("待读")
+    assert store.folder_items("待读") == []
+    assert store.folder_items("")[0]["url"] == "http://x/1"
+
+
+def test_resume_title_merged(base: Path):
+    class FakeProgress:
+        def summary(self, key):
+            return {"chapter_title": f"第{len(key)}章"} if key else None
+
+    store = LibraryStore(base / "lib.json")
+    store.add("src", "http://x/1", "在线书", content_type="novel")
+    svc = ShelfService(
+        output_dir=base / "dl",
+        data_dir=base / "data",
+        library_store=store,
+        reading_progress=FakeProgress(),
+    )
+    fav = svc.favorites()[0]
+    assert fav.resume_title == "第10章"
+
+
+def test_meta_cache_persisted(base: Path):
+    epub = base / "dl" / "书A" / "书A.epub"
+    make_epub(epub)
+    calls = []
+
+    def detector(p):
+        calls.append(p)
+        return "novel"
+
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=detector
+    )
+    svc.epub_type(str(epub))
+    svc2 = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=detector
+    )
+    assert svc2.epub_type(str(epub)) == "novel"
+    assert len(calls) == 1  # 重启服务后缓存文件命中，不再检测
+
+
+def test_to_rec_roundtrip():
+    it = ShelfItem(key="k", kind="local", title="t", content_type="novel",
+                   path="/p/a.epub", episode_count=3, resume_title="读到X")
+    rec = it.to_rec()
+    assert rec["key"] == "k"
+    assert rec["episode_count"] == 3
+    assert rec["resume_title"] == "读到X"
+    assert "missing" not in rec
+
+
+def test_scan_local_reuses_unchanged_dir_metadata(base: Path, monkeypatch):
+    """增量扫描：目录未变更时复用元数据，不重读目录；变更才重建。"""
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=lambda p: "novel"
+    )
+    real = ShelfService._build_local_item
+    calls: list[str] = []
+
+    def spy(self, sub, metadata_only):
+        calls.append(str(sub))
+        return real(self, sub, metadata_only)
+
+    monkeypatch.setattr(ShelfService, "_build_local_item", spy)
+
+    svc.scan_local()
+    svc.scan_local()
+    assert len(calls) == 1  # 第二次直接复用缓存条目
+
+    make_epub(base / "dl" / "书A" / "第二本.epub")  # 目录变更 → 重建
+    items = svc.scan_local()
+    assert len(calls) == 2
+    assert [i.title for i in items].count("书A") == 1
+
+
+def test_scan_local_discards_stale_generation(base: Path):
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=lambda p: "novel"
+    )
+    assert svc.metadata_snapshot() is not None
+    stale = svc._generation - 1
+    assert svc.scan_local(metadata_only=True, generation=stale) is None  # 迟到结果丢弃
+    assert svc.scan_local(metadata_only=True, generation=svc._generation) is not None
+
+
+def test_scan_local_cancel_stops_and_reports(base: Path):
+    import threading
+
+    make_epub(base / "dl" / "书A" / "书A.epub")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=lambda p: "novel"
+    )
+    ev = threading.Event()
+    ev.set()
+    assert svc.scan_local(cancel=ev) == []
+    assert svc.metadata_snapshot(cancel=ev) is None
+
+
+def test_scan_local_persists_type_cache_once(base: Path, monkeypatch):
+    """一次全量扫描多本，类型缓存落盘只写一次（不再逐本重写整表）。"""
+    for name in ("书A", "书B", "书C"):
+        make_epub(base / "dl" / name / f"{name}.epub")
+    svc = ShelfService(
+        output_dir=base / "dl", data_dir=base / "data", epub_detector=lambda p: "novel"
+    )
+    writes: list[int] = []
+    monkeypatch.setattr(svc, "_persist_meta", lambda: writes.append(1))
+    svc.scan_local()
+    assert len(writes) == 1

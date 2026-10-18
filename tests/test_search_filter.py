@@ -1,0 +1,264 @@
+# -*- coding: utf-8 -*-
+"""搜索页来源筛选 + WorkCard 来源可点接口测试。
+
+覆盖：
+- WorkCard 默认（发现页）source_filterable=False，无来源可点 label；
+- 启用后来源 label 可点击且发射 source_clicked(source_id)；
+- SearchPage._set_filter 从卡片来源点击接线：筛选只看该源 → 再次点击取消 → 清除恢复。
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import pytest
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtWidgets import QApplication
+
+from framework.config import SourceConfig
+from framework.parser import Parser
+from framework.search import Search, SearchResult
+from framework.source_manager import SourceManager
+from gui.components.work_card import WorkCard
+from gui.pages.search_page import SearchPage
+
+SRC = {
+    "$schema_version": 2,
+    "$id": "site_a",
+    "$type": "novel",
+    "$name": "站点A",
+    "transports": {"base_url": "http://x.com"},
+    "endpoints": {
+        "search": {
+            "base_url": "/search",
+            "method": "GET",
+            "item": {
+                "root_selector": {"css": ".item"},
+                "fields": {"title": {"css": ".t"}, "url": {"css": ".t", "attr": "href"}},
+            },
+        }
+    },
+}
+
+
+@pytest.fixture(scope="module")
+def app():
+    return QApplication.instance() or QApplication([])
+
+
+def _make_page(app):
+    # 排空上一用例遗留的已删除 HoverTitle 触发的过期事件，避免构造时
+    # 进入 hover_title.eventFilter 未初始化 _popup 的既有告警路径
+    app.processEvents()
+    app.processEvents()
+    mgr = SourceManager()
+    mgr.add(SourceConfig.from_dict(SRC))
+    mgr.add(SourceConfig.from_dict({**SRC, "$id": "site_b", "$name": "站点B"}))
+    search = Search(http=None, parser=Parser())
+    page = SearchPage(mgr, search)
+    page.show()
+    return page
+
+
+def _results():
+    return [
+        SearchResult(title="A1", url="u-a1", source_id="site_a", source_name="站点A"),
+        SearchResult(title="B1", url="u-b1", source_id="site_b", source_name="站点B"),
+        SearchResult(title="A2", url="u-a2", source_id="site_a", source_name="站点A"),
+    ]
+
+
+def _sheet_ids(page):
+    return {c.work.source_id for c in page.grid_container.findChildren(WorkCard)}
+
+
+def test_workcard_default_not_source_filterable(app):
+    """发现页默认卡片：source_filterable=False，无来源可点 label。"""
+    card = WorkCard(SearchResult(title="X", url="u-x", source_id="site_a", source_name="站点A"))
+    assert card._source_filterable is False
+    assert card.source_clicked is not None
+    card.set_source_filterable(True)
+    assert card._source_filterable is True
+    assert card._source_label is not None
+
+
+def test_workcard_source_label_click_emits(app):
+    """启用后可点击来源 label，点击发射 source_clicked(source_id)。"""
+    card = WorkCard(
+        SearchResult(title="X", url="u-x", source_id="site_a", source_name="站点A"),
+        source_filterable=True,
+    )
+    triggered = []
+    card.source_clicked.connect(triggered.append)
+    assert card._source_label.cursor().shape() == Qt.PointingHandCursor
+    ev = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        card._source_label.rect().center(),
+        Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+    )
+    card.eventFilter(card._source_label, ev)
+    assert triggered == ["site_a"]
+
+
+def test_filter_on_source_click(app):
+    """点击来源角标 → 只看该源，其余消失；再次点击同源取消；清除恢复全量。"""
+    page = _make_page(app)
+    page._results = _results()
+    page._results_display = list(page._results)
+    page._shown_count = len(page._results)
+    page._show_results()
+    assert _sheet_ids(page) == {"site_a", "site_b"}
+
+    page._set_filter("site_a")
+    assert page._filter_source == "site_a"
+    assert page.filter_label.text() == "仅看 站点A"
+    assert page.filter_bar_widget.isVisible() is True
+    assert _sheet_ids(page) == {"site_a"}
+
+    # 再次点击同源 → 取消筛选
+    page._set_filter("site_a")
+    assert page._filter_source == ""
+    assert page.filter_bar_widget.isVisible() is False
+    assert _sheet_ids(page) == {"site_a", "site_b"}
+
+    # 重新筛选后通过 × 清除筛选恢复
+    page._set_filter("site_b")
+    assert _sheet_ids(page) == {"site_b"}
+    page._clear_filter()
+    assert page._filter_source == ""
+    assert _sheet_ids(page) == {"site_a", "site_b"}
+
+
+def test_filter_load_more_keeps_source(app):
+    """筛选后滚动加载（_load_more_results）不得把其他源结果混进来。"""
+    page = _make_page(app)
+    page._results = _results()
+    page._results_display = list(page._results)
+    page._shown_count = len(page._results)
+    page._page_size = 2
+
+    # 首次筛选 site_a：1 屏（load_more 触发点）只应渲染该源卡片
+    page._set_filter("site_a")
+    page._shown_count = 0  # 模拟首屏只渲染了一部分、后续走滚动加载
+    page._load_more_results()
+    assert _sheet_ids(page) == {"site_a"}
+
+
+def test_filter_chips_row(app):
+    """来源筛选 chips 行：结果完成后聚合来源 → 点击筛选 → 全部恢复 → 增量刷新。"""
+    page = _make_page(app)
+    page._results = _results()
+    page._results_display = list(page._results)
+    page._shown_count = len(page._results)
+    page._refresh_source_chips()
+
+    # 聚合：site_a×2 / site_b×1，chips 行可见
+    assert page._source_chip_row.isVisible() is True
+    assert set(page._source_chip_btns) == {"site_a", "site_b"}
+    assert "站点A" in page._source_chip_btns["site_a"].text()
+    assert "站点B" in page._source_chip_btns["site_b"].text()
+
+    # 点 site_a chip → 只看该源，chip 选中同步
+    page._source_chip_btns["site_a"].click()
+    assert page._filter_source == "site_a"
+    assert page._source_chip_btns["site_a"].isChecked() is True
+    assert page._source_chip_btns["site_b"].isChecked() is False
+    assert _sheet_ids(page) == {"site_a"}
+
+    # 点「全部」→ 恢复全量，chip 全部取消
+    page._all_chip_btn.click()
+    assert page._filter_source == ""
+    assert page._all_chip_btn.isChecked() is True
+    assert _sheet_ids(page) == {"site_a", "site_b"}
+
+    # 增量刷新：删除一个来源后 chips 行同步移除该按钮
+    page._results = [page._results[0], page._results[2]]  # 只剩 site_a×2
+    page._results_display = list(page._results)
+    page._refresh_source_chips()
+    assert set(page._source_chip_btns) == {"site_a"}
+
+    # 结果清空 → 整行隐藏（_current_display 优先 _results_display，两者都要清）
+    page._reset_source_chips()
+    page._results = []
+    page._results_display = []
+    page._refresh_source_chips()
+    assert page._source_chip_row.isVisible() is False
+
+
+# ---------------------------------------------------------------------- #
+# D3：关键词过滤归一化（NFKC + casefold + 去空白）
+# ---------------------------------------------------------------------- #
+def test_normalize_match_text_is_strict_superset_of_raw():
+    """归一化匹配 ⊇ 裸子串匹配：命中全角/半角/大小写/空白差异的合法结果。"""
+    assert Search._normalize_match_text(" ＣｏＣｏ ") == "coco"
+    assert Search._normalize_match_text("ABC") == "abc"
+    assert Search._normalize_match_text("") == ""
+    # 原先能命中的（裸匹配）归一化后必然仍命中
+    assert Search._normalize_match_text("斗破") in Search._normalize_match_text("斗破苍穹")
+    # 但在全角下裸匹配失败、归一化能够命中
+    assert Search._normalize_match_text("coco") in Search._normalize_match_text("ＣｏＣｏ字幕组")
+
+
+def test_rendered_search_keyword_filter_matches_normalized_variant(monkeypatch):
+    """渲染搜索页关键词过滤用归一化匹配：全角标题命中半角关键词。"""
+    src = SourceConfig.from_dict(SRC)
+    item_cfg = {
+        "root_selector": {"css": ".item"},
+        "render_config": {"filter_keyword": True},
+    }
+    items = [
+        {"title": "ＣｏＣｏ字幕组", "href": "http://x.com/1", "text": "ＣｏＣｏ字幕组"},
+        {"title": "斗罗大陆", "href": "http://x.com/2", "text": "斗罗大陆"},
+    ]
+    monkeypatch.setattr(
+        "framework.playwright_helper.fetch_rendered_items_sync",
+        lambda *a, **k: items,
+    )
+    search = Search(http=None, parser=Parser())
+    results = search._search_html_rendered(
+        src, "http://x.com/s?q=coco", item_cfg, keyword="coco"
+    )
+    assert [r.title for r in results] == ["ＣｏＣｏ字幕组"]
+
+
+# ---------------------------------------------------------------------- #
+# D3：搜索关键词入参归一化（去首尾/压缩连续空白，不改大小写）
+# ---------------------------------------------------------------------- #
+def test_normalize_keyword_strips_and_collapses_whitespace():
+    from framework.search import _normalize_keyword
+
+    assert _normalize_keyword("  hello   world  ") == "hello world"
+    assert _normalize_keyword("\t斗破\n苍穹 ") == "斗破 苍穹"
+    assert _normalize_keyword("CoCo") == "CoCo"  # 大小写不变
+    assert _normalize_keyword(None) == ""
+    assert _normalize_keyword("   ") == ""
+
+
+def test_search_one_normalizes_keyword_in_built_url(monkeypatch):
+    """search_one 用归一化关键词构造查询：不同空白输入得到同一 URL。"""
+    src = SourceConfig.from_dict(SRC)
+    seen = []
+
+    def _fake_get(self, source, url, http=None):
+        seen.append(url)
+        return "<html></html>"
+
+    monkeypatch.setattr(Search, "_http_get", _fake_get)
+    monkeypatch.setattr(Search, "_verify_search", lambda *a, **k: None)
+    monkeypatch.setattr(Parser, "parse", lambda self, html: "<doc>")
+    monkeypatch.setattr(Parser, "parse_items", lambda self, *a, **k: [])
+    search = Search(http=None, parser=Parser())
+    search.search_one(src, "  hello   world ")
+    assert seen, "应发起请求"
+    assert "hello%20world" in seen[0]
+    assert "  " not in seen[0]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

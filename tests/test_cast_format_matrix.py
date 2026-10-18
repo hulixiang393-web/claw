@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import time
+from pathlib import Path
+from urllib.request import urlopen
+
+from framework.cast_session import CastSession
+from framework.dlna import DlnaClient
+from framework.media_proxy import MediaProxy
+from tools.generate_cast_samples import generate_sample_set
+from tools.virtual_dlna_renderer import VirtualRenderer, find_ffmpeg, run_ffprobe, start_media_server
+
+
+class _OffCache:
+    enabled = False
+
+
+def _media_url(base_url: str, root: Path, path: Path) -> str:
+    return f"{base_url}/{path.relative_to(root).as_posix()}"
+
+
+def _repair_hls_fmp4_fixture(ffmpeg_path: str, root: Path) -> None:
+    directory = root / "hls_fmp4"
+    manifest = directory / "index.m3u8"
+    init_path = directory / "init.mp4"
+    subprocess.run(
+        [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(root / "sample.mp4"),
+            "-c",
+            "copy",
+            "-f",
+            "hls",
+            "-hls_time",
+            "1",
+            "-hls_list_size",
+            "0",
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_fmp4_init_filename",
+            str(init_path),
+            "-hls_segment_filename",
+            str(directory / "index%d.m4s"),
+            str(manifest),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text(text.replace(str(init_path), init_path.name), encoding="utf-8")
+
+
+def _result(name: str, probe: dict, decoded: bool, elapsed_ms: float, reason: str = "") -> dict:
+    return {
+        "format": name,
+        "container": probe.get("container"),
+        "video_codec": probe.get("video_codec"),
+        "audio_codec": probe.get("audio_codec"),
+        "decoded": decoded,
+        "elapsed_ms": round(elapsed_ms, 1),
+        "reason": reason,
+    }
+
+
+def test_offline_cast_format_matrix_uses_lan_cast_session(tmp_path):
+    ffmpeg_path = find_ffmpeg()
+    samples = generate_sample_set(tmp_path / "samples", ffmpeg_path)
+    root = tmp_path / "samples"
+    _repair_hls_fmp4_fixture(ffmpeg_path, root)
+    media_server, media_base = start_media_server(root)
+    proxy = MediaProxy(cache=_OffCache())
+    results = []
+    local_urls = []
+    try:
+        capability = samples.get("capability", {})
+        for name in ("mp4", "hls_ts", "hls_fmp4", "dash", "webm"):
+            sample = samples.get(name)
+            if sample is None:
+                results.append(_result(name, {}, False, 0.0, capability.get(name, "fixture unavailable")))
+                continue
+
+            source_url = _media_url(media_base, root, sample)
+            probe = {}
+            started = time.perf_counter()
+            renderer = VirtualRenderer(ffmpeg_path=ffmpeg_path, fetch_timeout=30.0)
+            renderer.start()
+            stopped = []
+            session = CastSession(
+                proxy,
+                lambda current_renderer: DlnaClient(current_renderer, timeout=30.0),
+                lambda: stopped.append(True),
+            )
+            try:
+                session.start(renderer._descriptor(), 0, source_url, name, {}, None, True)
+                lan_url = session._current_url
+                assert lan_url
+                assert urlopen(lan_url, timeout=10).status == 200
+                probe = run_ffprobe(
+                    ffmpeg_path,
+                    lan_url,
+                    timeout=30.0,
+                    allow_extensionless=name.startswith("hls_"),
+                )
+                state = session.poll_state()
+                decoded = state["state"] == "PLAYING"
+                reason = "" if decoded else f"transport state: {state['state']}"
+                results.append(_result(name, probe, decoded, (time.perf_counter() - started) * 1000, reason))
+                if name == "mp4" and decoded:
+                    assert state["duration"]
+                    assert state["position"] is not None
+                    session.pause()
+                    assert renderer.state()["state"] == "PAUSED_PLAYBACK"
+                    session.play()
+                    assert renderer.state()["state"] == "PLAYING"
+                    session.seek(1)
+                    assert renderer.state()["position"] == 1
+                    assert stopped == [True]
+                    local_url = proxy.build_url(source_url, {}, None, True, None)
+                    local_urls.append(local_url)
+            except Exception as exc:
+                results.append(_result(name, probe, False, (time.perf_counter() - started) * 1000, f"{type(exc).__name__}: {exc}"))
+            finally:
+                session.stop()
+                renderer.stop()
+
+        results.append(_result("hevc", {}, False, 0.0, "capability not generated by fixture"))
+        print(json.dumps(results, ensure_ascii=False, sort_keys=True))
+        assert results[0]["decoded"] is True
+        assert next(item for item in results if item["format"] == "hls_ts")["decoded"] is True
+        assert next(item for item in results if item["format"] == "hls_fmp4")["decoded"] is True
+        assert local_urls
+        assert urlopen(local_urls[0], timeout=10).status == 200
+        assert proxy._lan_server is None
+        assert {item["format"] for item in results} == {"mp4", "hls_ts", "hls_fmp4", "dash", "webm", "hevc"}
+    finally:
+        proxy.stop_lan_endpoint()
+        proxy.stop()
+        media_server.shutdown()
+        media_server.server_close()

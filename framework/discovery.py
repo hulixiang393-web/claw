@@ -1,0 +1,1009 @@
+"""发现模块（discovery.py）。
+
+消费 endpoints.discovery 与 endpoints.search：
+- list_categories(source)  → 分类列表（读 discovery.list_item.fields）
+- list_works(source, url, page) → 一页作品（读 search.item / discovery.list_item）
+
+分页：支持 {page} 占位符注入 URL（increment 型）；next_link/cursor 后续扩展。
+对应 design.md §5.1 与 ui-discover.md。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+from .config import SourceConfig
+from .errors import ContentMissingError
+from .health import report_bg_check
+from .http import HttpClient
+from .parser import Parser
+from .selfcheck import StructureChecker
+from .utils import fill_json
+
+
+@dataclass
+class Category:
+    """一个分类。"""
+
+    title: str
+    url: str
+
+
+@dataclass
+class Work:
+    """作品列表项（与搜索结果共用字段结构）。"""
+
+    title: str
+    url: str
+    cover: str = ""
+    author: str = ""
+    update: str = ""
+    source_id: str = ""
+    source_name: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "cover": self.cover,
+            "source_id": self.source_id,
+            "source_name": self.source_name,
+            "url": self.url,
+            "update_info": self.update,
+        }
+
+
+class Discovery:
+    def __init__(
+        self,
+        http: HttpClient,
+        parser: Parser,
+        checker: StructureChecker,
+        health_reporter=None,
+    ):
+        self._http = http
+        self._parser = parser
+        self._checker = checker
+        self._health_reporter = health_reporter  # 可选：update_health(source_id, state, error)
+        self._ytdlp = None  # 懒加载单例
+
+    # ------------------------------------------------------------------ #
+    def _bg_check(self, source: SourceConfig, abs_url: str) -> None:
+        """后台线程执行结构自检，不阻塞抓取（委托 health.report_bg_check）。"""
+        # 源配置 diagnostics.selfcheck.strategy="off" → 关闭后台自检（同 content._bg_check）
+        if (
+            (source.raw.get("diagnostics") or {}).get("selfcheck") or {}
+        ).get("strategy") == "off":
+            return
+        report_bg_check(self._checker, self._health_reporter, source, abs_url)
+
+    def _apply_cover_state(
+        self, works: List[Work], cfg: dict, fields: dict, html: str
+    ) -> None:
+        """列表页封面兜底：INITIAL_STATE 里的真实封面填回为空/占位的条目。
+
+        cfg 配置（works_list_item.cover_state）：
+            lists       INITIAL_STATE 里的作品列表路径（如 ["home.boyList","home.girlList"]）
+            cover_key   列表项封面字段（如 thumbUri）
+            id_key      列表项作品 ID 字段（缺省 bookId），与列表页 href 对应
+        封面占位标记取 fields.cover.placeholder（与 detail 封面兜底一致）。
+        解析失败/无匹配 → 保留原封面（容错），不阻塞列表返回。
+        """
+        import re as _re
+
+        state = self._parse_initial_state(html)
+        if not state:
+            return
+        cover_key = cfg.get("cover_key") or "thumbUri"
+        id_key = cfg.get("id_key") or "bookId"
+        # 跨多个列表路径扁平收集：{id: thumb} 映射 + 顺序封面序列（索引 zip 兜底）
+        cover_by_id: dict = {}
+        cover_seq: List[str] = []
+        for path in cfg.get("lists") or []:
+            lst = self._simple_getpath(state, path)
+            if not isinstance(lst, list):
+                continue
+            for it in lst:
+                if not isinstance(it, dict):
+                    continue
+                thumb = it.get(cover_key)
+                if not thumb:
+                    continue
+                cover_seq.append(str(thumb))
+                cid = it.get(id_key)
+                if cid is not None:
+                    cover_by_id[str(cid)] = str(thumb)
+        if not cover_by_id and not cover_seq:
+            return
+        # 占位标记（fields.cover.placeholder）
+        placeholder = ""
+        fcover = fields.get("cover")
+        if isinstance(fcover, dict):
+            placeholder = str(fcover.get("placeholder") or "")
+        idx = 0
+        for w in works:
+            # 已是有效封面（非占位）→ 跳过
+            if w.cover and not (placeholder and placeholder in w.cover):
+                continue
+            # 优先按 URL 里的 bookId 匹配（去重/过滤后顺序仍对齐）
+            m = _re.search(r"/page/(\d+)", w.url or "")
+            cid = m.group(1) if m else ""
+            new_cover = ""
+            if cid and cid in cover_by_id:
+                new_cover = cover_by_id[cid]
+            elif idx < len(cover_seq):
+                # 顺序 zip 兜底：列表页条目与 href 一一对应
+                new_cover = cover_seq[idx]
+                idx += 1
+            if new_cover:
+                w.cover = new_cover
+
+    @staticmethod
+    def _apply_clean(value, pairs) -> str:
+        """按替换对列表清洗字段：pattern 以 "re:" 前缀按正则替换（同 search._apply_clean）。"""
+        import re as _re2
+
+        value = str(value or "").strip()
+        for pat, repl in (pairs or []):
+            if not pat:
+                continue
+            if pat.startswith("re:"):
+                value = _re2.sub(pat[3:], str(repl or ""), value)
+            else:
+                value = value.replace(pat, str(repl or ""))
+        return value.strip()
+
+    @staticmethod
+    def _parse_initial_state(html: str):
+        """从 html 中提取 window.__INITIAL_STATE__ = {...}; 并解析为 dict。
+        大括号平衡扫描（跳过字符串内）切出 JSON，容错：找不到/解析失败返回 None。
+        """
+        if not html:
+            return None
+        marker = "window.__INITIAL_STATE__"
+        idx = html.find(marker)
+        if idx < 0:
+            return None
+        start = html.find("{", idx)
+        if start < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(html)):
+            c = html[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        import json as _json
+
+                        return _json.loads(html[start:i + 1])
+                    except Exception:  # noqa: BLE001
+                        return None
+        return None
+
+    # ------------------------------------------------------------------ #
+    def _headers(self, source: SourceConfig) -> dict:
+        return source.request_headers()
+
+    @staticmethod
+    def _playwright_cookies(source: SourceConfig) -> list:
+        """Convert the source's merged Cookie header for rendered pages.
+
+        HTTP requests already receive cookies through SourceConfig. The browser
+        path needs the same session explicitly, otherwise a JS challenge can
+        return an empty shell even though the normal request is authenticated.
+        """
+        from urllib.parse import urlsplit
+
+        header = source.request_headers().get("Cookie", "")
+        host = (urlsplit(source.base_url).hostname or "").lstrip(".")
+        if not header or not host:
+            return []
+        cookies = []
+        for item in header.split(";"):
+            name, sep, value = item.strip().partition("=")
+            if not sep or not name or not value:
+                continue
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": host,
+                "path": "/",
+                "secure": source.base_url.lower().startswith("https://"),
+            })
+        return cookies
+
+    def _timeout(self, source: SourceConfig) -> float:
+        return float(source.transports().get("timeout") or self._http.defaults.timeout)
+
+    def _retries(self, source: SourceConfig) -> int:
+        return int(source.transports().get("retries") or self._http.defaults.retries)
+
+    def _interval_ms(self, source: SourceConfig) -> int:
+        return int(source.transports().get("interval_ms") or self._http.defaults.interval_ms)
+
+    def _abs_url(self, source: SourceConfig, url: str) -> str:
+        from . import utils
+
+        return utils.abs_url(source.base_url, url)
+
+    def _get(self, source: SourceConfig, url: str) -> str:
+        from urllib.parse import quote
+
+        abs_url = self._abs_url(source, url)
+        # 中文参数等需 URL 编码（保留结构字符）
+        abs_url = quote(abs_url, safe=":/?=&%#")
+        return self._http.get_text(
+            abs_url,
+            headers=self._headers(source),
+            timeout=self._timeout(source),
+            retries=self._retries(source),
+            interval_ms=self._interval_ms(source),
+            encoding=source.transports().get("charset"),
+            proxy_pool=source.proxy_pool(),
+            direct=bool(source.transports().get("direct")),
+        )
+
+    # ------------------------------------------------------------------ #
+    def list_categories(self, source: SourceConfig) -> List[Category]:
+        """抓取分类列表。未配置分类项 → 返回 []。
+
+        支持两种来源：
+        - list_item.categories 静态列表（API 站无分类 HTML 时硬编码，如 B 站分区）
+        - list_item.fields HTML 抓取（普通站），含 url_pattern 过滤
+        """
+        disc = source.get_discovery_config()
+        list_item = disc.get("list_item") or {}
+
+        # 静态分类列表（API 站）：categories = [{title, url}, ...]
+        static = list_item.get("categories") or []
+        if static:
+            cats = []
+            seen: set = set()
+            for c in static:
+                if not isinstance(c, dict) or not c.get("title") or not c.get("url"):
+                    continue
+                if c["url"] in seen:
+                    continue
+                seen.add(c["url"])
+                cats.append(Category(title=c["title"], url=c["url"]))
+            return cats
+
+        fields = list_item.get("fields") or {}
+        has_cat_fields = bool(
+            fields.get("title")
+            and (fields.get("url") or fields.get("data_val") or list_item.get("tag_url_template"))
+        )
+        if not has_cat_fields:
+            return []  # 未配置分类规则 → 无分类
+
+        url_pattern = list_item.get("url_pattern")
+        import re as _re
+
+        # 分类可能放在专属分类页而非首页：优先 list_categories_url，
+        # 否则 list_url，再回退首页/站点根
+        list_url = (
+            disc.get("list_categories_url")
+            or disc.get("list_url")
+            or source.base_url
+        )
+        # 自检移后台线程（不阻塞分类抓取，防每页多一次 GET 拖慢）
+        self._bg_check(source, self._abs_url(source, list_url))
+        html = self._get(source, list_url)
+        doc = self._parser.parse(html)
+
+        titles = self._parser.extract(doc, fields.get("title"))
+        urls = self._parser.extract(doc, fields.get("url"), source.base_url)
+        # 分类项可能只有标签值（data-val）而无 href：用 tag 字段名提取
+        # data_val 字段（如 data-val，供 ?tag={val} 构造 URL）
+        tag_vals = self._parser.extract(doc, fields.get("data_val"))
+        pass_filters = []
+        for pat in (url_pattern,):
+            if pat:
+                pass_filters.append(pat)
+        cats: List[Category] = []
+        seen_links: set = set()
+        for i, t in enumerate(titles):
+            u = urls[i] if i < len(urls) else ""
+            tv = tag_vals[i] if i < len(tag_vals) else ""
+            if pass_filters:
+                if u and not _re.search(pass_filters[0], u):
+                    continue  # 显式 url 不匹配模式 → 跳过
+            # 分类目录条：用 data_val（tag）构造专属分类页 URL
+            tag_template = list_item.get("tag_url_template")
+            if tv and tag_template:
+                u = tag_template.replace("{tag}", tv)
+            elif tv and not u:
+                # 无 url → 用 list_url + ?tag={val}
+                u = f"{disc.get('list_url', '/booklist')}?tag={tv}"
+            if not u:
+                continue
+            # 跳过分隔占位（data-val=-1，非真实分类）。仅当处于
+            # data_val 标签模式（tag_vals 非空）时才需要对 -1/空做过滤，
+            # 普通链接分类源（无 data_val）不受影响。
+            tag_mode = bool(tag_vals)
+            if tag_mode and tv in ("-1", ""):
+                continue
+            if u in seen_links:
+                continue
+            seen_links.add(u)
+            cats.append(Category(title=t, url=u))
+        return cats
+
+
+
+    # ------------------------------------------------------------------ #
+    def list_works(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
+        """抓取一页作品列表（懒加载用）。
+
+        优先 api_endpoints（JSON API 站），否则 HTML selector。
+        """
+        api = source.raw.get("api_endpoints") or {}
+        # 仅 API 发现源才走 _list_works_api：显式配置了 api_endpoints.discovery，
+        # 或仅有 api_endpoints.search 且无 HTML 发现规则（API 站用搜索接口兜底当列表）。
+        # 有 HTML 发现规则（endpoints.discovery）的源即使配了 api_endpoints.search
+        # 也走 HTML 解析（如纵横小说：发现走榜单 HTML、搜索走官方 JSON API），
+        # 否则 list_works 会被 search API 劫持返回 0。
+        disc_html = source.get_discovery_config()
+        has_html_rules = bool(
+            (disc_html.get("works_list_item") or {}).get("root_selector")
+            or (disc_html.get("list_item") or {}).get("root_selector")
+            or (disc_html.get("list_item") or {}).get("categories")
+        )
+        if api.get("discovery") or (api.get("search") and not has_html_rules):
+            return self._list_works_api(source, url, page)
+
+        fetch_url = self._build_page_url(source, url, page)
+        html = ""
+        render_mode = disc_html.get("render")
+        if render_mode == "playwright_fallback":
+            # Most pages are ordinary HTML; only pay the browser startup cost
+            # when the fast request is blocked or returns no usable cards.
+            try:
+                html = self._get(source, fetch_url)
+                probe = disc_html.get("works_list_item") or {}
+                probe_root = probe.get("root_selector")
+                probe_fields = probe.get("fields") or {}
+                if not probe_root or not self._parser.parse_items(
+                    self._parser.parse(html), probe_root, probe_fields, source.base_url
+                ):
+                    html = ""
+            except Exception:  # noqa: BLE001
+                html = ""
+        # SPA 站发现页（SvelteKit/React 等）：首屏 HTML 为空壳，列表由 JS
+        # 渲染进 DOM。源配置 discovery.render == "playwright" 时先渲染再解析，
+        # 复用下方 works_list_item 的 CSS 选择器（不改变纯 HTTP 源行为）。
+        if render_mode in ("playwright", "playwright_fallback") and not html:
+            try:
+                from .playwright_helper import fetch_rendered_html_sync
+
+                rc = disc_html.get("render_config") or {}
+                request_headers = source.request_headers()
+                browser_headers = {
+                    key: value for key, value in request_headers.items()
+                    if key.lower() not in {
+                        "user-agent", "cookie", "referer", "host", "content-length",
+                    }
+                }
+                rendered = fetch_rendered_html_sync(
+                    self._abs_url(source, fetch_url),
+                    wait_for=rc.get("wait_for", ""),
+                    wait_until=rc.get("wait_until", "networkidle"),
+                    timeout_ms=int(rc.get("timeout_ms") or 30000),
+                    extra_delay_ms=int(rc["extra_delay_ms"] if "extra_delay_ms" in rc else 2500),
+                    proxy=source.transports().get("proxy"),
+                    cookies=self._playwright_cookies(source),
+                    referer=source.request_headers().get("Referer", ""),
+                    headers=browser_headers,
+                    scroll_to_bottom=bool(rc.get("scroll_to_bottom", False)),
+                    scroll_step_px=int(rc.get("scroll_step_px", 800)),
+                    scroll_stale_rounds=int(rc.get("scroll_stale_rounds", 4)),
+                )
+                if rendered:
+                    html = rendered
+            except Exception as exc:  # noqa: BLE001 —— 渲染失败降级用原始 HTML
+                log.warning("[%s] 发现页 Playwright 渲染失败：%s", source.source_id, exc)
+        if not html and render_mode != "playwright_fallback":
+            # 自检移后台线程（不阻塞作品抓取）；纯 HTTP 是渲染不可用时的降级链。
+            self._bg_check(source, self._abs_url(source, fetch_url))
+            html = self._get(source, fetch_url)
+        doc = self._parser.parse(html)
+
+        # 作品项选择器：优先 works_list_item（专属作品列表），
+        # 其次 search.item，最后 list_item（分类项，通常不用于作品列表）
+        disc = source.get_discovery_config()
+        search = source.get_search_config()
+        works_list_item = disc.get("works_list_item") or {}
+        list_item = disc.get("list_item") or {}
+        search_item = search.get("item") or {}
+        root_sel = (
+            works_list_item.get("root_selector")
+            or search_item.get("root_selector")
+            or list_item.get("root_selector")
+        )
+        fields = (
+            works_list_item.get("fields")
+            or search_item.get("fields")
+            or list_item.get("fields")
+            or {}
+        )
+
+        if not root_sel or not fields:
+            raise ContentMissingError(
+                "源未配置作品列表规则（search.item / discovery.list_item）",
+                source_id=source.source_id,
+            )
+
+        items = self._parser.parse_items(doc, root_sel, fields, source.base_url)
+        # 字段清洗：works_list_item.clean.{field} 为 [pattern, repl] 替换对列表
+        # （同 search.item.clean / detail.fields.clean，去列表标题噪声如 51cg 的
+        # 「热搜 HOT」）。pattern 以 "re:" 开头按正则替换。
+        for it in items:
+            for _c_key, _pairs in (works_list_item.get("clean") or {}).items():
+                if _c_key in it:
+                    it[_c_key] = self._apply_clean(it[_c_key], _pairs)
+        works: List[Work] = []
+        seen: set = set()  # 同页内按 URL 去重（maccms 等列表页偶发重复项）
+        for it in items:
+            if not it.get("title") or not it.get("url"):
+                continue
+            url_key = it.get("url", "")
+            if url_key in seen:
+                continue
+            seen.add(url_key)
+            cover = it.get("cover", "")
+            works.append(
+                Work(
+                    title=it.get("title", ""),
+                    url=it.get("url", ""),
+                    cover=cover,
+                    author=it.get("author", ""),
+                    update=it.get("update", ""),
+                    source_id=source.source_id,
+                    source_name=source.source_name,
+                )
+            )
+        # 部分 SSR 首页把多个内容区一次性输出（18AV 当前每页约 120 条），
+        # 首屏全部建卡和排队封面会拖慢发现页。源可声明 page_item_limit，
+        # 后续页仍按滚动懒加载，不改变其他源默认行为。
+        try:
+            page_item_limit = int(works_list_item.get("page_item_limit") or 0)
+        except (TypeError, ValueError):
+            page_item_limit = 0
+        if page_item_limit > 0:
+            works = works[:page_item_limit]
+        # 封面加密站（18mh 类 AES 解密）或需 Playwright 渲染的源：
+        # 不再同步解密封面（阻塞列表返回），改为标记，由 GUI 层异步恢复
+        # （discover_page._start_cover_recovery），列表秒开、封面后补。
+        need_cover_decrypt = bool(
+            source.raw.get("decryption", {}).get("targets", {}).get("image")
+        )
+        if works and need_cover_decrypt:
+            works[0]._needs_cover_decrypt = True  # 标记：GUI 起 AES 异步恢复
+        if works and works_list_item.get("cover_render") == "playwright":
+            works[0]._needs_cover_recovery = True  # 标记：GUI 起 Playwright 恢复
+        # 封面兜底：works_list_item.cover_state 配置下，SSR 把全部封面渲染成共享
+        # 占位图，真实封面在 window.__INITIAL_STATE__（如 home.boyList/girlList 的
+        # thumbUri，与列表页条目 href 一一对应）。解析一次 state，把真实封面填回
+        # 为空/占位的条目（解析失败静默保留原封面，容错）。
+        if works and works_list_item.get("cover_state"):
+            self._apply_cover_state(works, works_list_item["cover_state"], fields, html)
+        # 列表字段文本解密（如番茄 rank 榜书名/作者被 PUA 字体混淆，需 translit 还原）。
+        # 只有源配置了 decryption.targets.title/author 时才创建 Decrypter（惰性、
+        # 避免无谓开销），逐条还原后写回（未配置 → decrypt 原样返回，安全）。
+        dec_targets = (source.raw.get("decryption") or {}).get("targets") or {}
+        if dec_targets.get("title", {}).get("strategy") or dec_targets.get("author", {}).get("strategy"):
+            from .decrypter import Decrypter
+
+            dec = Decrypter(self._http)
+            for w in works:
+                w.title = dec.decrypt(source, w.title, target="title")
+                w.author = dec.decrypt(source, w.author, target="author")
+        return works
+
+
+
+    # ------------------------------------------------------------------ #
+    def decrypt_covers(self, source: SourceConfig, works: List[Work]) -> dict:
+        """批量下载+AES 解密封面 → {work_url: data_uri}（18mh 类加密站）。
+
+        与 list_works 内联同步解密分离：列表先返回（不阻塞），GUI 异步调本方法
+        恢复封面后刷新卡片。单张失败跳过（保留原 URL 兜底）。
+
+        每批用独立 HttpClient：GUI 多页并发调本方法时，若共享 self._http
+        （requests.Session 非线程安全）会在并发下载时 Session 竞态，偶发
+        下载失败 → 部分页封面加载不出（实测发现页奇数页封面空白）。
+        """
+        targets = [
+            (w.url, w.cover)
+            for w in works
+            if w.url and w.cover and w.cover.startswith(("http://", "https://"))
+        ]
+        if not targets:
+            return {}
+        # 独立 HttpClient（复用同套 defaults），避免 Session 跨线程竞态
+        worker_http = self._http.__class__(
+            sleeper=getattr(self._http, "_sleeper", None),
+            defaults=self._http.defaults,
+        )
+        from concurrent.futures import ThreadPoolExecutor
+
+        result: dict = {}
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futs = {
+                    pool.submit(self._decrypt_cover, source, url, worker_http): wurl
+                    for wurl, url in targets
+                }
+                for fut in futs:
+                    try:
+                        data_uri = fut.result()
+                        if data_uri and data_uri.startswith("data:"):
+                            result[futs[fut]] = data_uri
+                    except Exception:  # noqa: BLE001
+                        pass
+        finally:
+            try:
+                worker_http.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return result
+
+    def _decrypt_cover(self, source: SourceConfig, cover_url: str, http=None) -> str:
+        """下载并解密带加密的封面 → data URI。解密失败保留原 URL（封面留空不阻塞）。
+
+        复用 Decrypter.decrypt_bytes；与正文图片同密钥（decryption.image）。
+        http：可指定独立 HttpClient（多任务并发时避免共享 Session 竞态）。
+        """
+        http = http or self._http
+        try:
+            from .decrypter import Decrypter
+
+            raw = http.get_bytes(
+                self._abs_url(source, cover_url),
+                headers=self._headers(source),
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
+            )
+            decrypter = Decrypter(self._http)
+            plain = decrypter.decrypt_bytes(source, raw, target="image")
+            if plain and plain is not raw:
+                import base64 as _b64
+
+                from . import utils
+
+                # 按魔数猜 mime（复用 utils.guess_image_mime，含 BMP 识别），默认 jpeg
+                mime = utils.guess_image_mime(plain)
+                return f"data:{mime};base64,{_b64.b64encode(plain).decode()}"
+        except Exception:  # noqa: BLE001
+            pass
+        return cover_url
+
+    def _list_works_api(self, source: SourceConfig, url: str, page: int = 1) -> List[Work]:
+        """API 站（api_endpoints）JSON 解析作品列表。
+
+        支持 fallback_url：当分类 URL 无有效关键词（如"全部"）时，
+        回退到 fallback_url（全站热门接口），用 fallback_response_path /
+        fallback_item_fields 解析。
+        """
+        import json
+        import re as _re
+        from urllib.parse import parse_qs, urlparse, urlencode
+
+        api = source.raw.get("api_endpoints") or {}
+        cfg = api.get("discovery") or api.get("search") or {}
+        if not cfg:
+            return []
+
+        # yt-dlp 引擎：从分类 URL 取 keyword，调 yt-dlp 搜索
+        if cfg.get("engine") == "ytdlp":
+            from urllib.parse import parse_qs, urlparse
+
+            url_qs = parse_qs(urlparse(url).query) if "?" in url else {}
+            kw = url_qs.get("keyword", [""])[0] or cfg.get("default_keyword") or "热门"
+            return self._list_works_ytdlp(source, kw)
+
+        # 从传入分类 URL 解析 query 参数（如 tids=1&keyword=新番）
+        url_qs = parse_qs(urlparse(url).query) if "?" in url else {}
+        cat_params = {k: v[0] for k, v in url_qs.items()}
+
+        # 判断是否回退（无有效关键词 → 全站热门接口）
+        use_fallback = False
+        if cfg.get("fallback_url"):
+            kw = cat_params.get("keyword") or ""
+            if not kw:
+                use_fallback = True
+
+        if use_fallback:
+            api_url = str(cfg.get("fallback_url"))
+            api_url = api_url.replace("{page}", str(page))
+            api_url = _re.sub(r"\{[^}]+\}", "", api_url)
+            abs_url = self._abs_url(source, api_url)
+            # popular 参数：ps/pn/rid
+            params = cfg.get("params") or {}
+            filled = {k: str(v) for k, v in params.items()}
+            filled = {k: v.replace("{page}", str(page)) for k, v in filled.items()}
+            # 忽略 keyword/tids 占位（popular 不需要）
+            filled = {k: _re.sub(r"\{[^}]+\}", "", v) for k, v in filled.items()}
+            qs = urlencode(filled)
+            abs_url = abs_url + ("&" if "?" in abs_url else "?") + qs
+            rpath = cfg.get("fallback_response_path")
+            item_fields = cfg.get("fallback_item_fields") or {}
+        else:
+            # search/type + keyword/tids
+            api_url = str(cfg.get("url") or url)
+            api_url = api_url.replace("{page}", str(page))
+            api_url = _re.sub(r"\{[^}]+\}", "", api_url)
+            abs_url = self._abs_url(source, api_url)
+            params = cfg.get("params") or {}
+            filled = {k: str(v) for k, v in params.items()}
+            filled = {k: v.replace("{page}", str(page)) for k, v in filled.items()}
+            # {offset} 占位：按页换算偏移量（offset = (page-1) * limit）。
+            # 覆盖 source-schema 中「API 分页」需求（fanqie rank offset=0,10,20…）。
+            _limit = int(params.get("limit") or cfg.get("page_size") or 20)
+            filled = {k: v.replace("{offset}", str((page - 1) * _limit)) for k, v in filled.items()}
+            # 用分类 URL 的 query 参数覆盖占位（tids/keyword）
+            for k, v in cat_params.items():
+                if f"{{{k}}}" in str(filled.get(k, "")) or k in filled:
+                    filled[k] = v
+            # 未填的占位符清空
+            filled = {k: _re.sub(r"\{[^}]+\}", "", v) for k, v in filled.items()}
+            sign_cfg = cfg.get("sign") or {}
+            strategy = sign_cfg.get("strategy")
+            if strategy:
+                from .signers import get_signer
+
+                filled = get_signer(strategy, self._http).sign(filled)
+            qs = urlencode(filled)
+            abs_url = abs_url + ("&" if "?" in abs_url else "?") + qs
+            rpath = cfg.get("response_path")
+            item_fields = cfg.get("item_fields") or {}
+
+        # GET / POST JSON
+        method = (cfg.get("method") or "GET").upper()
+        if method == "POST":
+            # JSON API（GraphQL 等）：POST body 递归替换 {page}，params 并入 body
+            body_filled = fill_json(cfg.get("body") or {}, page=str(page))
+            for k, v in params.items():
+                body_filled.setdefault(k, fill_json(v, page=str(page)))
+            resp_json = self._http.post_json(
+                abs_url,
+                json_body=body_filled,
+                headers=self._headers(source),
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
+            )
+        else:
+            resp_json = self._http.get_json(
+                abs_url,
+                headers=self._headers(source),
+                timeout=self._timeout(source),
+                retries=self._retries(source),
+                proxy_pool=source.proxy_pool(),
+            )
+
+        # 提取列表项
+        items = resp_json
+        if rpath:
+            items = self._simple_getpath(resp_json, rpath)
+        if not isinstance(items, list):
+            return []
+
+        works: List[Work] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            title = self._template_value(it, item_fields.get("title"))
+            url_v = self._template_url_value(it, item_fields.get("url"))
+            if not title or not url_v:
+                continue
+            url_v = self._resolve_tpl(source.base_url, url_v)
+            works.append(
+                Work(
+                    title=str(title),
+                    url=str(url_v),
+                    cover=str(self._template_value(it, item_fields.get("cover")) or ""),
+                    author=str(self._template_value(it, item_fields.get("author")) or ""),
+                    update=str(self._template_value(it, item_fields.get("update")) or ""),
+                    source_id=source.source_id,
+                    source_name=source.source_name,
+                )
+            )
+        # 列表字段文本解密（与 HTML 分支一致）：番茄等 API 源 bookName/author 也是
+        # PUA 字体混淆密文，漏解会让 GUI 把无字形码位渲染成空洞/连续空格。
+        dec_targets = (source.raw.get("decryption") or {}).get("targets") or {}
+        if dec_targets.get("title", {}).get("strategy") or dec_targets.get("author", {}).get("strategy"):
+            from .decrypter import Decrypter
+
+            dec = Decrypter(self._http)
+            for w in works:
+                w.title = dec.decrypt(source, w.title, target="title")
+                w.author = dec.decrypt(source, w.author, target="author")
+        return works
+
+    def _list_works_ytdlp(self, source: SourceConfig, keyword: str) -> List[Work]:
+        """yt-dlp 引擎：按关键词搜索返回作品列表（发现页用）。"""
+        if self._ytdlp is None:
+            from .ytdlp import Ytdlp
+
+            self._ytdlp = Ytdlp()
+        limit = 15
+        try:
+            items = self._ytdlp.search(keyword, limit=limit)
+        except Exception:
+            return []
+        cfg = source.raw.get("api_endpoints", {}).get("discovery") or {}
+        works: List[Work] = []
+        for it in items:
+            if not it.get("title") or not it.get("url"):
+                continue
+            works.append(
+                Work(
+                    title=it["title"],
+                    url=it["url"],
+                    cover=it.get("cover") or "",
+                    author=it.get("author") or "",
+                    source_id=source.source_id,
+                    source_name=source.source_name,
+                )
+            )
+        return works
+
+    @staticmethod
+    def _simple_getpath(data, path: str):
+        """简化的 JSONPath：data.list → data["list"]；data.list.0 → 列表首项。"""
+        from . import utils
+
+        return utils.jsonpath(data, path)
+
+    @staticmethod
+    def _template_url_value(item: dict, field_spec):
+        if isinstance(field_spec, str) and "{" in field_spec:
+            from urllib.parse import quote
+            import re
+
+            return re.sub(
+                r"\{(\w+)\}",
+                lambda match: quote(str(item.get(match.group(1), "") or ""), safe=""),
+                field_spec,
+            )
+        return Discovery._template_value(item, field_spec)
+
+    @staticmethod
+    def _template_value(item: dict, field_spec):
+        """字段值：若是模板（含 {}）则填充，否则直接取值。"""
+        if field_spec is None:
+            return ""
+        if isinstance(field_spec, str):
+            if "{" in field_spec:
+                # 模板如 https://bilibili.com/bangumi/media/md{media_id}
+                from . import utils
+
+                return utils.fill_template(field_spec, item)
+            if "." in field_spec:
+                # 嵌套路径如 owner.name 逐层取值
+                cur = item
+                for part in field_spec.split("."):
+                    if isinstance(cur, dict) and part in cur:
+                        cur = cur[part]
+                    else:
+                        return ""
+                return cur
+            return item.get(field_spec, "")
+
+        return ""
+
+    @staticmethod
+    def _resolve_tpl(base, url):
+        from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+
+        resolved = url if url.startswith("http") else urljoin(base, url)
+        parts = urlsplit(resolved)
+        if not parts.query:
+            return resolved
+        query = urlencode(parse_qsl(parts.query, keep_blank_values=True))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+    def _build_page_url(self, source: SourceConfig, url: str, page: int) -> str:
+        """按源配置 paginator 构造第 page 页的 URL。"""
+        import re as _re
+
+        disc = source.get_discovery_config()
+        paginator = disc.get("list_paginator") or {}
+        ptype = paginator.get("type") or "increment"
+
+        if ptype == "increment":
+            if page <= 1 and paginator.get("first_page_without_param"):
+                return url
+            # 1) 自定义分页模板（如 /list-8-{page}/）
+            page_template = paginator.get("page_url_template")
+            if page_template and page > 1:
+                return str(page_template).replace("{page}", str(page))
+            # 2) {page} 占位替换
+            if "{page}" in url:
+                return url.replace("{page}", str(page))
+            # 2) page_placeholder 正则：替换 URL 中页码位。
+            #    第 1 页不插页码（多数站第 1 页即 base URL，页码从第 2 页起）。
+            placeholder = paginator.get("page_placeholder")
+            if placeholder:
+                if page <= 1:
+                    return url
+                return _re.sub(placeholder, str(page), url, count=1)
+            # 3) 默认：?param=N
+            param = paginator.get("param") or "page"
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}{param}={page}"
+
+        if ptype == "cursor":
+            # ?offset=N
+            param = paginator.get("param") or "offset"
+            start = int(paginator.get("start") or 0)
+            step = int(paginator.get("step") or 20)
+            offset = start + (page - 1) * step
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}{param}={offset}"
+
+        # next_link / 默认：页码参数
+        return f"{url}?page={page}"
+
+    # ------------------------------------------------------------------ #
+    def check_links(
+        self,
+        source: SourceConfig,
+        urls: List[str],
+        thread_cap: int = 3,
+        timeout: float = 15.0,
+    ) -> List[dict]:
+        """并发检查一批链接可用性（每个链接一个线程）。
+
+        并发数 = 源 constraints（check_links_threads 或 max_concurrency）> 全局
+        network.check_links_threads > 入参 thread_cap（默认 3）；无显式限制时
+        按链接数自适应放宽到 8（仍是有界池，不线程爆炸）。
+        返回 [{url, ok, status, error, time_ms}]。单链接失败不影响其他。
+
+        HttpClient 非线程安全：每个 worker 从连接模板克隆独立实例（新 Session，
+        共享 NetworkDefaults 配置），绝不复用共享 Session（见 decrypt_covers）。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        import time
+
+        urls = [u for u in urls if u]
+        if not urls:
+            return []
+        workers = self._check_link_workers(source, urls, thread_cap)
+        results: List[dict] = [None] * len(urls)
+        base_headers = self._default_headers(source)
+        # 连接模板：复用 App 层已接线的 HttpClient 配置（NetworkDefaults 含
+        # impersonate/user_agents，与主 http 一致）。
+        template = self._http
+        # D8：每个 worker 线程复用同一 HttpClient（thread-local），而非每个链接
+        # 新建。线程池线程会被复用，故实例数 ≤ workers，避免连接/Session 泄漏
+        # 与重复构造开销；仍保证 Session 绝不跨线程共享（隔离不变）。
+        _tls = threading.local()
+
+        def _client_for_thread() -> HttpClient:
+            http = getattr(_tls, "client", None)
+            if http is None:
+                http = self._clone_check_client(template)
+                _tls.client = http
+            return http
+
+        def _check_one(idx: int, u: str) -> dict:
+            http = _client_for_thread()
+            t0 = time.time()
+            try:
+                # get_text 走完整反爬/重试链（GET，HEAD 对 Cloudflare 不稳）
+                http.get_text(u, headers=base_headers, timeout=timeout, retries=1)
+                return {
+                    "url": u,
+                    "ok": True,
+                    "status": 200,
+                    "error": "",
+                    "time_ms": int((time.time() - t0) * 1000),
+                }
+            except Exception as e:  # noqa: BLE001
+                status = getattr(e, "status_code", 0) or getattr(e, "status", 0) or 0
+                return {
+                    "url": u,
+                    "ok": False,
+                    "status": status,
+                    "error": str(e)[:200],
+                    "time_ms": int((time.time() - t0) * 1000),
+                }
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_check_one, i, u): i for i, u in enumerate(urls)}
+            for fut in as_completed(futs):
+                results[futs[fut]] = fut.result()
+        return results
+
+    def _check_link_workers(self, source: SourceConfig, urls: List[str], thread_cap: int) -> int:
+        """计算 check_links 并发数。
+
+        优先级（显式 > 全局 > 入参默认）：
+          1. source.raw.constraints.check_links_threads
+          2. 同源 constraints.max_concurrency（已有键，向后兼容）
+          3. 运行时 network.check_links_threads
+          4. 入参 thread_cap（默认 3）
+        无显式/全局限制时按链接数自适应放宽到 8（上下限 1..8）。
+        """
+        explicit = None
+        raw = getattr(source, "raw", None)
+        constraints = raw.get("constraints") if isinstance(raw, dict) else None
+        if isinstance(constraints, dict):
+            for key in ("check_links_threads", "max_concurrency"):
+                value = constraints.get(key)
+                if isinstance(value, int) and value >= 1:
+                    explicit = value
+                    break
+        base = max(1, int(thread_cap))
+        if explicit is not None:
+            base = max(1, min(8, explicit))
+        else:
+            global_cap = self._global_check_link_cap()
+            if global_cap is not None:
+                base = max(1, min(8, int(global_cap)))
+            else:
+                # 无显式限制：链接多时自适应放宽（上限 8，线程仍有限不爆炸）
+                return max(1, min(len(urls), 8))
+        return max(1, min(len(urls), base))
+
+    def _global_check_link_cap(self):
+        """读运行时 network.check_links_threads（SettingsManager 或 dict 均兼容）。"""
+        reporter = getattr(self, "_health_reporter", None)
+        runtime = getattr(reporter, "_runtime", None) if reporter is not None else None
+        if runtime is None:
+            return None
+        from .settings_manager import SettingsManager
+
+        if isinstance(runtime, SettingsManager):
+            return runtime.get("network", "check_links_threads", None)
+        if isinstance(runtime, dict):
+            return (runtime.get("network") or {}).get("check_links_threads")
+        return None
+
+    @staticmethod
+    def _clone_check_client(template: HttpClient) -> HttpClient:
+        """构造独立 HttpClient（每次新建 Session），配置与模板一致。
+
+        requests.Session 非线程安全，不可跨 worker 共享连接；按模板的
+        sleeper/defaults/cache 重建实例，得到配置一致但会话隔离的 client
+        （与旧实现仅传 defaults 相比，额外保留了 sleeper/cache 接线）。
+        """
+        return HttpClient(
+            sleeper=getattr(template, "_sleeper", None),
+            defaults=getattr(template, "defaults", None),
+            cache=getattr(template, "cache", None),
+        )
+
+    def _default_headers(self, source: SourceConfig) -> dict:
+        """源默认请求头（UA + 可选 Referer），供检查线程使用。"""
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        base = getattr(source, "base_url", "") or ""
+        if base:
+            headers["Referer"] = base.rstrip("/") + "/"
+        return headers

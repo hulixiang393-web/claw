@@ -1,0 +1,98 @@
+{
+  "network": {
+    "default_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 SpiderFramework/1.0",
+    "default_timeout": 10,
+    "default_retries": 3,
+    "default_request_interval": 0,
+    "proxy": null,
+    "concurrent_search_sources": 4,
+    "max_bytes_per_image": 5242880,
+    "impersonate": null,
+    "user_agents": [],
+    "check_links_threads": null,
+    "proxy_pool": {
+      "file": "data/proxies.json",
+      "max_switches": 3
+    }
+  },
+  "ui": {
+    "theme": "midnight",
+    "font_scale": 1.5,
+    "cover_cache_size_mb": 256,
+    "default_page_size": 20,
+    "background_image": "D:/code/claw/薇尔莉特.jpg",
+    "background_opacity": 0.4,
+    "reading_bg": "#FBF3D2",
+    "reading_font_size": 0
+  },
+  "download": {
+    "output_dir": "downloads",
+    "naming_template": "{title}_{chapter_no}_{chapter_title}",
+    "merge_chapters_into_one_file": true,
+    "skip_existing": true,
+    "max_concurrent_downloads": 6,
+    "show_notification": true,
+    "max_parallel_chapters": 3
+  },
+  "library": {
+    "shelf_export_dir": "library",
+    "webdav_url": null
+  },
+  "diagnostics": {
+    "verbose_logging": false,
+    "log_dir": "logs",
+    "log_file_pattern": "framework-{date}.jsonl"
+  },
+  "adblock": {
+    "extra_rule_dir": ""
+  },
+  "video_cache": {
+    "enabled": true,
+    "max_videos": 5,
+    "max_bytes_mb": 8192
+  },
+  "media": {
+    "source_probe": {
+      "enabled": true,
+      "max_sources": 5,
+      "concurrency": 1,
+      "timeout_ms": 30000
+    }
+  },
+  "hls_prefetch": {
+    "enabled": false,
+    "depth": 4,
+    "workers": 3
+  },
+  "content": {
+    "show_adult_sources": true
+  },
+  "reader": {
+    "prefetch_enabled": true,
+    "prefetch_ahead": 3,
+    "prefetch_behind": 1,
+    "show_images": true,
+    "font_size": 0,
+    "font_family": "system",
+    "line_spacing": 1.8,
+    "content_width": 960,
+    "paragraph_indent": true,
+    "language": "zh-cn"
+  },
+  "discover": {
+    "preload_pages": 5,
+    "preload_concurrency": 3
+  },
+  "shelf_cache": {
+    "max_book_mb": 256,
+    "max_total_mb": 8192
+  },
+  "sources_runtime": {
+    "broken_source_warn_interval_hours": 24,
+    "auto_disable_after_failures": 3,
+    "selfcheck_strategy": "soft",
+    "dead_line_ttl_seconds": 600,
+    "play_url_probe_timeout_cap": 5,
+    "sources_selected": true
+  }
+}

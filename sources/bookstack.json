@@ -1,0 +1,204 @@
+{
+  "$schema_version": 2,
+  "$id": "bookstack",
+  "$type": "novel",
+  "$name": "BookStack",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.bookstack.cn",
+    "description": "BookStack 中文公开文档书籍源。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["小说", "文档"]
+  },
+  "transports": {
+    "base_url": "https://www.bookstack.cn",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.bookstack.cn/"
+    },
+    "timeout": 20,
+    "retries": 1,
+    "interval_ms": 250
+  },
+  "detail_cache_version": 3,
+  "chapter_cache_version": 3,
+  "page_cache_version": 3,
+  "endpoints": {
+      "discovery": {
+        "list_url": "/explore?tab=latest&lang=",
+        "render": "playwright",
+        "render_config": {
+          "wait_for": "dl.manual-item-standard",
+          "wait_until": "domcontentloaded",
+          "timeout_ms": 45000,
+          "extra_delay_ms": 0
+        },
+        "list_paginator": {
+          "type": "increment",
+          "first_page_without_param": true
+        },
+
+      "works_list_item": {
+        "root_selector": {
+          "css": "dl.manual-item-standard"
+        },
+        "fields": {
+          "title": {
+            "css": "dd a.name"
+          },
+          "url": {
+            "css": "dd a.name",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "dt a img",
+            "attr": "src"
+          },
+          "author": {
+            "css": "dd.manual-item-author"
+          },
+          "update": {
+            "css": "dd.manual-item-meta"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/result",
+      "method": "GET",
+      "keyword_param": "wd",
+      "render": "playwright",
+      "extra_params": {
+        "tab": "book"
+      },
+      "paginator": {
+        "url_template": "/search/result?wd={keyword}&tab=book&page={page}"
+      },
+      "item": {
+        "root_selector": {
+            "css": ".result-list li.clearfix"
+
+        },
+        "fields": {
+          "title": {
+            "css": "h4"
+          },
+          "url": {
+            "xpath": ".//h4/parent::a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          },
+          "author": {
+            "css": ".author"
+          }
+        },
+        "render_config": {
+          "wait_for": ".result-list li.clearfix",
+          "wait_until": "domcontentloaded",
+          "timeout_ms": 45000,
+          "extra_delay_ms": 0
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/books/",
+      "render": "http",
+      "render_config": {
+        "wait_for": "h1.wd-book-title, .m-manual.manual-mode-view .article-menu-detail, article#page-content",
+        "wait_until": "domcontentloaded",
+        "timeout_ms": 45000,
+        "extra_delay_ms": 0
+      },
+      "fields": {
+        "title": {
+            "fallback": [
+            {"css": "h1.wd-book-title"},
+            {"xpath": "//h1[contains(concat(' ', normalize-space(@class), ' '), ' wd-book-title ')]"},
+            {"css": "h1.book-title"}
+          ]
+        },
+        "author": {
+          "fallback": [
+            {"css": ".wd-book-author"},
+            {"xpath": "//*[contains(concat(' ', normalize-space(@class), ' '), ' wd-book-author ')]"},
+            {"css": ".wd-author a[title^='来源：']"},
+            {"css": ".wd-author"},
+            {"css": ".book-meta .author"}
+          ]
+        },
+        "cover": {
+          "fallback": [
+            {"css": ".wd-cover-img", "attr": "src"},
+            {"xpath": "//*[contains(concat(' ', normalize-space(@class), ' '), ' wd-cover-img ')]", "attr": "src"},
+            {"css": ".book-cover img", "attr": "src"}
+          ]
+        },
+        "summary": {
+          "fallback": [
+            {"css": ".wd-description"},
+            {"xpath": "//*[contains(concat(' ', normalize-space(@class), ' '), ' wd-description ')]"},
+            {"css": ".book-description"}
+          ]
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "list": {
+          "root_selector": {
+            "css": ".wd-tab-content ul.none-listyle > li"
+          },
+          "fields": {
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "fallback": [
+              {"css": "article.article-body.markdown-body"},
+              {"css": "article#page-content.markdown-body"},
+              {"css": "article#page-content"},
+              {"xpath": "//article[contains(concat(' ', normalize-space(@class), ' '), ' article-body ') and contains(concat(' ', normalize-space(@class), ' '), ' markdown-body ')]"},
+              {"xpath": "//article[@id='page-content']"},
+              {"xpath": "//*[@id='page-content']"}
+            ]
+          },
+          "render": "http",
+          "render_config": {
+            "wait_for": "article.article-body.markdown-body, article#page-content",
+            "wait_until": "domcontentloaded",
+            "timeout_ms": 45000,
+            "extra_delay_ms": 0
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 20,
+      "max_results": 0
+    },
+    "chapter": {
+      "max_pages": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

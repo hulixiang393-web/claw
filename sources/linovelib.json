@@ -1,0 +1,158 @@
+{
+  "$schema_version": 2,
+  "$id": "linovelib",
+  "$type": "novel",
+  "$name": "哔哩轻小说",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.linovelib.com",
+    "description": "哔哩轻小说 - 日文轻小说汉化/插图站（目录页入口，正文无加密）",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "小说",
+      "轻小说",
+      "汉化",
+      "插图",
+      "日本"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.linovelib.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Accept-Encoding": "identity",
+      "Referer": "https://www.linovelib.com/"
+    },
+    "timeout": 10,
+    "retries": 2,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/topfull/allvisit/1.html",
+      "list_paginator": {
+        "type": "increment",
+        "page_placeholder": "\\d+(?=\\.html)"
+      },
+      "list_item": {
+        "categories": [
+          {
+            "title": "完本榜",
+            "url": "/topfull/allvisit/1.html"
+          },
+          {
+            "title": "最近更新",
+            "url": "/topfull/lastupdate/1.html"
+          },
+          {
+            "title": "最新入库",
+            "url": "/topfull/postdate/1.html"
+          },
+          {
+            "title": "收藏榜",
+            "url": "/topfull/goodnum/1.html"
+          },
+          {
+            "title": "新书榜",
+            "url": "/topfull/newhot/1.html"
+          },
+          {
+            "title": "月点击榜",
+            "url": "/topfull/monthvisit/1.html"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.rank_d_list"
+        },
+        "fields": {
+          "title": {
+            "css": ".rank_d_b_name a"
+          },
+          "url": {
+            "css": ".rank_d_b_name a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": ".rank_d_book_img img",
+            "attr": "data-original"
+          },
+          "author": {
+            "css": ".rank_d_b_cate a"
+          }
+        }
+      }
+    },
+    "detail": {
+      "fields": {
+        "title": {
+          "css": "h1"
+        },
+        "book_name": {
+          "css": "meta[property='og:novel:book_name']",
+          "attr": "content"
+        },
+        "summary": {
+          "css": "meta[name='description']",
+          "attr": "content"
+        },
+        "author": {
+          "css": "meta[property='og:novel:author']",
+          "attr": "content"
+        },
+        "cover": {
+          "css": "meta[property='og:image']",
+          "attr": "content"
+        },
+        "status": {
+          "css": "meta[property='og:novel:status']",
+          "attr": "content"
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "list": {
+          "chapters_url": "/novel/{id}/catalog",
+          "root_selector": {
+            "css": "ul.chapter-list li a"
+          },
+          "chapter_order": "asc",
+          "fields": {
+            "title": {
+              "css": "a"
+            },
+            "url": {
+              "css": "a",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": "#mlfy_main_text p"
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 500,
+      "max_items": 500
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

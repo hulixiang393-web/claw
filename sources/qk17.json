@@ -1,0 +1,250 @@
+{
+  "$schema_version": 2,
+  "$id": "qk17",
+  "$type": "novel",
+  "$name": "17K小说",
+  "$enabled": true,
+  "$weight": 1.0,
+  "detail_cache_version": 3,
+  "chapter_cache_version": 3,
+  "page_cache_version": 3,
+  "api_endpoints": {
+    "detail": {
+      "url": "https://api.17k.com/ck/book/{id}",
+      "method": "GET",
+      "params": {"appKey": "2406394919"},
+      "field_extractors": {
+        "title": "bookName",
+        "author": "authorPenName",
+        "cover": "bigCoverImg",
+        "status": "bookStatus.name",
+        "summary": "intro"
+      },
+      "chapters": {
+        "api": {
+          "url": "https://api.17k.com/ck/book/{id}/{volume_id}/lists",
+          "volumes_url": "https://api.17k.com/ck/book/{id}/volumes",
+          "volumes_response_path": "data",
+          "volume_id_field": "volumeId",
+          "params": {"appKey": "2406394919"},
+          "response_path": "data",
+          "item_fields": {"title": "chapterName", "chapter_id": "chapterId"},
+          "url_template": "https://www.17k.com/chapter/{id}/{chapter_id}.html",
+          "page_param": "page",
+          "page_size": 0,
+          "max_pages": 500
+        }
+      }
+    }
+  },
+  "decryption": {
+    "targets": {
+      "chapter": {
+        "strategy": "aes_cbc_base64",
+        "key": "4eae35f1b35977a0",
+        "iv": "4eae35f1b35977a0"
+      }
+    }
+  },
+  "$metadata": {
+    "homepage": "https://www.17k.com",
+    "icon": "https://www.17k.com/favicon.ico",
+    "description": "17K小说网（www.17k.com）正版小说站（17K小说网官方，芥子、中文在线旗下老牌原创站，以都市/玄幻/热血作品著称）。目录页 /list/{bookId}.html 单页全量章节，正文页 /chapter/{bookId}/{chapterId}.html 为纯文本（免登录可抓全部免费章节，VIP 章仅第一章免费）。搜索、详情、目录和正文均通过 Playwright 执行阿里云 WAF 挑战后提取 DOM；结果 20 条/页。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "小说",
+      "正版",
+      "VIP",
+      "render"
+    ],
+    "last_verified": "2026-09-13"
+  },
+  "transports": {
+    "base_url": "https://www.17k.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.17k.com/"
+    },
+    "timeout": 20,
+    "retries": 3,
+    "interval_ms": 2000,
+    "follow_redirects": true
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/top/",
+      "list_item": {
+        "categories": [
+          {
+            "title": "排行榜",
+            "url": "/top/"
+          }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.TYPE ul li"
+        },
+        "fields": {
+          "title": {
+            "css": "a"
+          },
+          "url": {
+            "css": "a.book",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a.book img",
+            "attr": "src"
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "https://search.17k.com",
+      "method": "GET",
+      "keyword_param": "c.q",
+      "render": "playwright",
+      "paginator": {
+        "url_template": "https://search.17k.com/search.xhtml?c.st=0&c.q={keyword}"
+      },
+      "note": "搜索 subdom.search.17k.com 对 requests/urllib 直连恒 405（阿里云反 bot，TLS/JA3 指纹级），curl 200 但 body 压缩二进制不可解析；/ck/book/search/merge JSON API 只返回侧栏「猜你喜欢」推荐，不返回搜索结果 → 必须 playwright 渲染 DOM 提取。搜索页 URL https://search.17k.com/search.xhtml?c.st=0&c.q={keyword}，结果 20 条/页（只抓第 1 页，分页参数 page 渲染路径不支持）。原站站内模糊匹配：搜「近战狂兵」会返回超级兵王/至尊狂兵/极道狂兵等相似书名 → render_config.filter_keyword=false 避免误杀。root_selector 只取 .textlist > .textleft（封面块），天然排除顶部作者卡（div.author、无 /book/ 链接）。渲染结果字段：title=img[alt]（图标书名，a[title] 在整卡上是「标签」非书名，故不用整卡作 root）。",
+      "item": {
+        "root_selector": {
+          "css": ".search-list > .textlist > div.textleft"
+        },
+        "fields": {
+          "title": {
+            "css": "img",
+            "attr": "alt"
+          },
+          "url": {
+            "css": "a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img",
+            "attr": "src"
+          }
+        },
+        "render_config": {
+          "wait_for": ".search-list > .textlist > div.textleft",
+          "wait_until": "domcontentloaded",
+          "timeout_ms": 45000,
+          "extra_delay_ms": 1500,
+          "filter_keyword": false
+        }
+      }
+    },
+    "detail": {
+      "render": "playwright",
+      "render_config": {
+        "wait_for": ".Info.Sign h1, #bookInfo, h1.Title, dl.Volume",
+        "wait_until": "domcontentloaded",
+        "timeout_ms": 45000,
+        "extra_delay_ms": 1200
+      },
+      "url_pattern": "/book/\\d+\\.html$",
+      "note": "详情页经 Playwright 执行 WAF 挑战后元数据齐全。title=.Info.Sign h1 a；author 从 <meta property=og:title>（《书名》作者著-17K小说网）正则取（meta[name=Keywords] 的书名,作者,.. 正则兜底）；cover=#bookCover img.book src（cdn.static.17k.com 动态图）；status=.Info.Sign .label a:first-child span（连载=span.green/完本=span.gray）；summary=#bookInfo .cont p.intro（text_content 含作者寄语等纯文本）；tags=table tr.label td a span（如 叶军浪/撒旦/热血；完本 8 个）。update 取自 dl.Tab dt.tit em「更新:2026-09-11 12:30:00」，schema 无 update_time 字段仅作参考。",
+      "fields": {
+        "title": {
+          "css": ".Info.Sign h1 a"
+        },
+        "author": {
+          "css": "meta[property='og:title']",
+          "attr": "content",
+          "regex": "《[^》]*》([^著]+)著",
+          "fallback": [
+            {
+              "css": "meta[name='Keywords']",
+              "attr": "content",
+              "regex": "^[^,]+,([^,]+)"
+            }
+          ]
+        },
+        "cover": {
+          "css": "#bookCover img.book",
+          "attr": "src"
+        },
+        "status": {
+          "css": ".Info.Sign .label a:first-child span"
+        },
+        "summary": {
+          "css": "#bookInfo .cont p.intro"
+        },
+        "tags": {
+          "css": "table tr.label td a span"
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "pagination": {
+          "enabled": true,
+          "max_pages": 1
+        },
+        "list": {
+          "note": "独立目录页 /list/{bookId}.html（Playwright 执行 WAF 挑战后返回全量章节，5728 章/约 1.3MB）：h1.Title 书名 + div.Author 作者 + dl.Volume 卷（作品相关/正文）×2，卷内 dd 平铺 <a href=/chapter/{bookId}/{chapterId}.html><span class=ellipsis>章名</span></a>。root_selector 直接以章节链接 <a> 为根，url 用 xpath=\".\" 取根节点自身 href（框架字段查询相对各根执行）。目录页无需登录。",
+          "chapters_url": "/list/{id}.html",
+          "root_selector": {
+            "css": "dl.Volume dd a"
+          },
+          "fields": {
+            "title": {
+              "css": "span.ellipsis"
+            },
+            "url": {
+              "xpath": ".",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "note": "正文 /chapter/{bookId}/{chapterId}.html 经 Playwright 执行 WAF 挑战后返回纯文本（UTF-8 无字体混淆），免费章节全文可见；VIP 章免登录仅第一章（约 1-2 段预览后直接结束，框架不支持付费自动化）。容器 #readArea .readAreaBox.content .p 内正文为 <p>，另有页脚广告 p.copy（本书首发来自17K小说网…，text_content 为空）+ div.author-say/qrcode/chapter_text_ad → 用 :not(.copy) 排掉。每章单页无章内分页。章节标题取页面 h1（非目录 span）。",
+          "selector": {
+            "css": "#readArea .readAreaBox.content .p p:not(.copy)"
+          },
+          "api": {
+            "url": "https://api.17k.com/ckv3/book/{id}/chapter/{chapter_id}",
+            "params": {
+              "subAllPrice": "1",
+              "platform": "4",
+              "appKey": "2406394919"
+            },
+            "response_path": "data.content.0.text",
+            "decrypt_target": "chapter"
+          },
+          "render": "playwright",
+          "render_config": {
+            "wait_for": "#readArea .readAreaBox.content, #readArea",
+            "wait_until": "domcontentloaded",
+            "timeout_ms": 45000,
+            "extra_delay_ms": 800
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "max_concurrency": 1,
+    "search": {
+      "max_pages": 500,
+      "max_results": 30
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 1,
+      "max_items": 10000
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

@@ -1,0 +1,134 @@
+{
+  "$schema_version": 2,
+  "$id": "omofuna",
+  "$type": "video",
+  "$name": "Omofun动漫",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.omofuna.com/",
+    "description": "Omofun动漫：日漫、国漫、动画、剧场、特摄、美漫，多线路分集播放",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": ["视频", "动漫", "日漫", "国漫", "剧场", "特摄", "美漫", "HLS"]
+  },
+  "transports": {
+    "base_url": "https://www.omofuna.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.omofuna.com/"
+    },
+    "timeout": 20,
+    "retries": 2,
+    "interval_ms": 800,
+    "follow_redirects": true
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/type/1-{page}.html",
+      "list_paginator": {"type": "increment", "start": 1, "step": 1, "param": "page"},
+      "list_item": {
+        "categories": [
+          {"title": "日漫", "url": "/type/1-{page}.html"},
+          {"title": "国漫", "url": "/type/2-{page}.html"},
+          {"title": "动画", "url": "/type/5-{page}.html"},
+          {"title": "剧场", "url": "/type/24-{page}.html"},
+          {"title": "特摄", "url": "/type/4-{page}.html"},
+          {"title": "美漫", "url": "/type/3-{page}.html"}
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {"css": "a[data-original][href^='/anime/']"},
+        "fields": {
+          "title": {"css": "a", "attr": "title"},
+          "url": {"css": "a", "attr": "href"},
+          "cover": {"css": "a", "attr": "data-original"}
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/",
+      "method": "GET",
+      "keyword_param": "wd",
+      "paginator": {"url_template": "/search/{keyword}-------------.html"},
+      "verify": {
+        "url": "/index.php/ajax/verify_check?type=search",
+        "method": "POST",
+        "body": {"i": "$token"},
+        "token": {"strategy": "maccms_ts_b64", "key_hex": "4e3fa9c2127d88ef55aa0bcddeadbeef"}
+      },
+      "item": {
+        "root_selector": {"css": "a[data-original][href^='/anime/']"},
+        "fields": {
+          "title": {"css": "a", "attr": "title"},
+          "url": {"css": "a", "attr": "href"},
+          "cover": {"css": "a", "attr": "data-original"}
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/anime/[a-f0-9]+\\.html",
+      "fields": {
+        "title": {"css": "h1"},
+        "cover": {"css": "a.pic img", "attr": "data-original"},
+        "author": {"xpath": "//p[@class='data'][starts-with(.,'导演')]", "regex": "导演：\\s*(\\S+)"},
+        "summary": {"fallback": [{"css": ".detail-content"}, {"css": ".detail-sketch"}]},
+        "status": {"xpath": "//p[@class='data'][span]", "regex": "状态：(.*)"},
+        "tags": {"xpath": "//p[contains(@class,'data') and contains(.,'类型：')]", "regex": "类型：([^/]+)"},
+        "clean": {"tags": [["re:\\s+$", ""]]}
+      }
+    },
+    "content": {
+      "render_config": {
+        "wait_until": "domcontentloaded",
+        "timeout_ms": 60000,
+        "extra_delay_ms": 12000
+      },
+      "episode": {
+        "play_url": {
+          "render": "playwright_fallback"
+        },
+        "list": {
+          "root_selector": {"css": ".play-list-content li"},
+          "fields": {"title": {"css": "a"}, "url": {"css": "a", "attr": "href"}}
+        },
+        "source_switch": {
+          "param": "sid",
+          "default_sid": "3",
+          "list_selector": ".channel-tab li a",
+          "list_attr": "href",
+          "sid_regex": "playlist(\\d+)",
+          "name_selector": ".channel-tab li",
+          "ep_list_selector": ".play-list-content a[href*='/play/{sid}/']",
+          "ep_href_contains": "/play/",
+          "detail_url_regex": "(.*/anime/[a-f0-9]+)/play/",
+          "detail_url_template": "{1}.html",
+          "play_regex": "var player_aaaa=(\\{.*?\\})\\s*</script>",
+          "play_url_path": "url",
+          "default_parse": "https://art.v2player.top:8989/player/",
+          "max_switch_attempts": 4
+        }
+      }
+    }
+  },
+  "decryption": {
+    "targets": {
+      "video_url": {
+        "strategy": "js_custom",
+        "entry": "decrypt",
+        "script": "function decrypt(d) { return decodeURIComponent(d); }",
+        "params": {}
+      }
+    }
+  },
+  "media": {"format": "hls", "select": {"video": {"quality": "best"}}, "hls": {"workers": 4}},
+  "stream_resolver": {
+    "candidate_timeout": 60,
+    "total_budget": 90
+  },
+  "ad_block": {"enabled": true},
+  "constraints": {"search": {"max_pages": 10, "max_results": 300}, "detail": {"max_pages": 1}, "episode": {"max_pages": 1, "max_items": 1000}, "max_concurrency": 2},
+  "diagnostics": {"selfcheck": {"strategy": "soft", "selector": {"css": "a[href^='/anime/']"}}}
+}

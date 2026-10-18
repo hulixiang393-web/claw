@@ -1,0 +1,593 @@
+from types import SimpleNamespace
+
+import pytest
+
+from framework.cast_session import CastSession
+
+
+class FakeProxy:
+    def __init__(self, events=None):
+        self.calls = []
+        self.events = events if events is not None else self.calls
+        self.next_url = "http://192.168.1.10:4321/s/token"
+        self.lan_tokens = {"token"}
+        self.release_calls = []
+        self._lan_error = None
+
+    def start_lan_endpoint(self, local_ip):
+        self.calls.append(("start_lan_endpoint", local_ip))
+        if self.events is not self.calls:
+            self.events.append(("start_lan_endpoint", local_ip))
+        return "http://192.168.1.10:4321"
+
+    def build_url(self, media_url, headers, ad_block, force_proxy, public_base):
+        self.calls.append(("build_url", media_url, headers, ad_block, force_proxy, public_base))
+        if self.events is not self.calls:
+            self.events.append(("build_url", media_url))
+        token = self.next_url.rsplit("/", 1)[-1]
+        self.lan_tokens.add(token)
+        return self.next_url
+
+    def release_token(self, url):
+        token = url.rsplit("/", 1)[-1]
+        self.release_calls.append(token)
+        self.lan_tokens.discard(token)
+
+    def stop_lan_endpoint(self):
+        self.calls.append(("stop_lan_endpoint",))
+        if self.events is not self.calls:
+            self.events.append(("stop_lan_endpoint",))
+
+    def lan_endpoint_error(self):
+        return self._lan_error
+
+
+class FakeClient:
+    def __init__(self, calls, states=None, positions=None, events=None):
+        self.calls = calls
+        self.events = events if events is not None else calls
+        self.states = iter(states or [{"state": "PLAYING"}])
+        self.positions = iter(positions or [{"position": 12, "duration": 90, "track": 1, "uri": "u"}])
+
+    def set_av_transport_uri(self, uri, title, mime):
+        self.calls.append(("set_av_transport_uri", uri, title, mime))
+        if self.events is not self.calls:
+            self.events.append(("set_av_transport_uri", uri, title, mime))
+
+    def play(self):
+        self.calls.append(("play",))
+        if self.events is not self.calls:
+            self.events.append(("play",))
+
+    def pause(self):
+        self.calls.append(("pause",))
+        if self.events is not self.calls:
+            self.events.append(("pause",))
+
+    def seek(self, seconds):
+        self.calls.append(("seek", seconds))
+        if self.events is not self.calls:
+            self.events.append(("seek", seconds))
+
+    def stop(self):
+        self.calls.append(("stop",))
+        if self.events is not self.calls:
+            self.events.append(("stop",))
+
+    def get_transport_info(self):
+        self.calls.append(("get_transport_info",))
+        if self.events is not self.calls:
+            self.events.append(("get_transport_info",))
+        return next(self.states)
+
+    def get_position_info(self):
+        self.calls.append(("get_position_info",))
+        if self.events is not self.calls:
+            self.events.append(("get_position_info",))
+        return next(self.positions)
+
+
+@pytest.fixture
+def renderer():
+    return SimpleNamespace(location="http://192.168.1.20:80/root.xml")
+
+
+def test_start_uses_lan_url_sets_uri_then_plays_without_stopping_local_player(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    stopped = []
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, stopped.append)
+
+    session.start(renderer, 2, "https://cdn.example/video.m3u8", "第二集", {"Referer": "r"}, {"x": 1}, True)
+
+    assert proxy.calls == [
+        ("start_lan_endpoint", "192.168.1.5"),
+        ("build_url", "https://cdn.example/video.m3u8", {"Referer": "r"}, {"x": 1}, True, "http://192.168.1.10:4321"),
+    ]
+    assert calls == [
+        ("set_av_transport_uri", "http://192.168.1.10:4321/s/token", "第二集", "application/vnd.apple.mpegurl"),
+        ("play",),
+    ]
+    assert stopped == []
+
+
+def test_poll_transitional_then_playing_stops_local_player_once(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(
+        calls,
+        states=[{"state": "TRANSITIONING"}, {"state": "PLAYING"}, {"state": "PLAYING"}],
+        positions=[{"position": 0, "duration": 90, "track": 1, "uri": "u"}] * 3,
+    )
+    stopped = []
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, lambda: stopped.append("stopped"))
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    assert session.poll_state()["state"] == "TRANSITIONING"
+    assert session.poll_state()["state"] == "PLAYING"
+    assert session.poll_state()["state"] == "PLAYING"
+    assert stopped == ["stopped"]
+
+
+def test_poll_marks_stopped_even_when_stop_callback_raises(monkeypatch, renderer):
+    # R-3/M-2：回调抛异常时也必须置位，「只尝试一次」不得重复触发
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(
+        calls,
+        states=[{"state": "PLAYING"}, {"state": "PLAYING"}],
+        positions=[{"position": 0, "duration": 90, "track": 1, "uri": "u"}] * 2,
+    )
+    attempts = []
+
+    def exploding_callback():
+        attempts.append("attempt")
+        raise RuntimeError("callback boom")
+
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, exploding_callback)
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    with pytest.raises(RuntimeError, match="callback boom"):
+        session.poll_state()
+
+    assert session.local_player_stopped is True
+    assert session.poll_state()["state"] == "PLAYING"
+    assert attempts == ["attempt"]
+
+
+def test_poll_skips_stop_callback_when_session_stopped_mid_poll(monkeypatch, renderer):
+    # R-2：轮询网络调用在锁外，期间另一线程完成 stop() 后不得再触发回调
+    proxy = FakeProxy()
+    stopped = []
+    client = FakeClient(
+        [],
+        states=[{"state": "PLAYING"}],
+        positions=[{"position": 0, "duration": 90, "track": 1, "uri": "u"}],
+    )
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, lambda: stopped.append("stopped"))
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    original_position_info = client.get_position_info
+
+    def stop_during_poll():
+        # 同线程重入模拟「锁外网络调用期间另一线程完成 stop()」
+        session.stop()
+        return original_position_info()
+
+    client.get_position_info = stop_during_poll
+
+    result = session.poll_state()
+
+    assert result["state"] == "PLAYING"
+    assert stopped == []
+    assert session.local_player_stopped is False
+
+
+def test_pause_and_seek_delegate_to_client(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    session.pause()
+    session.seek(37)
+
+    assert calls[-2:] == [("pause",), ("seek", 37)]
+
+
+def test_set_episode_updates_index_and_sets_uri_then_plays(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+    session.start(renderer, 0, "https://cdn.example/first.mp4", "第一集", {}, None, False)
+    proxy.next_url = "http://192.168.1.10:4321/s/next"
+
+    session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
+
+    assert session.current_episode_index == 1
+    assert calls[-2:] == [
+        ("set_av_transport_uri", "http://192.168.1.10:4321/s/next", "第二集", "video/mp4"),
+        ("play",),
+    ]
+
+
+def test_start_failure_cleans_lan_endpoint_without_stopping_local_player(monkeypatch, renderer):
+    proxy = FakeProxy()
+    stopped = []
+
+    def fail_factory(_):
+        raise RuntimeError("client failed")
+
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, fail_factory, stopped.append)
+
+    with pytest.raises(RuntimeError, match="client failed"):
+        session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    assert proxy.calls[-1] == ("stop_lan_endpoint",)
+    assert stopped == []
+
+
+def test_stop_is_idempotent_and_cleans_endpoint_when_client_stop_fails(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+
+    class FailingStopClient(FakeClient):
+        def stop(self):
+            calls.append(("stop",))
+            raise OSError("stop failed")
+
+    client = FailingStopClient(calls)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    with pytest.raises(OSError, match="stop failed"):
+        session.stop()
+    session.stop()
+
+    assert calls.count(("stop",)) == 1
+    assert proxy.calls.count(("stop_lan_endpoint",)) == 2
+    with pytest.raises(RuntimeError):
+        session.pause()
+
+
+def test_poll_returns_normalized_transport_and_position_fields(monkeypatch, renderer):
+    proxy = FakeProxy()
+    client = FakeClient(
+        [],
+        states=[{"state": "PLAYING", "status": "OK"}],
+        positions=[{"position": 12, "duration": 90, "track": 3, "uri": "http://tv/video.mp4"}],
+    )
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+    session.start(renderer, 2, "https://cdn.example/video.mp4", "第二集", {}, None, False)
+
+    assert session.poll_state() == {
+        "state": "PLAYING",
+        "position": 12,
+        "duration": 90,
+        "track": 3,
+        "uri": "http://tv/video.mp4",
+    }
+
+
+def test_controls_require_active_session():
+    session = CastSession(FakeProxy(), lambda _: None)
+
+    with pytest.raises(RuntimeError):
+        session.play()
+    with pytest.raises(RuntimeError):
+        session.pause()
+    with pytest.raises(RuntimeError):
+        session.seek(1)
+
+
+def test_start_rejects_active_session_with_runtime_error(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    with pytest.raises(RuntimeError, match="already active"):
+        session.start(renderer, 1, "https://cdn.example/video2.mp4", "第二集", {}, None, False)
+
+
+def test_set_episode_recovers_old_uri_on_play_failure(monkeypatch, renderer):
+    events = []
+    proxy = FakeProxy(events=events)
+    calls = []
+
+    class FailingPlayClient(FakeClient):
+        def __init__(self, calls, events, fail_on_play_count):
+            super().__init__(calls, events=events)
+            self.play_count = 0
+            self.fail_on_play_count = fail_on_play_count
+
+        def play(self):
+            self.play_count += 1
+            self.calls.append(("play",))
+            if self.events is not self.calls:
+                self.events.append(("play", self.play_count))
+            if self.play_count == self.fail_on_play_count:
+                raise RuntimeError("play failed")
+
+    client = FailingPlayClient(calls, events, fail_on_play_count=2)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/first.mp4", "第一集", {}, None, False)
+    old_url = session._current_url
+    proxy.next_url = "http://192.168.1.10:4321/s/new_token"
+
+    with pytest.raises(RuntimeError, match="play failed"):
+        session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
+
+    assert session.current_episode_index == 0
+    assert session._current_url == old_url
+    # 恢复动作是最后一次 set_av_transport_uri，且用的是旧标题
+    assert calls[-2] == ("set_av_transport_uri", old_url, "第一集", "video/mp4")
+    assert "new_token" in proxy.release_calls
+    # 旧 token 保留，LAN token 集合回到仅剩旧 token 的状态
+    assert old_url.rsplit("/", 1)[-1] not in proxy.release_calls
+    assert proxy.lan_tokens == {"token"}
+
+
+def test_set_episode_releases_old_token_on_success(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/first.mp4", "第一集", {}, None, False)
+    old_token = session._current_url.rsplit("/", 1)[-1]
+    proxy.next_url = "http://192.168.1.10:4321/s/new_token"
+
+    session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
+
+    assert old_token in proxy.release_calls
+    assert proxy.lan_tokens == {"new_token"}
+
+
+def test_stop_propagates_lan_endpoint_error(monkeypatch, renderer):
+    proxy = FakeProxy()
+    stop_attempts = [0]
+
+    def failing_stop_lan_endpoint():
+        stop_attempts[0] += 1
+        proxy.calls.append(("stop_lan_endpoint",))
+        if stop_attempts[0] == 1:
+            proxy._lan_error = RuntimeError("endpoint cleanup failed")
+        else:
+            proxy._lan_error = None
+
+    proxy.stop_lan_endpoint = failing_stop_lan_endpoint
+    calls = []
+    client = FakeClient(calls)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    with pytest.raises(RuntimeError, match="endpoint cleanup failed"):
+        session.stop()
+
+    # N-1：stop() 只读代理错误，不得清空失败生命周期标记（否则守卫被解除）
+    assert proxy._lan_error is not None
+
+    session.stop()
+    assert stop_attempts[0] == 2
+    assert proxy._lan_error is None
+
+
+def test_complete_startup_order_with_unified_events(monkeypatch, renderer):
+    events = []
+    proxy = FakeProxy(events=events)
+    calls = []
+    client = FakeClient(calls, events=events)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/video.mp4", "第一集", {}, None, False)
+
+    expected_order = [
+        ("start_lan_endpoint", "192.168.1.5"),
+        ("build_url", "https://cdn.example/video.mp4"),
+        ("set_av_transport_uri", "http://192.168.1.10:4321/s/token", "第一集", "video/mp4"),
+        ("play",),
+    ]
+
+    for i, expected in enumerate(expected_order):
+        assert events[i] == expected, f"Event {i}: expected {expected}, got {events[i]}"
+    assert len(events) == len(expected_order)
+
+
+def test_set_episode_build_url_failure_does_not_affect_state(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/first.mp4", "第一集", {}, None, False)
+    old_index = session.current_episode_index
+    old_url = session._current_url
+
+    original_build_url = proxy.build_url
+    def failing_build_url(*args, **kwargs):
+        raise RuntimeError("build url failed")
+
+    proxy.build_url = failing_build_url
+
+    with pytest.raises(RuntimeError, match="build url failed"):
+        session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
+
+    assert session.current_episode_index == old_index
+    assert session._current_url == old_url
+    assert proxy.release_calls == []
+    assert proxy.lan_tokens == {"token"}
+
+
+def test_set_episode_recovery_failure_wraps_error(monkeypatch, renderer):
+    events = []
+    proxy = FakeProxy(events=events)
+    calls = []
+
+    class PartialFailClient(FakeClient):
+        def __init__(self, calls, events):
+            super().__init__(calls, events=events)
+            self.set_episode_started = False
+            self.play_fails = 0
+
+        def play(self):
+            if self.set_episode_started:
+                self.play_fails += 1
+                self.calls.append(("play",))
+                if self.events is not self.calls:
+                    self.events.append(("play", "after_uri_set"))
+                if self.play_fails == 1:
+                    raise RuntimeError("play after new uri failed")
+                raise RuntimeError("recovery play failed")
+            super().play()
+
+    client = PartialFailClient(calls, events=events)
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/first.mp4", "第一集", {}, None, False)
+    old_url = session._current_url
+    old_index = session.current_episode_index
+    proxy.next_url = "http://192.168.1.10:4321/s/new_token"
+
+    client.set_episode_started = True
+
+    with pytest.raises(RuntimeError) as excinfo:
+        session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
+
+    # F-2：包装消息需同时含恢复失败与原始失败（GUI 直接展示 str(exc)）
+    message = str(excinfo.value)
+    assert "set_episode failed and recovery failed: recovery play failed" in message
+    assert "original: play after new uri failed" in message
+
+    # 恢复失败分支：会话保持 active，索引/URL 未被改写，仅新 token 被释放
+    assert session._active is True
+    assert session.current_episode_index == old_index
+    assert session._current_url == old_url
+    assert "new_token" in proxy.release_calls
+    assert "token" not in proxy.release_calls
+    # 恢复时用的是会话持有的旧标题（最后一次 set_av_transport_uri）
+    assert calls[-2] == ("set_av_transport_uri", old_url, "第一集", "video/mp4")
+
+
+def test_set_episode_recovery_uses_session_owned_title(monkeypatch, renderer):
+    # N-2：类真实 DlnaClient（无 calls 属性），恢复标题必须来自会话自身状态
+    proxy = FakeProxy()
+    log = []
+
+    class NoCallsClient:
+        def set_av_transport_uri(self, uri, title, mime):
+            log.append(("set_av_transport_uri", uri, title, mime))
+
+        def play(self):
+            log.append(("play",))
+            if log.count(("play",)) == 2:
+                raise RuntimeError("play failed")
+
+        def stop(self):
+            log.append(("stop",))
+
+    client = NoCallsClient()
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start(renderer, 0, "https://cdn.example/first.mp4", "第一集", {}, None, False)
+    old_url = session._current_url
+    proxy.next_url = "http://192.168.1.10:4321/s/new_token"
+
+    with pytest.raises(RuntimeError, match="play failed"):
+        session.set_episode(1, "https://cdn.example/second.mp4", "第二集", {}, None, False)
+
+    uri_calls = [entry for entry in log if entry[0] == "set_av_transport_uri"]
+    assert uri_calls[-1] == ("set_av_transport_uri", old_url, "第一集", "video/mp4")
+    assert session.current_episode_index == 0
+    assert session._current_url == old_url
+    assert "new_token" in proxy.release_calls
+    assert old_url.rsplit("/", 1)[-1] not in proxy.release_calls
+
+
+def test_start_transcoded_reuses_active_renderer_client_and_hls_mime(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    stopped = []
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, stopped.append)
+
+    session.start(renderer, 0, "https://cdn.example/original.mp4", "第一集", {}, None, False)
+    session.start_transcoded(renderer, 0, "http://192.168.1.10:4321/transcode/index.m3u8", "第一集")
+
+    assert calls[-2:] == [
+        ("set_av_transport_uri", "http://192.168.1.10:4321/transcode/index.m3u8", "第一集", "application/vnd.apple.mpegurl"),
+        ("play",),
+    ]
+    assert calls.count(("set_av_transport_uri", "http://192.168.1.10:4321/transcode/index.m3u8", "第一集", "application/vnd.apple.mpegurl")) == 1
+    assert proxy.calls.count(("start_lan_endpoint", "192.168.1.5")) == 1
+    assert stopped == []
+
+
+def test_transcoded_fallback_is_one_shot_and_stop_cleans_session(monkeypatch, renderer):
+    proxy = FakeProxy()
+    calls = []
+    client = FakeClient(calls)
+    transcode = SimpleNamespace(stop=lambda: calls.append(("transcode_stop",)))
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client)
+
+    session.start_transcoded(
+        renderer, 1, "http://192.168.1.10:4321/transcode/index.m3u8", "第二集",
+        transcode_session=transcode,
+    )
+
+    with pytest.raises(RuntimeError, match="already attempted"):
+        session.start_transcoded(renderer, 1, "http://192.168.1.10:4321/transcode/again.m3u8", "第二集")
+
+    session.stop()
+
+    assert ("transcode_stop",) in calls
+    assert session.has_transcode_fallback() is True
+    assert session._active is False
+
+
+def test_transcoded_fallback_failure_does_not_stop_local_player(monkeypatch, renderer):
+    proxy = FakeProxy()
+    stopped = []
+
+    class FailingClient(FakeClient):
+        def set_av_transport_uri(self, uri, title, mime):
+            super().set_av_transport_uri(uri, title, mime)
+            if "transcode" in uri:
+                raise RuntimeError("transcoded uri rejected")
+
+    client = FailingClient([])
+    monkeypatch.setattr("framework.cast_session._local_ip_for_renderer", lambda _: "192.168.1.5")
+    session = CastSession(proxy, lambda _: client, stopped.append)
+
+    with pytest.raises(RuntimeError, match="transcoded uri rejected"):
+        session.start_transcoded(renderer, 0, "http://192.168.1.10:4321/transcode/index.m3u8", "第一集")
+
+    assert stopped == []
+    assert session._active is False
+    assert session.has_transcode_fallback() is True

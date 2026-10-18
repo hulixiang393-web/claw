@@ -1,0 +1,580 @@
+# -*- coding: utf-8 -*-
+"""adblock HTML 内容层广告过滤测试。
+
+覆盖：
+1. filter_html：CSS 广告节点剔除（内置通用 + 源级 extra_css 追加）
+2. filter_text：广告文本特征行过滤
+3. is_ad_url / filter_m3u8 向后兼容（回归）
+4. 广告图片位 URL 识别（img tag src 命中广告域名/路径特征）
+"""
+import pytest
+
+from framework.adblock import AdblockEngine
+
+HTML_WITH_ADS = """
+<html><body>
+<div id="content">
+<p>正常正文第一段，讲的是主角起床。</p>
+<p>正常正文第二段。</p>
+<div class="ads"><a href="https://ad.example.com/x">点我下载</a></div>
+<div class="read-ad">手机阅读请访问 m.example.com 观看更多</div>
+<div id="adtext">这里是广告正文插入内容，请记住本站域名。</div>
+<ins class="adsbygoogle"></ins>
+<iframe src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></iframe>
+<div class="banner-ad"><img src="https://img.example.com/banner_468x60.jpg"></div>
+<p>正文第三段，继续剧情。</p>
+<p>（广告）点击进入领取福利</p>
+<p>正文结尾段。</p>
+</div>
+</body></html>
+"""
+
+
+class TestFilterHtml:
+    def test_remove_ad_nodes(self):
+        eng = AdblockEngine()
+        out = eng.filter_html(HTML_WITH_ADS)
+        # 广告节点及其文本被剔除
+        assert "点我下载" not in out
+        assert "手机阅读请访问" not in out
+        assert "adsbygoogle" not in out
+        assert "banner_468x60" not in out
+        # 正文保留
+        assert "主角起床" in out
+        assert "继续剧情" in out
+        assert "正文结尾段" in out
+
+    def test_extra_css_source_override(self):
+        class FakeSource:
+            raw = {
+                "ad_block": {
+                    "enabled": True,
+                    "extra_css": [".custom-ad", "#site-ad"],
+                }
+            }
+
+        eng = AdblockEngine(FakeSource())
+        html = (
+            "<div class='custom-ad'>垃圾广告</div>"
+            "<div id='site-ad'>另一个广告</div>"
+            "<p>正文</p>"
+        )
+        out = eng.filter_html(html)
+        assert "垃圾广告" not in out
+        assert "另一个广告" not in out
+        assert "正文" in out
+
+    def test_text_ad_line_filter(self):
+        eng = AdblockEngine()
+        out = eng.filter_text("这是正文\n点击进入查看详情\n（广告）推广\n正文继续")
+        assert "点击进入" not in out
+        assert "推广" not in out
+        assert "正文" in out
+
+    def test_ad_image_url_detection(self):
+        eng = AdblockEngine()
+        assert eng.is_ad_image_url("https://img.example.com/banner_468x60.jpg")
+        assert eng.is_ad_image_url("https://ad.example.com/pic.jpg")
+        assert not eng.is_ad_image_url("https://img.example.com/comics/123/1.jpg")
+
+
+class TestM3u8StreamAds:
+    """m3u8 流内广告段过滤（xuandm 实测：重复插入的片头/片尾推广块）。"""
+
+    # 同一 4 段素材（KEY:NONE 无加密）在列表中重复插入两次 → 全部判广告
+    DUP_BLOCK = (
+        "#EXTM3U\n#EXT-X-VERSION:3\n"
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"/seg/key.key\"\n"
+        "#EXTINF:2.0,\n/seg/001.ts\n"
+        "#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=NONE\n"
+        "#EXTINF:5.0,\n/admaterial/VWd1eJQz.ts\n"
+        "#EXTINF:5.0,\n/admaterial/6UkoUQLF.ts\n"
+        "#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=AES-128,URI=\"/seg/key.key\"\n"
+        "#EXTINF:2.0,\n/seg/002.ts\n"
+        "#EXTINF:2.0,\n/seg/003.ts\n"
+        "#EXT-X-DISCONTINUITY\n#EXT-X-KEY:METHOD=NONE\n"
+        "#EXTINF:5.0,\n/admaterial/VWd1eJQz.ts\n"
+        "#EXTINF:5.0,\n/admaterial/6UkoUQLF.ts\n"
+        "#EXT-X-ENDLIST\n"
+    )
+
+    def test_repeated_ad_block_removed(self):
+        eng = AdblockEngine()
+        out = eng.filter_m3u8(self.DUP_BLOCK, "https://cdn.example.com/hls/index.m3u8")
+        assert "VWd1eJQz" not in out and "6UkoUQLF" not in out
+        segs = [l for l in out.splitlines() if l and not l.startswith("#")]
+        assert segs == ["/seg/001.ts", "/seg/002.ts", "/seg/003.ts"]
+        assert "#EXT-X-KEY:METHOD=AES-128" in out
+        assert "#EXT-X-KEY:METHOD=NONE" in out
+        # 列表合法：EXTINF 数与段数一致
+        extinf = sum(1 for l in out.splitlines() if l.startswith("#EXTINF"))
+        assert extinf == len(segs)
+
+    def test_same_url_different_byte_ranges_are_not_duplicates(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n"
+            "#EXT-X-BYTERANGE:100@0\n#EXTINF:10,\n/media.ts\n"
+            "#EXT-X-BYTERANGE:100@100\n#EXTINF:10,\n/media.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_same_normal_url_and_range_is_not_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-BYTERANGE:100@0\n#EXTINF:10,\n/media.ts\n"
+            "#EXT-X-DISCONTINUITY\n#EXT-X-BYTERANGE:100@0\n#EXTINF:10,\n/media.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_ts_binary_keyword_is_not_used_as_ad_signal(self):
+        eng = AdblockEngine()
+        m3u8 = "#EXTM3U\n#EXTINF:10,\n/seg/%E6%BE%B3%E9%97%A8.ts\n#EXT-X-ENDLIST\n"
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_normal_short_named_leading_block_is_kept(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5,\n/seg/000.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            + "".join(f"#EXTINF:10,\n/seg/{i:03d}.ts\n" for i in range(1, 8))
+            + "#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_normal_key_none_and_map_are_retained(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+            "#EXT-X-KEY:METHOD=NONE\n#EXTINF:10,\n/seg/a.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/index.m3u8") == m3u8
+
+    def test_normal_short_seg_after_discontinuity_kept(self):
+        # DISCONTINUITY 后 2s 段是正片第一段（xuandm seg96），不能被旧规则误删
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"/k.key\"\n"
+            "#EXTINF:2.0,\n/seg/096.ts\n"
+            "#EXTINF:2.0,\n/seg/097.ts\n"
+            "#EXTINF:2.0,\n/seg/098.ts\n#EXT-X-ENDLIST\n"
+        )
+        assert eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8") == m3u8
+
+    def test_isolated_short_block_is_kept_without_reliable_ad_signal(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXT-X-DISCONTINUITY\n#EXTINF:1.5,\nhttps://cdn.example.com/seg/1003.ts\n"
+            "#EXT-X-DISCONTINUITY\n#EXTINF:10.0,\nhttps://cdn.example.com/seg/1004.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/play/list.m3u8")
+        assert out == m3u8
+
+    def test_configured_leading_block_requires_host_and_key_transition(self):
+        class FakeSource:
+            raw = {
+                "ad_block": {
+                    "enabled": True,
+                    "hls_rules": {
+                        "drop_leading_block": {
+                            "max_duration": 30,
+                            "max_ratio": 0.25,
+                            "require_discontinuity": True,
+                            "require_host_change": True,
+                            "require_encryption_transition": True,
+                            "encryption_transition": "unencrypted_to_encrypted",
+                        }
+                    },
+                }
+            }
+
+        eng = AdblockEngine(FakeSource())
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n"
+            "#EXTINF:3.0,\nhttps://intro.example/intro0.ts\n"
+            "#EXTINF:1.5,\nhttps://intro.example/intro1.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"/key\"\n"
+            "#EXTINF:10.0,\nhttps://main.example/video0.ts\n"
+            "#EXTINF:10.0,\nhttps://main.example/video1.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        ads, out = eng.detect_m3u8_ads(m3u8, "https://main.example/index.m3u8")
+        assert ads == [0, 1]
+        assert "intro0.ts" not in out and "intro1.ts" not in out
+        assert "video0.ts" in out and "#EXT-X-KEY:METHOD=AES-128" in out
+        assert out.count("#EXTINF:") == 2
+        assert "#EXT-X-DISCONTINUITY" not in out
+
+    def test_configured_leading_block_keeps_content_when_one_signal_is_missing(self):
+        class FakeSource:
+            raw = {
+                "ad_block": {
+                    "enabled": True,
+                    "hls_rules": {
+                        "drop_leading_block": {
+                            "max_duration": 30,
+                            "max_ratio": 0.25,
+                            "require_discontinuity": True,
+                            "require_host_change": True,
+                            "require_encryption_transition": True,
+                            "encryption_transition": "unencrypted_to_encrypted",
+                        }
+                    },
+                }
+            }
+
+        eng = AdblockEngine(FakeSource())
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:3.0,\nhttps://intro.example/intro0.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"/key\"\n"
+            "#EXTINF:10.0,\nhttps://intro.example/video0.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        ads, out = eng.detect_m3u8_ads(m3u8, "https://main.example/index.m3u8")
+        assert ads == []
+        assert out == m3u8
+
+    def test_source_url_rule_removes_ikanpp_baofeng_adjumps(self):
+        class FakeSource:
+            raw = {
+                "ad_block": {
+                    "enabled": True,
+                    "block_url_regex": [r"/video/adjump(?:/|$)"],
+                }
+            }
+
+        eng = AdblockEngine(FakeSource())
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+            "#EXTINF:4.0,\n0000000.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:3.0,\nhttps://fengbao13.com/video/adjump/time/ad0.ts\n"
+            "#EXTINF:3.0,\nhttps://fengbao13.com/video/adjump/time/ad1.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:4.0,\n0000001.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        ads, out = eng.detect_m3u8_ads(m3u8, "https://fengbao13.com/video/show/index.m3u8")
+        assert ads == [1, 2]
+        assert "adjump" not in out
+        assert "0000000.ts" in out and "0000001.ts" in out
+        assert out.count("#EXTINF:") == 2
+        # 中插广告移除后保留一个 PTS 边界，避免音视频时间戳直接拼接抖动。
+        assert out.count("#EXT-X-DISCONTINUITY") == 1
+
+
+class TestBackwardCompat:
+    def test_is_ad_url_still_works(self):
+        eng = AdblockEngine()
+        assert eng.is_ad_url("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js")
+        assert not eng.is_ad_url("https://cdn.example.com/seg/1001.ts")
+
+    def test_filter_m3u8_still_works(self):
+        eng = AdblockEngine()
+        m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n" \
+               "#EXT-X-DISCONTINUITY\n#EXTINF:2.0,\nhttps://cdn.example.com/ads/ad1.ts\n" \
+               "#EXTINF:10.0,\nhttps://cdn.example.com/seg/1001.ts\n#EXT-X-ENDLIST\n"
+        out = eng.filter_m3u8(m3u8)
+        assert "ad1.ts" not in out
+        assert "1001.ts" in out
+
+    def test_configure_reset(self):
+        class FakeSource:
+            raw = {"ad_block": {"enabled": True, "extra_css": [".a"]}}
+
+        eng = AdblockEngine(FakeSource())
+        assert eng._extra_css == [".a"]
+
+        class FakeSource2:
+            raw = {"ad_block": {"enabled": True, "extra_css": [".b"]}}
+
+        eng.configure(FakeSource2())
+        assert eng._extra_css == [".b"]
+        assert ".a" not in eng._extra_css
+
+    def test_configure_reset_on_no_adblock_source(self):
+        class FakeSource:
+            raw = {"ad_block": {"enabled": True, "extra_css": [".a"]}}
+
+        class FakeNoAdBlock:
+            raw = {"content_type": "video"}
+
+        eng = AdblockEngine(FakeSource())
+        assert eng._extra_css == [".a"]
+        eng.configure(FakeNoAdBlock())
+        assert eng._extra_css == []
+        assert eng._extra_regexes == []
+        assert eng._extra_domains == []
+
+
+class TestDefaultOn:
+    class _NoAdBlock:
+        raw = {"content_type": "video"}
+
+    class _Disabled:
+        raw = {"ad_block": {"enabled": False}}
+
+    def test_source_without_adblock_disabled_by_default(self):
+        assert AdblockEngine(self._NoAdBlock()).enabled is False
+
+    def test_source_without_adblock_default_on(self):
+        eng = AdblockEngine(self._NoAdBlock(), default_on=True)
+        assert eng.enabled is True
+        assert eng.is_ad_url("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js")
+
+    def test_configure_default_on_param(self):
+        eng = AdblockEngine()
+        eng.configure(self._NoAdBlock(), default_on=True)
+        assert eng.enabled is True
+
+    def test_explicit_enabled_false_respected(self):
+        assert AdblockEngine(self._Disabled(), default_on=True).enabled is False
+
+    def test_adblock_for_default_on(self):
+        from framework.adblock import adblock_for
+
+        assert adblock_for(self._NoAdBlock(), default_on=True).enabled is True
+        assert adblock_for(self._NoAdBlock()).enabled is False
+
+
+class TestM3u8CueTags:
+    def test_cue_out_in_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n#EXT-X-VERSION:3\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            "#EXT-X-CUE-OUT:30.0\n"
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXTINF:5.0,\n/seg/ad2.ts\n"
+            "#EXT-X-CUE-IN\n"
+            "#EXTINF:5.0,\n/seg/a2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/index.m3u8")
+        assert "ad1.ts" not in out and "ad2.ts" not in out
+        assert "a1.ts" in out and "a2.ts" in out
+
+    def test_dangling_cue_out_until_end(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXT-X-CUE-OUT:10.0\n"
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXTINF:5.0,\n/seg/ad2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad2.ts" not in out
+
+    def test_scte35_out_in_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            "#EXT-X-SCTE35-OUT\n"
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXT-X-SCTE35-IN\n"
+            "#EXTINF:5.0,\n/seg/a2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out
+        assert "a1.ts" in out and "a2.ts" in out
+
+    def test_legacy_scte35_splice(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            '#EXT-X-SCTE35:CUE="ad_id=1000, am_splice_type=0x02"\n'
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            '#EXT-X-SCTE35:CUE="am_splice_type=0x0e"\n'
+            "#EXTINF:5.0,\n/seg/a2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out
+        assert "a1.ts" in out and "a2.ts" in out
+
+    def test_daterange_ad_marker(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            '#EXT-X-DATERANGE:ID="ad1",CLASS="com.example.ad",X-ASSET="/ad",SCTE35-OUT=0xFC00\n'
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXT-X-CUE-IN\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out
+        assert "a1.ts" in out
+
+    def test_cue_out_cont_keeps_trailing_content(self):
+        # CUE-OUT 后多个 -OUT-CONT 续帧之间夹广告段，CUE-IN 后回到正片：
+        # 全部广告段被剔除，且 CUE-IN 之后的内容必须保留（regression：
+        # 旧 cue_depth 计数会把续帧当嵌套开启，CUE-IN 只减一次 → 深度永不为 0）。
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/f1.ts\n"
+            "#EXTINF:5.0,\n/seg/f2.ts\n"
+            "#EXT-X-CUE-OUT:30.0\n"
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXT-X-CUE-OUT-CONT:30.0/5.0\n"
+            "#EXTINF:5.0,\n/seg/ad2.ts\n"
+            "#EXT-X-CUE-OUT-CONT:30.0/10.0\n"
+            "#EXTINF:5.0,\n/seg/ad3.ts\n"
+            "#EXT-X-CUE-IN\n"
+            "#EXTINF:5.0,\n/seg/c1.ts\n"
+            "#EXTINF:5.0,\n/seg/c2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad2.ts" not in out and "ad3.ts" not in out
+        assert "f1.ts" in out and "f2.ts" in out
+        assert "c1.ts" in out and "c2.ts" in out
+
+    def test_daterange_out_in_pair(self):
+        # DATERANGE SCTE35-OUT 开启、SCTE35-IN 关闭：广告段剔除、闭后内容保留
+        # （regression：旧代码把 SCTE35-IN 当开启，闭后内容被过度过滤）。
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/f1.ts\n"
+            "#EXTINF:5.0,\n/seg/f2.ts\n"
+            '#EXT-X-DATERANGE:ID="ad1",CLASS="com.ad",SCTE35-OUT=0xFC002000\n'
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            '#EXT-X-DATERANGE:ID="ad1",CLASS="com.ad",SCTE35-IN=0xFC002000\n'
+            "#EXTINF:5.0,\n/seg/c1.ts\n"
+            "#EXTINF:5.0,\n/seg/c2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out
+        assert "f1.ts" in out and "f2.ts" in out
+        assert "c1.ts" in out and "c2.ts" in out
+
+    def test_dual_signal_cue_out_and_daterange(self):
+        # CUE-OUT 与 DATERANGE SCTE35-OUT 双信号开启 + 单条 CUE-IN 关闭：
+        # 广告段剔除、闭后内容保留（regression：旧计数对双信号两次开启、
+        # 一次关闭 → 深度永不为 0，闭后内容被整体误删）。
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/f1.ts\n"
+            "#EXTINF:5.0,\n/seg/f2.ts\n"
+            "#EXT-X-CUE-OUT:30.0\n"
+            '#EXT-X-DATERANGE:ID="ad1",CLASS="com.ad",SCTE35-OUT=0xFC002000\n'
+            "#EXTINF:5.0,\n/seg/ad1.ts\n"
+            "#EXTINF:5.0,\n/seg/ad2.ts\n"
+            "#EXT-X-CUE-IN\n"
+            "#EXTINF:5.0,\n/seg/c1.ts\n"
+            "#EXTINF:5.0,\n/seg/c2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad2.ts" not in out
+        assert "f1.ts" in out and "f2.ts" in out
+        assert "c1.ts" in out and "c2.ts" in out
+
+
+class TestM3u8PreRoll:
+    def test_leading_short_uniform_block_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            + "".join(f"#EXTINF:5.0,\n/seg/ad{i}.ts\n" for i in range(1, 4))
+            + "#EXT-X-DISCONTINUITY\n"
+            + "".join(f"#EXTINF:10.0,\n/seg/{i:03d}.ts\n" for i in range(1, 11))
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad3.ts" not in out
+        segs = [ln for ln in out.splitlines() if ln and not ln.startswith("#")]
+        assert segs == [f"/seg/{i:03d}.ts" for i in range(1, 11)]
+
+    def test_trailing_short_uniform_block_removed(self):
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            + "".join(f"#EXTINF:10.0,\n/seg/{i:03d}.ts\n" for i in range(1, 11))
+            + "#EXT-X-DISCONTINUITY\n"
+            + "".join(f"#EXTINF:5.0,\n/seg/ad{i}.ts\n" for i in range(1, 4))
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert "ad1.ts" not in out and "ad3.ts" not in out
+        segs = [ln for ln in out.splitlines() if ln and not ln.startswith("#")]
+        assert segs == [f"/seg/{i:03d}.ts" for i in range(1, 11)]
+
+    def test_leading_block_not_short_kept(self):
+        # 首位块占 50%（30s/60s）> 25% → 保留
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            + "".join(f"#EXTINF:10.0,\n/seg/f{i}.ts\n" for i in range(1, 4))
+            + "#EXT-X-DISCONTINUITY\n"
+            + "".join(f"#EXTINF:10.0,\n/seg/c{i}.ts\n" for i in range(1, 4))
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert out == m3u8
+
+    def test_short_video_first_block_kept(self):
+        # 整体 25s < 60s → 预滚不启用（防短视频误删）
+        eng = AdblockEngine()
+        m3u8 = (
+            "#EXTM3U\n"
+            "#EXTINF:5.0,\n/seg/a1.ts\n"
+            "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:10.0,\n/seg/b1.ts\n"
+            "#EXTINF:10.0,\n/seg/b2.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert out == m3u8
+
+
+class TestM3u8MidRoll:
+    def test_short_uniform_interior_block_kept_without_ad_signal(self):
+        eng = AdblockEngine()
+        content = "".join(f"#EXTINF:10.0,\n/seg/c{i}.ts\n" for i in range(1, 5))
+        content2 = "".join(f"#EXTINF:10.0,\n/seg/c{i}.ts\n" for i in range(5, 9))
+        m3u8 = (
+            "#EXTM3U\n" + content
+            + "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:4.0,\n/seg/m1.ts\n"
+            "#EXTINF:4.0,\n/seg/m2.ts\n"
+            "#EXT-X-DISCONTINUITY\n" + content2
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert out == m3u8
+
+    def test_longer_varied_interior_block_kept(self):
+        # 12s 内部块（8+4 非均匀），各块中位数 80s：12 < 80/3 成立但无均匀签名
+        # 且 12 > 10 → 保留
+        eng = AdblockEngine()
+        content = "".join(f"#EXTINF:20.0,\n/seg/c{i}.ts\n" for i in range(1, 5))
+        content2 = "".join(f"#EXTINF:20.0,\n/seg/c{i}.ts\n" for i in range(5, 9))
+        m3u8 = (
+            "#EXTM3U\n" + content
+            + "#EXT-X-DISCONTINUITY\n"
+            "#EXTINF:8.0,\n/seg/m1.ts\n"
+            "#EXTINF:4.0,\n/seg/m2.ts\n"
+            "#EXT-X-DISCONTINUITY\n" + content2
+            + "#EXT-X-ENDLIST\n"
+        )
+        out = eng.filter_m3u8(m3u8, "https://cdn.example.com/hls/i.m3u8")
+        assert out == m3u8

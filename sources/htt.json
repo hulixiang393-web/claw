@@ -1,0 +1,149 @@
+{
+  "$schema_version": 2,
+  "$id": "htt",
+  "$type": "novel",
+  "$name": "和图书",
+  "$enabled": true,
+  "$weight": 2.0,
+  "$metadata": {
+    "homepage": "https://www.hetushu.com",
+    "description": "和图书（hetushu.com）免费小说在线阅读。全站 SSR、无登录要求；站点部署 Cloudflare 托管质询（JS challenge），requests 直连恒 403（含手动 cf_clearance，TLS 指纹绑定）→ 搜索/正文必须走 playwright 渲染。⚠ 详情页框架暂无 render 支持（见最终报告），此源 detail 抓取为已知受限项，需框架补充 endpoints.detail.render 才能真正完整可用。",
+    "icon": "https://www.hetushu.com/favicon.ico",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "小说",
+      "免费",
+      "render",
+      "cloudflare"
+    ]
+  },
+  "transports": {
+    "base_url": "https://www.hetushu.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.hetushu.com/"
+    },
+    "timeout": 20,
+    "retries": 2,
+    "interval_ms": 800
+  },
+  "endpoints": {
+    "search": {
+      "base_url": "/search/",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "render": "playwright",
+      "item": {
+        "root_selector": {
+          "css": "dl.list#body dd h4 a"
+        },
+        "fields": {
+          "title": {
+            "css": "h4 a"
+          },
+          "url": {
+            "css": "h4 a",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "a img",
+            "attr": "src"
+          },
+          "author": {
+            "css": "h4 span"
+          },
+          "summary": {
+            "css": "div.intro"
+          }
+        },
+        "clean": {
+          "author": [
+            [
+              "/",
+              ""
+            ]
+          ]
+        },
+        "render_config": {
+          "wait_for": "dl.list#body dd h4 a",
+          "wait_until": "domcontentloaded",
+          "timeout_ms": 45000,
+          "extra_delay_ms": 4000,
+          "filter_keyword": true
+        }
+      }
+    },
+    "detail": {
+      "note": "全站 CF 质询 → detail 抓取需框架支持渲染（待审批）。以下字段选择器已按真实详情页 SSR 校验，渲染/绕过后即可直接生效。",
+      "fields": {
+        "title": {
+          "css": "div.book_info h2"
+        },
+        "author": {
+          "css": "div.book_info div a[href*='/author/']"
+        },
+        "cover": {
+          "css": "div.book_info img",
+          "attr": "src"
+        },
+        "summary": {
+          "css": "div.book_info div.intro"
+        },
+        "tags": {
+          "css": "dl.tag dd a"
+        }
+      }
+    },
+    "content": {
+      "chapter": {
+        "list": {
+          "root_selector": {
+            "css": "dl#dir dd"
+          },
+          "fields": {
+            "title": {
+              "css": "a[href*='/book/']"
+            },
+            "url": {
+              "css": "a[href*='/book/']",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": "#content div"
+          },
+          "render": "playwright",
+          "render_config": {
+            "wait_for": "#content div",
+            "wait_until": "domcontentloaded",
+            "timeout_ms": 45000,
+            "extra_delay_ms": 5000
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 100
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "chapter": {
+      "max_pages": 10000,
+      "max_items": 10000
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    }
+  }
+}

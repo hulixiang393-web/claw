@@ -1,0 +1,208 @@
+{
+  "$schema_version": 2,
+  "$id": "qimao",
+  "$type": "novel",
+  "$name": "七猫小说",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://www.qimao.com/",
+    "description": "七猫中文网免费正版小说。首页和详情页为 SSR，正文页按章节 URL 直接读取。搜索结果由前端渲染。",
+    "icon": "https://cdn-front.qimao.com/global/static/images/favicon2022.ico",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "小说",
+      "免费",
+      "正版",
+      "中文"
+    ],
+    "last_verified": "2026-10-12"
+  },
+  "transports": {
+    "base_url": "https://www.qimao.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+      "Referer": "https://www.qimao.com/"
+    },
+    "timeout": 20,
+    "retries": 2,
+    "interval_ms": 300,
+    "follow_redirects": true
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/",
+      "list_item": {
+        "categories": [
+          { "title": "首页推荐", "url": "/" },
+          { "title": "女生原创", "url": "/shuku/1-a-a-a-a-a-a-click-1/" },
+          { "title": "男生原创", "url": "/shuku/2-a-a-a-a-a-a-click-1/" },
+          { "title": "玄幻仙侠", "url": "/shuku/a-4-21-a-a-a-a-click-1/" },
+          { "title": "古代言情", "url": "/shuku/a-2-a-a-a-a-a-click-1/" },
+          { "title": "总裁豪门", "url": "/shuku/a-1-8-a-a-a-a-click-1/" },
+          { "title": "完结小说", "url": "/shuku/a-a-a-a-a-a-over-1/" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "li.book-list-item, li.rank-list-box-list-item"
+        },
+        "fields": {
+          "title": {
+            "fallback": [
+              { "css": ".s-title" },
+              { "css": ".s-tit" },
+              { "css": "img", "attr": "alt" }
+            ]
+          },
+          "url": {
+            "css": "a[href*='/shuku/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.book-cover-src",
+            "attr": "src"
+          },
+          "author": {
+            "fallback": [
+              { "css": ".s-author" },
+              { "css": ".s-des" }
+            ]
+          }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/index",
+      "method": "GET",
+      "keyword_param": "keyword",
+      "render": "playwright",
+      "paginator": {
+        "url_template": "/search/index?keyword={keyword}&page={page}"
+      },
+      "item": {
+        "root_selector": {
+          "css": "li.qm-cover-text-item"
+        },
+        "fields": {
+          "title": {
+            "fallback": [
+              { "css": ".s-title" },
+              { "css": ".s-tit" },
+              { "css": "img", "attr": "alt" }
+            ]
+          },
+          "url": {
+            "css": "a[href*='/shuku/']",
+            "attr": "href"
+          },
+          "cover": {
+            "css": "img.book-cover-src",
+            "attr": "src"
+          },
+          "author": {
+            "css": "a[href*='/zuozhe/']"
+          }
+        },
+        "render_config": {
+          "wait_for": ".search-result-content, li.qm-cover-text-item",
+          "wait_until": "domcontentloaded",
+          "timeout_ms": 30000,
+          "extra_delay_ms": 1200,
+          "filter_keyword": true
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/shuku/\\d+(?:-\\d+)?/?$",
+      "fields": {
+        "title": {
+          "fallback": [
+            { "css": ".book-detail-info .title .txt" },
+              { "css": ".book-info .title span" }
+          ]
+        },
+        "author": {
+          "fallback": [
+            { "css": ".book-detail-info .sub-title .txt:first-child em" },
+            { "css": ".book-info .author" }
+          ]
+        },
+        "cover": {
+          "fallback": [
+            { "css": ".book-information .wrap-pic img", "attr": "src" },
+            { "css": ".book-photo img", "attr": "src" }
+          ]
+        },
+        "summary": {
+          "fallback": [
+            { "css": ".book-introduction .intro" },
+            { "css": ".book-desc" }
+          ]
+        },
+        "status": {
+          "css": ".tags-wrap .qm-tag"
+        },
+        "tags": {
+          "css": ".tags-wrap .qm-tag"
+          },
+          "clean": {
+            "author": [
+              ["re:^作者[:：]?\\s*", ""]
+            ]
+          }
+      }
+    },
+    "content": {
+      "chapter": {
+        "pagination": {
+          "enabled": false
+        },
+        "list": {
+          "note": "使用七猫官网目录接口，详情页 SSR 只保留最新章节；接口返回 data.chapters[].id/title，正文链接为 /shuku/{book_id}-{chapter_id}/。",
+          "chapters_api": {
+            "url": "/qimaoapi/api/book/chapter-list",
+            "method": "GET",
+            "body": {
+              "book_id": "{id}"
+            },
+            "response_path": "data.chapters",
+            "item_fields": {
+              "title": "title",
+              "chapter_id": "id"
+            },
+            "url_template": "/shuku/{id}-{chapter_id}/"
+          },
+          "root_selector": {
+            "css": ".update-chapter-title a"
+          },
+          "fields": {
+            "title": {
+              "xpath": "."
+            },
+            "url": {
+              "xpath": ".",
+              "attr": "href"
+            }
+          }
+        },
+        "body": {
+          "selector": {
+            "css": ".chapter-detail-article .article"
+          }
+        }
+      }
+    }
+  },
+  "constraints": {
+    "search": { "max_pages": 1, "max_results": 30 },
+    "detail": { "max_pages": 1 },
+    "chapter": { "max_pages": 1, "max_items": 3000 }
+  },
+  "diagnostics": {
+    "selfcheck": { "strategy": "off" }
+  }
+}

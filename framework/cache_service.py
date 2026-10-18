@@ -1,0 +1,427 @@
+"""Redis 风格缓存服务（零第三方依赖）。
+
+dict + LRU + TTL + 字节配额 + pickle-gz 持久化。永不 raise：
+所有失败路径上层降级为"不缓存"。
+
+用法：
+    store = RedisLikeStore(quota=3*1024**3, persist_path="data/cache/redis_shelf.gz")
+    store.load()                       # 启动时读盘
+    store.set("cover:x:u", b"...")                    # 永久
+    store.set("body:x:u", "...", ttl=7*86400)         # 7 天
+    store.get("cover:x:u")
+    store.hset("search:x:kw", "s1", [...]); store.hgetall("search:x:kw")
+    store.bytes_used() / store.scan("search:*") / store.delete(...)
+    store.flush_checked()              # 业务侧调用；退出前必 save
+"""
+
+from __future__ import annotations
+
+import atexit
+import builtins
+import fnmatch
+import gzip
+import logging
+import os
+import pickle
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, Optional
+
+from .atomic_io import atomic_write_stream
+
+log = logging.getLogger(__name__)
+
+# 每 key 的近似固定开销（dict entry + LRU 指针 + ttl 元数据）
+_OVERHEAD_PER_KEY = 200
+
+# 受限反序列化白名单：只允许基础容器/标量，禁止执行未知代码。
+_ALLOWED_BUILTINS = frozenset(
+    {
+        "dict", "list", "set", "frozenset", "tuple", "str", "bytes",
+        "bytearray", "int", "float", "bool", "complex", "NoneType",
+    }
+)
+# 本项目明确允许落盘的自定义类型（发现页会话快照含 Work 实例）。
+_ALLOWED_PROJECT_TYPES = {("framework.discovery", "Work")}
+
+
+class _RestrictedUnpickler(pickle.Unpickler):
+    """缓存专用 unpickler：仅允许白名单类型，篡改/损坏数据触发异常而非执行代码。"""
+
+    def find_class(self, module: str, name: str):
+        if module == "builtins" and name in _ALLOWED_BUILTINS:
+            return getattr(builtins, name)
+        if (module, name) in _ALLOWED_PROJECT_TYPES:
+            import importlib
+
+            return getattr(importlib.import_module(module), name)
+        raise pickle.UnpicklingError(f"缓存反序列化被拒绝：{module}.{name}")
+
+
+def _validate_cache_payload(payload: Any) -> None:
+    """显式结构校验：载荷或条目结构异常即视为缓存损坏。"""
+    if not isinstance(payload, dict):
+        raise ValueError("缓存载荷不是字典")
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise ValueError("缓存 data 不是列表")
+    for entry in data:
+        if (
+            not isinstance(entry, (tuple, list))
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+        ):
+            raise ValueError("缓存条目格式非法")
+    for field in ("ttl", "bytes"):
+        value = payload.get(field)
+        if value is not None and not isinstance(value, dict):
+            raise ValueError(f"缓存 {field} 不是字典")
+
+
+def _value_bytes(value: Any) -> int:
+    """估算 value 内存字节（序列化长度）。"""
+    try:
+        return len(pickle.dumps(value, protocol=4))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+class RedisLikeStore:
+    """Redis 风格键值缓存。线程安全，LRU + TTL + 字节配额 + 落盘。"""
+
+    def __init__(
+        self,
+        quota: int,
+        persist_path: Optional[str] = None,
+        source_lru_prefix: Optional[str | tuple[str, ...]] = None,
+        source_lru_limit: Optional[int] = None,
+    ):
+        # 排序字典：插入序 = LRU 序（队首最旧，队尾最新）。访问 move_to_end。
+        self._data: "OrderedDict[str, Any]" = OrderedDict()
+        self._ttl: dict[str, float] = {}    # key -> 过期时间戳（0.0 = 永久）
+        self._bytes: dict[str, int] = {}    # key -> 估算字节
+        self._bytes_used = 0
+        self._quota = max(1, int(quota))
+        self._persist_path = persist_path
+        self._source_lru_prefix = source_lru_prefix
+        self._source_lru_limit = source_lru_limit
+        self._lock = threading.RLock()
+        self._writes = 0
+        self._last_save_ts = 0.0
+        self._save_interval = 60.0
+        self._save_write_threshold = 500
+        if self._persist_path:
+            atexit.register(self.save)
+
+    # ------------------------------------------------------------------ #
+    def _drop_locked(self, key: str) -> None:
+        """移除 key 并扣减字节计数。调用方持锁。"""
+        if key in self._data:
+            self._data.pop(key)
+            self._bytes_used -= self._bytes.pop(key, 0)
+        self._ttl.pop(key, None)
+
+    def _is_expired(self, key: str) -> bool:
+        t = self._ttl.get(key, 0.0)
+        return t != 0.0 and t <= time.time()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self._ttl.clear()
+            self._bytes.clear()
+            self._bytes_used = 0
+            self._writes += 1
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._drop_locked(key)
+            self._writes += 1
+
+    def get(self, key: str) -> Any:
+        with self._lock:
+            if key in self._data:
+                if self._is_expired(key):
+                    self._drop_locked(key)
+                    return None
+                self._data.move_to_end(key)  # LRU 命中
+                return self._data[key]
+            return None
+
+    def get_cached(self, key: str) -> Any:
+        return self.get(key)
+
+    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> bool:
+        """写缓存。False = 跳过（单 key 超配额）。"""
+        try:
+            b = _value_bytes(value)
+            if b > self._quota:
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        with self._lock:
+            if key in self._data:
+                self._bytes_used -= self._bytes.pop(key, 0)
+                self._data.pop(key)
+            self._data[key] = value
+            total = b + _OVERHEAD_PER_KEY
+            self._bytes[key] = total
+            self._bytes_used += total
+            self._ttl[key] = (time.time() + ttl) if (ttl is not None and ttl > 0) else 0.0
+            self._writes += 1
+            self._evict_until_under_quota()
+            self._evict_source_lru_locked()
+        return True
+
+    def ttl(self, key: str) -> Optional[float]:
+        with self._lock:
+            t = self._ttl.get(key)
+            if t is None:
+                return None
+            if t == 0.0:
+                return None
+            if t <= time.time():
+                self._drop_locked(key)
+                return None
+            return t - time.time()
+
+    def expire(self, key: str, ttl: float) -> None:
+        with self._lock:
+            if key in self._data:
+                self._ttl[key] = (time.time() + ttl) if ttl > 0 else 0.0
+
+    # ------------------------------------------------------------------ #
+    def hset(self, key: str, field: str, value: Any) -> None:
+        with self._lock:
+            cur = self._data.get(key)
+            if not isinstance(cur, dict):
+                cur = {}
+            cur = dict(cur)
+            cur[field] = value
+            if key in self._data:
+                self._bytes_used -= self._bytes.pop(key, 0)
+            self._data[key] = cur
+            total = _value_bytes(cur) + _OVERHEAD_PER_KEY
+            self._bytes[key] = total
+            self._bytes_used += total
+            if key not in self._ttl:
+                self._ttl[key] = 0.0
+            self._data.move_to_end(key)
+            self._writes += 1
+            self._evict_until_under_quota()
+
+    def hget(self, key: str, field: str) -> Any:
+        with self._lock:
+            cur = self._data.get(key)
+            if not isinstance(cur, dict):
+                return None
+            if self._is_expired(key):
+                self._drop_locked(key)
+                return None
+            self._data.move_to_end(key)
+            return cur.get(field)
+
+    def hgetall(self, key: str) -> dict:
+        with self._lock:
+            cur = self._data.get(key)
+            if not isinstance(cur, dict):
+                return {}
+            if self._is_expired(key):
+                self._drop_locked(key)
+                return {}
+            self._data.move_to_end(key)
+            return dict(cur)
+
+    # ------------------------------------------------------------------ #
+    def scan(self, pattern: str) -> list:
+        with self._lock:
+            return [k for k in self._data if fnmatch.fnmatch(k, pattern)]
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def bytes_used(self) -> int:
+        with self._lock:
+            return self._bytes_used
+
+    def _evict_until_under_quota(self) -> None:
+        """从队首（最旧）逐出直到字节低于 quota*0.9。"""
+        target = self._quota * 0.9
+        while self._bytes_used > target and self._data:
+            key = next(iter(self._data))
+            self._drop_locked(key)
+
+    def _evict_source_lru_locked(self) -> None:
+        if not self._source_lru_prefix or not self._source_lru_limit:
+            return
+        prefixes = (
+            self._source_lru_prefix
+            if isinstance(self._source_lru_prefix, tuple)
+            else (self._source_lru_prefix,)
+        )
+        keys = [key for key in self._data if key.startswith(prefixes)]
+        while len(keys) > self._source_lru_limit:
+            self._drop_locked(keys.pop(0))
+
+    # ------------------------------------------------------------------ #
+    def save(self) -> None:
+        """落盘（gzip + pickle 单文件，流式写入）。失败静默。"""
+        if not self._persist_path:
+            return
+        try:
+            payload = {
+                "data": list(self._data.items()),
+                "ttl": self._ttl,
+                "bytes": self._bytes,
+                "bytes_used": self._bytes_used,
+            }
+
+            def _write(handle):
+                with gzip.GzipFile(fileobj=handle, mode="wb") as gz:
+                    pickle.dump(payload, gz, protocol=4)
+
+            atomic_write_stream(self._persist_path, _write)
+            self._last_save_ts = time.time()
+            self._writes = 0
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cache] 落盘失败 %s: %s", self._persist_path, exc)
+
+    def load(self) -> None:
+        """读盘。失败/被篡改 → 降级为空缓存（不执行未知代码）。"""
+        if not self._persist_path:
+            return
+        try:
+            if not os.path.exists(self._persist_path):
+                return
+            with open(self._persist_path, "rb") as fh:
+                with gzip.GzipFile(fileobj=fh, mode="rb") as gz:
+                    payload = _RestrictedUnpickler(gz).load()
+            _validate_cache_payload(payload)
+            with self._lock:
+                self._data = OrderedDict(payload["data"])
+                self._ttl = payload.get("ttl") or {}
+                self._bytes = payload.get("bytes") or {}
+                self._bytes_used = payload.get("bytes_used") or 0
+                self._writes = 0
+                self._last_save_ts = time.time()
+                # 清理已过期 key
+                for k in [k for k in self._data if self._is_expired(k)]:
+                    self._drop_locked(k)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cache] 读盘失败 %s: %s", self._persist_path, exc)
+
+    def flush_checked(self) -> None:
+        """按节流规则落盘：写计数达标或超时。"""
+        if not self._persist_path:
+            return
+        now = time.time()
+        if (
+            self._writes >= self._save_write_threshold
+            or now - self._last_save_ts >= self._save_interval
+        ):
+            self.save()
+
+
+# ---------------------------------------------------------------------- #
+# 两个配额池的单例（业务注入用）
+# ---------------------------------------------------------------------- #
+_DEFAULT_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cache"
+)
+
+_shelf_singleton: Optional[RedisLikeStore] = None
+_search_singleton: Optional[RedisLikeStore] = None
+_session_singleton: Optional[RedisLikeStore] = None
+
+
+def _configure_shelf(data_dir: Optional[str] = None) -> RedisLikeStore:
+    """按传入目录独立构建书架缓存池。"""
+    global _shelf_singleton
+    base = data_dir or _DEFAULT_DATA_DIR
+    _shelf_singleton = RedisLikeStore(
+        quota=3 * 1024 * 1024 * 1024, persist_path=os.path.join(base, "redis_shelf.gz")
+    )
+    return _shelf_singleton
+
+
+def _configure_search(data_dir: Optional[str] = None) -> RedisLikeStore:
+    """按传入目录独立构建搜索/发现缓存池。"""
+    global _search_singleton
+    base = data_dir or _DEFAULT_DATA_DIR
+    _search_singleton = RedisLikeStore(
+        quota=10 * 1024 * 1024 * 1024, persist_path=os.path.join(base, "redis_search.gz")
+    )
+    return _search_singleton
+
+
+def _configure_session(data_dir: Optional[str] = None) -> RedisLikeStore:
+    """构建进程内会话缓存池（发现页快照，最多保留最近 5 个源）。"""
+    global _session_singleton
+    # 清理旧版本留下的持久化快照；当前会话缓存只存在于进程内。
+    stale_path = os.path.join(data_dir or _DEFAULT_DATA_DIR, "redis_session.gz")
+    try:
+        if os.path.isfile(stale_path):
+            os.remove(stale_path)
+    except OSError:
+        log.debug("[cache] 清理旧会话缓存失败: %s", stale_path, exc_info=True)
+    _session_singleton = RedisLikeStore(
+        quota=2 * 1024 * 1024 * 1024,
+        # 会话快照不能跨应用启动恢复；搜索/正文缓存仍使用持久化池。
+        persist_path=None,
+        source_lru_prefix=("snap:", "disc:"),
+        source_lru_limit=5,
+    )
+    return _session_singleton
+
+
+def _ensure_loaded(store: Optional[RedisLikeStore]) -> Optional[RedisLikeStore]:
+    """首次访问时读盘（幂等）。"""
+    if store is not None and not getattr(store, "_loaded", False):
+        try:
+            store.load()
+            store._loaded = True
+        except Exception:  # noqa: BLE001
+            pass
+    return store
+
+
+def get_shelf_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]:
+    """获取书架缓存池（懒加载）。初始化失败返回 None → 调用方跳过缓存。"""
+    global _shelf_singleton
+    if _shelf_singleton is None:
+        try:
+            _configure_shelf(data_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cache] 书架缓存初始化失败: %s", exc)
+            _shelf_singleton = None
+    return _ensure_loaded(_shelf_singleton)
+
+
+def get_search_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]:
+    """获取搜索/发现缓存池。"""
+    global _search_singleton
+    if _search_singleton is None:
+        try:
+            _configure_search(data_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cache] 搜索缓存初始化失败: %s", exc)
+            _search_singleton = None
+    return _ensure_loaded(_search_singleton)
+
+
+def get_session_cache(data_dir: Optional[str] = None) -> Optional[RedisLikeStore]:
+    """获取会话级缓存池（发现页快照用）。
+
+    快照只在当前进程有效，重启后从空缓存开始。
+    初始化失败返回 None → 调用方功能降级禁用。
+    """
+    global _session_singleton
+    if _session_singleton is None:
+        try:
+            _configure_session(data_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cache] 会话缓存初始化失败: %s", exc)
+            _session_singleton = None
+    return _ensure_loaded(_session_singleton)
