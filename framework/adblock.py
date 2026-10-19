@@ -593,13 +593,19 @@ class AdblockEngine:
         # R4: 协议级广告标签区间（CUE-OUT/CUE-IN、SCTE35、DATERANGE 广告标记）
         ad_set |= seg_cue
 
-        # ---- R5：片头/片尾预滚（双信号：块占整体 <25% + 短 或 块内时长全一致） ----
+        # ---- R5：片头/片尾预滚（块占整体 <25% + 短 或 块内时长全一致，
+        #      且清单里必须另有段命中广告词——否则"有广告词"与"该块"是同一
+        #      个信号，整条清单的 URL 都命中时等于把节目块判成广告） ----
         total_dur = sum(d for _joined, d, _byte_range in seg_infos if d is not None)
 
         def _uniform(b: dict) -> bool:
             durs = b["durs"]
             return len(durs) >= 2 and all(_d == durs[0] for _d in durs)
 
+        # 盘内 VOD（mp4 转 HLS 的片源）的块划分不表示内容边界：omofuna 天堂源
+        # 实测全是 5 片/块（标签只用来触发播放器的 PTS 重置），而节目分片 URL
+        # 本身可能命中广告词。此时「段 URL 有广告特征」不是独立信号 → 不判。
+        url_signal = any(self.is_ad_url(j) for j, _d, _r in seg_infos)
         for bi, _b in enumerate(blocks):
             _segs = _b["seg"]
             if not _segs:
@@ -618,6 +624,7 @@ class AdblockEngine:
             if (
                 (_is_first or _is_last)
                 and _has_ad_name
+                and url_signal
                 and total_dur >= 60.0
                 and _b["dur"] < 0.25 * total_dur
                 and (_b["dur"] <= 30.0 or _uniform(_b))
