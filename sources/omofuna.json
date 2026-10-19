@@ -128,7 +128,12 @@
     "candidate_timeout": 60,
     "total_budget": 90
   },
-  "ad_block": {"enabled": true},
+  "ad_block": {
+    "enabled": true,
+    "hls_rules": {
+      "remux_timestamps": {"enabled": true}
+    }
+  },
   "constraints": {"search": {"max_pages": 10, "max_results": 300}, "detail": {"max_pages": 1}, "episode": {"max_pages": 1, "max_items": 1000}, "max_concurrency": 2},
   "diagnostics": {"selfcheck": {"strategy": "soft", "selector": {"css": "a[href^='/anime/']"}}}
 }

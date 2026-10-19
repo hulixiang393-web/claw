@@ -34,9 +34,13 @@ import hashlib
 import inspect
 import ipaddress
 import mimetypes
+import os
+import shutil
 from contextlib import nullcontext
 import posixpath
 import re
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -132,6 +136,253 @@ _DIRECT_FAIL_LOCK = threading.Lock()
 _UPSTREAM_DIAGNOSTICS_MAX = 128
 _UPSTREAM_DIAGNOSTICS = []
 _UPSTREAM_DIAGNOSTICS_LOCK = threading.Lock()
+
+# HLS 分片时间戳重写（ad_block.hls_rules.remux_timestamps）。
+# 部分源的片源是把 mp4 硬切成 TS：分片 PTS/DTS 各自回到 ~0 且边界帧常常不是
+# I 帧，播放器跨分片接不上关键帧 → 表现为周期性"跳帧/花屏一下"。选项开关时
+# 第 2 片起先按序重封装为 PTS 连续的 TS 再交给播放器；播放器的分片磁盘缓存
+# 仍按原始分片落盘，命中后整理，不改变缓存键与命中语义。
+_REMUX_CTX_MAX = 64
+_REMUX_TIMEOUT = 60.0
+_REMUX_CTX = {}
+_REMUX_LOCKS = {}
+_REMUX_CTX_LOCK = threading.Lock()
+
+
+def _remux_ctx(key: str):
+    with _REMUX_CTX_LOCK:
+        ctx = _REMUX_CTX.get(key)
+        if ctx is None:
+            if len(_REMUX_CTX) >= _REMUX_CTX_MAX:
+                _REMUX_CTX.pop(next(iter(_REMUX_CTX)))
+            ctx = {"lock": threading.Lock(), "segs": {}, "inflight": {}, "done": 0}
+            _REMUX_CTX[key] = ctx
+        return ctx
+
+
+def _remux_serial(key: str) -> "threading.RLock":
+    """同一清单 key 的整理串行锁（建表也加锁，避免并发建两份上下文）。
+
+    锁表单独存放：_REMUX_CTX 的值必须都是 dict（行为与清理逻辑一致）。
+    """
+    with _REMUX_CTX_LOCK:
+        lock = _REMUX_LOCKS.get(key)
+        if lock is None:
+            if len(_REMUX_LOCKS) >= _REMUX_CTX_MAX * 4:
+                _REMUX_LOCKS.pop(next(iter(_REMUX_LOCKS)))
+            lock = threading.RLock()
+            _REMUX_LOCKS[key] = lock
+        return lock
+
+
+def _remux_active(ad_block: dict | None) -> bool:
+    rules = (ad_block or {}).get("hls_rules") or {}
+    rule = rules.get("remux_timestamps") if isinstance(rules, dict) else None
+    return isinstance(rule, dict) and bool(rule.get("enabled", True))
+
+
+def _ctx_get(ctx, index: int, default=None):
+    """按位置取 token/缓存上下文里的可选字段。
+
+    token_context 的 source_id 只对 18j 与 remux 源追加；其他调用方（外部播放器
+    全集中继、cast、测试里的三元组）不追加，写入位置不恒定 → 只认 str。
+    """
+    value = ctx[index] if len(ctx) > index else None
+    return value if isinstance(value, str) else default
+
+
+def _is_ts_payload(head: bytes) -> bool:
+    return bool(head) and head[0] == 0x47 and (
+        len(head) < 377 or head[188] == 0x47)
+
+
+def _locate_ffmpeg() -> str:
+    """定位 ffmpeg（打包内置优先，其次 PATH）；没有就返回空串。"""
+    try:
+        from .ffmpeg_merger import _find_ffmpeg
+
+        path = _find_ffmpeg()
+    except Exception:  # noqa: BLE001 —— 缺 ffmpeg 只是不重写，不影响播放
+        return ""
+    return path if path and (Path(path).is_file() or path == "ffmpeg") else ""
+
+
+def _pes_header_offset(data, off: int, step: int):
+    """PES 头起始偏移；越界（畸形包）返回 None。
+
+    adaptation_field_length 为 0 时其后仍紧跟 1 个「适配字段长度」字节本身
+    （ffmpeg 复用出的 TS 就带这种占位），必须用 1 + N 跳过，否则整个 PES 头
+    被读偏 1 字节 —— 会算出假的 PTS/DTS，再平移就写坏时间戳（实测 728727 /
+    0 之类的错值）。每个包的时间戳都靠这个偏移定位。
+    """
+    afc = (data[off + 3] >> 4) & 0x03
+    p = off + 4
+    if afc in (2, 3):
+        p += 1 + data[p]
+        if p >= off + step:
+            return None
+    return p
+
+
+def _read_ts_timestamps(data, off: int, step: int):
+    """取单个 188 字节 TS 包里 PES 头的 PTS/DTS 字段偏移列表。
+
+    返回空列表表示本包没有可平移的时间戳。PCR 不参与：播放器按 PES 时间戳
+    计时，PCR 一起平移会把对齐打乱。
+    """
+    values = []
+    p = _pes_header_offset(data, off, step)
+    if p is None or not (data[off + 1] & 0x40) or p + 9 >= off + step:
+        return values
+    if data[p] == 0 and data[p + 1] == 0 and data[p + 2] == 1 \
+            and data[p + 3] in (0xBC, 0xBE, 0xBF, 0xF0, 0xF1, 0xFF, 0xF2, 0xF8):
+        return values                             # padding 等无 PTS 的 PES
+    h = data[p + 7] & 0xC0
+    if h == 0x80 and p + 13 < off + step:         # PTS only
+        values.append(p + 9)
+    elif h == 0xC0 and p + 18 < off + step:       # PTS + DTS
+        values.append(p + 9)
+        values.append(p + 14)
+    return values
+
+
+def _decode_ts5(data, p: int) -> int:
+    return (((data[p] >> 1) & 0x07) << 30) | (data[p + 1] << 22) | \
+           (((data[p + 2] >> 1) & 0x7F) << 15) | (data[p + 3] << 7) | (data[p + 4] >> 1)
+
+
+def _encode_ts5(data, p: int, value: int) -> None:
+    value &= 0x1FFFFFFFF
+    data[p] = (data[p] & 0xF1) | ((value >> 29) & 0x0E)
+    data[p + 1] = (value >> 22) & 0xFF
+    data[p + 2] = ((value >> 14) & 0xFE) | 0x01
+    data[p + 3] = (value >> 7) & 0xFF
+    data[p + 4] = ((value << 1) & 0xFE) | 0x01
+
+
+def _stream_key(data, off: int, offsets) -> tuple:
+    """PES 所属节目流标识（PID + stream_id）。
+
+    连续性按流分别检查：音视频各自的 DTS 序列互不干扰。
+    """
+    pid = ((data[off + 1] & 0x1F) << 8) | data[off + 2]
+    p = _pes_header_offset(data, off, 188)
+    if p is None or p + 3 >= off + 188:
+        return pid, -1
+    return pid, data[p + 3]
+
+
+def _ts_shift(src: Path, first_dts: float) -> bool:
+    """时间戳整理：让本片**首帧**落在 first_dts（秒），并修掉片内错位时间戳。
+
+    1. 锚点：片内最早的时间戳平移到 first_dts；
+    2. 连续性：每个 PES 的 DTS 必须紧跟同流上一个 DTS（帧间隔取片内中位数）；
+       倒退或偏离过远的包按预期时刻重锚，后续包随之顺延。
+    只改 PES 头的 PTS/DTS，帧数与字节内容都不变；否则返回 False。
+    """
+    try:
+        data = bytearray(src.read_bytes())
+    except OSError:
+        return False
+    step = 188
+    if len(data) < step * 2:
+        return False
+    entries = []          # [(包偏移, [(字段偏移, 原值)])]，按文件顺序
+    min_ts = None
+    off = 0
+    while off + step <= len(data):
+        if data[off] != 0x47:
+            return False
+        if (data[off + 1] & 0x1F) != 0x1F:
+            offsets = _read_ts_timestamps(data, off, step)
+            if offsets:
+                values = []
+                for p in reversed(offsets):     # 先取再写：DTS 偏移与 PTS 字面向量
+                    values.append((p, _decode_ts5(data, p)))
+                values.reverse()
+                entries.append((off, values))
+                frame_min = min(v for _p, v in values)
+                min_ts = frame_min if min_ts is None else min(min_ts, frame_min)
+        off += step
+    if min_ts is None or not entries:
+        return False
+    bump = int(round(first_dts * 90000)) - min_ts
+
+    # 帧间隔：同流相邻 DTS 差的中位数（90kHz）。样本太少就不做连续性修正。
+    diffs = []
+    last_by_stream = {}
+    for off, values in entries:
+        key = _stream_key(data, off, values)
+        dts = values[-1][1]
+        prev = last_by_stream.get(key)
+        if prev is not None and 0 < dts - prev < 90000 * 3:
+            diffs.append(dts - prev)
+        last_by_stream[key] = dts
+    gap = sorted(diffs)[len(diffs) // 2] if diffs else 0
+
+    resid = 0
+    changed = False
+    last_by_stream = {}
+    for off, values in entries:
+        key = _stream_key(data, off, values)
+        prev = last_by_stream.get(key)
+        if gap and prev is not None:
+            # values 是**原始**时间戳（必须先加已累计的 resid 再比较），否则
+            # 每次比较都会把 resid 重复算一遍 → 后续包被越推越远。
+            want = prev + gap
+            dts = values[-1][1] + bump + resid
+            if dts <= prev or dts - want > max(gap, 90000 * 0.5):
+                resid += want - dts
+        delta = bump + resid
+        if delta:
+            changed = True
+            for p, _v in values:
+                _encode_ts5(data, p, _decode_ts5(data, p) + delta)
+        last_by_stream[key] = values[-1][1] + delta
+    if not changed:
+        return True
+    try:
+        src.write_bytes(bytes(data))
+    except OSError:
+        return False
+    return True
+
+
+def _ts_duration(src: Path) -> float:
+    """分片实际时长（秒）：ffprobe 的 format 时长，失败返回 0。"""
+    ffprobe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+    if not ffprobe:
+        return 0.0
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(src)],
+            capture_output=True, text=True, timeout=_REMUX_TIMEOUT).stdout.strip()
+        return float(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
+
+
+def _ts_first_dts(path: Path):
+    """文件里最早的 DTS（秒，按 PES 头解析）；读不到返回 None。"""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    step = 188
+    best = None
+    off = 0
+    while off + step <= len(data):
+        if data[off] != 0x47:
+            return None
+        if (data[off + 1] & 0x1F) == 0x1F:
+            off += step
+            continue
+        for p in _read_ts_timestamps(data, off, step):
+            v = _decode_ts5(data, p)
+            best = v if best is None else min(best, v)
+        off += step
+    return None if best is None else best / 90000.0
 
 
 def _classify_media_protocol(target: str, headers: dict) -> str:
@@ -946,7 +1197,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "token not found")
                 return
             target, headers, ad_block = entry[0], entry[1], entry[2]
-            source_id = entry[4] if len(entry) >= 5 else ""
+            source_id = _ctx_get(entry, 4, "")
             force_proxy = _tuple_force_proxy(entry)
             try:
                 # 拖动进度（Range 非 0 起始）若越过正在下载的缓存区间，先放弃
@@ -1558,7 +1809,9 @@ class MediaProxy:
         token_context = (
             target_url, _strip_stale_headers(headers or {}), ad_block, force_proxy,
         )
-        if trusted_source_id(source_id) == "18j":
+        if trusted_source_id(source_id) == "18j" or _remux_active(ad_block):
+            # 18j 的可信上下文、remux 开关都要随 token 一路带到 /c/ 分片，
+            # 否则变体清单过滤与分片重写会丢掉策略（令牌位置不固定 → _ctx_like）。
             token_context = token_context + (source_id,)
 
         with self._lock:
@@ -2401,6 +2654,147 @@ class MediaProxy:
         handler.end_headers()  # 有 Content-Length 定界 → 可 keep-alive 复用
         handler.wfile.write(body)
 
+    def _send_bytes(self, handler: "_ProxyHandler", body: bytes,
+                    status: int = 200, content_type: str = "video/mp2t") -> None:
+        """发送一段已成型的字节（remux 输出）：定长 200，可 keep-alive 复用。"""
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    # ------------------------------------------------------------------ #
+    # 分片时间戳重写（ad_block.hls_rules.remux_timestamps）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _store_segment_bytes(cache, cache_key: str, seg_name: str,
+                             body: bytes) -> None:
+        """把整流的分片写进分片缓存（原始字节；整理输出随后原地替换）。"""
+        try:
+            final = cache.hls_segment_final(cache_key, seg_name)
+            part = cache.hls_segment_part(cache_key, seg_name)
+            part.parent.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(body)
+            if final.exists():
+                final.unlink()
+            os.replace(part, final)
+        except OSError:
+            pass
+
+    def _serve_remux_from_file(self, handler: "_ProxyHandler", cache_key: str,
+                               seg_name: str, target: str, path) -> bool:
+        """缓存命中的分片：需要时按片序整理后发送；不适用返回 False。
+
+        ctx["segs"][name] > 0 表示该片已整理且输出已直写缓存文件（下次直通）。
+        首片在 ctx 里登记的是 0，它从未被整理，必须继续走读取/直通逻辑。
+        """
+        ctx = _remux_ctx(cache_key)
+        with ctx["lock"]:
+            anchor = ctx["segs"].get(seg_name)
+        if anchor is not None and anchor > 0:
+            return False          # 已整理且有输出（输出已直写缓存文件）
+        data = self._read_whole_ts(path)
+        if data is None:
+            return False
+        out = self._remux_segment(cache_key, seg_name, data, None)
+        if out is None:
+            return False
+        self._send_bytes(handler, out)
+        try:
+            if not path.name.endswith(".remux.ts"):
+                tmp = path.with_name(path.name + ".remux.ts")
+                tmp.write_bytes(out)
+                os.replace(tmp, path)
+        except OSError:
+            pass
+        return True
+
+    @staticmethod
+    def _read_whole_ts(path, budget: int = 32 * 1024 * 1024):
+        """读取整个 TS 分片；文件过大/读失败返回 None（不整理，直接直通）。"""
+        try:
+            size = path.stat().st_size
+            if size <= 0 or size > budget:
+                return None
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    def _remux_segment(self, cache_key: str, seg_name: str, raw: bytes,
+                       req_headers) -> bytes | None:
+        """把本片整理成"接上前一片"的 TS；失败/不适用返回 None。
+
+        第 0 片是后续所有片的时间基准，原样返回（关键帧、锚点都在里面）。
+        之后每片：ffmpeg 只做 TS 重封装（-c copy，不转码）把 TS 时间戳重新
+        编号，再整体平移到前一片结束点，播放器时钟连续，拼接处不再丢帧。
+        分片必须按播放顺序到达；乱序/拖动引起的片段不整理（直接直通）。
+        """
+        # 同一个 key 上的整理串行执行：每个请求在自己的 HTTP 线程里跑，两个分片
+        # 同时到达时不能在"读基准/写基准"之间穿插（会拿到过期 base）。
+        sctx = _remux_serial(cache_key)
+        with sctx:
+            return self._remux_segment_locked(cache_key, seg_name, raw, req_headers)
+
+    def _remux_segment_locked(self, cache_key: str, seg_name: str, raw: bytes,
+                              req_headers) -> bytes | None:
+        """_remux_segment 的实现体（调用方已持 _remux_serial 锁）。"""
+        ctx = _remux_ctx(cache_key)
+        with ctx["lock"]:
+            if not ctx["segs"]:
+                ctx["segs"][seg_name] = 0.0
+                ctx["inflight"][seg_name] = False
+                ctx["done"] = 1
+                return None
+            if seg_name in ctx["segs"]:
+                return None
+            base = max(ctx["segs"].values())
+            ctx["inflight"][seg_name] = True
+        ffmpeg = _locate_ffmpeg()
+        result = None
+        if ffmpeg:
+            result = self._run_remux(ffmpeg, raw, base, req_headers)
+        with ctx["lock"]:
+            ctx["inflight"].pop(seg_name, None)
+            if result is not None:
+                ctx["segs"][seg_name] = base + result[1]
+                ctx["done"] += 1
+        return None if result is None else result[0]
+
+    def _run_remux(self, ffmpeg: str, raw: bytes, base: float,
+                   req_headers=None) -> tuple[bytes, float] | None:
+        """ffmpeg 重封装 + 时间戳平移；返回 (输出字节, 实际时长) 或 None。
+
+        输入是本地临时文件，不访问网络 → 不能带 -headers 之类的 http 协议选项
+        （ffmpeg 会直接报 "Option headers not found" 并拒绝运行）。
+        """
+        tmpdir = tempfile.TemporaryDirectory(prefix="claw-remux-")
+        try:
+            root = Path(tmpdir.name)
+            src = root / "in.ts"
+            src.write_bytes(raw)
+            work = root / "out.ts"
+            cmd = [ffmpeg, "-v", "error", "-nostdin",
+                   "-copyts", "-i", str(src), "-map", "0", "-c", "copy",
+                   "-muxdelay", "0.7", "-f", "mpegts", "-y", str(work)]
+            proc = subprocess.run(cmd, capture_output=True, timeout=_REMUX_TIMEOUT)
+            if proc.returncode != 0 or not work.is_file():
+                return None
+            duration = _ts_duration(work)
+            if duration <= 0:
+                return None
+            # ffmpeg 的 mpegts 复用器会把时间戳重排（-copyts 对 TS→TS 无效），
+            # 锚点必须按**重封装后的输出**重算并直接落到 base，不能先归零再
+            # 平移——第二步会在已归零的时间轴上再次取模，负数被绕回成 33 位
+            # 时间戳高位，整片被推飞。
+            if not _ts_shift(work, base):
+                return None
+            return work.read_bytes(), duration
+        except (OSError, subprocess.SubprocessError):
+            return None
+        finally:
+            tmpdir.cleanup()
+
+
     # ------------------------------------------------------------------ #
     def _serve_cache(self, handler: "_ProxyHandler", path: str,
                      public_base: str | None = None) -> None:
@@ -2429,7 +2823,7 @@ class MediaProxy:
             handler.send_error(502, "cache context lost")
             return
         base_url, base_headers, ad_block = ctx[0], ctx[1], ctx[2]
-        source_id = ctx[5] if len(ctx) > 5 else ""
+        source_id = _ctx_get(ctx, 5, "")
         force_proxy = _tuple_force_proxy(ctx)
 
         final_base = ctx[4] if len(ctx) > 4 and ctx[4] else None
@@ -2444,12 +2838,18 @@ class MediaProxy:
         fetch_owner = False
         fetch_state = None
         shared_fetch = not handler.headers.get("Range")
+        # 分片时间戳重写只作用于"播放"（播放器顺序拉片、无 Range）；下载器用
+        # Range 顺序读段，整理会打乱字节偏移，必须保持原始分片。
+        remux = _remux_active(ad_block) and not handler.headers.get("Range")
         if not seg_name.endswith(".m3u8"):
             final = cache.hls_segment_final(cache_key, seg_name)
             entry = cache.entry(cache_key)
             if entry and entry.get("complete") and final.is_file():
                 cache.touch(cache_key)
                 _record_cache_diagnostic(target, base_headers, "hit")
+                if remux and self._serve_remux_from_file(
+                        handler, cache_key, seg_name, target, final):
+                    return
                 self._serve_local_file(handler, final)
                 return
         if shared_fetch:
@@ -2488,8 +2888,8 @@ class MediaProxy:
                         if child_ctx is not None else force_proxy
                     )
                     child_source_id = (
-                        child_ctx[5] if child_ctx is not None and len(child_ctx) > 5
-                        else source_id
+                        _ctx_get(child_ctx, 5, source_id)
+                        if child_ctx is not None else source_id
                     )
                     rewritten = self._rewrite_m3u8(
                         cached, child_base, child_headers, child_ad_block,
@@ -2511,6 +2911,11 @@ class MediaProxy:
                 if entry and entry.get("complete") and final.is_file():
                     cache.touch(cache_key)
                     _record_cache_diagnostic(target, base_headers, "hit")
+                    if remux and self._serve_remux_from_file(
+                            handler, cache_key, seg_name, target, final):
+                        if fetch_owner:
+                            cache.finish_fetch(fetch_key, fetch_state, None)
+                        return
                     self._serve_local_file(handler, final)
                     if fetch_owner:
                         cache.finish_fetch(fetch_key, fetch_state, None)
@@ -2609,6 +3014,21 @@ class MediaProxy:
                         resume = False
                         resume_offset = 0
                         head_bytes = b""
+                if not resume and _remux_active(ad_block) and _is_ts_payload(first):
+                    # 时间戳重写源：本片整流后按序整理（原地替换缓存文件）再
+                    # 交给播放器；任何一步失败都退回原始字节，绝不阻断播放。
+                    body = first + (resp.raw.read() or b"") if not whole else first
+                    _update_upstream_diagnostic(resp, 0, finished=True)
+                    if total and _full_zero_offset_response(
+                            resp, handler.headers.get("Range")):
+                        self._store_segment_bytes(
+                            cache, cache_key, seg_name, body)
+                    out = self._remux_segment(
+                        cache_key, seg_name, body, req_headers)
+                    self._send_bytes(handler, out if out is not None else body)
+                    if fetch_owner:
+                        fetch_status = resp.status_code
+                    return
                 if resume:
                     # 续传：对客户端仍是完整 200——回放磁盘头部 + 续流剩余字节。
                     handler.send_response(200)
