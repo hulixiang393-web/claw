@@ -202,12 +202,18 @@ def _fit_series(episodes: list, start_idx: int, resolve,
     仅当全集超出 _SERIES_MAX_MRL 条数或 _SERIES_MAX_CMD 总字符数时，才降级为
     「从当前集往后」的窗口（此时当前集恒为窗口首项，握手依然找得到）。
 
+    **多集连播卡顿的现状（实测，非断言）**：VLC 3.0.23 单实例连播到第 N 集时
+    仍持有前几集的连接（live 连接 1→3→5→7→9 单调累积）；但实测确认它**不会**
+    提前 preparse 后续集（播第 1 集期间请求后续集 /e/ 的次数为 0，带与不带
+    --no-auto-preparse 都一样）。故全集入列本身不会诱发提前取流，这里保持全集
+    行为不变；args 组装的 preparse flag 只是压低累积斜率，非根治。
+
     resolve(url) -> play_url：非本机代理 URL 才经它包一层代理
     （惰性 /e/ URL 原样使用）。协议里**没有 audio 形参**——系列路径丢弃各集
     音频轨（单集路径的 audio/input-slave 不受影响），留着它只会让人误以为
     音频被用上了。**先解析再计长**——代理 URL 比原 URL 长，先计长会低估
     命令行占用。空 URL 的集整条跳过。至少保留 1 条（单条超长也不丢，
-    保证「当前集能播」优先于命令行长度）。
+    保证「当前集能播」优先于命令行长度）
 
     begin episodes 在整表里的**起始集位**（降级重取窗口时传切片起点，默认 0）。
     返回的集下标 = begin + 切片内位置，使集号兜底标题与握手下标始终同源。
@@ -397,10 +403,20 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             # 播放处理（调研 VLC 流播放调优）：除加大网络缓冲外，加 --no-drop-late-frames
             # 让 VLC 不丢晚到的帧（默认丢帧会表现为画面卡顿跳动）；不强制硬件解码——
             # DXVA2/D3D11VA 的 copy-back 开销在某些机器上反而更卡，交给 VLC 自动判断。
-            # 组装顺序：全局选项在前 → 单集路径追加主 MRL（音频非空则紧跟其后
-            # 的 :input-slave=）→ 系列路径改为全集按 1..N 顺序追加，不另加主 MRL。
+            #
+            # 防多集连播连接积压（实测结论，勿夸大其词）：
+            # 实测 VLC 3.0.23 单实例连播时**不会**提前 preparse 后续集（播第 1 集
+            # 期间请求后续集 /e/<idx> 的次数：带与不带 flag 均为 0），所以
+            # `503 并发解析 / 后续集被提前打开` 并不是本机卡顿的成因。
+            # 真正被实测复现的是：VLC 播到第 N 集时**仍持有第 1..N-1 集的连接**
+            # （live 连接随集数单调累积 1→3→5→7→9）。这三项 flag 的作用只是
+            # 压低这条曲线的斜率（多轮复测：峰值 9→6~9，不稳定、非根治），
+            # 属「无害且偏正面」的加固：关掉本就用不上的 preparse / 元数据联网。
+            # 根治需要另寻方案（见 media_proxy 侧 token/连接回收），修这里只是顺手。
             args = [
                 vlc, "--no-video-title-show", "--no-drop-late-frames",
+                "--no-auto-preparse", "--no-metadata-network-access",
+                "--preparse-timeout=1",
                 f"--network-caching={_caching}",
             ]
             # VLC HTTP 控制接口（App 内按键 → player_command 转发 VLC 命令）：

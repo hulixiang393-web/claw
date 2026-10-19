@@ -22,6 +22,29 @@ _CONTROL_ARGS = [
     "--http-port=8090", "--http-password=TESTPWD",
 ]
 
+# 多集连播卡顿的三件套：关掉 VLC 的播放列表自动 preparse + 联网抓取元数据，
+# 否则 VLC 会提前打开后续几集的惰性 /e/ URL → 代理侧重取流并发积压。
+# 这几个 flag 必须在 args[1:4]，且**顺序固定**（VLC 选项区在 MRL 之前）。
+_PREPARSE_ARGS = [
+    "--no-auto-preparse", "--no-metadata-network-access",
+    "--preparse-timeout=1",
+]
+
+
+def args_net_caching(args) -> int:
+    """从启动参数里取 --network-caching=<ms> 的值（找不到返回 -1）。
+
+    不用固定下标断言：前面还有 3 个 preparse flag，写死下标会随 flag 增删而
+    误报，也显不出「这一项到底是多少」的意图。
+    """
+    for a in args:
+        if a.startswith("--network-caching="):
+            try:
+                return int(a.split("=", 1)[1])
+            except ValueError:
+                return -1
+    return -1
+
 
 class _FakeProc:
     """模拟 Popen 返回对象：记录 args、统计 terminate 调用。"""
@@ -90,15 +113,50 @@ def test_episodes_none_single_mrl(monkeypatch):
     assert args[0] == _VLC
     assert args[1] == "--no-video-title-show"
     assert args[2] == "--no-drop-late-frames"
-    assert args[3].startswith("--network-caching=")
-    assert args[4:8] == _CONTROL_ARGS
-    assert args[8] == "P:https://cdn.example.com/hls/a.m3u8"
-    assert len(args) == 9
+    # 多集卡顿根治 flag：关掉播放列表自动 preparse / 元数据联网抓取
+    assert args[3:6] == _PREPARSE_ARGS
+    assert args[6].startswith("--network-caching=")
+    assert args[7:11] == _CONTROL_ARGS
+    assert args[11] == "P:https://cdn.example.com/hls/a.m3u8"
+    assert len(args) == 12
     assert "--no-random" not in args
     assert "--no-playlist-autostart" not in args
     assert ep._control_state == {
         "host": "127.0.0.1", "port": 8090, "password": "TESTPWD",
     }
+
+
+def test_multi_episode_lag_preparse_disabled(monkeypatch):
+    """多集连播加固：VLC 启动必须带 preparse/metadata 三项。
+
+    实测口径（勿夸大）：VLC 3.0.23 单实例连播时**不会**提前 preparse 后续集
+    （播第 1 集期间请求后续集 /e/ 的次数为 0，带与不带 flag 相同），所以这三项
+    **不是**本机卡顿的根治；被实测复现的是「播到第 N 集仍持有前几集连接」
+    （live 连接 1→3→5→7→9 单调累积），这三项只是压低斜率（峰值 9→6~9，不稳）。
+    本用例只锁住「这三个无害 flag 在位、且不被默认值反转」，防回归。
+    """
+    procs = _install(monkeypatch)
+    eps = [(f"http://127.0.0.1:9/e/k/{i}", "", f"第{i + 1}集")
+           for i in range(40)]
+    ep.open_with_player(eps[0][0], episodes=eps)
+    args = procs[0].args
+    # 三项都在，且位置在 VLC 的选项区（任何 MRL 之前）
+    assert args[3:6] == _PREPARSE_ARGS
+    mrls = [a for a in args if "/e/k/" in a]
+    assert mrls, "系列 MRL 未入列"
+    assert args.index("--no-auto-preparse") < args.index(mrls[0])
+    assert "--auto-preparse" not in args        # 不能以默认值（1）反转回去
+    assert args.count("--preparse-timeout=1") == 1
+
+
+def test_multi_episode_lag_preparse_flags_present_for_single_episode(monkeypatch):
+    """单集播放同样带这三项（VLC 一套配置走到底，无害但保持一致性）。"""
+    procs = _install(monkeypatch)
+    ep.open_with_player("https://cdn.example.com/movie.mp4")
+    args = procs[0].args
+    assert "--no-auto-preparse" in args
+    assert "--no-metadata-network-access" in args
+    assert "--preparse-timeout=1" in args
 
 
 def test_episodes_full_series_in_order_with_titles(monkeypatch):
@@ -112,11 +170,12 @@ def test_episodes_full_series_in_order_with_titles(monkeypatch):
            for i, c in enumerate("abc")]
     ep.open_with_player(eps[2][0], episodes=eps)
     args = procs[0].args
-    assert args[4:8] == _CONTROL_ARGS
-    assert args[8] == "--no-random"
+    assert args[3:6] == _PREPARSE_ARGS
+    assert args[7:11] == _CONTROL_ARGS
+    assert args[11] == "--no-random"
     # 起始项是第 3 集（非首项）→ 需 no-playlist-autostart + 握手定位
-    assert args[9] == "--no-playlist-autostart"
-    assert args[10:] == [
+    assert args[12] == "--no-playlist-autostart"
+    assert args[13:] == [
         "P:https://cdn.example.com/hls/a.m3u8#第1集 章节a",
         "P:https://cdn.example.com/hls/b.m3u8#第2集 章节b",
         "P:https://cdn.example.com/hls/c.m3u8#第3集 章节c",
@@ -149,7 +208,7 @@ def test_handshake_receives_start_idx_and_whole_series(monkeypatch):
     ]
     assert cb is ready
     # 传的必须就是真正入列的那些 MRL（args 去掉全局选项/flag 的尾部）
-    assert [m for _i, m in series] == procs[0].args[10:]
+    assert [m for _i, m in series] == procs[0].args[13:]
 
 
 def test_handshake_failure_does_not_fall_back_to_browser(monkeypatch):
@@ -283,8 +342,10 @@ def test_series_all_urls_empty_falls_back_to_single(monkeypatch):
     eps = [("", "", "第01集"), ("", "", "第02集")]
     ep.open_with_player("https://cdn.example.com/hls/a.m3u8", episodes=eps)
     args = procs[0].args
-    assert args[8] == "P:https://cdn.example.com/hls/a.m3u8"
-    assert len(args) == 9
+    assert args[3:6] == _PREPARSE_ARGS
+    assert args[7:11] == _CONTROL_ARGS
+    assert args[11] == "P:https://cdn.example.com/hls/a.m3u8"
+    assert len(args) == 12
     assert "--no-random" not in args
 
 
@@ -327,14 +388,16 @@ def test_classify_url_used_for_caching(monkeypatch):
     ep.open_with_player(eps[0][0], episodes=eps,
                         classify_url="https://cdn.example.com/real/x.m3u8")
     assert seen["target"] == "https://cdn.example.com/real/x.m3u8"
-    assert procs[0].args[3] == "--network-caching=30000"
+    assert args_net_caching(procs[0].args) == 30000
 
 
 def test_classify_url_empty_falls_back_to_url(monkeypatch):
     """classify_url 为空 → 仍按 url 分类（老行为不变）。
 
-    用 HLS URL：_resolve 对 .m3u8 一律包代理，故 play_url != url 命中「多一跳
-    → 缓冲 8s 起」分支（分类给的 2000 被加码吃掉）。
+    注意 stub 给的是 kind="mp4" / 2000ms：**「多一跳抬到 8s」只对
+    hls/dash 生效**，mp4 直链走 Range 渐进读取，给大缓冲只会拖慢起播
+    （代码注释里有实测：441MB mp4 用 15s 缓冲要等 15.2s 才开播）。
+    故这里锁定 2000，不是 8000。
     """
     procs = _install(monkeypatch)
     seen = {}
@@ -348,7 +411,25 @@ def test_classify_url_empty_falls_back_to_url(monkeypatch):
     monkeypatch.setattr(mt, "classify", _classify)
     ep.open_with_player("https://cdn.example.com/hls/a.m3u8")
     assert seen["target"] == "https://cdn.example.com/hls/a.m3u8"
-    assert procs[0].args[3] == "--network-caching=8000"  # 走代理多一跳 → 8s 起
+    assert args_net_caching(procs[0].args) == 2000   # mp4 不吃 8s 抬码
+
+
+def test_classify_url_hls_through_proxy_gets_min_8s(monkeypatch):
+    """同一条 URL，但分类真判成 HLS 且经代理多一跳 → 缓冲抬到 8s 起。
+
+    这是上面 mp4 用例的对偶：证明「8s 下限」分支本身是活的（否则没人守着，
+    被误删也没测试报警）。
+    """
+    procs = _install(monkeypatch)
+    from types import SimpleNamespace
+
+    def _classify(target):
+        return SimpleNamespace(kind="hls", buffer_ms=3000)
+
+    import framework.media_tuner as mt
+    monkeypatch.setattr(mt, "classify", _classify)
+    ep.open_with_player("https://cdn.example.com/hls/a.m3u8")
+    assert args_net_caching(procs[0].args) == 8000
 
 
 def test_local_proxy_episode_not_double_proxied(monkeypatch):
@@ -365,9 +446,10 @@ def test_local_proxy_episode_not_double_proxied(monkeypatch):
         "http://127.0.0.1:9/e/k/0#第01集",
         "http://127.0.0.1:9/e/k/1#第02集",
     ]
-    # 顺带锁缓冲下限：url 本身就是代理 URL（play_url == url），"多一跳"判不
-    # 出来，只能靠 _is_local_proxy_url(url) 兜底，否则 /e/ 会掉回 2500ms。
-    assert procs[0].args[3] == "--network-caching=8000"
+    # /e/ URL 不含 .m3u8/.mp4 特征 → classify 判 unknown，取默认 2500ms。
+    # 「8s 抬码」只对 hls/dash 生效，惰性 URL 判不出类型，故这里就是 2500
+    # （惰性系列的真实类型要传 classify_url 才会被识别）。
+    assert args_net_caching(procs[0].args) == 2500
 
 
 def test_oversized_series_truncated(monkeypatch):
@@ -507,7 +589,11 @@ def test_terminate_clears_control_state(monkeypatch):
     monkeypatch.setattr(ep.secrets, "token_hex", lambda n: "NEWPWD")
     ep.open_with_player("https://cdn.example.com/hls/b.m3u8")
     assert procs[0].terminated == 1
-    assert procs[1].args[7] == "--http-password=NEWPWD"
+    # 控制接口四项在 args[7:11]（前面多了 3 个 preparse flag）
+    assert procs[1].args[7:11] == [
+        "--extraintf=http", "--http-host=127.0.0.1",
+        "--http-port=8091", "--http-password=NEWPWD",
+    ]
     assert ep._control_state["port"] == 8091
     assert ep._control_state["password"] == "NEWPWD"
 
