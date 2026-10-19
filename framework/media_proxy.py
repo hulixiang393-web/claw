@@ -272,27 +272,33 @@ def _stream_key(data, off: int, offsets) -> tuple:
     return pid, data[p + 3]
 
 
-def _ts_shift(src: Path, first_dts: float) -> bool:
+def _ts_shift(src: Path, first_dts: float):
     """时间戳整理：让本片**首帧**落在 first_dts（秒），并修掉片内错位时间戳。
 
     1. 锚点：片内最早的时间戳平移到 first_dts；
     2. 连续性：每个 PES 的 DTS 必须紧跟同流上一个 DTS（帧间隔取片内中位数）；
        倒退或偏离过远的包按预期时刻重锚，后续包随之顺延。
     只改 PES 头的 PTS/DTS，帧数与字节内容都不变；否则返回 False。
+
+    返回**本片时长（秒）**而不是 True：时长是下一片锚点的推进量，而本函数
+    本来就要逐包扫一遍取 min_ts，顺手记 max 即可算出（max-min）/90000，
+    实测与 ffprobe 的 format=duration 相差 <1 帧（20ms 量级），因此再起一个
+    ffprobe 子进程纯属浪费（冷启动约 2s，直接卡住播放）。失败返回 None。
     """
     try:
         data = bytearray(src.read_bytes())
     except OSError:
-        return False
+        return None
     step = 188
     if len(data) < step * 2:
-        return False
+        return None
     entries = []          # [(包偏移, [(字段偏移, 原值)])]，按文件顺序
     min_ts = None
+    max_ts = None
     off = 0
     while off + step <= len(data):
         if data[off] != 0x47:
-            return False
+            return None
         if (data[off + 1] & 0x1F) != 0x1F:
             offsets = _read_ts_timestamps(data, off, step)
             if offsets:
@@ -301,11 +307,15 @@ def _ts_shift(src: Path, first_dts: float) -> bool:
                     values.append((p, _decode_ts5(data, p)))
                 values.reverse()
                 entries.append((off, values))
-                frame_min = min(v for _p, v in values)
-                min_ts = frame_min if min_ts is None else min(min_ts, frame_min)
+                for _p, v in values:
+                    min_ts = v if min_ts is None else min(min_ts, v)
+                    max_ts = v if max_ts is None else max(max_ts, v)
         off += step
-    if min_ts is None or not entries:
-        return False
+    if min_ts is None or not entries or max_ts is None:
+        return None
+    duration = (max_ts - min_ts) / 90000.0
+    if duration <= 0:
+        return None
     bump = int(round(first_dts * 90000)) - min_ts
 
     # 帧间隔：同流相邻 DTS 差的中位数（90kHz）。样本太少就不做连续性修正。
@@ -340,27 +350,12 @@ def _ts_shift(src: Path, first_dts: float) -> bool:
                 _encode_ts5(data, p, _decode_ts5(data, p) + delta)
         last_by_stream[key] = values[-1][1] + delta
     if not changed:
-        return True
+        return duration
     try:
         src.write_bytes(bytes(data))
     except OSError:
-        return False
-    return True
-
-
-def _ts_duration(src: Path) -> float:
-    """分片实际时长（秒）：ffprobe 的 format 时长，失败返回 0。"""
-    ffprobe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
-    if not ffprobe:
-        return 0.0
-    try:
-        out = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", str(src)],
-            capture_output=True, text=True, timeout=_REMUX_TIMEOUT).stdout.strip()
-        return float(out)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return 0.0
+        return None
+    return duration
 
 
 def _ts_first_dts(path: Path):
@@ -2694,7 +2689,11 @@ class MediaProxy:
         if anchor is not None and anchor > 0:
             return False          # 已整理且有输出（输出已直写缓存文件）
         data = self._read_whole_ts(path)
-        if data is None:
+        if data is None or not _is_ts_payload(data):
+            # 非明文 TS（典型：AES-128 加密分片，首字节随机而非 0x47）不整理：
+            # 本路径此前漏了这个判断，命中加密片仍会起 ffmpeg 去整理密文——
+            # 必然失败，每片白烧一次进程（实测 ~0.13s，且逐片串行）。未命中
+            # 路径早就有同样的 _is_ts_payload 守卫，这里补齐保持一致。
             return False
         out = self._remux_segment(cache_key, seg_name, data, None)
         if out is None:
@@ -2779,14 +2778,14 @@ class MediaProxy:
             proc = subprocess.run(cmd, capture_output=True, timeout=_REMUX_TIMEOUT)
             if proc.returncode != 0 or not work.is_file():
                 return None
-            duration = _ts_duration(work)
-            if duration <= 0:
-                return None
+            # 时长由 _ts_shift 的逐包扫描一并算出（max-min），不再起 ffprobe
+            # 子进程：省掉每片一次进程创建/冷启动（实测冷启动 ~2s 直接卡播放）。
             # ffmpeg 的 mpegts 复用器会把时间戳重排（-copyts 对 TS→TS 无效），
             # 锚点必须按**重封装后的输出**重算并直接落到 base，不能先归零再
             # 平移——第二步会在已归零的时间轴上再次取模，负数被绕回成 33 位
             # 时间戳高位，整片被推飞。
-            if not _ts_shift(work, base):
+            duration = _ts_shift(work, base)
+            if duration is None or duration <= 0:
                 return None
             return work.read_bytes(), duration
         except (OSError, subprocess.SubprocessError):
