@@ -65,7 +65,7 @@
     "workers": 3
   },
   "content": {
-    "show_adult_sources": true
+    "show_adult_sources": false
   },
   "reader": {
     "prefetch_enabled": true,
