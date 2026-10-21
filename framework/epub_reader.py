@@ -102,6 +102,7 @@ class FastEpub:
         self.manifest: dict[str, str] = {}     # item id → href
         self.spine_hrefs: list[str] = []       # 正文文档路径（spine 顺序，含 opf 目录前缀）
         self.toc_titles: dict[str, str] = {}   # 文档路径/basename → 标题
+        self.toc_depths: dict[str, int] = {}   # 文档路径/basename → 目录层级（0 起）
         self.basename_index: dict[str, str] = {}  # basename → zip 内路径（图片懒读用）
         for _n in self._names:
             self.basename_index.setdefault(posixpath.basename(_n), _n)
@@ -177,6 +178,7 @@ class FastEpub:
         except Exception:
             return titles
         text = raw.decode("utf-8", errors="replace")
+        self.toc_depths = self._depth_map(raw, text, opf_dir)
         # NCX
         ncx_hrefs = re.findall(
             r'<navPoint\b[^>]*>.*?<navLabel>.*?<text>([^<]*)</text>.*?</navLabel>'
@@ -199,6 +201,98 @@ class FastEpub:
             titles[key] = label
             titles[posixpath.basename(key)] = label
         return titles
+
+    def _depth_map(self, raw: bytes, text: str, opf_dir: str) -> dict[str, int]:
+        """目录层级：NCX navPoint 嵌套 / nav.xhtml 的 ol 嵌套，键为路径与 basename。"""
+        try:
+            if "<navpoint" in text.lower():
+                return self._ncx_depths(raw, opf_dir)
+            return self._nav_depths(text, opf_dir)
+        except Exception:  # noqa: BLE001 —— 目录层级解析失败不影响阅读
+            return {}
+
+    def _ncx_depths(self, raw: bytes, opf_dir: str) -> dict[str, int]:
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            return {}
+
+        def tag(name: str) -> str:
+            return f"{{{NCX_NS}}}{name}"
+
+        depths: dict[str, int] = {}
+
+        def walk(node, depth: int) -> None:
+            points = node.findall(tag("navPoint"))
+            if not points:
+                points = node.findall("navPoint")
+            for point in points:
+                content = point.find(tag("content"))
+                if content is None:
+                    content = point.find("content")
+                src = (content.get("src") if content is not None else "") or ""
+                if src:
+                    key = self._join(opf_dir, src.split("#", 1)[0])
+                    depths[key] = depth
+                    depths[posixpath.basename(key)] = depth
+                walk(point, depth + 1)
+
+        nav_map = root.find(".//" + tag("navMap"))
+        if nav_map is None:
+            nav_map = root.find(".//navMap")
+        if nav_map is not None:
+            walk(nav_map, 0)
+        return depths
+
+    def _nav_depths(self, text: str, opf_dir: str) -> dict[str, int]:
+        try:
+            from lxml import html as lxml_html
+        except Exception:  # noqa: BLE001 —— lxml 缺失时退回扁平目录
+            return {}
+        try:
+            doc = lxml_html.fromstring(text)
+        except Exception:  # noqa: BLE001
+            return {}
+        ops = "http://www.idpf.org/2007/ops"
+        toc_nav = None
+        for candidate in doc.xpath("//*[local-name()='nav']"):
+            kind = (
+                candidate.get(f"{{{ops}}}type")
+                or candidate.get("epub:type")
+                or candidate.get("type")
+                or ""
+            )
+            if "toc" in kind:
+                toc_nav = candidate
+                break
+        if toc_nav is None:
+            return {}
+        depths: dict[str, int] = {}
+
+        def walk(ol, depth: int) -> None:
+            for li in ol:
+                if not isinstance(li.tag, str) or li.tag.lower() != "li":
+                    continue
+                link = sub = None
+                for child in li:
+                    if not isinstance(child.tag, str):
+                        continue
+                    name = child.tag.lower()
+                    if name == "a" and link is None:
+                        link = child
+                    elif name == "ol" and sub is None:
+                        sub = child
+                if link is not None and link.get("href"):
+                    key = self._join(opf_dir, link.get("href").split("#", 1)[0])
+                    depths[key] = depth
+                    depths[posixpath.basename(key)] = depth
+                if sub is not None:
+                    walk(sub, depth + 1)
+
+        for child in toc_nav:
+            if isinstance(child.tag, str) and child.tag.lower() == "ol":
+                walk(child, 0)
+        return depths
 
     # ------------------------------------------------------------------ #
     def has(self, name: str) -> bool:

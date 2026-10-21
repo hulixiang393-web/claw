@@ -321,6 +321,7 @@ class DownloadQueue:
             t.done = 0
             t.bytes_written = 0
             t.epub_chapters = []
+            t.epub_depths = []
             t.done_chapters = []
             t.merge_progress = 0
             t.failed = []

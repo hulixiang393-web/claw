@@ -770,6 +770,22 @@ class ReaderPage(BasePage):
 
         self.epub_view.open(path, start_idx=0, on_loaded=_on_loaded)
 
+    def close_local_path(self, path: str) -> bool:
+        """仅当当前 epub_view 打开的是 path 时关闭它（释放 zip 句柄）。"""
+        if not path:
+            return False
+        import os
+
+        target = os.path.normcase(os.path.abspath(str(path)))
+        current = getattr(self.epub_view, "_path", "") or ""
+        if not current:
+            return False
+        current_norm = os.path.normcase(os.path.abspath(current))
+        if current_norm != target and not current_norm.startswith(target + os.sep):
+            return False
+        self.epub_view.close_book()
+        return True
+
     def refresh(self) -> None:
         pass
 

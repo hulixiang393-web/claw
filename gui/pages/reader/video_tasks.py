@@ -43,7 +43,7 @@ class _FetchStreamTask(QRunnable):
     """后台获取播放流（fetch_video_streams，覆盖 HLS/MP4/DASH 双流）。"""
 
     def __init__(self, content, source, ep_url, quality="best", gen=None,
-                 source_lock=False):
+                 source_lock=False, prefetch=False):
         super().__init__()
         self.signals = _VideoSignals()
         self._content = content
@@ -52,6 +52,7 @@ class _FetchStreamTask(QRunnable):
         self._quality = quality
         self._gen = gen
         self._source_lock = source_lock
+        self._prefetch = bool(prefetch)
         self._cancelled = threading.Event()
         self._context = StreamBudget()
 
@@ -70,7 +71,7 @@ class _FetchStreamTask(QRunnable):
         try:
             if self._cancelled.is_set():
                 return
-            kwargs = {"quality": self._quality, "merged": True}
+            kwargs = {"quality": self._quality, "merged": not self._prefetch}
             try:
                 parameters = inspect.signature(
                     self._content.fetch_video_streams

@@ -22,11 +22,11 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -73,6 +73,7 @@ class _Chapter:
         text: str = "",
         img_srcs: list | None = None,
         content_parts: list | None = None,
+        depth: int = 0,
     ):
         self.title = title or "未命名章节"
         self.src = src
@@ -80,6 +81,7 @@ class _Chapter:
         self.img_srcs = list(img_srcs or [])
         self.content_parts = list(content_parts or [])
         self.is_comic = bool(self.img_srcs)
+        self.depth = max(0, int(depth or 0))
 
 
 class _OpenSignals(QObject):
@@ -291,11 +293,15 @@ class EpubView(QWidget):
         body = QHBoxLayout()
         body.setSpacing(0)
 
-        self.toc_list = QListWidget()
+        self.toc_list = QTreeWidget()
         self.toc_list.setFixedWidth(180)
+        self.toc_list.setHeaderHidden(True)
         self.toc_list.setWordWrap(True)  # 长标题换行完整显示，不被截断
+        self.toc_list.setUniformRowHeights(False)
+        self.toc_list.setIndentation(14)
         self.toc_list.itemClicked.connect(self._on_toc_clicked)
         self.toc_list.setVisible(False)
+        self._toc_items: list = []
         body.addWidget(self.toc_list)
 
         self.scroll = QScrollArea()
@@ -322,6 +328,20 @@ class EpubView(QWidget):
             app.installEventFilter(self)
 
     # ------------------------------------------------------------------ #
+    def close_book(self) -> None:
+        """释放当前 epub 的 zip 句柄并清空引用（不删除 UI，可重复调用）。"""
+        epub = self._epub
+        self._epub = None
+        if epub is not None:
+            try:
+                epub.close()
+            except Exception:
+                pass
+        self._path = ""
+        self._chapters = []
+        self._open_task = None
+        self._current_idx = -1
+
     def open(self, path: str, start_idx: int = 0, on_loaded=None) -> bool:
         """异步打开本地 epub。立即返回；后台建索引完成后回调 on_loaded(chapters)。
 
@@ -397,7 +417,9 @@ class EpubView(QWidget):
             title = (epub.toc_titles.get(href) or epub.toc_titles.get(leaf) or "").strip()
             if not title:
                 title = posixpath.splitext(leaf)[0]
-            chapters.append(_Chapter(title or f"第{len(chapters)+1}章", src=href))
+            depth = epub.toc_depths.get(href, epub.toc_depths.get(leaf, 0))
+            chapters.append(_Chapter(title or f"第{len(chapters)+1}章", src=href,
+                                     depth=depth))
         return chapters
 
     @staticmethod
@@ -471,12 +493,23 @@ class EpubView(QWidget):
 
     def _populate_toc(self) -> None:
         self.toc_list.clear()
+        self._toc_items = [None] * len(self._chapters)
         self.toc_list.setUpdatesEnabled(False)
         try:
+            stack: list[tuple[int, QTreeWidgetItem]] = []
             for i, chapter in enumerate(self._chapters):
-                item = QListWidgetItem(chapter.title or f"第{i+1}章")
-                item.setData(Qt.UserRole, i)
-                self.toc_list.addItem(item)
+                depth = max(0, int(getattr(chapter, "depth", 0) or 0))
+                item = QTreeWidgetItem([chapter.title or f"第{i+1}章"])
+                item.setData(0, Qt.UserRole, i)
+                while stack and stack[-1][0] >= depth:
+                    stack.pop()
+                if stack:
+                    stack[-1][1].addChild(item)
+                else:
+                    self.toc_list.addTopLevelItem(item)
+                stack.append((depth, item))
+                self._toc_items[i] = item
+            self.toc_list.expandAll()
         finally:
             self.toc_list.setUpdatesEnabled(True)
 
@@ -484,7 +517,7 @@ class EpubView(QWidget):
         if item is None:
             return
         try:
-            idx = item.data(Qt.UserRole)
+            idx = item.data(0, Qt.UserRole)
         except (AttributeError, TypeError):
             return
         if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < len(self._chapters):
@@ -512,7 +545,8 @@ class EpubView(QWidget):
             return
         self._current_idx = idx
         ch = self._chapters[idx]
-        self.toc_list.setCurrentRow(idx)
+        if idx < len(self._toc_items) and self._toc_items[idx] is not None:
+            self.toc_list.setCurrentItem(self._toc_items[idx])
         self.progress_label.setText(f"第{idx+1}/{len(self._chapters)}章 · {ch.title}")
         self._current_chapter_title = ch.title
         task = _LoadChapterTask(idx, ch, self._epub)

@@ -1104,10 +1104,13 @@ class MainWindow(QMainWindow):
             # 仅当前进程复用，首次启动一定为空，不读取历史会话。
             session_cache=get_session_cache(),
             settings=self.settings,
+            shelf_folder_provider=self._available_shelf_folders,
         )
         page.read_requested.connect(self._open_reader)
         page.download_requested.connect(self._open_download_dialog)
         page.favorite_requested.connect(self._on_favorite)
+        page.add_to_shelf_requested.connect(self._on_batch_add_shelf)
+        page.batch_download_requested.connect(self._on_batch_download)
         self.discover_page = page
         return page
 
@@ -1428,8 +1431,15 @@ class MainWindow(QMainWindow):
         self.library_page.download_requested.connect(self._download_from_shelf)
         # 点本地视频书 → 弹集选择播本地 mp4（离线）
         self.library_page.play_local_video_requested.connect(self._play_local_video)
+        self.library_page.set_local_close_handler(self._close_local_before_delete)
         self.library_page.cards_ready.connect(self._on_library_cards_ready)
         return self.library_page
+
+    def _close_local_before_delete(self, path: str) -> bool:
+        reader = getattr(self, "reader", None)
+        if reader is None:
+            return False
+        return reader.close_local_path(path)
 
     def _on_library_cards_ready(self) -> None:
         """Only construct search after the shelf has painted its first cards."""

@@ -44,7 +44,7 @@ def test_populate_toc_sets_zero_based_user_roles(_qapp):
 
     view._populate_toc()
 
-    assert [view.toc_list.item(i).data(Qt.UserRole) for i in range(2)] == [0, 1]
+    assert [view.toc_list.topLevelItem(i).data(0, Qt.UserRole) for i in range(2)] == [0, 1]
     view.deleteLater()
 
 
@@ -55,13 +55,13 @@ def test_toc_click_loads_valid_index_for_novel_and_comic_and_ignores_invalid(_qa
     monkeypatch.setattr(view, "_load_chapter", lambda index: calls.append(index))
 
     for kind in ("novel", "comic"):
-        item = view.toc_list.item(0) if view.toc_list.count() else None
+        item = view.toc_list.topLevelItem(0) if view.toc_list.topLevelItemCount() else None
         view._populate_toc()
-        item = view.toc_list.item(1)
-        item.setData(Qt.UserRole, 1)
+        item = view.toc_list.topLevelItem(1)
+        item.setData(0, Qt.UserRole, 1)
         view._on_toc_clicked(item)
-        view._on_toc_clicked(SimpleNamespace(data=lambda role: None))
-        view._on_toc_clicked(SimpleNamespace(data=lambda role: 99))
+        view._on_toc_clicked(SimpleNamespace(data=lambda *args: None))
+        view._on_toc_clicked(SimpleNamespace(data=lambda *args: 99))
 
     assert calls == [1, 1]
     view.deleteLater()

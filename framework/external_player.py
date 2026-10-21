@@ -567,11 +567,23 @@ def player_session():
     return _control_state
 
 
+_FLUSH_LOCK_TIMEOUT = 0.05
+
+
 def flush_player_progress():
     monitor = _progress_monitor
-    if monitor is not None:
-        with monitor._lock:
-            monitor._publish(force=True)
+    if monitor is None:
+        return
+    lock = getattr(monitor, "_lock", None)
+    if lock is None:
+        monitor._publish(force=True)
+        return
+    if not lock.acquire(timeout=_FLUSH_LOCK_TIMEOUT):
+        return
+    try:
+        monitor._publish(force=True)
+    finally:
+        lock.release()
 
 
 def _session_alive(state, proc) -> bool:

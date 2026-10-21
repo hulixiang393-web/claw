@@ -107,11 +107,19 @@ class Downloader:
         """续传：漫画话目录已存在且含文件 → 跳过。"""
         return self.skip_existing() and path.is_dir() and any(path.iterdir())
 
-    def _store_epub_chapter(self, task, index: int, title: str, payload) -> None:
+    def _store_epub_chapter(self, task, index: int, title: str, payload,
+                            depth: int = 0) -> None:
         missing = index + 1 - len(task.epub_chapters)
         if missing > 0:
             task.epub_chapters.extend([None] * missing)
         task.epub_chapters[index] = (title, self._maybe_spill(task, index, payload))
+        depths = getattr(task, "epub_depths", None)
+        if depths is None:
+            depths = []
+            setattr(task, "epub_depths", depths)
+        if len(depths) < len(task.epub_chapters):
+            depths.extend([0] * (len(task.epub_chapters) - len(depths)))
+        depths[index] = max(0, int(depth or 0))
 
     # ---- 内存有界：超阈值把章节材料落盘，以 _SpilledMaterial 占位 ------- #
     def _material_root(self) -> Path:
@@ -199,28 +207,40 @@ class Downloader:
         setattr(task, "_spill_active", False)
         setattr(task, "_epub_material_bytes", 0)
 
-    def _ordered_epub_chapters(self, task) -> list[tuple[str, object]]:
+    def _ordered_epub_indices(self, task) -> list[int]:
         chapters = list(getattr(task, "epub_chapters", []) or [])
         if not chapters:
             return []
         selected = list(getattr(task, "selected", []) or [])
         done = set(getattr(task, "done_chapters", []) or [])
         if done:
-            picked = [
-                item
-                for index, item in enumerate(chapters)
+            return [
+                index for index, item in enumerate(chapters)
                 if item is not None and index in done
             ]
-        elif not any(item is None for item in chapters):
-            picked = [item for item in chapters if item is not None]
-        else:
-            picked = [
-                item
-                for index, item in enumerate(chapters)
-                if item is not None
-                and (not selected or (index < len(selected) and selected[index]))
-            ]
-        return [self._resolve_item(item) for item in picked]
+        if not any(item is None for item in chapters):
+            return [index for index, item in enumerate(chapters) if item is not None]
+        return [
+            index for index, item in enumerate(chapters)
+            if item is not None
+            and (not selected or (index < len(selected) and selected[index]))
+        ]
+
+    def _ordered_epub_chapters(self, task) -> list[tuple[str, object]]:
+        chapters = list(getattr(task, "epub_chapters", []) or [])
+        return [
+            self._resolve_item(chapters[index])
+            for index in self._ordered_epub_indices(task)
+            if chapters[index] is not None
+        ]
+
+    def _ordered_epub_depths(self, task) -> list[int]:
+        indices = self._ordered_epub_indices(task)
+        depths = list(getattr(task, "epub_depths", []) or [])
+        return [
+            int(depths[index]) if index < len(depths) and depths[index] is not None else 0
+            for index in indices
+        ]
 
     # ------------------------------------------------------------------ #
     def download_chapter(self, source, task, chapter, index: int) -> int:
@@ -236,37 +256,55 @@ class Downloader:
         # 只产出 epub：抓正文累积到 task.epub_chapters，全书写完统一合成
         text = self._content.fetch_chapter(source, chapter.url)
         raw = (text or "").encode("utf-8")
-        self._store_epub_chapter(task, index, chapter.title or f"第{index+1}章", text or "")
+        self._store_epub_chapter(task, index, chapter.title or f"第{index+1}章",
+                                 text or "", getattr(chapter, "depth", 0))
         return len(raw)
 
     def _download_comic(self, source, task, chapter, index: int) -> int:
         # 只产出 epub：抓图片字节累积，全书写完统一合成
         images = self._content.fetch_comic_pages(source, chapter.url)
-        # 并发下载图片（CDN 慢的站提速），逐张回调更新进度。
-        # 用 index→bytes 字典占位，保持图片顺序（as_completed 完成序会打乱页序）。
+        progress_cb = getattr(task, "image_progress_cb", None)
+        img_bytes = self._download_comic_images(images, chapter.url, progress_cb)
+        self._store_epub_chapter(task, index, chapter.title or f"第{index+1}话",
+                                 img_bytes, getattr(chapter, "depth", 0))
+        return sum(len(b) for b in img_bytes)
+
+    def _download_comic_images(self, images, referer, progress_cb=None,
+                               max_workers: int = 8, max_retries: int = 2) -> list[bytes]:
+        if not images:
+            return []
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        import logging
+
+        def _fetch(img):
+            last_exc = None
+            for _ in range(max_retries + 1):
+                try:
+                    return self._image_bytes(img, referer)
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+            logging.getLogger(__name__).warning(
+                "图片下载失败（已重试 %d 次），跳过：%s（%s）",
+                max_retries, img[:120], last_exc,
+            )
+            return b""
 
         img_map: dict = {}
-        progress_cb = getattr(task, "image_progress_cb", None)
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            # 防盗链：按当前章节页 URL 透传 Referer——manben 等图床校验精确章节页
-            # Referer 才放行（缺失/站根会 403），与阅读器 CoverLoader 同策略。
-            # 字节统一走 HttpClient.get_bytes（CF cookie 注入 / 重试 / 反爬识别）。
-            futs = {pool.submit(self._image_bytes, img, chapter.url): i for i, img in enumerate(images)}
+        workers = min(max(1, max_workers), len(images))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_fetch, img): i for i, img in enumerate(images)}
             for fut in as_completed(futs):
                 idx = futs[fut]
                 try:
                     b = fut.result()
-                except Exception:
-                    continue  # 失败图片跳过，不入集合（避免 epub 内 0 字节碎图）
+                except Exception:  # noqa: BLE001
+                    continue
                 if not b:
                     continue
                 img_map[idx] = b
                 if progress_cb is not None:
                     progress_cb(len(b))
-        img_bytes = [img_map[i] for i in sorted(img_map)]
-        self._store_epub_chapter(task, index, chapter.title or f"第{index+1}话", img_bytes)
-        return sum(len(b) for b in img_bytes)
+        return [img_map[i] for i in sorted(img_map)]
 
     def _download_video(self, source, task, chapter, index: int) -> int:
         book_dir = self.book_dir(task)
@@ -986,12 +1024,13 @@ class Downloader:
             if images is None:
                 raise RuntimeError(f"渲染失败：{ch.title or ch.url}")
             # 防盗链：同样按当前章节页 URL 透传 Referer（与 _download_comic 一致）。
-            img_bytes = [self._image_bytes(img, ch.url) for img in images]
+            img_bytes = self._download_comic_images(images, ch.url)
             collected.append((idx, ch, img_bytes))
         # 整批全部成功，一次性累积
         out: dict[int, int] = {}
         for idx, ch, img_bytes in collected:
-            self._store_epub_chapter(task, idx, ch.title or f"第{idx+1}话", img_bytes)
+            self._store_epub_chapter(task, idx, ch.title or f"第{idx+1}话",
+                                     img_bytes, getattr(ch, "depth", 0))
             out[idx] = sum(len(b) for b in img_bytes)
         # 未处理的话标记 0
         for idx in indices:
@@ -1035,6 +1074,7 @@ class Downloader:
         chapters = self._ordered_epub_chapters(task)
         if not chapters:
             raise RuntimeError("无章节内容，无法合成 epub")
+        depths = self._ordered_epub_depths(task)
         book_dir = self.book_dir(task)
         book_dir.mkdir(parents=True, exist_ok=True)
         out = book_dir / f"{sanitize_filename(task.title or 'untitled')}.epub"
@@ -1045,8 +1085,8 @@ class Downloader:
         title = task.title or "untitled"
         merge = bool(self._settings.get("download", "merge_chapters_into_one_file", False))
         if ctype == "comic":
-            build_comic_epub(title, out, chapters, merge=merge)
+            build_comic_epub(title, out, chapters, merge=merge, depths=depths)
         else:
-            build_novel_epub(title, out, chapters, merge=merge)
+            build_novel_epub(title, out, chapters, merge=merge, depths=depths)
         self.discard_materials(task)  # 合成成功：清理落盘材料
         return out

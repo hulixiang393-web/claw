@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 from PySide6.QtCore import Qt, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -70,6 +71,8 @@ class DiscoverPage(BasePage):
     download_requested = Signal(object)
     # 对外信号：收藏/取消收藏 → App 层写书架收藏库
     favorite_requested = Signal(object)
+    add_to_shelf_requested = Signal(object, str)
+    batch_download_requested = Signal(object)
 
     def __init__(
         self,
@@ -82,6 +85,7 @@ class DiscoverPage(BasePage):
         parent=None,
         session_cache=None,      # 会话级换源缓存（可选注入；None=禁用）
         settings=None,
+        shelf_folders_provider=None,
     ):
         super().__init__(parent)
         self._manager = source_manager
@@ -92,6 +96,8 @@ class DiscoverPage(BasePage):
         self._theme_manager = theme_manager
         self.session_cache = session_cache
         self.settings = settings
+        self._shelf_folders_provider = shelf_folders_provider or (lambda: [])
+        self._selected: dict = {}
         self._pending_restore = None
         self._scroll_timer = None
         self._restore_rest_scheduled = False
@@ -209,6 +215,32 @@ class DiscoverPage(BasePage):
         self.scroll.setWidget(self.list_container)
 
         layout.addLayout(body, stretch=1)
+
+        self.batch_bar = QWidget()
+        self.batch_bar.setVisible(False)
+        bb = QHBoxLayout(self.batch_bar)
+        bb.setContentsMargins(0, 6, 0, 0)
+        bb.setSpacing(8)
+        self.select_all_check = QCheckBox("全选")
+        self.select_all_check.toggled.connect(self._on_select_all)
+        bb.addWidget(self.select_all_check)
+        self.batch_count = QLabel("已选 0 项")
+        self.batch_count.setStyleSheet("color: palette(dark); font-size: 12px;")
+        bb.addWidget(self.batch_count)
+        bb.addStretch(1)
+        self.batch_shelf_btn = QPushButton("加入书架")
+        self.batch_shelf_btn.setFixedHeight(26)
+        self.batch_shelf_btn.clicked.connect(self._on_batch_add_shelf)
+        bb.addWidget(self.batch_shelf_btn)
+        self.batch_dl_btn = QPushButton("加入下载")
+        self.batch_dl_btn.setFixedHeight(26)
+        self.batch_dl_btn.clicked.connect(self._on_batch_download)
+        bb.addWidget(self.batch_dl_btn)
+        self.batch_clear_btn = QPushButton("取消选择")
+        self.batch_clear_btn.setFixedHeight(26)
+        self.batch_clear_btn.clicked.connect(self._clear_selection)
+        bb.addWidget(self.batch_clear_btn)
+        layout.addWidget(self.batch_bar)
 
         # 滚动到底触发
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -688,10 +720,7 @@ class DiscoverPage(BasePage):
         self._current_page = int(snap.get("current_page") or 0) or max(self._loaded_pages or [0])
         self._has_more = bool(snap.get("has_more"))
         cols = self._columns()
-        # 首屏批：视口高度能容纳的卡片数 + 1 屏缓冲（保证滚动条立即可用）
-        view_h = max(1, self.scroll.viewport().height() or self.height() or 600)
-        per_screen = max(1, (view_h // (CARD_HEIGHT + 4)) * cols)
-        first_batch = min(len(fresh), per_screen * 2)
+        first_batch = min(len(fresh), self._batch_size(cols))
         for w in fresh[:first_batch]:
             self._append_card(w, cols)
         self._apply_column_stretch(cols)
@@ -788,6 +817,7 @@ class DiscoverPage(BasePage):
         self._seen_urls = set()
         # 换源/清空：中止进行中的分批铺设（旧 flush 因会话号不匹配自弃）
         self._restore_rest_scheduled = False
+        self._clear_selection()
 
     def _clear_grid_widgets(self) -> None:
         """只清空网格卡片（保留 self._works 数据）。
@@ -1136,9 +1166,15 @@ class DiscoverPage(BasePage):
         与外部列数不一致、卡片错乱）。
         """
         row, col = divmod(self._work_count, cols)
-        card = WorkCard(w)
+        card = WorkCard(w, selectable=True, defer_cover=True)
         card.clicked.connect(self._on_work_clicked)
+        card.checked.connect(self._on_card_checked)
+        if getattr(w, "url", "") in self._selected:
+            card.blockSignals(True)
+            card.set_checked(True)
+            card.blockSignals(False)
         self.grid_layout.addWidget(card, row, col)
+        card.load_cover()
         self._work_count += 1
 
     def _reflow(self) -> None:
@@ -1148,12 +1184,13 @@ class DiscoverPage(BasePage):
         否则抽屉显示/隐藏导致列数变化时，_clear_works 会把已加载作品
         列表一并清空，重建后网格变空（点详情页"内容消失"）。
         """
-        cols = self._columns()
+        view_w = self.scroll.viewport().width() or self.width() or 900
+        cols = self.grid_columns(view_w)
         if cols == self._last_columns:
             return
+        rendered = min(self._work_count, len(self._works))
         self._clear_grid_widgets()
-        self._work_count = 0
-        for w in self._works:
+        for w in self._works[:rendered]:
             self._append_card(w, cols)
         self._apply_column_stretch(cols)
 
@@ -1168,10 +1205,8 @@ class DiscoverPage(BasePage):
         （如 maccms 分页失效返回相同内容），已显示过的跳过，不重复渲染。
         返回实际新增条数（整页全重复时为 0，调用方据此停止加载）。
 
-        分批铺设：一页可能有 20~30 张卡，主线程一次全建会卡顿（漫画源
-        首屏整页同步建卡即卡顿之源）。改为「首屏可视区同步铺 + 剩余
-        QTimer 分批补」（setValue/时长与恢复分批一致，主线程峰值可控），
-        滚动时 _fetch_more_cached 会加速补插已就绪的卡。
+        按需渲染：每批只铺「一屏 + 一屏缓冲」，其余留在 _works；
+        滚动接近底部时由 _render_next_batch 追加下一批，再触发下一页请求。
         """
         fresh = []
         for w in works:
@@ -1183,24 +1218,113 @@ class DiscoverPage(BasePage):
             return 0
         self._works.extend(fresh)
         cols = self._columns()
-        view_h = max(1, self.scroll.viewport().height() or self.height() or 600)
-        per_screen = max(1, (view_h // (CARD_HEIGHT + 4)) * cols)
-        # 懒加载钉底锚定：追加前记录位置。贴底时（value≥旧 max）追加后钉到
-        # 新底部续接，让新内容从视野下方持续进来；否则保持原位置不跳屏。
         vbar = self.scroll.verticalScrollBar()
         prev_value = vbar.value()
         was_at_bottom = vbar.maximum() > 0 and prev_value >= vbar.maximum() - 8
-        sync_batch = fresh[:per_screen]
-        for w in sync_batch:
+        if self._work_count == 0 or was_at_bottom:
+            self._render_next_batch(cols)
+            QTimer.singleShot(
+                0, lambda: self._finish_append_anchor(was_at_bottom, prev_value)
+            )
+        return len(fresh)
+
+    def _batch_size(self, cols: int) -> int:
+        view_h = max(1, self.scroll.viewport().height() or self.height() or 600)
+        rows_per_screen = max(1, -(-view_h // (CARD_HEIGHT + 4)))
+        return rows_per_screen * cols * 2
+
+    def _render_next_batch(self, cols: int | None = None) -> int:
+        if self._work_count >= len(self._works):
+            return 0
+        cols = cols or self._columns()
+        end = self._work_count + self._batch_size(cols)
+        todo = self._works[self._work_count:end]
+        for w in todo:
             self._append_card(w, cols)
         self._apply_column_stretch(cols)
-        # 布局完成（scrollbar 范围更新）后再恢复，锚定一个视口用的才是新范围
-        QTimer.singleShot(0, lambda: self._finish_append_anchor(was_at_bottom, prev_value))
-        if len(self._works) > self._work_count:
-            # 首屏已铺，剩余走定时器分批（中途滚动会被 _fetch_more_cached 加速）
-            self._restore_session += 1
-            self._schedule_pending_restore(self._restore_session)
-        return len(fresh)
+        return len(todo)
+
+    def _on_card_checked(self, work, checked: bool) -> None:
+        url = getattr(work, "url", "")
+        if not url:
+            return
+        if checked:
+            self._selected[url] = work
+        else:
+            self._selected.pop(url, None)
+        self._refresh_batch_bar()
+
+    def _refresh_batch_bar(self) -> None:
+        n = len(self._selected)
+        self.batch_count.setText(f"已选 {n} 项")
+        total = len(self._works)
+        self.select_all_check.blockSignals(True)
+        self.select_all_check.setChecked(total > 0 and n == total)
+        self.select_all_check.blockSignals(False)
+        self.batch_bar.setVisible(n > 0)
+
+    def _on_select_all(self, checked: bool) -> None:
+        if checked:
+            for w in self._works:
+                url = getattr(w, "url", "")
+                if url:
+                    self._selected[url] = w
+            for card in self.list_container.findChildren(WorkCard):
+                if getattr(card.work, "url", "") in self._selected:
+                    card.blockSignals(True)
+                    card.set_checked(True)
+                    card.blockSignals(False)
+        else:
+            self._clear_selection()
+            return
+        self._refresh_batch_bar()
+
+    def _clear_selection(self) -> None:
+        self._selected = {}
+        for card in self.list_container.findChildren(WorkCard):
+            card.blockSignals(True)
+            card.set_checked(False)
+            card.blockSignals(False)
+        self._refresh_batch_bar()
+
+    def _writable_folder_names(self) -> list[str]:
+        return [
+            name for name in self._shelf_folders_provider()
+            if name and name != "全部"
+        ]
+
+    def _choose_shelf_folder(self):
+        from PySide6.QtWidgets import QInputDialog
+
+        folders = ["未分类"] + self._writable_folder_names()
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "选择收藏夹",
+            "加入到：",
+            folders,
+            0,
+            False,
+        )
+        if not accepted:
+            return None
+        return "" if choice == "未分类" else choice
+
+    def _on_batch_add_shelf(self) -> None:
+        items = list(self._selected.values())
+        if not items:
+            return
+        folder = self._choose_shelf_folder()
+        if folder is None:
+            return
+        self.add_to_shelf_requested.emit(items, folder)
+        self._clear_selection()
+
+    def _on_batch_download(self) -> None:
+        items = list(self._selected.values())
+        if not items:
+            return
+        self.batch_download_requested.emit(items)
+        self._clear_selection()
 
     # ------------------------------------------------------------------ #
     def _on_work_clicked(self, work: Work) -> None:
@@ -1287,28 +1411,17 @@ class DiscoverPage(BasePage):
         if self._restoring_scroll:
             return  # 钉底/恢复滚动位置中，不触发懒加载与快照写入
         self._schedule_scroll_snapshot()
-        if self._restore_rest_scheduled or self._work_count < len(self._works):
-            # 会话还原尚未铺完：先把缓存卡片补上，网络请求留到铺完再发
-            self._fetch_more_cached()
-            return
         vbar = self.scroll.verticalScrollBar()
-        if vbar.maximum() > 0 and value >= vbar.maximum() * 0.8:
-            self._load_next_page()
+        if vbar.maximum() <= 0 or value < vbar.maximum() * 0.8:
+            return
+        if self._work_count < len(self._works):
+            self._render_next_batch()
+            if self._restore_rest_scheduled:
+                return
+        self._load_next_page()
 
     def _fetch_more_cached(self) -> None:
-        """立即再铺一批未渲染的缓存作品（滚动时增量，避免等待定时器）。"""
-        if len(self._works) <= self._work_count:
-            return
-        view_h = max(1, self.scroll.viewport().height() or self.height() or 600)
-        cols = self._columns()
-        per_screen = max(1, (view_h // (CARD_HEIGHT + 4)) * cols)
-        todo = self._works[self._work_count:]
-        batch = todo[:per_screen]
-        for w in batch:
-            self._append_card(w, cols)
-        self._apply_column_stretch(cols)
-        if len(self._works) > self._work_count and self._restore_session > 0:
-            self._schedule_pending_restore(self._restore_session)
+        self._render_next_batch()
 
     def _schedule_scroll_snapshot(self) -> None:
         """滚动比例延迟 500ms 落盘（节流，避免高频写缓存）。"""

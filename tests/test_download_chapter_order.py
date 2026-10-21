@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import sys
@@ -129,7 +129,7 @@ def test_finalizer_passes_ordered_materials_to_novel_builder(tmp_path, monkeypat
     downloader = Downloader(None, None, _Settings(tmp_path))
     captured = {}
 
-    def fake_builder(title, output, chapters, merge=False):
+    def fake_builder(title, output, chapters, merge=False, depths=None):
         captured.update(title=title, output=output, chapters=chapters, merge=merge)
 
     monkeypatch.setattr(epub_builder, "build_novel_epub", fake_builder)
@@ -175,7 +175,7 @@ def test_retry_finalize_keeps_completed_materials(tmp_path, monkeypatch):
     task.done_chapters.append(2)
     captured = {}
 
-    def fake_builder(title, output, chapters, merge=False):
+    def fake_builder(title, output, chapters, merge=False, depths=None):
         captured["chapters"] = chapters
 
     monkeypatch.setattr(epub_builder, "build_novel_epub", fake_builder)
@@ -234,14 +234,14 @@ def test_finalize_status_preserves_paused_and_priority():
 
     task.status = TaskStatus.PAUSED
     queue._finalize_status(task)
-    assert task.status == TaskStatus.PAUSED  # 暂停保持，不被覆盖
+    assert task.status == TaskStatus.PAUSED  # 鏆傚仠淇濇寔锛屼笉琚鐩?
 
     task.status = TaskStatus.DOWNLOADING
     task.failed = ["x"]
     queue._finalize_status(task)
     assert task.status == TaskStatus.FAILED
 
-    task.cancel_evt.set()  # 取消优先于失败
+    task.cancel_evt.set()  # 鍙栨秷浼樺厛浜庡け璐?
     queue._finalize_status(task)
     assert task.status == TaskStatus.CANCELED
 
@@ -263,10 +263,10 @@ def test_large_materials_spill_to_disk_and_resolve(tmp_path, monkeypatch):
     downloader = Downloader(None, None, _SpillSettings(tmp_path))
     task = _task(count=2)
 
-    downloader._store_epub_chapter(task, 0, "C1", "1234567890")  # = 阈值，仍驻内存
+    downloader._store_epub_chapter(task, 0, "C1", "1234567890")  # = 闃堝€硷紝浠嶉┗鍐呭瓨
     assert task.epub_chapters[0] == ("C1", "1234567890")
 
-    downloader._store_epub_chapter(task, 1, "C2", "abcdefghij")  # 超阈值 → 全部落盘
+    downloader._store_epub_chapter(task, 1, "C2", "abcdefghij")  # 瓒呴槇鍊?鈫?鍏ㄩ儴钀界洏
     assert not isinstance(task.epub_chapters[0][1], str)
     assert not isinstance(task.epub_chapters[1][1], str)
 
@@ -277,18 +277,18 @@ def test_large_materials_spill_to_disk_and_resolve(tmp_path, monkeypatch):
 
     monkeypatch.setattr(epub_builder, "build_novel_epub", lambda *a, **k: None)
     downloader.finalize_epub(task)
-    assert not downloader._material_dir(task).exists()  # 合成成功后清理材料
+    assert not downloader._material_dir(task).exists()  # 鍚堟垚鎴愬姛鍚庢竻鐞嗘潗鏂?
 
 
 def test_large_comic_materials_spill_and_cleanup_on_discard(tmp_path):
     downloader = Downloader(None, None, _SpillSettings(tmp_path))
     task = _task(content_type="comic", count=1)
 
-    downloader._store_epub_chapter(task, 0, "C1", [b"x" * 6, b"y" * 6])  # 超阈值
+    downloader._store_epub_chapter(task, 0, "C1", [b"x" * 6, b"y" * 6])  # 瓒呴槇鍊?
     marker = task.epub_chapters[0][1]
     assert not isinstance(marker, (str, list))
     assert downloader._ordered_epub_chapters(task) == [("C1", [b"x" * 6, b"y" * 6])]
 
-    downloader.discard_materials(task)  # 取消/重启：清理落盘材料并复位溢出状态
+    downloader.discard_materials(task)  # 鍙栨秷/閲嶅惎锛氭竻鐞嗚惤鐩樻潗鏂欏苟澶嶄綅婧㈠嚭鐘舵€?
     assert not downloader._material_dir(task).exists()
     assert getattr(task, "_spill_active", False) is False

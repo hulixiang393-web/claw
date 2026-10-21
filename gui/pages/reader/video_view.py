@@ -100,9 +100,11 @@ class VideoView(QWidget):
     # emit 后队列投递到主线程才真正停本地播放器（跨线程绝不碰 Qt 对象）。
     # 顺序保证：start() 不停本地 VLC，只有电视报 PLAYING 才走到这条信号。
     _cast_local_player_stop = Signal()
+    _progress_position = Signal(int, float, float)
 
     # spec §6.4 步骤 6：投屏启动后轮询到电视 PLAYING 的超时（毫秒）
     CAST_PLAYING_TIMEOUT_MS = 8000
+    PREFETCH_BEFORE_END_S = 4 * 60
 
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
@@ -143,6 +145,7 @@ class VideoView(QWidget):
         self._locked_source_id = ""
         self._switching = False
         self._stream_cache: dict = {}
+        self._prefetch_cache: dict = {}
         self._stream_cache_ttl = 30.0
         self._stream_task = None
         self._probe_task = None
@@ -152,6 +155,7 @@ class VideoView(QWidget):
         self._probe_names = {}
         self._prefetch_task = None
         self._prefetch_idx = -2  # 正在预拉下一集（<0 空闲）
+        self._prefetch_attempted: set = set()
         self._quality = "best"
         self._quality_options: list = []
         self._detail_url_for_play = ""  # 无分集时记录详情 URL
@@ -178,6 +182,7 @@ class VideoView(QWidget):
         self._stream_gen = 0
         self._external_now_playing.connect(self._on_external_now_playing)
         self._vlc_playlist_ready.connect(self._on_vlc_playlist_ready)
+        self._progress_position.connect(self._on_progress_position)
         self._last_ep_toast_ts = 0.0  # 「已是最后一集」提示去抖时间戳
         from framework.media_tuner import MediaTuner
 
@@ -1473,6 +1478,23 @@ class VideoView(QWidget):
             return (ep_url, quality)
         return (source_id, ep_url, quality, True)
 
+    def _prefetch_cache_get(self, key):
+        value = self._prefetch_cache.get(key)
+        if value is None:
+            return None
+        if len(value) == 2:
+            return value
+        expires_at, video, audio = value
+        if expires_at <= time.monotonic():
+            self._prefetch_cache.pop(key, None)
+            return None
+        return video, audio
+
+    def _source_needs_merged(self) -> bool:
+        raw = getattr(self._source, "raw", None) or {}
+        episode = (raw.get("api_endpoints") or {}).get("episode") or {}
+        return episode.get("engine") == "ytdlp"
+
     def _stream_cache_get(self, key):
         value = self._stream_cache.get(key)
         if value is None and len(key) == 4:
@@ -1542,6 +1564,9 @@ class VideoView(QWidget):
                     cancel()
                 setattr(self, name, None)
         self._prefetch_idx = -2
+        if hasattr(self, "_prefetch_attempted"):
+            self._prefetch_attempted.clear()
+        self._prefetch_cache.clear()
 
     def _invalidate_stream_cache(self, ep_url=None, quality=None) -> None:
         source = self._source
@@ -1551,8 +1576,9 @@ class VideoView(QWidget):
                 invalidate(source, ep_url, quality, True)
         if ep_url is None and quality is None:
             self._stream_cache.clear()
+            self._prefetch_cache.clear()
             return
-        for key in list(self._stream_cache):
+        for key in list(self._stream_cache) + list(self._prefetch_cache):
             key_url = key[1] if len(key) == 4 else key[0]
             key_quality = key[2] if len(key) == 4 else key[1]
             if ep_url is not None and key_url != ep_url:
@@ -1560,6 +1586,7 @@ class VideoView(QWidget):
             if quality is not None and key_quality != quality:
                 continue
             self._stream_cache.pop(key, None)
+            self._prefetch_cache.pop(key, None)
 
     def _on_quality_changed(self, text: str) -> None:
         if not text or text == self._quality or self._current_idx < 0:
@@ -1594,7 +1621,15 @@ class VideoView(QWidget):
             video, audio = cached
             self._current_play = video
             self._play(video, audio, ep.title)
-            self._prefetch_next(idx)
+            return
+        hint = None
+        if not self._source_needs_merged():
+            hint = self._prefetch_cache_get(key)
+            self._prefetch_cache.pop(key, None)
+        if hint:
+            video, audio = hint
+            self._current_play = video
+            self._play(video, audio, ep.title)
             return
         self._show_status(f"正在获取播放流：{ep.title}...")
         self._current_play = ""
@@ -1605,9 +1640,6 @@ class VideoView(QWidget):
         task.signals.finished.connect(self._on_stream_loaded)
         self._stream_task = task  # 防 GC
         QThreadPool.globalInstance().start(task)
-        # 取流慢（yt-dlp 签名/慢站反爬）时，本集加载期间即预拉下一集——
-        # 预拉是后台串行，本集完成后下一集大概率已缓存，连播/点下一集秒切。
-        self._prefetch_next(idx)
 
     def _on_ep_card(self, card) -> None:
         """点分集卡片 → 选集加载。"""
@@ -1658,7 +1690,7 @@ class VideoView(QWidget):
         return False
 
     def _on_stream_loaded(self, ep_url, video, audio, err, quality, gen=None) -> None:
-        """取流完成：写缓存 →（仍为当前集/画质则）播放 → 预拉下一集。
+        """取流完成：写缓存 →（仍为当前集/画质则）播放。
 
         旧任务后到（ep_url/quality 已非当前）：只写缓存，不覆盖播放。
         缓存 key 用发起时 quality，避免切画质后 key 错位（B3）。
@@ -1679,7 +1711,6 @@ class VideoView(QWidget):
         if 0 <= self._current_idx < len(self._episodes):
             title = self._episodes[self._current_idx].title or ""
         self._request_play(video, audio, title)
-        self._prefetch_next(self._current_idx)
 
     # ------------------------------------------------------------------ #
     def _request_play(self, video: str, audio: str, title: str) -> None:
@@ -2814,6 +2845,12 @@ class VideoView(QWidget):
                     self.position_changed.emit(payload)
                 except RuntimeError:
                     pass
+            try:
+                self._progress_position.emit(
+                    int(idx), float(position["seconds"]), float(position["duration"])
+                )
+            except (RuntimeError, KeyError, TypeError, ValueError):
+                pass
 
         handoff_writer = getattr(self, "handoff_writer", None)
         if episodes:
@@ -2983,8 +3020,17 @@ class VideoView(QWidget):
         self._reflow_cards()
 
     # ------------------------------------------------------------------ #
+    def _on_progress_position(self, idx: int, seconds: float, duration: float) -> None:
+        if duration <= 0 or idx != self._current_idx:
+            return
+        if not (0 <= idx < len(self._episodes) - 1):
+            return
+        remaining = duration - seconds
+        if 0 <= remaining <= self.PREFETCH_BEFORE_END_S:
+            self._prefetch_next(idx)
+
     def _prefetch_next(self, idx: int = -1) -> None:
-        """后台预拉下一集播放流（命中缓存/无下一集/正在预拉则跳过）。"""
+        """后台解析并缓存下一集播放链接（命中缓存/无下一集/正在预拉则跳过）。"""
         if idx < 0:
             idx = self._current_idx
         self._prefetch_episode(idx + 1)
@@ -3003,11 +3049,14 @@ class VideoView(QWidget):
         key = self._stream_cache_key(ep.url, self._quality)
         if self._stream_cache_get(key) is not None:
             return
+        if key in self._prefetch_attempted:
+            return
         if self._prefetch_idx >= 0:
             return  # 已有其他集在预拉（串行）
+        self._prefetch_attempted.add(key)
         self._prefetch_idx = idx
         task = _FetchStreamTask(self._content, self._source, ep.url, self._quality,
-                                gen=self._stream_gen)
+                                gen=self._stream_gen, prefetch=True)
         task.signals.finished.connect(self._on_prefetch_done)
         self._prefetch_task = task
         QThreadPool.globalInstance().start(task)
@@ -3018,8 +3067,20 @@ class VideoView(QWidget):
             return
         if err or not video:
             return
-        # 预拉缓存 key 用发起时 quality（与任务一致，防切画质错位）
-        self._stream_cache_set(self._stream_cache_key(ep_url, quality), video, audio)
+        try:
+            from framework.stream_resolver import StreamResolver
+
+            ttl = StreamResolver.cache_ttl_for_result(
+                (video, audio), self._stream_cache_ttl
+            )
+        except Exception:
+            ttl = 0.0
+        if ttl <= 0:
+            self._prefetch_cache.pop(self._stream_cache_key(ep_url, quality), None)
+            return
+        self._prefetch_cache[self._stream_cache_key(ep_url, quality)] = (
+            time.monotonic() + ttl, video, audio
+        )
 
     def _next_available_sid(self) -> str:
         """返回当前源之后的第一个可用源 sid（无则空）。"""

@@ -516,7 +516,10 @@ class ShelfService:
     def favorite_remove(self, url: str) -> bool:
         removed = bool(self._store and self._store.remove(url))
         if self._repository is not None and url:
-            self._repository.clear_content_cache(url)
+            try:
+                self._repository.clear_content_cache(url)
+            except Exception:
+                pass
         return removed
 
     def favorite_clear_folder(self, folder: str) -> int:
