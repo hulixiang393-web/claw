@@ -104,12 +104,14 @@
         "max_providers": 3,
         "response_path": "list"
       },
+      "group": { "enabled": true },
       "item_fields": {
         "title": "vod_name",
         "url": "/title/{vod_id}?title={vod_name}&source={source}",
         "cover": "vod_pic",
         "author": "vod_area",
-        "update": "vod_remarks"
+        "update": "vod_remarks",
+        "provider": "source"
       }
     },
     "detail": {

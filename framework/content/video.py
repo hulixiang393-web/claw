@@ -1890,6 +1890,19 @@ class VideoMixin:
             detail = self.fetch_detail(source, new_url, deadline=deadline, context=context)
         return detail, detail.chapters
 
+    def switch_source_url(
+        self, source: SourceConfig, target_url: str, deadline=None, context=None
+    ) -> tuple:
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
+        if deadline is None:
+            detail = self.fetch_detail(source, target_url)
+        else:
+            detail = self.fetch_detail(
+                source, target_url, deadline=deadline, context=context
+            )
+        return detail, detail.chapters
+
     @staticmethod
     def _ytdlp_format(cfg: dict, quality: str = "") -> str:
         """quality → yt-dlp 格式串（下载端双流路径）。

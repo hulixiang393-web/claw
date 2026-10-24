@@ -226,6 +226,42 @@ def test_search_parallel_sse_aggregates_sources():
     assert all(r.source_id == "ikanpp" for r in res)
 
 
+def test_search_groups_same_title_and_keeps_provider_variants():
+    from framework.search import Search
+
+    src = _source()
+    searcher = Search(_GroupHttp(), Parser())
+    results = searcher.search_one(src, "测试剧")
+    assert len(results) == 1
+    assert results[0].title == "测试剧"
+    assert results[0].provider == "juliang"
+    assert results[0].provider_name == "巨量资源"
+    assert [v.provider for v in results[0].variants] == ["baofeng", "jisu"]
+
+
+def test_grouped_detail_exposes_source_list_and_switches_by_detail_url():
+    from framework.search import Search
+
+    src = _source()
+    http = _GroupHttp()
+    searcher = Search(http, Parser())
+    result = searcher.search_one(src, "测试剧")[0]
+    content = Content(http, Parser(), _Checker())
+    detail = content.fetch_detail(src, result.url)
+    assert [item["source_id"] for item in detail.source_list] == [
+        "juliang", "baofeng", "jisu",
+    ]
+    assert [item["name"] for item in detail.source_list] == [
+        "巨量资源", "暴风资源", "极速资源",
+    ]
+    variant_url = detail.source_list[1]["detail_url"]
+    switched, chapters = content.switch_source_url(src, variant_url)
+    assert http.last_body["id"] == "100"
+    assert http.last_body["source"] == "baofeng"
+    assert switched.source_list[0]["source_id"] == "baofeng"
+    assert chapters[0].url == _M3U8
+
+
 def test_search_parallel_posts_query_and_sources():
     from framework.search import Search
 
@@ -250,6 +286,25 @@ def test_search_parallel_sse_passes_charset_encoding():
     searcher.search_one(src, "战狼")
     assert http.last_post_kw is not None
     assert http.last_post_kw.get("encoding") == "utf-8"
+
+
+class _GroupHttp(_FakeHttp):
+    def post_text(self, url, json_body=None, **kw):
+        self.last_post_kw = dict(kw)
+        self.last_body = dict(json_body or {})
+        rows = [
+            {"source": "baofeng", "vod_id": 100, "vod_name": "测试剧", "vod_pic": "", "vod_area": "中国大陆", "vod_remarks": "HD"},
+            {"source": "juliang", "vod_id": 1, "vod_name": "测试剧", "vod_pic": "", "vod_area": "中国大陆", "vod_remarks": "HD"},
+            {"source": "jisu", "vod_id": 7, "vod_name": "测试剧", "vod_pic": "", "vod_area": "中国大陆", "vod_remarks": "HD"},
+        ]
+        return "data: " + json.dumps({"type": "videos", "videos": rows}, ensure_ascii=False) + "\n\n"
+
+    def post_json(self, url, json_body=None, **kw):
+        self.last_body = dict(json_body or {})
+        payload = json.loads(json.dumps(_DETAIL))
+        payload["data"]["vod_name"] = "测试剧"
+        payload["data"]["episodes"] = [{"name": "第1集", "url": _M3U8, "index": 1}]
+        return payload
 
 
 class _IkanppFallbackHttp(_FakeHttp):

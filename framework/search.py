@@ -15,15 +15,16 @@ import logging
 import re as _re
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from .config import SourceConfig
 from .discovery import Discovery
 from .errors import SourceError
 from .http import AntiScrapeError, HttpClient
 from .parser import Parser
+from .search_groups import normalize_title, remember_group
 from .utils import fill_json, fill_template, jsonpath
 
 log = logging.getLogger(__name__)
@@ -88,6 +89,8 @@ class SearchResult:
     cover: str = ""
     author: str = ""
     update: str = ""
+    provider: str = ""
+    provider_name: str = ""
     # 合并相似结果时：该结果的其它源版本（PROJECT_GUIDE.md §6.4）
     variants: "list[SearchResult]" = field(default_factory=list)
 
@@ -100,6 +103,8 @@ class SearchResult:
             "cover": self.cover,
             "author": self.author,
             "update": self.update,
+            "provider": self.provider,
+            "provider_name": self.provider_name,
         }
 
 
@@ -312,9 +317,10 @@ class Search:
                 http,
             )
         if search_cfg:
-            return self._decrypt_results(
+            results = self._decrypt_results(
                 source, self._search_api(source, keyword, http=http), http
             )
+            return self._group_provider_results(source, search_cfg, results)
         return self._search_html(source, keyword, http=http, on_page=on_page)
 
 
@@ -1097,6 +1103,15 @@ class Search:
                 body = dict(body)
                 body["sources"] = [by_id[provider_id] for provider_id in ranked_ids]
 
+        provider_names: dict[str, str] = {}
+        raw_providers = body.get("sources") if isinstance(body, dict) else None
+        if isinstance(raw_providers, list):
+            for provider in raw_providers:
+                if not isinstance(provider, dict) or not provider.get("id"):
+                    continue
+                provider_id = str(provider["id"])
+                provider_names[provider_id] = str(provider.get("name") or provider_id)
+
         # 翻页：读 constraints.search.max_pages（默认 1），多页合并去重
         constraints = source.raw.get("constraints") or {}
         max_pages = int((constraints.get("search") or {}).get("max_pages") or 1)
@@ -1210,6 +1225,9 @@ class Search:
                 if url in seen_urls:
                     continue
                 seen_urls.add(url)
+                provider_id = str(self._tpl(it, item_fields.get("provider")) or "").strip()
+                if not provider_id:
+                    provider_id = str((parse_qs(parts.query).get("source") or [""])[0])
                 cover = self._clean_cover(self._tpl(it, item_fields.get("cover")))
                 results.append(
                     SearchResult(
@@ -1220,6 +1238,8 @@ class Search:
                         cover=str(cover or ""),
                         author=str(self._tpl(it, item_fields.get("author")) or ""),
                         update=str(self._tpl(it, item_fields.get("update")) or ""),
+                        provider=provider_id,
+                        provider_name=provider_names.get(provider_id, provider_id),
                     )
                 )
         return self._provider_fallback(source, keyword, results, http)
@@ -1258,6 +1278,56 @@ class Search:
             if normalized and (normalized == needle or needle in normalized):
                 return True
         return False
+
+    def _group_provider_results(
+        self, source: SourceConfig, cfg: dict, results: List[SearchResult]
+    ) -> List[SearchResult]:
+        group_cfg = cfg.get("group") or {}
+        if not group_cfg.get("enabled") or len(results) < 2:
+            return results
+        body = cfg.get("body") if isinstance(cfg.get("body"), dict) else {}
+        providers = body.get("sources") or []
+        orders: dict[str, int] = {}
+        names: dict[str, str] = {}
+        for index, provider in enumerate(providers, 1):
+            if not isinstance(provider, dict) or not provider.get("id"):
+                continue
+            provider_id = str(provider["id"])
+            names[provider_id] = str(provider.get("name") or provider_id)
+            try:
+                orders[provider_id] = int(provider.get("priority") or index)
+            except (TypeError, ValueError):
+                orders[provider_id] = index
+
+        groups: dict[str, list[SearchResult]] = {}
+        order: list[str] = []
+        for result in results:
+            key = normalize_title(result.title) or result.title
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(result)
+
+        merged: list[SearchResult] = []
+        for key in order:
+            items = groups[key]
+            if len(items) < 2:
+                merged.append(items[0])
+                continue
+            items.sort(key=lambda item: orders.get(item.provider, 10**9))
+            head = items[0]
+            merged.append(replace(head, variants=items[1:]))
+            remembered = [
+                {
+                    "provider": item.provider,
+                    "name": item.provider_name or names.get(item.provider, item.provider),
+                    "url": item.url,
+                    "order": orders.get(item.provider, 10**9),
+                }
+                for item in items
+            ]
+            remember_group(source.source_id, head.title, remembered)
+        return merged
 
     def _provider_fallback(
         self, source: SourceConfig, keyword: str, results: List[SearchResult], http: HttpClient
@@ -1345,6 +1415,8 @@ class Search:
                     cover=self._clean_cover(str(item.get("vod_pic") or "")),
                     author=str(item.get("vod_area") or ""),
                     update=str(item.get("vod_remarks") or ""),
+                    provider=provider_id,
+                    provider_name=str(provider.get("name") or provider_id),
                 ))
             if fallback_results:
                 return fallback_results

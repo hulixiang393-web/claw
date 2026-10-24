@@ -241,6 +241,32 @@ def test_source_menu_selection_changes_combo(_qapp):
         view.close()
 
 
+def test_source_switch_emits_variant_detail_url(_qapp):
+    view = VideoView(object())
+    try:
+        detail = SimpleNamespace(
+            source_list=[
+                {"source_id": "a", "name": "线路 A"},
+                {
+                    "source_id": "b",
+                    "name": "线路 B",
+                    "detail_url": "https://example/title/2?title=T&source=b",
+                },
+            ],
+            url="https://example/title/1?title=T&source=a",
+        )
+        view._detail = detail
+        view._populate_source_combo(detail)
+        emitted = []
+        view.source_changed.connect(emitted.append)
+        view._on_source_switch(1)
+        assert emitted == [
+            (detail, "b", "https://example/title/2?title=T&source=b")
+        ]
+    finally:
+        view.close()
+
+
 def _probe_view(monkeypatch):
     from gui.pages.reader import video_view
 

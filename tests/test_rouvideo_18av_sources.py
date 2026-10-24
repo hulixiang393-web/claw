@@ -213,6 +213,27 @@ def test_18av_protected_player_rule_is_configured():
     assert source.raw["media"]["format"] == "hls"
 
 
+def test_18av_disables_generic_ad_filtering_and_keeps_raw_hls():
+    source = _source("18av")
+    assert source.raw["ad_block"] == {"enabled": False}
+
+    from framework.media_proxy import MediaProxy
+
+    text = (
+        "#EXTM3U\n"
+        "#EXT-X-CUE-OUT\n"
+        "#EXTINF:5.0,\n/seg/ad1.ts\n"
+        "#EXT-X-CUE-IN\n"
+        "#EXTINF:10.0,\n/seg/001.ts\n"
+        "#EXT-X-ENDLIST\n"
+    )
+    out = MediaProxy.instance()._filter_ad_segments(
+        text, "https://cdn.example/hls/i.m3u8",
+        source.raw["ad_block"], source_id="18av",
+    )
+    assert out == text
+
+
 def test_18av_search_and_category_details_are_configured():
     source = _source("18av")
     assert source.get_discovery_config()["works_list_item"]["page_item_limit"] == 30

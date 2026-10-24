@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -38,14 +39,16 @@ def setup_logging(settings: Any | None = None) -> None:
     if any(isinstance(h, logging.StreamHandler) for h in root.handlers):
         return
 
-    # stderr handler（始终有）
-    sh = logging.StreamHandler()
-    sh.setLevel(log_level)
-    sh.setFormatter(logging.Formatter(
-        "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    ))
-    root.addHandler(sh)
+    # pythonw 启动时 sys.stderr 为 None：此时只写文件，避免每条日志都触发
+    # StreamHandler 的 "Logging error"。
+    if sys.stderr is not None:
+        sh = logging.StreamHandler()
+        sh.setLevel(log_level)
+        sh.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        root.addHandler(sh)
 
     # 文件 handler（按日期，追加模式）
     try:

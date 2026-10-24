@@ -155,7 +155,8 @@ def _remux_ctx(key: str):
         if ctx is None:
             if len(_REMUX_CTX) >= _REMUX_CTX_MAX:
                 _REMUX_CTX.pop(next(iter(_REMUX_CTX)))
-            ctx = {"lock": threading.Lock(), "segs": {}, "inflight": {}, "done": 0}
+            ctx = {"lock": threading.Lock(), "segs": {}, "processed": set(),
+                   "inflight": {}, "done": 0}
             _REMUX_CTX[key] = ctx
         return ctx
 
@@ -227,8 +228,8 @@ def _pes_header_offset(data, off: int, step: int):
 def _read_ts_timestamps(data, off: int, step: int):
     """取单个 188 字节 TS 包里 PES 头的 PTS/DTS 字段偏移列表。
 
-    返回空列表表示本包没有可平移的时间戳。PCR 不参与：播放器按 PES 时间戳
-    计时，PCR 一起平移会把对齐打乱。
+    返回空列表表示本包没有可平移的时间戳。PCR 由 _read_ts_pcr_offset 单独
+    取出，必须与 PES 用同一个 delta 平移，否则播放器时钟会逐片回跳。
     """
     values = []
     p = _pes_header_offset(data, off, step)
@@ -278,7 +279,7 @@ def _ts_shift(src: Path, first_dts: float):
     1. 锚点：片内最早的时间戳平移到 first_dts；
     2. 连续性：每个 PES 的 DTS 必须紧跟同流上一个 DTS（帧间隔取片内中位数）；
        倒退或偏离过远的包按预期时刻重锚，后续包随之顺延。
-    只改 PES 头的 PTS/DTS，帧数与字节内容都不变；否则返回 False。
+    只改 PES 头的 PTS/DTS 与 PCR，帧数与媒体字节内容都不变；否则返回 None。
 
     返回**本片时长（秒）**而不是 True：时长是下一片锚点的推进量，而本函数
     本来就要逐包扫一遍取 min_ts，顺手记 max 即可算出（max-min）/90000，
@@ -293,12 +294,16 @@ def _ts_shift(src: Path, first_dts: float):
     if len(data) < step * 2:
         return None
     entries = []          # [(包偏移, [(字段偏移, 原值)])]，按文件顺序
+    pcrs = []             # [(包偏移, PCR 字段偏移)]，按文件顺序
     min_ts = None
     max_ts = None
     off = 0
     while off + step <= len(data):
         if data[off] != 0x47:
             return None
+        q = _read_ts_pcr_offset(data, off, step)
+        if q is not None:
+            pcrs.append((off, q))
         if (data[off + 1] & 0x1F) != 0x1F:
             offsets = _read_ts_timestamps(data, off, step)
             if offsets:
@@ -333,6 +338,7 @@ def _ts_shift(src: Path, first_dts: float):
     resid = 0
     changed = False
     last_by_stream = {}
+    delta_by_off = {}
     for off, values in entries:
         key = _stream_key(data, off, values)
         prev = last_by_stream.get(key)
@@ -344,11 +350,23 @@ def _ts_shift(src: Path, first_dts: float):
             if dts <= prev or dts - want > max(gap, 90000 * 0.5):
                 resid += want - dts
         delta = bump + resid
+        delta_by_off[off] = delta
         if delta:
             changed = True
             for p, _v in values:
                 _encode_ts5(data, p, _decode_ts5(data, p) + delta)
         last_by_stream[key] = values[-1][1] + delta
+    if pcrs:
+        idx = 0
+        cur_delta = bump
+        ordered = [(off, delta_by_off[off]) for off, _v in entries]
+        for off, p in pcrs:
+            while idx < len(ordered) and ordered[idx][0] <= off:
+                cur_delta = ordered[idx][1]
+                idx += 1
+            if cur_delta:
+                _shift_ts_pcr(data, p, cur_delta)
+                changed = True
     if not changed:
         return duration
     try:
@@ -378,6 +396,51 @@ def _ts_first_dts(path: Path):
             best = v if best is None else min(best, v)
         off += step
     return None if best is None else best / 90000.0
+
+
+def _ts_last_ts(data) -> float | None:
+    """TS 字节里最晚的 PTS/DTS（秒）；无有效时间戳返回 None。"""
+    step = 188
+    best = None
+    off = 0
+    while off + step <= len(data):
+        if data[off] != 0x47:
+            return None
+        if (data[off + 1] & 0x1F) != 0x1F:
+            for p in _read_ts_timestamps(data, off, step):
+                v = _decode_ts5(data, p)
+                best = v if best is None else max(best, v)
+        off += step
+    return None if best is None else best / 90000.0
+
+
+def _read_ts_pcr_offset(data, off: int, step: int):
+    """返回本包 PCR 字段起始偏移；无 PCR 返回 None。"""
+    if ((data[off + 3] >> 4) & 0x03) not in (2, 3):
+        return None
+    af_len = data[off + 4]
+    if af_len <= 0:
+        return None
+    p = off + 5
+    if p >= off + step or not (data[p] & 0x10):
+        return None
+    q = p + 1
+    return q if q + 6 <= off + step and q + 6 <= p + af_len else None
+
+
+def _remux_marker(path: Path) -> Path:
+    return path.with_name(path.name + ".remuxed")
+
+
+def _shift_ts_pcr(data, p: int, delta: int) -> None:
+    base = ((data[p] << 25) | (data[p + 1] << 17) | (data[p + 2] << 9)
+            | (data[p + 3] << 1) | (data[p + 4] >> 7))
+    base = (base + delta) & 0x1FFFFFFFF
+    data[p] = (base >> 25) & 0xFF
+    data[p + 1] = (base >> 17) & 0xFF
+    data[p + 2] = (base >> 9) & 0xFF
+    data[p + 3] = (base >> 1) & 0xFF
+    data[p + 4] = ((base & 1) << 7) | (data[p + 4] & 0x7F)
 
 
 def _classify_media_protocol(target: str, headers: dict) -> str:
@@ -2680,13 +2743,12 @@ class MediaProxy:
                                seg_name: str, target: str, path) -> bool:
         """缓存命中的分片：需要时按片序整理后发送；不适用返回 False。
 
-        ctx["segs"][name] > 0 表示该片已整理且输出已直写缓存文件（下次直通）。
-        首片在 ctx 里登记的是 0，它从未被整理，必须继续走读取/直通逻辑。
+        ctx["processed"] 记录该片已处理（首片原样直通，后续片已整理并写回缓存）。
         """
         ctx = _remux_ctx(cache_key)
         with ctx["lock"]:
-            anchor = ctx["segs"].get(seg_name)
-        if anchor is not None and anchor > 0:
+            processed = seg_name in ctx["processed"]
+        if processed:
             return False          # 已整理且有输出（输出已直写缓存文件）
         data = self._read_whole_ts(path)
         if data is None or not _is_ts_payload(data):
@@ -2695,15 +2757,21 @@ class MediaProxy:
             # 必然失败，每片白烧一次进程（实测 ~0.13s，且逐片串行）。未命中
             # 路径早就有同样的 _is_ts_payload 守卫，这里补齐保持一致。
             return False
+        if _remux_marker(path).exists():
+            end = _ts_last_ts(data)
+            with ctx["lock"]:
+                ctx["segs"][seg_name] = end if end and end > 0 else 1e-6
+                ctx["processed"].add(seg_name)
+            return False
         out = self._remux_segment(cache_key, seg_name, data, None)
         if out is None:
             return False
         self._send_bytes(handler, out)
         try:
-            if not path.name.endswith(".remux.ts"):
-                tmp = path.with_name(path.name + ".remux.ts")
-                tmp.write_bytes(out)
-                os.replace(tmp, path)
+            tmp = path.with_name(path.name + ".remux.tmp")
+            tmp.write_bytes(out)
+            os.replace(tmp, path)
+            _remux_marker(path).touch()
         except OSError:
             pass
         return True
@@ -2740,11 +2808,13 @@ class MediaProxy:
         ctx = _remux_ctx(cache_key)
         with ctx["lock"]:
             if not ctx["segs"]:
-                ctx["segs"][seg_name] = 0.0
+                end = _ts_last_ts(raw) if _is_ts_payload(raw) else None
+                ctx["segs"][seg_name] = end if end and end > 0 else 1e-6
+                ctx["processed"].add(seg_name)
                 ctx["inflight"][seg_name] = False
                 ctx["done"] = 1
                 return None
-            if seg_name in ctx["segs"]:
+            if seg_name in ctx["processed"]:
                 return None
             base = max(ctx["segs"].values())
             ctx["inflight"][seg_name] = True
@@ -2756,6 +2826,7 @@ class MediaProxy:
             ctx["inflight"].pop(seg_name, None)
             if result is not None:
                 ctx["segs"][seg_name] = base + result[1]
+                ctx["processed"].add(seg_name)
                 ctx["done"] += 1
         return None if result is None else result[0]
 
@@ -3018,13 +3089,20 @@ class MediaProxy:
                     # 交给播放器；任何一步失败都退回原始字节，绝不阻断播放。
                     body = first + (resp.raw.read() or b"") if not whole else first
                     _update_upstream_diagnostic(resp, 0, finished=True)
+                    out = self._remux_segment(
+                        cache_key, seg_name, body, req_headers)
+                    payload = out if out is not None else body
                     if total and _full_zero_offset_response(
                             resp, handler.headers.get("Range")):
                         self._store_segment_bytes(
-                            cache, cache_key, seg_name, body)
-                    out = self._remux_segment(
-                        cache_key, seg_name, body, req_headers)
-                    self._send_bytes(handler, out if out is not None else body)
+                            cache, cache_key, seg_name, payload)
+                        if out is not None:
+                            try:
+                                _remux_marker(cache.hls_segment_final(
+                                    cache_key, seg_name)).touch()
+                            except OSError:
+                                pass
+                    self._send_bytes(handler, payload)
                     if fetch_owner:
                         fetch_status = resp.status_code
                     return
@@ -3159,6 +3237,10 @@ class MediaProxy:
                              headers: dict | None = None,
                              source_id=None) -> str:
 
+        # 源显式关闭广告过滤（如 18av：站点无广告）→ 原样使用爬取到的播放流，
+        # 不做任何分片识别/改写；预取和代理转发仍由后续流程负责。
+        if isinstance(ad_block, dict) and ad_block.get("enabled") is False:
+            return m3u8_text
         try:
             from .adblock import AdblockEngine
 

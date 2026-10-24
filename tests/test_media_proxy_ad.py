@@ -40,6 +40,20 @@ def test_serve_m3u8_text_filters_without_source_config(monkeypatch):
     assert "001.ts" in sent[0]
 
 
+def test_serve_m3u8_text_18av_keeps_raw_stream(monkeypatch):
+    mp = MediaProxy.instance()
+    sent = []
+    monkeypatch.setattr(mp, "_rewrite_m3u8", lambda text, *args, **kwargs: text)
+    monkeypatch.setattr(mp, "_emit_m3u8", lambda handler, text: sent.append(text))
+
+    mp._serve_m3u8_text(
+        object(), _AD_M3U8, "https://cdn.example.com/hls/i.m3u8", {},
+        {"enabled": False}, source_id="18av",
+    )
+
+    assert sent == [_AD_M3U8]
+
+
 def test_cache_context_preserves_real_target_and_sensitive_headers_only_in_memory():
     proxy = MediaProxy(cache=type("Cache", (), {"enabled": False})())
     target = "https://cdn.example/hls/index.m3u8?token=signed&expires=9"

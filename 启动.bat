@@ -53,11 +53,40 @@ if "%CLAW_CHECK%"=="1" (
     exit /b %errorlevel%
 )
 
+rem Launch without a console window. Set CLAW_CONSOLE=1 to keep it.
+if not "%CLAW_CONSOLE%"=="1" (
+    if /i "%PYTHON_EXE%"=="py" (
+        pyw %PYTHON_ARGS% -c "import PySide6" >nul 2>&1
+        if not errorlevel 1 (
+            start "" pyw %PYTHON_ARGS% gui/app.py %*
+            exit /b 0
+        )
+    )
+    if not "%PYTHON_EXE%"=="py" (
+        for %%I in ("%PYTHON_EXE%") do (
+            if exist "%%~dpIpythonw.exe" (
+                start "" "%%~dpIpythonw.exe" %PYTHON_ARGS% gui/app.py %*
+                exit /b 0
+            )
+        )
+    )
+    where pythonw.exe >nul 2>&1
+    if not errorlevel 1 (
+        pythonw.exe -c "import PySide6" >nul 2>&1
+        if not errorlevel 1 (
+            start "" pythonw.exe %PYTHON_ARGS% gui/app.py %*
+            exit /b 0
+        )
+    )
+)
+
 "%PYTHON_EXE%" %PYTHON_ARGS% gui/app.py %*
 if errorlevel 1 (
     echo.
     echo [FAIL] The selected Python environment could not start claw.
     echo Set CLAW_PYTHON to a Python executable with PySide6, or install it with:
     echo   "%PYTHON_EXE%" %PYTHON_ARGS% -m pip install PySide6
+    echo.
+    echo Run with CLAW_CONSOLE=1 to see the full traceback.
     pause
 )

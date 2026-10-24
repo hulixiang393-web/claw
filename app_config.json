@@ -16,7 +16,7 @@
     }
   },
   "ui": {
-    "theme": "midnight",
+    "theme": "sakura",
     "font_scale": 1.5,
     "cover_cache_size_mb": 256,
     "default_page_size": 20,
@@ -65,7 +65,7 @@
     "workers": 3
   },
   "content": {
-    "show_adult_sources": false
+    "show_adult_sources": true
   },
   "reader": {
     "prefetch_enabled": true,

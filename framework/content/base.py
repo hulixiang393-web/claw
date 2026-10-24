@@ -455,6 +455,38 @@ class ContentBase:
                 self._repository.evict_book_content(book_key, keep)
         return detail
 
+    def _attach_search_provider_sources(self, source: SourceConfig, detail: Detail) -> None:
+        if detail.source_list or source.content_type != "video":
+            return
+        search_cfg = ((source.raw.get("api_endpoints") or {}).get("search") or {})
+        if not (search_cfg.get("group") or {}).get("enabled"):
+            return
+        from ..search_groups import lookup_group
+
+        items = lookup_group(source.source_id, detail.title, detail.url)
+        if len(items) < 2:
+            return
+        from urllib.parse import parse_qs, urlsplit
+
+        query = parse_qs(urlsplit(detail.url).query)
+        current = str((query.get("source") or query.get("sid") or [""])[0])
+        items.sort(
+            key=lambda item: (
+                str(item.get("provider") or "") != current,
+                int(item.get("order") or 10**9),
+            )
+        )
+        detail.source_list = [
+            {
+                "source_id": str(item.get("provider") or ""),
+                "sid": str(item.get("provider") or ""),
+                "name": str(item.get("name") or item.get("provider") or ""),
+                "detail_url": str(item.get("url") or ""),
+            }
+            for item in items
+            if item.get("provider") and item.get("url")
+        ]
+
     def fetch_detail(self, source: SourceConfig, url: str, deadline=None, context=None) -> Detail:
         """抓取详情页：元数据 + 章节列表。
 
@@ -468,6 +500,7 @@ class ContentBase:
         if cached is not None and not any(
             self._looks_like_direct_media(ch.url) for ch in (cached.chapters or [])
         ):
+            self._attach_search_provider_sources(source, cached)
             return cached
 
         api = source.raw.get("api_endpoints") or {}
@@ -478,6 +511,7 @@ class ContentBase:
             else:
                 detail = self._fetch_detail_api(source, url, detail_api, context=context)
             self._check_stream_context(context, deadline)
+            self._attach_search_provider_sources(source, detail)
             self._cache_set_detail(cache_key, detail)
             return detail
 

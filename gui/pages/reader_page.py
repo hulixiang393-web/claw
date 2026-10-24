@@ -52,23 +52,31 @@ class _SwitchSourceSignals(QObject):
 
 
 class _SwitchSourceTask(QRunnable):
-    """后台切换播放源：重新抓详情（换 sid）。"""
+    """后台切换播放源：按 sid 或目标详情 URL 重新抓详情。"""
 
-    def __init__(self, content, source, detail_url, sid, identity, generation):
+    def __init__(
+        self, content, source, detail_url, sid, identity, generation, target_url=""
+    ):
         super().__init__()
         self.signals = _SwitchSourceSignals()
         self._content = content
         self._source = source
         self._url = detail_url
         self._sid = sid
+        self._target_url = target_url
         self.identity = identity
         self.generation = generation
 
     def run(self) -> None:
         try:
-            new_detail, chapters = self._content.switch_source(
-                self._source, self._url, self._sid
-            )
+            if self._target_url:
+                new_detail, chapters = self._content.switch_source_url(
+                    self._source, self._target_url
+                )
+            else:
+                new_detail, chapters = self._content.switch_source(
+                    self._source, self._url, self._sid
+                )
             try:
                 self.signals.done.emit(new_detail, self)
             except RuntimeError:
@@ -278,6 +286,7 @@ class ReaderPage(BasePage):
         if self._content is None or not isinstance(payload, (tuple, list)) or len(payload) < 2:
             return
         detail, new_sid = payload[0], payload[1]
+        target_url = str(payload[2] or "") if len(payload) > 2 else ""
         if (detail is None or not new_sid or not self._current_book_url
                 or self._current_content_type != "video"
                 or detail is not getattr(self.video_view, "detail", None)
@@ -288,6 +297,7 @@ class ReaderPage(BasePage):
         task = _SwitchSourceTask(
             self._content, self._current_source, detail.url, new_sid,
             (self._current_source_id, self._current_book_url), self._switch_generation,
+            target_url,
         )
         task.signals.done.connect(self._on_source_switched)
         task.signals.error.connect(self._on_source_switch_failed)

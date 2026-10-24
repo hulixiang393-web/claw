@@ -111,6 +111,9 @@
     "format": "hls",
     "select": {"video": {"quality": "best"}}
   },
+  "ad_block": {
+    "enabled": false
+  },
   "constraints": {
       "search": {"max_pages": 30, "max_results": 0},
     "detail": {"max_pages": 1},

@@ -26,7 +26,7 @@ import threading
 import time
 import webbrowser
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
@@ -81,7 +81,7 @@ class VideoView(QWidget):
 
     episode_changed = Signal(object)  # (detail, 集标题, 集URL) → 进度记忆
     position_changed = Signal(object)  # (detail, 标题, URL, 播放进度 0~1, None) 续读
-    source_changed = Signal(object)  # (detail, new_sid) → ReaderPage 换源
+    source_changed = Signal(object)  # (detail, new_sid, target_url) → ReaderPage 换源
     download_requested = Signal(object)  # (source_id, detail.url, content_type) → 下载当前作品
     recommend_open_requested = Signal(object)  # (source_id, url, content_type) → 打开推荐视频
 
@@ -1047,7 +1047,11 @@ class VideoView(QWidget):
 
     def _update_probe_button(self) -> None:
         enabled = bool(self._probe_config().get("enabled", True))
-        available = bool(self._detail is not None and self._source_list)
+        probeable = any(
+            not (isinstance(item, dict) and item.get("detail_url"))
+            for item in self._source_list
+        )
+        available = bool(self._detail is not None and self._source_list and probeable)
         running = self._probe_task is not None
         self.probe_btn.setVisible(available)
         self.probe_btn.setEnabled(enabled and available and not running)
@@ -1068,6 +1072,8 @@ class VideoView(QWidget):
                 if isinstance(item, dict) else getattr(item, "source_id", "")
             )
             if not source_id or source_id in seen:
+                continue
+            if isinstance(item, dict) and item.get("detail_url"):
                 continue
             seen.add(source_id)
             source = item.get("source", self._source) if isinstance(item, dict) else self._source
@@ -1437,6 +1443,10 @@ class VideoView(QWidget):
         self._update_probe_button()
         if has:
             cur_sid = self._current_sid
+            if not cur_sid:
+                query = parse_qs(urlsplit(str(getattr(detail, "url", "") or "")).query)
+                cur_sid = str((query.get("sid") or query.get("source") or [""])[0])
+                self._current_sid = cur_sid
             idx = 0
             for i, s in enumerate(self._source_list):
                 if str(s.get("source_id") or s.get("sid")) == str(cur_sid):
@@ -1468,8 +1478,10 @@ class VideoView(QWidget):
         self._play_gen += 1
         self._clear_probe_state()
         self._cancel_probe_task()
+        item = self._source_list[idx] if 0 <= idx < len(self._source_list) else {}
+        target_url = str(item.get("detail_url") or "") if isinstance(item, dict) else ""
         self._populate_source_combo(self._detail)
-        self.source_changed.emit((self._detail, str(sid)))
+        self.source_changed.emit((self._detail, str(sid), target_url))
         self._video_frame.setFocus()  # 换源后快捷键继续可用
 
     def _stream_cache_key(self, ep_url: str, quality: str):

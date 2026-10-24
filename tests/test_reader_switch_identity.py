@@ -5,7 +5,7 @@ import pytest
 from framework.content import Chapter, Detail
 from framework.library_store import LibraryStore
 from framework.reading_progress import ReadingProgress
-from gui.pages.reader_page import ReaderPage
+from gui.pages.reader_page import ReaderPage, _SwitchSourceTask
 
 
 @pytest.fixture
@@ -32,6 +32,20 @@ def finish(task):
     thread.join(timeout=2)
     assert not thread.is_alive()
     QApplication.instance().processEvents()
+
+
+def test_switch_source_task_uses_variant_detail_url(_qapp):
+    calls = []
+    moved = Detail(source_id="ikanpp", url="target", title="t", content_type="video")
+    content = SimpleNamespace(
+        switch_source_url=lambda source, url: calls.append((source, url)) or (moved, []),
+        switch_source=lambda *args: (_ for _ in ()).throw(AssertionError("sid path used")),
+    )
+    source = SimpleNamespace(source_id="ikanpp")
+    _SwitchSourceTask(
+        content, source, "origin", "b", ("ikanpp", "book"), 1, "target"
+    ).run()
+    assert calls == [(source, "target")]
 
 
 def detail(name, route=""):
