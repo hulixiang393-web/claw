@@ -510,6 +510,7 @@ class SearchPage(BasePage):
             item = self.status_bar_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                widget.hide()
                 widget.setParent(None)
                 widget.deleteLater()
         self._status_chips = {}
@@ -1187,8 +1188,9 @@ class SearchPage(BasePage):
             child = self.grid_layout.takeAt(0)
             w = child.widget()
             if w is not None:
-                # 立即解除父子关系（不再渲染/被 findChildren 找到），deleteLater 再释放内存。
-                # 只用 deleteLater 时旧卡片在事件循环处理前短暂残留，换源搜索会"闪出旧内容"。
+                # 先隐藏再脱离父子关系（防换词闪旧内容）：直接对可见卡片
+                # setParent(None) 会让它瞬间成为顶层 "pythonw" 窗口（弹窗刷屏）。
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
         self._work_count = 0

@@ -108,7 +108,7 @@ class _GridCard(QFrame):
         self._cover.setText("▶")
         lay.addWidget(self._cover)
 
-        self._title = HoverTitle(title or "", parent_card=self)
+        self._title = HoverTitle(title or "", parent_card=self, parent=self)
         self._title.setFixedHeight(20)
         self._title.setStyleSheet("font-size: 13px;")
         lay.addWidget(self._title, stretch=1)

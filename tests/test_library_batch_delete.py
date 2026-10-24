@@ -51,6 +51,40 @@ def _cards(page):
     return out
 
 
+def test_batch_action_buttons_visible_and_follow_selection():
+    from gui.pages.library_page import LibraryPage
+
+    class _OneShelf(_FakeShelf):
+        def list_items(self, **kwargs):
+            return [_fav()]
+
+    page = LibraryPage(shelf_service=_OneShelf())
+    page.resize(900, 760)
+    page.show()
+    _app.processEvents()
+    try:
+        assert page.minimumSizeHint().width() <= page.width()
+        for btn in (page.batch_btn, page.batch_move_btn, page.batch_delete_btn):
+            assert btn.isVisible()
+            assert btn.mapTo(page, btn.rect().topLeft()).x() + btn.width() <= page.width()
+        assert not page.batch_move_btn.isEnabled()
+        assert not page.batch_delete_btn.isEnabled()
+
+        page.batch_btn.setChecked(True)
+        page._on_batch_state(_fav(), 2)
+        _app.processEvents()
+        assert page.batch_move_btn.isEnabled()
+        assert page.batch_delete_btn.isEnabled()
+        assert page.batch_count_label.text() == "已选 1 项"
+
+        page.batch_btn.setChecked(False)
+        assert not page.batch_move_btn.isEnabled()
+        assert not page.batch_delete_btn.isEnabled()
+        assert page.batch_count_label.text() == ""
+    finally:
+        page.close()
+
+
 def test_batch_box_hidden_by_default_and_toggles_with_mode():
     page = _page()
     page._render([_fav()])

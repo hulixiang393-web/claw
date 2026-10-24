@@ -810,7 +810,10 @@ class DiscoverPage(BasePage):
             child = self.grid_layout.takeAt(0)
             w = child.widget()
             if w is not None:
-                w.setParent(None)  # 立即解除父子关系（防换源闪旧内容）
+                # 先隐藏再脱离父子关系（防换源闪旧内容）：直接 setParent(None)
+                # 会让可见卡片瞬间变成顶层 "pythonw" 窗口（弹窗刷屏）。
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
         self._work_count = 0
         self._works = []
@@ -829,6 +832,7 @@ class DiscoverPage(BasePage):
             child = self.grid_layout.takeAt(0)
             w = child.widget()
             if w is not None:
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
         self._work_count = 0

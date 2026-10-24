@@ -153,17 +153,63 @@ class _Section(QWidget):
 
 
 class SettingsPage(BasePage):
-    """设置页：分区 Tab + 应用/恢复默认。"""
+    """设置页：分区 Tab + 应用/恢复默认。
+
+    「独立加载」：每个设置项在加载时记录基线值，应用时逐项比较，只有值发生
+    变化的设置项才写回 app_config 并触发对应刷新；未变化的设置项一律跳过。
+    ``self._dirty_flags`` 保存每个设置项的布尔值（True = 本次有修改）。
+    """
 
     theme_changed = Signal(str)  # 主题切换 → App 层刷新全局 QSS
-    settings_applied = Signal()  # 点「应用」→ App 层重跑主题 QSS / 字体缩放 / 背景图
+    settings_applied = Signal(object)  # 应用 → 携带变化的设置键集合（frozenset）
     source_select_requested = Signal()  # 点「源选择」→ App 层打开源选择引导对话框
+
+    # 设置键 → (分区, 键名)。独立加载时按该表逐项判断/写回。
+    _SETTING_KEYS = (
+        "network.default_user_agent",
+        "network.default_timeout",
+        "network.default_retries",
+        "network.default_request_interval",
+        "network.proxy",
+        "network.concurrent_search_sources",
+        "network.max_bytes_per_image",
+        "ui.theme",
+        "ui.font_scale",
+        "ui.cover_cache_size_mb",
+        "ui.default_page_size",
+        "ui.background_image",
+        "ui.background_opacity",
+        "ui.reading_bg",
+        "ui.reading_font_size",
+        "download.output_dir",
+        "download.naming_template",
+        "download.merge_chapters_into_one_file",
+        "download.skip_existing",
+        "download.max_concurrent_downloads",
+        "download.max_parallel_chapters",
+        "library.shelf_export_dir",
+        "library.webdav_url",
+        "diagnostics.verbose_logging",
+        "diagnostics.log_dir",
+        "sources_runtime.broken_source_warn_interval_hours",
+        "sources_runtime.auto_disable_after_failures",
+        "sources_runtime.selfcheck_strategy",
+        "adblock.extra_rule_dir",
+        "content.show_adult_sources",
+        "reader.prefetch_enabled",
+        "reader.prefetch_ahead",
+        "reader.prefetch_behind",
+        "reader.show_images",
+    )
 
     def __init__(self, settings, theme_manager, parent=None):
         super().__init__(parent)
         self.setStyleSheet("QWidget { color: #000000; }")
         self._sm = settings
         self._tm = theme_manager
+        # 独立加载状态：基线值 + 每项布尔修改标记
+        self._baseline: dict[str, object] = {}
+        self._dirty_flags: dict[str, bool] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -463,52 +509,76 @@ class SettingsPage(BasePage):
         self._reader_prefetch_behind.setValue(int(g("reader", "prefetch_behind", 1)))
         self._reader_show_images.setChecked(bool(g("reader", "show_images", True)))
 
+        # 加载完成 → 记录基线；所有设置项修改标记复位为 False
+        self._baseline = self._read_setting_values()
+        self._dirty_flags = {key: False for key in self._baseline}
+
+    def _read_setting_values(self) -> dict:
+        """读取全部控件当前值（key = "分区.键名"，值为最终写入值）。
+
+        独立加载的基础：应用时与基线逐项比较，只有值变化的设置项才写回；
+        每个设置项都对应 ``_dirty_flags`` 里的一个布尔值。
+        """
+        return {
+            "network.default_user_agent": self._net_ua.text().strip(),
+            "network.default_timeout": self._net_timeout.value(),
+            "network.default_retries": self._net_retries.value(),
+            "network.default_request_interval": self._net_interval.value(),
+            "network.proxy": self._net_proxy.text().strip() or None,
+            "network.concurrent_search_sources": self._net_concurrent.value(),
+            "network.max_bytes_per_image": self._net_img_max.value() * 1024 * 1024,
+            "ui.theme": self._ui_theme.currentText(),
+            "ui.font_scale": round(self._ui_font.value(), 3),
+            "ui.cover_cache_size_mb": self._ui_cover_cache.value(),
+            "ui.default_page_size": self._ui_page_size.value(),
+            "ui.background_image": self._ui_bg_image.text().strip(),
+            "ui.background_opacity": round(self._ui_bg_opacity.value(), 3),
+            "ui.reading_bg": self._ui_reading_bg.text().strip(),
+            "ui.reading_font_size": self._ui_reading_font.value(),
+            "download.output_dir": self._dl_dir.text().strip() or "downloads",
+            "download.naming_template": self._dl_tpl.text().strip(),
+            "download.merge_chapters_into_one_file": self._dl_merge.isChecked(),
+            "download.skip_existing": self._dl_skip.isChecked(),
+            "download.max_concurrent_downloads": self._dl_concurrent.value(),
+            "download.max_parallel_chapters": self._dl_parallel.value(),
+            "library.shelf_export_dir": self._lib_dir.text().strip() or "library",
+            "library.webdav_url": self._lib_webdav.text().strip() or None,
+            "diagnostics.verbose_logging": self._diag_level.currentText() == "DEBUG",
+            "diagnostics.log_dir": self._diag_dir.text().strip() or "logs",
+            "sources_runtime.broken_source_warn_interval_hours": self._diag_warn.value(),
+            "sources_runtime.auto_disable_after_failures": self._diag_disable.value(),
+            "sources_runtime.selfcheck_strategy": self._diag_strategy.currentText(),
+            "adblock.extra_rule_dir": self._ad_dir.text().strip(),
+            "content.show_adult_sources": self._content_adult.isChecked(),
+            "reader.prefetch_enabled": self._reader_prefetch_enabled.isChecked(),
+            "reader.prefetch_ahead": self._reader_prefetch_ahead.value(),
+            "reader.prefetch_behind": self._reader_prefetch_behind.value(),
+            "reader.show_images": self._reader_show_images.isChecked(),
+        }
+
+    def _write_setting(self, key: str, value) -> None:
+        """按 "分区.键名" 写回一个设置项（仅对发生变化的项调用）。"""
+        section, _, name = key.partition(".")
+        if not section or not name:
+            return
+        self._sm.set(section, name, value)
+
     def _on_apply(self) -> None:
-
-        """把所有控件值写回 settings 并保存。"""
-        s = self._sm
-        s.set("network", "default_user_agent", self._net_ua.text().strip())
-        s.set("network", "default_timeout", self._net_timeout.value())
-        s.set("network", "default_retries", self._net_retries.value())
-        s.set("network", "default_request_interval", self._net_interval.value())
-        s.set("network", "proxy", self._net_proxy.text().strip() or None)
-        s.set("network", "concurrent_search_sources", self._net_concurrent.value())
-        s.set("network", "max_bytes_per_image", self._net_img_max.value() * 1024 * 1024)
-
-        s.set("ui", "font_scale", self._ui_font.value())
-        s.set("ui", "cover_cache_size_mb", self._ui_cover_cache.value())
-        s.set("ui", "default_page_size", self._ui_page_size.value())
-        s.set("ui", "background_image", self._ui_bg_image.text().strip())
-        s.set("ui", "background_opacity", self._ui_bg_opacity.value())
-        s.set("ui", "reading_bg", self._ui_reading_bg.text().strip())
-        s.set("ui", "reading_font_size", self._ui_reading_font.value())
-
-        s.set("download", "output_dir", self._dl_dir.text().strip() or "downloads")
-        s.set("download", "naming_template", self._dl_tpl.text().strip())
-        s.set("download", "merge_chapters_into_one_file", self._dl_merge.isChecked())
-        s.set("download", "skip_existing", self._dl_skip.isChecked())
-        s.set("download", "max_concurrent_downloads", self._dl_concurrent.value())
-        s.set("download", "max_parallel_chapters", self._dl_parallel.value())
-
-        s.set("library", "shelf_export_dir", self._lib_dir.text().strip() or "library")
-        s.set("library", "webdav_url", self._lib_webdav.text().strip() or None)
-
-        s.set("diagnostics", "verbose_logging", self._diag_level.currentText() == "DEBUG")
-        s.set("diagnostics", "log_dir", self._diag_dir.text().strip() or "logs")
-        s.set("sources_runtime", "broken_source_warn_interval_hours", self._diag_warn.value())
-        s.set("sources_runtime", "auto_disable_after_failures", self._diag_disable.value())
-        s.set("sources_runtime", "selfcheck_strategy", self._diag_strategy.currentText())
-
-        s.set("adblock", "extra_rule_dir", self._ad_dir.text().strip())
-        s.set("content", "show_adult_sources", self._content_adult.isChecked())
-        s.set("reader", "prefetch_enabled", self._reader_prefetch_enabled.isChecked())
-        s.set("reader", "prefetch_ahead", self._reader_prefetch_ahead.value())
-        s.set("reader", "prefetch_behind", self._reader_prefetch_behind.value())
-        s.set("reader", "show_images", self._reader_show_images.isChecked())
-
-        s.save()
-
-        self.settings_applied.emit()
+        """独立加载：只写回/应用发生变化的设置项，未变化项完全跳过。"""
+        current = self._read_setting_values()
+        baseline = getattr(self, "_baseline", {}) or {}
+        # 逐项布尔判断：只有与基线不同的设置项才需要加载/应用
+        self._dirty_flags = {
+            key: baseline.get(key) != value for key, value in current.items()
+        }
+        changed = frozenset(key for key, dirty in self._dirty_flags.items() if dirty)
+        if changed:
+            for key in changed:
+                self._write_setting(key, current[key])
+            self._sm.save()
+        # 新基线：本次应用后未变化的项不再重复触发刷新
+        self._baseline = dict(current)
+        self.settings_applied.emit(changed)
 
     def _on_theme_selected(self, idx: int) -> None:
         """主题选择实时切换全局样式。"""
@@ -532,6 +602,8 @@ class SettingsPage(BasePage):
         theme = self._sm.get("ui", "theme", "sakura")
         self._tm.switch_to(theme)
         self.theme_changed.emit(theme)
+        # 恢复默认 = 所有设置项都变化 → 全量刷新一次
+        self.settings_applied.emit(frozenset(self._baseline))
 
     def refresh(self) -> None:
         self._load_values()

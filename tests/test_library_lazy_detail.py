@@ -163,6 +163,60 @@ def test_repeated_scan_result_does_not_duplicate_shelf_cards():
     assert grid.count() == 2
 
 
+def test_reentry_keeps_lazy_loaded_cards_and_remaining_plan():
+    page = _page()
+    records = [
+        {**_online(f"book-{i}"), "title": f"书{i}"}
+        for i in range(50)
+    ]
+    page._render(records)
+    assert len(page._shelf_cards) == 30
+    page._render_batch(15)
+    assert len(page._shelf_cards) == 45
+    first_card = page._shelf_cards[0]
+
+    page._render(records, reuse=True)
+
+    assert len(page._shelf_cards) == 45
+    assert page._shelf_cards[0] is first_card
+    assert len(page._cards_by_key) == 45
+    assert page._has_more_cards()
+    page._render_batch(15)
+    assert len(page._shelf_cards) == 50
+    assert not page._has_more_cards()
+
+
+def test_same_view_rebuild_keeps_loaded_count():
+    page = _page()
+    records = [
+        {**_online(f"book-{i}"), "title": f"书{i}"}
+        for i in range(50)
+    ]
+    page._render(records)
+    page._render_batch(15)
+    assert len(page._shelf_cards) == 45
+
+    page._render(records, reuse=False)
+
+    assert len(page._shelf_cards) == 45
+    assert page._has_more_cards()
+
+
+def test_render_order_change_keeps_loaded_count_without_reloading_first_batch():
+    page = _page()
+    records = [
+        {**_online(f"book-{i}"), "title": f"书{i}"}
+        for i in range(40)
+    ]
+    page._render(records)
+    page._render_batch(10)
+    assert len(page._shelf_cards) == 40
+
+    page._render(list(reversed(records)), reuse=True)
+
+    assert len(page._shelf_cards) == 40
+
+
 def test_render_does_not_fetch_detail_chapter_or_body():
     content = _ControlledContent()
     page = _page(content)
@@ -383,9 +437,9 @@ def test_folder_filter_reuses_metadata_snapshot_without_content_reads(tmp_path, 
     assert page._metadata_snapshot is original_snapshot
     page.activate()
     assert len(scans) == 1
-    assert reads == []
-    assert backfills == []
-    assert cached
+    assert [r for r in reads if r != "network"] == []
+    assert backfills  # 封面缺失 -> 触发后台补写
+    assert cached == []  # 书架不再 cache-only，允许联网回源
     assert content.detail_calls == content.chapter_calls == content.body_calls == []
     assert original_snapshot[0][0].url == ""
     assert original_snapshot[0][0].folder == ""

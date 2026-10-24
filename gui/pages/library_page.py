@@ -41,6 +41,9 @@ from .base_page import BasePage
 
 _DELETE_RETRY_ATTEMPTS = 20
 _DELETE_RETRY_DELAY = 0.05
+_SHELF_RENDER_BATCH = 30   # 首次/每次滚动加载的卡片数，避免上百条收藏一次渲染卡死
+_SHELF_LOAD_THRESHOLD = 240  # 滚动到距底部多少像素时继续加载
+_BADGE_BATCH = 4  # 每轮事件循环最多补几个章节数徽标，避免 SQLite 查询阻塞 UI
 
 
 class _ScanSignals(QObject):
@@ -173,11 +176,14 @@ class _ShelfCard(QFrame):
         layout.setSpacing(6)
 
         # 封面（独立区域：图片铺满 + 右上角系列角标，与下方信息区分离）
-        cover_box = QWidget()
+        # 所有子控件一律带 Qt 父对象：无父对象的 QWidget 会被 Qt 当成
+        # 顶层窗口，批量建卡时系统任务栏/窗口列表会瞬间冒出大量标题为
+        # "pythonw" 的「弹窗」，随后才被布局 reparent 掉（用户看到的弹窗）。
+        cover_box = QWidget(self)
         cover_box.setFixedHeight(90)
         cbox = QGridLayout(cover_box)
         cbox.setContentsMargins(0, 0, 0, 0)
-        cover = QLabel("📚")
+        cover = QLabel("📚", cover_box)
         cover.setAlignment(Qt.AlignCenter)
         cover.setStyleSheet(
             "background: palette(midlight); border-radius: 8px; font-size: 36px;"
@@ -190,7 +196,7 @@ class _ShelfCard(QFrame):
 
         # 系列合并角标（如「共 3 話」「第1-3季」，悬停显示成员全名）
         if rec.get("series_badge"):
-            badge = QLabel(rec["series_badge"])
+            badge = QLabel(rec["series_badge"], cover_box)
             badge.setAlignment(Qt.AlignCenter)
             badge.setStyleSheet(
                 "font-size: 10px; font-weight: bold; color: white;"
@@ -203,7 +209,7 @@ class _ShelfCard(QFrame):
 
         # 书名（独立单行，超长省略；悬停滑出完整标题浮层）
         title_text = rec.get("title") or "无题"
-        title = HoverTitle(title_text, parent_card=self)
+        title = HoverTitle(title_text, parent_card=self, parent=self)
         title.setFixedHeight(20)
         title.setStyleSheet("font-size: 15px; font-weight: bold;")
         layout.addWidget(title)
@@ -213,7 +219,7 @@ class _ShelfCard(QFrame):
         author_text = (rec.get("author") or "").strip()
         self._author_label = None
         if author_text:
-            author = QLabel(author_text)
+            author = QLabel(author_text, self)
             author.setWordWrap(False)
             author.setFixedHeight(16)
             author.setStyleSheet("color: palette(dark); font-size: 11px;")
@@ -225,7 +231,7 @@ class _ShelfCard(QFrame):
         src = (rec.get("source_name") or rec.get("source_id") or "").strip()
         if not src:
             src = "本地"
-        source = QLabel(f"来源：{src}")
+        source = QLabel(f"来源：{src}", self)
         source.setWordWrap(False)
         source.setFixedHeight(16)
         source.setStyleSheet("color: palette(dark); font-size: 11px;")
@@ -236,7 +242,7 @@ class _ShelfCard(QFrame):
         # 状态行（独立：本地徽章 + 类型/集数/大小/续读）
         state = QHBoxLayout()
         if rec.get("kind") == "local":
-            badge = QLabel("本地")
+            badge = QLabel("本地", self)
             badge.setFixedWidth(36)
             badge.setAlignment(Qt.AlignCenter)
             badge.setStyleSheet(
@@ -245,7 +251,7 @@ class _ShelfCard(QFrame):
             )
             state.addWidget(badge)
         meta_text = self._meta_text()
-        meta = QLabel()
+        meta = QLabel(parent=self)
         meta.setWordWrap(False)
         meta.setFixedHeight(16)
         meta.setStyleSheet("color: palette(dark); font-size: 10px;")
@@ -253,14 +259,15 @@ class _ShelfCard(QFrame):
         meta.setToolTip(meta_text)
         state.addWidget(meta, stretch=1)
         self._meta_label = meta
-        self._badge_label = QLabel("")
+        self._badge_label = QLabel("", self)
         self._badge_label.setFixedHeight(16)
         self._badge_label.setStyleSheet("color: palette(highlight); font-size: 10px;")
         state.addWidget(self._badge_label)
         layout.addLayout(state)
         if rec.get("kind") == "favorite" or rec.get("online"):
             self._reading_status_label = QLabel(
-                "已看完" if rec.get("reading_status") == "completed" else "在看"
+                "已看完" if rec.get("reading_status") == "completed" else "在看",
+                self,
             )
             self._reading_status_label.setStyleSheet("color: palette(highlight); font-size: 11px;")
             layout.addWidget(self._reading_status_label)
@@ -295,8 +302,8 @@ class _ShelfCard(QFrame):
             return
         from gui.components.cover_loader import CoverLoader
 
-        CoverLoader.instance().load_cached(
-            url, self._on_cover_ready,
+        CoverLoader.instance().load(
+            url, self._on_cover_ready, persist=True,
             source_id=self.rec.get("source_id") or "",
         )
 
@@ -453,6 +460,7 @@ class LibraryPage(BasePage):
         self._batch_mode = False
         self._local_close_handler = None
         self._unlocked: set[str] = set()
+        self._unlock_cancelled = False
         self._shelf_export_dir = Path(shelf_export_dir) if shelf_export_dir else Path("library")
         self._scan_task = None
         self._scan_generation = 0
@@ -460,8 +468,24 @@ class LibraryPage(BasePage):
         self._metadata_task = None
         self._metadata_enriched = False
         self._cards_ready_generation = -1
+        # 懒加载渲染状态：收藏多时只渲染前 N 张，滚动/按钮继续追加
+        self._render_plan: list[tuple[str, list[dict]]] = []
+        self._render_section = 0
+        self._render_offset = 0
+        self._render_grid = None
+        self._render_grid_count = 0
+        self._render_more_btn = None
+        self._render_busy = False
+        self._last_render_view_key = None
+        # 章节数徽标：缓存 + 分批补齐，避免逐卡 SQLite 查询阻塞 UI
+        self._badge_cache: dict[str, str] = {}
+        self._badge_pending: list[tuple[object, str]] = []
+        self._badge_timer = QTimer(self)
+        self._badge_timer.setInterval(0)
+        self._badge_timer.timeout.connect(self._flush_badges)
         # 缺封面收藏后台补写回调（App 层注入：内容层 fetch_cover → store.set_cover）
         self._cover_backfiller = cover_backfiller
+        self._cover_backfill_attempted: set[str] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -499,37 +523,56 @@ class LibraryPage(BasePage):
         self.clear_fav_btn.clicked.connect(self._clear_folder)
         top.addWidget(self.clear_fav_btn)
 
-        top.addSpacing(12)
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        tools = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索书架…")
         self.search_edit.setFixedWidth(160)
         self.search_edit.returnPressed.connect(self._rebuild)
-        top.addWidget(self.search_edit)
+        tools.addWidget(self.search_edit)
 
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["最近阅读", "最近添加", "书名"])
         self.sort_combo.currentTextChanged.connect(lambda _: self._rebuild())
-        top.addWidget(self.sort_combo)
+        tools.addWidget(self.sort_combo)
 
         self.export_btn = QPushButton("导出书架")
         self.export_btn.clicked.connect(self._export_shelf)
-        top.addWidget(self.export_btn)
+        tools.addWidget(self.export_btn)
 
         self.import_btn = QPushButton("导入书架")
         self.import_btn.clicked.connect(self._import_shelf)
-        top.addWidget(self.import_btn)
+        tools.addWidget(self.import_btn)
 
         self.batch_btn = QPushButton("批量选择")
         self.batch_btn.setCheckable(True)
         self.batch_btn.setToolTip("进入批量选择模式（勾选卡片后可批量迁移/删除）")
         self.batch_btn.toggled.connect(self._on_batch_mode_toggled)
-        top.addWidget(self.batch_btn)
+        tools.addWidget(self.batch_btn)
 
-        top.addStretch(1)
+        self.batch_move_btn = QPushButton("批量迁移")
+        self.batch_move_btn.setToolTip("迁移已勾选的收藏到其它收藏夹")
+        self.batch_move_btn.setEnabled(False)
+        self.batch_move_btn.clicked.connect(self._batch_move)
+        tools.addWidget(self.batch_move_btn)
+
+        self.batch_delete_btn = QPushButton("批量删除")
+        self.batch_delete_btn.setToolTip("从书架删除已勾选的收藏（不删本地文件）")
+        self.batch_delete_btn.setEnabled(False)
+        self.batch_delete_btn.clicked.connect(self._batch_delete)
+        tools.addWidget(self.batch_delete_btn)
+
+        self.batch_count_label = QLabel("")
+        self.batch_count_label.setStyleSheet("color: palette(dark);")
+        tools.addWidget(self.batch_count_label)
+
+        tools.addStretch(1)
         self.count_label = QLabel("")
         self.count_label.setStyleSheet("color: palette(dark);")
-        top.addWidget(self.count_label)
-        layout.addLayout(top)
+        tools.addWidget(self.count_label)
+        layout.addLayout(tools)
 
         # ---- 滚动区 ----
         self.scroll = QScrollArea()
@@ -544,6 +587,7 @@ class LibraryPage(BasePage):
         self.body.setSpacing(16)
         self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll, stretch=1)
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_shelf_scrolled)
 
         self._rebuild()
 
@@ -560,10 +604,15 @@ class LibraryPage(BasePage):
         info = self._store.folder_info(name) if self._store is not None else None
         if info is None or not info.get("locked"):
             return True
+        if name in self._unlocked:
+            return True  # 本次会话已解锁：任何入口都不再重复弹窗
+        self._unlock_cancelled = False
         pw, ok = QInputDialog.getText(
             self, f"解锁收藏夹「{name}」", "请输入密码：", QLineEdit.Password
         )
         if not ok:
+            # 用户主动取消：交给调用方直接还原，不再连环弹管理员/设密码弹窗
+            self._unlock_cancelled = True
             return False
         if verify_password(pw, info.get("pw"), info.get("salt")):
             self._unlocked.add(name)
@@ -702,16 +751,27 @@ class LibraryPage(BasePage):
             self._queue_metadata_refresh()
 
     def _sync_combos(self) -> None:
-        """刷新收藏夹下拉（保持当前选择）。"""
+        """刷新收藏夹下拉（保持当前选择；列表未变时不动 combo）。
+
+        每次 rebuild 都 clear()/addItems() 会重建 combo 的弹出容器，用户正在
+        打开下拉时容易产生多余的顶层 popup 窗口；只有收藏夹集合真正变化时
+        才重建，否则仅同步当前选择。
+        """
         cur = self.folder_combo.currentText()
-        self.folder_combo.blockSignals(True)
-        self.folder_combo.clear()
-        self.folder_combo.addItem("全部")
+        desired = ["全部"]
         if self._store is not None:
-            self.folder_combo.addItems(self._shelf.folders())
-        idx = self.folder_combo.findText(cur)
-        self.folder_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.folder_combo.blockSignals(False)
+            desired.extend(self._shelf.folders())
+        existing = [
+            self.folder_combo.itemText(i)
+            for i in range(self.folder_combo.count())
+        ]
+        if existing != desired:
+            self.folder_combo.blockSignals(True)
+            self.folder_combo.clear()
+            self.folder_combo.addItems(desired)
+            idx = self.folder_combo.findText(cur)
+            self.folder_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.folder_combo.blockSignals(False)
         cur_folder = self.folder_combo.currentText()
         self._previous_folder = cur_folder or "全部"
         self.delete_folder_btn.setEnabled(bool(cur_folder and cur_folder != "全部"))
@@ -758,6 +818,10 @@ class LibraryPage(BasePage):
         want_type = type_map.get(self.type_combo.currentText(), "")
         selected_folder = self.folder_combo.currentText()
         keyword = self.search_edit.text().strip().lower()
+        view_key = (want_type, selected_folder, keyword, self.sort_combo.currentText())
+        same_view = self._last_render_view_key == view_key
+        loaded = len(self._shelf_cards) if (reuse or same_view) else 0
+        self._last_render_view_key = view_key
         locked = []
         if self._store is not None:
             for fname in self._store.list_folders():
@@ -784,72 +848,101 @@ class LibraryPage(BasePage):
                         "locked_folder": fname,
                         "locked_count": len(locked_items),
                     })
-        if reuse and self._try_reuse_cards(locals_, favorites, locked):
-            return
-        self._clear_all()
-        if not locals_ and not favorites and not locked:
-            self._add_empty()
-            self.count_label.setText("书架还空着")
-            return
         visible_total = len(locals_) + len(favorites) + len(locked)
-        self.count_label.setText(
-            f"共 {visible_total} 本 · 本地{len(locals_)} / 收藏{len(favorites)}"
-        )
+        sections: list[tuple[str, list[dict]]] = []
         if locals_:
-            self._add_group("本地", [{"rec": b} for b in locals_])
+            sections.append(("本地", [{"rec": b} for b in locals_]))
         if favorites or locked:
             items: list[dict] = [{"rec": b} for b in locked]
             for grp in group_favorites(favorites):
                 items.append(self._to_shelf_item(grp))
-            self._add_group("收藏", items)
+            sections.append(("收藏", items))
+        if reuse and self._try_reuse_cards(
+                sections, locals_, favorites, visible_total):
+            return
+        self._clear_all()
+        if not sections:
+            self._add_empty()
+            self.count_label.setText("书架还空着")
+            return
+        self.count_label.setText(
+            f"共 {visible_total} 本 · 本地{len(locals_)} / 收藏{len(favorites)}"
+        )
+        self._start_lazy_render(sections, initial_limit=loaded)
+        self._maybe_backfill_covers(favorites)
 
-    def _try_reuse_cards(self, locals_: list[dict], favorites: list[dict],
-                         locked: list[dict]) -> bool:
+    def _try_reuse_cards(self, sections: list[tuple[str, list[dict]]],
+                         locals_: list[dict], favorites: list[dict],
+                         visible_total: int) -> bool:
         if not self._shelf_cards:
             return False
-        items: list[dict] = [{"rec": b} for b in locked]
-        items.extend({"rec": b} for b in locals_)
-        items.extend(self._to_shelf_item(grp) for grp in group_favorites(favorites))
+        plan = [(title, list(items)) for title, items in sections if items]
+        if len(plan) != len(self._render_plan):
+            return False
+        for (title, items), (old_title, old_items) in zip(plan, self._render_plan):
+            if title != old_title or len(items) != len(old_items):
+                return False
+        display_items = [item for _, items in plan for item in items]
         by_key: dict = {}
-        for item in items:
+        for item in display_items:
             key = self._stable_item_key(item["rec"])
             if key in by_key:
                 return False
             by_key[key] = item
-        if len(by_key) != len(self._shelf_cards):
+        if len(by_key) != len(display_items):
             return False
-        updates = []
-        for card in self._shelf_cards:
-            item = by_key.get(self._stable_item_key(card.rec))
-            if item is None:
+        if len(self._shelf_cards) > len(display_items):
+            return False
+        for card, item in zip(self._shelf_cards, display_items):
+            if self._stable_item_key(card.rec) != self._stable_item_key(item["rec"]):
                 return False
-            updates.append((card, item))
-        for card, item in updates:
+        for card, item in zip(self._shelf_cards, display_items):
             card.update_record(item["rec"])
             book_key = card.rec.get("url") or card.rec.get("key") or ""
             if (card.rec.get("kind") == "favorite" and book_key
                     and card.rec.get("content_type") != "video"):
                 card.set_badge(self._cached_badge(book_key))
-        visible_total = len(locals_) + len(favorites) + len(locked)
+        for (_title, old_items), (_new_title, new_items) in zip(self._render_plan, plan):
+            for old_item, new_item in zip(old_items, new_items):
+                old_item["rec"] = new_item["rec"]
         self.count_label.setText(
             f"共 {visible_total} 本 · 本地{len(locals_)} / 收藏{len(favorites)}"
         )
         return True
 
+    def update_cover(self, url: str, cover: str) -> None:
+        """后台补写封面成功 → 就地更新对应卡片，不重建整个书架。"""
+        if not url or not cover:
+            return
+        for _title, items in self._render_plan:
+            for item in items:
+                rec = item.get("rec") or {}
+                if (rec.get("url") or "") == url:
+                    rec["cover"] = cover
+        card = self._cards_by_key.get(url)
+        if card is None:
+            return
+        card.update_record({**card.rec, "cover": cover})
+
     def _maybe_backfill_covers(self, favorites: list[dict]) -> None:
         """收藏记录封面无效 → 后台补详情封面（幂等、失败静默、不阻塞渲染）。
 
         有效性判定交给 App 层 backfiller（空 / 等于 base_url / 命中占位图都
-        算无效——历史 bug 曾把 base_url 这类垃圾写进收藏库）。每次书架渲染都
-        触发：已补齐的记录 cover 已写回不再进 need；补写失败的记录下次渲染
-        重试。真实网络只在详情页缓存缺失时发生（fetch_cover 复用 page: 缓存），
-        串行后台执行不压垮站点。
+        算无效——历史 bug 曾把 base_url 这类垃圾写进收藏库）。同一次会话内
+        每个 URL 只尝试一次，避免元数据刷新反复触发网络；用户手动刷新书架
+        时清空尝试记录。真实网络只在详情页缓存缺失时发生（fetch_cover 复用
+        page: 缓存），串行后台执行不压垮站点。
         """
         if self._cover_backfiller is None:
             return
-        need = [b for b in favorites
-                if b.get("source_id") and b.get("url")]
+        need = [
+            b for b in favorites
+            if b.get("source_id") and b.get("url")
+            and b["url"] not in self._cover_backfill_attempted
+        ]
         if need:
+            for b in need:
+                self._cover_backfill_attempted.add(b["url"])
             try:
                 self._cover_backfiller(need)
             except Exception:  # noqa: BLE001 —— 补封面失败不影响书架显示
@@ -913,61 +1006,158 @@ class LibraryPage(BasePage):
 
     @staticmethod
     def _wipe(layout) -> None:
-        """递归删除 layout 下所有 widget（含嵌套子 layout）。"""
+        """递归删除 layout 下所有 widget（含嵌套子 layout）。
+
+        必须先 ``hide()`` 再 ``setParent(None)``：布局里的卡片当前是可见的，
+        直接 ``setParent(None)`` 会让它瞬间变成独立顶层窗口（标题 "pythonw"），
+        批量重建时表现为「大量弹窗」，随后 deleteLater 才清除。先隐藏后脱离
+        父子关系，视觉上立即消失，且不会产生可见顶层窗口。
+        """
         while layout.count():
             item = layout.takeAt(0)
             if item.widget():
                 w = item.widget()
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
             elif item.layout():
                 LibraryPage._wipe(item.layout())
 
     def _clear_all(self) -> None:
+        self._badge_pending.clear()
+        self._badge_timer.stop()
+        self._render_plan = []
+        self._render_section = 0
+        self._render_offset = 0
+        self._render_grid = None
+        self._render_grid_count = 0
+        self._render_more_btn = None
         self._cards_by_key.clear()
         self._shelf_cards.clear()
         LibraryPage._wipe(self.body)
 
     # ------------------------------------------------------------------ #
-    def _add_group(self, title: str, items: list[dict]) -> None:
-        """渲染一组卡片。items 每项为 {"rec": 记录, "members"?=系列成员列表}。
+    def _start_lazy_render(
+        self, sections: list[tuple[str, list[dict]]], initial_limit: int = _SHELF_RENDER_BATCH
+    ) -> None:
+        """按 section 分批渲染；首批默认 30 张，重建时保留已加载数量，其余随滚动追加。"""
+        self._render_plan = [(title, list(items)) for title, items in sections if items]
+        self._render_section = 0
+        self._render_offset = 0
+        self._render_grid = None
+        self._render_grid_count = 0
+        self._render_more_btn = None
+        self._render_batch(max(_SHELF_RENDER_BATCH, initial_limit))
 
-        members>1 → 合并卡（点开弹成员选集）；否则普通卡。
-        """
-        header = QLabel(title)
-        header.setStyleSheet("font-size: 14px; font-weight: bold; color: palette(text);")
-        self.body.addWidget(header)
-        grid = QGridLayout()
-        grid.setSpacing(12)
-        for i, item in enumerate(items):
-            rec = item["rec"]
-            card = _ShelfCard(rec)
-            card.batch_box.stateChanged.connect(
-                lambda state, r=rec: self._on_batch_state(r, state)
+    def _has_more_cards(self) -> bool:
+        return self._render_section < len(self._render_plan)
+
+    def _render_batch(self, limit: int = _SHELF_RENDER_BATCH) -> None:
+        """追加下一批卡片。调用方可能是滚动事件或“加载更多”按钮。"""
+        if self._render_busy or not self._has_more_cards():
+            return
+        self._render_busy = True
+        try:
+            if self._render_more_btn is not None:
+                self.body.removeWidget(self._render_more_btn)
+            added = 0
+            while added < limit and self._render_section < len(self._render_plan):
+                title, items = self._render_plan[self._render_section]
+                if self._render_grid is None:
+                    header = QLabel(title, self.container)
+                    header.setStyleSheet(
+                        "font-size: 14px; font-weight: bold; color: palette(text);"
+                    )
+                    self.body.addWidget(header)
+                    grid = QGridLayout()
+                    grid.setSpacing(12)
+                    self.body.addLayout(grid)
+                    self._render_grid = grid
+                    self._render_grid_count = 0
+                    self._render_offset = 0
+                while self._render_offset < len(items) and added < limit:
+                    self._add_card(items[self._render_offset])
+                    self._render_offset += 1
+                    added += 1
+                if self._render_offset >= len(items):
+                    self._render_section += 1
+                    self._render_grid = None
+            if self._has_more_cards():
+                if self._render_more_btn is None:
+                    btn = QPushButton("加载更多", self.container)
+                    btn.clicked.connect(
+                        lambda: self._render_batch(_SHELF_RENDER_BATCH)
+                    )
+                    self._render_more_btn = btn
+                self.body.addWidget(self._render_more_btn)
+            elif self._render_more_btn is not None:
+                self._render_more_btn.hide()
+                self._render_more_btn.setParent(None)
+                self._render_more_btn.deleteLater()
+                self._render_more_btn = None
+        finally:
+            self._render_busy = False
+
+    def _on_shelf_scrolled(self, value: int) -> None:
+        if not self._has_more_cards() or self._render_busy:
+            return
+        bar = self.scroll.verticalScrollBar()
+        if value >= bar.maximum() - _SHELF_LOAD_THRESHOLD:
+            self._render_batch(_SHELF_RENDER_BATCH)
+
+    def _add_card(self, item: dict) -> None:
+        """渲染单张卡片到当前 grid；调用前 _render_grid 必须已创建。"""
+        rec = item["rec"]
+        # 传入 Qt 父对象：卡片在加入网格前就是容器子控件，不会作为顶层
+        # 窗口短暂出现（批量渲染时的「pythonw 弹窗」根因）。
+        card = _ShelfCard(rec, self.container)
+        card.batch_box.stateChanged.connect(
+            lambda state, r=rec: self._on_batch_state(r, state)
+        )
+        self._shelf_cards.append(card)
+        card.set_batch_mode(self._batch_mode)
+        if self._batch_mode:
+            batch_key = rec.get("url") or rec.get("key") or rec.get("path") or ""
+            card.batch_box.blockSignals(True)
+            card.batch_box.setChecked(batch_key in self._batch_selected)
+            card.batch_box.blockSignals(False)
+        book_key = rec.get("url") or rec.get("key") or ""
+        if rec.get("kind") == "favorite" and book_key:
+            self._cards_by_key[book_key] = card
+            if self._metadata_enriched and rec.get("content_type") != "video":
+                self._apply_badge(card, book_key)
+        # clicked 信号携带 rec 参数 → 首参吞掉它，闭包 it=item 才能拿到条目
+        card.clicked.connect(
+            lambda _rec, it=item: self._on_card_clicked(it)
+        )
+        if not item["rec"].get("locked_folder"):
+            card.menu_requested.connect(
+                lambda r, p, it=item: self._show_card_menu(it["rec"], p)
             )
-            self._shelf_cards.append(card)
-            card.set_batch_mode(self._batch_mode)
-            if self._batch_mode:
-                batch_key = rec.get("url") or rec.get("key") or rec.get("path") or ""
-                card.batch_box.blockSignals(True)
-                card.batch_box.setChecked(batch_key in self._batch_selected)
-                card.batch_box.blockSignals(False)
-            book_key = rec.get("url") or rec.get("key") or ""
-            if rec.get("kind") == "favorite" and book_key:
-                self._cards_by_key[book_key] = card
-                if self._metadata_enriched and rec.get("content_type") != "video":
-                    card._badge_label.setText(self._cached_badge(book_key))
-            # clicked 信号携带 rec 参数 → 首参吞掉它，闭包 it=item 才能拿到条目
-            card.clicked.connect(
-                lambda _rec, it=item: self._on_card_clicked(it)
-            )
-            if not item["rec"].get("locked_folder"):
-                card.menu_requested.connect(
-                    lambda r, p, it=item: self._show_card_menu(it["rec"], p)
-                )
-            row, col = divmod(i, 3)
-            grid.addWidget(card, row, col)
-        self.body.addLayout(grid)
+        row, col = divmod(self._render_grid_count, 3)
+        self._render_grid.addWidget(card, row, col)
+        self._render_grid_count += 1
+
+    def _apply_badge(self, card, book_key: str) -> None:
+        cached = self._badge_cache.get(book_key)
+        if cached is not None:
+            card.set_badge(cached)
+            return
+        self._badge_pending.append((card, book_key))
+        if not self._badge_timer.isActive():
+            self._badge_timer.start()
+
+    def _flush_badges(self) -> None:
+        """分批补章节数徽标，给事件循环留出处理输入/重绘的机会。"""
+        import shiboken6
+
+        for _ in range(min(_BADGE_BATCH, len(self._badge_pending))):
+            card, book_key = self._badge_pending.pop(0)
+            if not shiboken6.isValid(card):
+                continue
+            card.set_badge(self._cached_badge(book_key))
+        if not self._badge_pending:
+            self._badge_timer.stop()
 
     def _toggle_batch_item(self, rec: dict) -> None:
         key = rec.get("url") or rec.get("key") or rec.get("path") or ""
@@ -975,6 +1165,7 @@ class LibraryPage(BasePage):
             self._batch_selected.pop(key, None)
         elif key:
             self._batch_selected[key] = rec
+        self._update_batch_actions()
 
     def _on_batch_state(self, rec: dict, state: int) -> None:
         key = rec.get("url") or rec.get("key") or rec.get("path") or ""
@@ -984,6 +1175,13 @@ class LibraryPage(BasePage):
             self._batch_selected[key] = rec
         else:
             self._batch_selected.pop(key, None)
+        self._update_batch_actions()
+
+    def _update_batch_actions(self) -> None:
+        count = len(self._batch_selected)
+        self.batch_move_btn.setEnabled(bool(count))
+        self.batch_delete_btn.setEnabled(bool(count))
+        self.batch_count_label.setText(f"已选 {count} 项" if count else "")
 
     def _on_batch_mode_toggled(self, checked: bool) -> None:
         self.set_batch_mode(checked)
@@ -1006,6 +1204,7 @@ class LibraryPage(BasePage):
                 card.batch_box.setChecked(False)
             card.batch_box.blockSignals(False)
             card.set_batch_mode(enabled)
+        self._update_batch_actions()
 
     def _batch_move(self) -> None:
         from PySide6.QtWidgets import QInputDialog, QMessageBox
@@ -1022,6 +1221,7 @@ class LibraryPage(BasePage):
         for rec in items:
             self._shelf.favorite_move(rec.get("url", ""), target)
         self._batch_selected.clear()
+        self._update_batch_actions()
         self.refresh()
 
     def _batch_delete(self) -> None:
@@ -1039,20 +1239,28 @@ class LibraryPage(BasePage):
             except Exception:
                 failed += 1
         self._batch_selected.clear()
+        self._update_batch_actions()
         if failed:
             QMessageBox.warning(self, "批量删除", f"{failed} 项删除失败，请重试。")
         self.refresh()
 
     def _cached_badge(self, book_key: str) -> str:
+        if not book_key:
+            return ""
+        cached = self._badge_cache.get(book_key)
+        if cached is not None:
+            return cached
         repo = self._shelf_cache_repository
         getter = getattr(repo, "cached_chapter_count", None)
-        if getter is None or not book_key:
+        if getter is None:
             return ""
         try:
             count = getter(book_key)
         except Exception:
             return ""
-        return f"已缓存 {count} 章" if count else ""
+        text = f"已缓存 {count} 章" if count else ""
+        self._badge_cache[book_key] = text
+        return text
 
     def _set_precache_badge(self, book_key: str, done: int, total: int, done_state: bool = False) -> None:
         card = self._cards_by_key.get(book_key)
@@ -1064,7 +1272,9 @@ class LibraryPage(BasePage):
         if done_state:
             self._precache_jobs.pop(book_key, None)
             label.setText(f"已缓存 {done} 章")
+            self._badge_cache[book_key] = f"已缓存 {done} 章"
         else:
+            self._badge_cache.pop(book_key, None)
             label.setText(f"缓存中 {done}/{total}")
 
     def _precache_book(self, rec: dict) -> None:
@@ -1135,7 +1345,10 @@ class LibraryPage(BasePage):
         return {"rec": leader, "members": group}
 
     def _add_empty(self) -> None:
-        empty = QLabel("书架还空着，去发现里找点好东西吧\n（可搜索、可分类、本地书可直接离线阅读）")
+        empty = QLabel(
+            "书架还空着，去发现里找点好东西吧\n（可搜索、可分类、本地书可直接离线阅读）",
+            self.container,
+        )
         empty.setAlignment(Qt.AlignCenter)
         empty.setStyleSheet("color: palette(mid); font-size: 14px; padding: 60px;")
         self.body.addWidget(empty)
@@ -1143,6 +1356,14 @@ class LibraryPage(BasePage):
     def _on_folder_changed(self, name: str) -> None:
         if name and name != "全部" and not self.is_folder_unlocked(name):
             if not self._prompt_unlock(name):
+                if getattr(self, "_unlock_cancelled", False):
+                    # 用户取消密码输入：直接还原下拉，不再连环弹「管理员解锁 /
+                    # 设置密码 / 恢复码」，避免首次加载收藏夹时弹窗刷屏。
+                    self.folder_combo.blockSignals(True)
+                    previous = self.folder_combo.findText(self._previous_folder)
+                    self.folder_combo.setCurrentIndex(previous if previous >= 0 else 0)
+                    self.folder_combo.blockSignals(False)
+                    return
                 from PySide6.QtWidgets import QMessageBox
 
                 choice = QMessageBox.question(
@@ -1976,6 +2197,8 @@ class LibraryPage(BasePage):
         self._metadata_task = None
         self._metadata_snapshot = None
         self._metadata_enriched = False
+        self._badge_cache.clear()
+        self._cover_backfill_attempted.clear()
         self.cancel_precache_jobs()
         self._rebuild()
 

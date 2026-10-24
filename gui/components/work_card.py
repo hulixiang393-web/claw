@@ -105,7 +105,7 @@ class WorkCard(QFrame):
         cover_row = QHBoxLayout()
         cover_row.setSpacing(4)
 
-        cover = QLabel("🖼")
+        cover = QLabel("🖼", self)
         cover.setAlignment(Qt.AlignCenter)
         cover.setFixedHeight(COVER_HEIGHT)
         cover.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
@@ -115,7 +115,7 @@ class WorkCard(QFrame):
 
         self._checkbox = None
         if selectable:
-            self._checkbox = QCheckBox()
+            self._checkbox = QCheckBox(self)
             self._checkbox.setCursor(Qt.PointingHandCursor)
             self._checkbox.toggled.connect(self._on_check_toggled)
             # 放封面右上角，避免挡住封面
@@ -125,14 +125,14 @@ class WorkCard(QFrame):
         layout.addSpacing(COVER_TITLE_GAP)
 
         # 标题：固定单行省略；一行放不下时悬停卡片滑出完整标题（HoverTitle）
-        title = HoverTitle(work.title or "无标题", parent_card=self)
+        title = HoverTitle(work.title or "无标题", parent_card=self, parent=self)
         title.setFixedHeight(TITLE_HEIGHT)
         title.setStyleSheet("font-size: 13px; font-weight: bold; color: #000000;")
         layout.addWidget(title)
         self._title = title
 
         # 作者：一行省略；无作者不渲染空标签
-        self._author_label = QLabel(work.author or "")
+        self._author_label = QLabel(work.author or "", self)
         self._author_label.setStyleSheet("font-size: 11px; color: #000000;")
         if not work.author:
             self._author_label.hide()
@@ -142,14 +142,14 @@ class WorkCard(QFrame):
         layout.addStretch(1)
         self._source_label = None
         self._update_label = None
-        self._meta_label = QLabel("")
+        self._meta_label = QLabel("", self)
         self._meta_label.setStyleSheet("color: #000000; font-size: 10px;")
 
         source_name = work.source_name or ""
         update_text = work.update or ""
 
         if source_filterable and source_name:
-            self._source_label = QLabel(source_name)
+            self._source_label = QLabel(source_name, self)
             self._source_label.setStyleSheet(
                 "color: #000000; font-size: 10px;"
             )
@@ -158,7 +158,7 @@ class WorkCard(QFrame):
             self._source_label.installEventFilter(self)
             layout.addWidget(self._source_label)
             if update_text:
-                self._update_label = QLabel(f" · {update_text}")
+                self._update_label = QLabel(f" · {update_text}", self)
                 self._update_label.setStyleSheet("color: #000000; font-size: 10px;")
                 layout.addWidget(self._update_label)
         else:
@@ -314,7 +314,7 @@ class WorkCard(QFrame):
             if self._meta_label:
                 layout.removeWidget(self._meta_label)
                 self._meta_label.hide()
-            self._source_label = QLabel(source_name)
+            self._source_label = QLabel(source_name, self)
             self._source_label.setStyleSheet(
                 "color: #000000; font-size: 10px;"
             )
@@ -323,7 +323,7 @@ class WorkCard(QFrame):
             self._source_label.installEventFilter(self)
             layout.addWidget(self._source_label)
             if update_text:
-                self._update_label = QLabel(f" · {update_text}")
+                self._update_label = QLabel(f" · {update_text}", self)
                 self._update_label.setStyleSheet("color: #000000; font-size: 10px;")
                 layout.addWidget(self._update_label)
         elif not enabled:

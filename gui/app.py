@@ -1104,7 +1104,7 @@ class MainWindow(QMainWindow):
             # 仅当前进程复用，首次启动一定为空，不读取历史会话。
             session_cache=get_session_cache(),
             settings=self.settings,
-            shelf_folder_provider=self._available_shelf_folders,
+            shelf_folders_provider=self._available_shelf_folders,
         )
         page.read_requested.connect(self._open_reader)
         page.download_requested.connect(self._open_download_dialog)
@@ -1471,6 +1471,7 @@ class MainWindow(QMainWindow):
 
         class _CoverBackfillSignals(QObject):
             finished = Signal(object)  # 完成的任务对象（供主线程注销引用）
+            updated = Signal(str, str)  # (url, cover) 单条补写成功，供书架即刻刷新
 
         class _CoverBackfillTask(_AppRunnable):
             def __init__(self, content, source_manager, store, recs):
@@ -1513,7 +1514,10 @@ class MainWindow(QMainWindow):
                             )
                             if not cover or self._cover_invalid(cover, source):
                                 continue  # 仍然取不到有效封面 → 保持原样待下轮
-                            self._store.set_cover(r.get("url", ""), cover)
+                            if self._store.set_cover(r.get("url", ""), cover):
+                                self.emit_safe(
+                                    self.signals.updated, r.get("url", ""), cover
+                                )
                         except Exception:  # noqa: BLE001 —— 单条失败静默，继续补其它
                             continue
                 finally:
@@ -1523,9 +1527,17 @@ class MainWindow(QMainWindow):
         # 持有任务引用防 GC；完成后经信号在主线程移除，避免集合无界增长。
         task = _CoverBackfillTask(content, source_manager, store, recs)
         task.signals.finished.connect(self._on_cover_backfill_finished)
+        task.signals.updated.connect(self._on_favorite_cover_backfilled)
         self._cover_backfill_tasks = getattr(self, "_cover_backfill_tasks", None) or []
         self._cover_backfill_tasks.append(task)
         QThreadPool.globalInstance().start(task)
+
+    def _on_favorite_cover_backfilled(self, url: str, cover: str) -> None:
+        """补写封面成功 → 让书架卡片立即换上封面，无需重进书架。"""
+        page = getattr(self, "library_page", None)
+        updater = getattr(page, "update_cover", None)
+        if callable(updater):
+            updater(url, cover)
 
     def _on_cover_backfill_finished(self, task) -> None:
         """封面回填任务完成 → 注销其引用（主线程槽；防止集合无界增长）。"""
@@ -2207,8 +2219,17 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
 }}
 """
 
-    def _schedule_settings_refresh(self) -> None:
-        """合并设置应用后的 GUI 刷新，并在主线程下一轮读取最新设置。"""
+    def _schedule_settings_refresh(self, changed=None) -> None:
+        """合并设置应用后的 GUI 刷新，并且只刷新发生变化的设置对应的部分。
+
+        changed：设置页传来的「变化键集合」（"分区.键名"）。None 表示未知，
+        按全量刷新处理（向后兼容直接调用）。多次调用会合并变化键。
+        """
+        pending = getattr(self, "_pending_settings_changes", None)
+        if changed is None or pending is None:
+            self._pending_settings_changes = None if changed is None else set(changed)
+        else:
+            self._pending_settings_changes = set(pending) | set(changed)
         if getattr(self, "_settings_refresh_scheduled", False):
             return
         self._settings_refresh_scheduled = True
@@ -2217,30 +2238,55 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
 
         def _refresh():
             self._settings_refresh_scheduled = False
-            _sync_source_visibility(self.settings, self.source_manager, self.event_bus)
+            changed_keys = getattr(self, "_pending_settings_changes", None)
+            self._pending_settings_changes = None
 
-            from gui.components.cover_loader import CoverLoader
-            from framework.cache_service import get_shelf_cache
+            def _changed(*keys: str) -> bool:
+                # changed_keys=None → 未知/全量；空集合 → 没有任何项变化
+                if changed_keys is None:
+                    return True
+                return any(key in changed_keys for key in keys)
 
-            CoverLoader.instance().configure(
-                self.settings.get("ui", "cover_cache_size_mb", 256),
-                shelf_cache=get_shelf_cache(str(_app_base_dir() / "data" / "cache")),
-            )
-            self._apply_theme_qss(self.theme_manager.current_key())
-
-            font_scale = float(self.settings.get("ui", "font_scale", 1.0))
-            if hasattr(self, "reader") and self.reader is not None:
-                self.reader.apply_font_scale(font_scale)
-                self.reader.apply_reading_style(
-                    self.settings.get("ui", "reading_bg", "") or "",
-                    int(self.settings.get("ui", "reading_font_size", 0) or 0),
+            # 1) 成人源可见性
+            if _changed("content.show_adult_sources"):
+                _sync_source_visibility(
+                    self.settings, self.source_manager, self.event_bus
                 )
+
+            # 2) 封面缓存预算
+            if _changed("ui.cover_cache_size_mb"):
+                from gui.components.cover_loader import CoverLoader
+                from framework.cache_service import get_shelf_cache
+
+                CoverLoader.instance().configure(
+                    self.settings.get("ui", "cover_cache_size_mb", 256),
+                    shelf_cache=get_shelf_cache(
+                        str(_app_base_dir() / "data" / "cache")
+                    ),
+                )
+
+            # 3) 主题 / 背景图 / 透明度
+            if _changed("ui.theme", "ui.background_image", "ui.background_opacity"):
+                self._apply_theme_qss(self.theme_manager.current_key())
+
+            # 4) 阅读器字号 / 阅读区背景（只刷新对应项）
+            reader = getattr(self, "reader", None)
+            if reader is not None:
+                if _changed("ui.font_scale"):
+                    reader.apply_font_scale(
+                        float(self.settings.get("ui", "font_scale", 1.0))
+                    )
+                if _changed("ui.reading_bg", "ui.reading_font_size"):
+                    reader.apply_reading_style(
+                        self.settings.get("ui", "reading_bg", "") or "",
+                        int(self.settings.get("ui", "reading_font_size", 0) or 0),
+                    )
 
         QTimer.singleShot(0, _refresh)
 
-    def _on_settings_applied(self) -> None:
-        """设置页点「应用」→ 合并并延后主题、可见性、缓存和字体刷新。"""
-        self._schedule_settings_refresh()
+    def _on_settings_applied(self, changed=None) -> None:
+        """设置页点「应用」→ 只刷新本次实际修改的设置项。"""
+        self._schedule_settings_refresh(changed)
 
     # ------------------------------------------------------------------ #
     def _install_shortcuts(self) -> None:
@@ -2311,6 +2357,22 @@ def main() -> int:
     # 日志初始化（诊断区 verbose_logging / log_dir）
     base_dir = _app_base_dir()
     setup_logging(SettingsManager(base_dir / "app_config.json"))
+
+    def _log_uncaught(exc_type, exc, tb) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        log.error("未捕获异常（UI 线程）", exc_info=(exc_type, exc, tb))
+
+    def _log_thread_uncaught(args) -> None:
+        thread_name = getattr(getattr(args, "thread", None), "name", "?")
+        log.error(
+            "未捕获异常（线程 %s）", thread_name,
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _log_uncaught
+    threading.excepthook = _log_thread_uncaught
 
     app = QApplication(sys.argv)
     win = MainWindow()
