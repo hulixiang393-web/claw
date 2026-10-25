@@ -70,6 +70,13 @@ class Chapter:
     # 由 content.<type>.list.fields.cover 提取，空则章节界面回退作品封面
     cover: str = ""
     depth: int = 0
+    # 线路切换（api_endpoints.detail.chapters.related_episodes 并入的「同作品
+    # 其它线路」分集专用）：line_name 是线路显示名，line_switch_url 是切到该
+    # 线路的详情 URL，line_switch_source 是线路标识（provider 同值）。普通源的
+    # 分集三项均为空，换源仍走 source_switch / detail_url 的既有链路。
+    line_name: str = ""
+    line_switch_url: str = ""
+    line_switch_source: str = ""
 
 
 @dataclass
@@ -96,6 +103,10 @@ class Detail:
     chapters: List[Chapter] = field(default_factory=list)
     # 播放源列表（换源站）：[{sid, name, from_, ps, parse}]；无换源配置时为空
     source_list: List[dict] = field(default_factory=list)
+    # 该详情还能从详情接口拉「同作品其它线路」，但**尚未拉取**（延迟加载标记）。
+    # 由 Content._mark_line_menu 置位，播放界面据此在后台补线路菜单——详情主
+    # 链路不为换线路多花 ~3s 网络往返（实测 ikanpp 4.5s → 1.2s）。
+    line_menu_available: bool = False
     # 图文集（video 详情页内嵌截图序列等，如 xasiat 的 fancybox screenshots）；
     # 由 detail.fields.gallery 多值选择器提取，详情抽屉以缩略图形式展示
     gallery: List[str] = field(default_factory=list)

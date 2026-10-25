@@ -135,7 +135,28 @@
         "items": "episodes",
         "title": "name",
         "number": "index",
-        "url_template": "{url}"
+        "url_template": "{url}",
+        "related_episodes": {
+          "enabled": true,
+          "url": "/api/detail",
+          "id_path": "vod_id",
+          "source_path": "source",
+          "line_sources": ["guangsu", "jisu", "baofeng"],
+          "max_lines": 2,
+          "items": "episodes",
+          "title": "name",
+          "url_key": "url",
+          "item_fields": { "play_id": "vod_id" },
+          "resolve_url": "/title/{play_id}",
+          "provider_catalog": {
+            "juliang": "巨量资源",
+            "guangsu": "光速资源",
+            "baofeng": "暴风资源",
+            "jisu": "极速资源",
+            "wujin": "无尽资源",
+            "zuida": "最大资源"
+          }
+        }
       }
     }
   },
@@ -164,7 +185,15 @@
     "enabled": true,
     "block_url_regex": [
       "/video/adjump(?:/|$)"
-    ]
+    ],
+    "hls_rules": {
+      "drop_short_blocks": {
+        "enabled": true,
+        "max_duration": 30,
+        "max_ratio": 0.05,
+        "require_boundary": true
+      }
+    }
   },
   "constraints": {
     "search": {

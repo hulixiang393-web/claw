@@ -109,7 +109,15 @@
   },
   "media": {
     "format": "hls",
-    "select": {"video": {"quality": "best"}}
+    "select": {"video": {"quality": "best"}},
+    "hls": {
+      "network_caching_ms": 15000,
+      "prefetch": {
+        "enabled": true,
+        "depth": 10,
+        "workers": 4
+      }
+    }
   },
   "ad_block": {
     "enabled": false

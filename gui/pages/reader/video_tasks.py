@@ -205,6 +205,45 @@ class _ProbeSourcesTask(QRunnable):
             pass
 
 
+class _LineMenuSignals(QObject):
+    # (detail, chapters, gen)：chapters 是其它线路的分集（空=没取到）
+    finished = Signal(object, object, object)
+
+
+class _FetchLineMenuTask(QRunnable):
+    """后台补「同作品其它线路」菜单（延迟加载，不阻塞详情）。
+
+    换线路需要其它采集源按标题检索 + 各自请求详情，实测约 3s。放在详情主链路
+    里会把打开视频从 1.2s 拖到 4.5s，而多数用户并不换线路，因此改为详情加载完
+    之后再后台补。失败/空结果都只是「没有线路菜单」，不影响播放。
+    """
+
+    def __init__(self, content, source, detail, generation):
+        super().__init__()
+        self.signals = _LineMenuSignals()
+        self._content = content
+        self._source = source
+        self._detail = detail
+        self._generation = generation
+
+    def run(self) -> None:
+        fetch = getattr(self._content, "fetch_line_menu", None)
+        chapters = []
+        if callable(fetch):
+            try:
+                chapters = fetch(
+                    self._source,
+                    getattr(self._detail, "url", "") or "",
+                    getattr(self._detail, "title", "") or "",
+                ) or []
+            except Exception:  # noqa: BLE001 —— 线路只是可选增强，静默降级
+                chapters = []
+        try:
+            self.signals.finished.emit(self._detail, chapters, self._generation)
+        except RuntimeError:
+            pass
+
+
 class _CastSignals(QObject):
     # 第二参是产生该信号的 _CastPollTask：停投+再投后旧任务的迟到信号在
     # 槽内按身份比对丢弃（F5-1）。失败原因放**首参**，1 参的旁路槽

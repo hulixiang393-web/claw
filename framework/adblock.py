@@ -684,6 +684,96 @@ class AdblockEngine:
                 if valid:
                     ad_set.update(first_ids)
 
+        # ---- R5c：源声明的「短块」规则（中插/片尾广告） ----
+        # 依据真实清单定标（ikanpp / json1080 源，2026-10 实测）：
+        #   block0 124片 497.7s 正片 | block1 4片 16.47s 广告
+        #   block2 325片 1299.0s 正片 | block3 5片 17.67s 广告
+        #   block4 244片 973.2s 正片 | block5 4片 16.47s 广告(片尾)
+        # 关键事实：广告块与正片**同主机、同目录**，URL 不含广告词，唯一的
+        # 结构差异是「被 DISCONTINUITY 夹住的极短块」。因此不能靠主机切换或
+        # URL 特征识别（旧 drop_inserted_blocks 要求主机切换 → 一条都命中不了，
+        # 这就是「广告没去掉」的直接原因）。
+        #
+        # 判定（全部条件须同时成立）：
+        #   a) 块由 DISCONTINUITY 分隔，且存在 >=2 个明显更长的正片块；
+        #   b) 块时长 <= max_duration 且 <= max_ratio × 总时长（相对约束防止
+        #      把短视频整条判成广告）；
+        #   c) 内部块直接命中；
+        #   d) 首/尾块（片头/片尾广告）额外要求「时长序列签名」与已判定为广告
+        #      的内部块一致——同一广告素材被重复插入时签名相同（实测 block1 与
+        #      block5 均为 [6.63,3.33,4.8,1.7]），这样才不会把正常的片尾内容
+        #      当成广告删掉。
+        short_rule = (self._hls_rules or {}).get("drop_short_blocks")
+        if (
+            isinstance(short_rule, dict)
+            and short_rule.get("enabled", True)
+            and len(blocks) >= 3
+        ):
+            try:
+                short_max_dur = float(short_rule.get("max_duration", 30.0))
+            except (TypeError, ValueError):
+                short_max_dur = 30.0
+            try:
+                short_max_ratio = float(short_rule.get("max_ratio", 0.05))
+            except (TypeError, ValueError):
+                short_max_ratio = 0.05
+            require_boundary = bool(short_rule.get("require_boundary", True))
+
+            def _has_boundary(_bi: int, _b: dict) -> bool:
+                """块与相邻正片之间是否有 DISCONTINUITY 隔开。
+
+                `independent` 表示块**前面**有边界（首块则是清单开头就有 DISCONTINUITY），
+                `boundary_after` 表示块**后面**有边界。片尾块后面只有 ENDLIST，
+                只有前边界；片头块只有后边界；中间块两侧都有。三段判定要按边界
+                的实际存在性来要求，不能一律要求两侧——否则片尾广告永远删不掉。
+                """
+                before = bool(_b["independent"])
+                after = bool(_b.get("boundary_after"))
+                if _bi == 0:
+                    return after
+                if _bi == len(blocks) - 1:
+                    return before
+                return before and after
+
+            def _is_short_candidate(_bi: int, _b: dict) -> bool:
+                if not _b["seg"]:
+                    return False
+                if short_max_dur > 0 and _b["dur"] > short_max_dur:
+                    return False
+                if (
+                    short_max_ratio > 0
+                    and total_dur > 0
+                    and _b["dur"] > short_max_ratio * total_dur
+                ):
+                    return False
+                if require_boundary and not _has_boundary(_bi, _b):
+                    return False
+                return True
+
+            def _signature(_b: dict) -> tuple:
+                return tuple(round(d, 2) for d in _b["durs"])
+
+            # 正片块必须存在且足够多：全是短块的清单（短视频/预告）不能动
+            long_blocks = [b for b in blocks if b["dur"] >= short_max_dur]
+            if len(long_blocks) >= 2:
+                interior = [
+                    bi for bi, _b in enumerate(blocks)
+                    if 0 < bi < len(blocks) - 1 and _is_short_candidate(bi, _b)
+                ]
+                ad_signatures = {_signature(blocks[bi]) for bi in interior}
+                ad_blocks = set(interior)
+                # 首/尾块：只有与已知广告素材签名一致才删
+                for bi in (0, len(blocks) - 1):
+                    if bi < 0 or bi in ad_blocks:
+                        continue
+                    _b = blocks[bi]
+                    if not _is_short_candidate(bi, _b):
+                        continue
+                    if ad_signatures and _signature(_b) in ad_signatures:
+                        ad_blocks.add(bi)
+                for bi in ad_blocks:
+                    ad_set.update(blocks[bi]["seg"])
+
         # ---- R6：中插离群块（内部块 + 块时长远小于中位数 + 均匀/超短） ----
         block_durs = sorted(_b["dur"] for _b in blocks if _b["seg"])
         if block_durs:
@@ -743,24 +833,25 @@ class AdblockEngine:
                         or out[-1].startswith("#EXT-X-BYTERANGE")
                     ):
                         out.pop()
-                    # 跳过本段及后续紧邻的 DISCONTINUITY
+                    # 跳过本段及后续紧邻的 DISCONTINUITY（本例保留还是丢弃由下方
+                    # has_future_kept 决定：中插保留前边界，片尾回收前边界）
                     i += 1
-                    skipped_boundary = False
                     while i < n and lines[i].startswith("#EXT-X-DISCONTINUITY"):
-                        skipped_boundary = True
                         i += 1
                     # 中插广告前后的两个边界合并为一个；片头和片尾不保留
                     # 孤立边界。这样既避免 PTS 连续性破坏，也不制造空块。
-                    has_previous_kept = any(j not in ad_set for j in range(seg_idx))
                     has_future_kept = any(
                         j not in ad_set for j in range(seg_idx + 1, len(seg_infos))
                     )
-                    if skipped_boundary and has_previous_kept and has_future_kept:
-                        # 前面的 DISCONTINUITY 已经在 out 中，保留它作为合并后的边界。
-                        pass
-                    elif skipped_boundary and not has_future_kept:
+                    if not has_future_kept:
+                        # 后面没有正片了（片尾广告块）：块**前**的边界也必须
+                        # 回收。否则结尾会留下 `#EXT-X-DISCONTINUITY` 紧跟
+                        # `#EXT-X-ENDLIST` 的孤立边界——播放器会等一个永远不来的
+                        # 新时间轴，表现为结尾卡住或显示异常。
                         while out and out[-1].startswith("#EXT-X-DISCONTINUITY"):
                             out.pop()
+                    # 其余情况（中插）：前面的 DISCONTINUITY 已写入 out，
+                    # 保留它作为合并后的 PTS 边界。
                     continue
             out.append(line)
             i += 1

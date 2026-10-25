@@ -98,12 +98,15 @@ class TranscodeSession:
             log_file = log_path.open("w", encoding="utf-8")
             process = None
             try:
+                from .subprocess_no_window import no_window_kwargs
+
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=log_file,
                     cwd=str(directory),
+                    **no_window_kwargs(),  # Windows 静默，不弹控制台窗口
                 )
             except Exception as exc:
                 log_file.close()

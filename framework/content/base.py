@@ -457,6 +457,8 @@ class ContentBase:
 
     def _attach_search_provider_sources(self, source: SourceConfig, detail: Detail) -> None:
         if detail.source_list or source.content_type != "video":
+            # 已有多线路（搜索分组聚合出的其它采集源）：播放界面线路菜单就按它，
+            # 不再叠加详情接口并入的线路，避免同一作品出现两份互不相干的线路列表。
             return
         search_cfg = ((source.raw.get("api_endpoints") or {}).get("search") or {})
         if not (search_cfg.get("group") or {}).get("enabled"):
@@ -487,6 +489,17 @@ class ContentBase:
             if item.get("provider") and item.get("url")
         ]
 
+    def _prepare_video_source_list(self, source: SourceConfig, detail: Detail) -> None:
+        """视频详情的线路列表：搜索分组优先，否则用详情接口并入的同作品线路。
+
+        两条路都产出 `detail.source_list`，播放界面只认这一份（source_id/name/
+        detail_url），换线路走 `switch_source_url`。
+        """
+        self._attach_search_provider_sources(source, detail)
+        attach_lines = getattr(self, "_attach_line_sources", None)
+        if attach_lines is not None and not detail.source_list:
+            attach_lines(source, detail)
+
     def fetch_detail(self, source: SourceConfig, url: str, deadline=None, context=None) -> Detail:
         """抓取详情页：元数据 + 章节列表。
 
@@ -500,7 +513,7 @@ class ContentBase:
         if cached is not None and not any(
             self._looks_like_direct_media(ch.url) for ch in (cached.chapters or [])
         ):
-            self._attach_search_provider_sources(source, cached)
+            self._prepare_video_source_list(source, cached)
             return cached
 
         api = source.raw.get("api_endpoints") or {}
@@ -511,7 +524,7 @@ class ContentBase:
             else:
                 detail = self._fetch_detail_api(source, url, detail_api, context=context)
             self._check_stream_context(context, deadline)
-            self._attach_search_provider_sources(source, detail)
+            self._prepare_video_source_list(source, detail)
             self._cache_set_detail(cache_key, detail)
             return detail
 
@@ -662,6 +675,8 @@ class ContentBase:
 
         # 播放源列表（换源站）：解析 source_switch 配置的可用源
         detail.source_list = self._parse_source_list(source, html, context=context)
+        if not detail.source_list:
+            self._prepare_video_source_list(source, detail)
 
         self._cache_set_detail(cache_key, detail)
         return detail

@@ -123,7 +123,19 @@
       }
     }
   },
-  "media": {"format": "hls", "select": {"video": {"quality": "best"}}, "hls": {"workers": 4}},
+  "media": {
+    "format": "hls",
+    "select": {"video": {"quality": "best"}},
+    "hls": {
+      "workers": 4,
+      "network_caching_ms": 12000,
+      "prefetch": {
+        "enabled": true,
+        "depth": 8,
+        "workers": 3
+      }
+    }
+  },
   "stream_resolver": {
     "candidate_timeout": 60,
     "total_budget": 90

@@ -153,6 +153,102 @@ def test_prefetched_link_is_reused_for_non_ytdlp(_qapp, monkeypatch):
     assert view._prefetch_cache == {}
 
 
+def test_prefetch_cache_survives_four_minute_window(_qapp, monkeypatch):
+    """预取结果必须在 4 分钟窗口内仍可命中（旧实现只缓存 30s，等于无效）。"""
+    import time
+
+    view = _view(3)
+    view._current_idx = 0
+    ep = view._episodes[1]
+    key = view._stream_cache_key(ep.url, view._quality)
+    monkeypatch.setattr(view, "_warm_next_episode", lambda *a: None)
+
+    view._on_prefetch_done(ep.url, "https://cdn/next.mp4", "", None,
+                           view._quality, gen=0)
+
+    stored = view._prefetch_cache[key]
+    assert stored[0] - time.monotonic() >= view.PREFETCH_BEFORE_END_S
+    # 模拟预取后已经过了 3 分钟（剩余 60s）：仍必须命中
+    view._prefetch_cache[key] = (time.monotonic() + 60.0,
+                                 "https://cdn/next.mp4", "")
+    assert view._prefetch_cache_get(key) == ("https://cdn/next.mp4", "")
+
+
+def test_prefetch_cache_uses_signed_url_expiry(_qapp, monkeypatch):
+    """带时效签名的链接按 expire 计算 TTL；无过期信息则不缓存。"""
+    import time
+
+    view = _view(3)
+    view._current_idx = 0
+    ep = view._episodes[1]
+    key = view._stream_cache_key(ep.url, view._quality)
+    monkeypatch.setattr(view, "_warm_next_episode", lambda *a: None)
+
+    future = int(time.time()) + 300
+    signed = f"https://cdn/next.mp4?token=abc&expire={future}"
+    view._on_prefetch_done(ep.url, signed, "", None, view._quality, gen=0)
+    assert key in view._prefetch_cache
+    assert view._prefetch_cache_get(key) == (signed, "")
+
+    view._prefetch_cache.clear()
+    view._on_prefetch_done(
+        ep.url, "https://cdn/next.mp4?token=abc", "", None, view._quality, gen=0
+    )
+    assert key not in view._prefetch_cache
+
+
+def test_prefetch_completion_warms_series_memo_when_ttl_covers_window(_qapp, monkeypatch):
+    """预取完成要预热媒体代理 memo；签名链接覆盖不了窗口时不能预热。"""
+    import time
+
+    view = _view(3)
+    view._current_idx = 0
+    view._series_key = "series-key"
+    ep = view._episodes[1]
+    warmed: list = []
+    monkeypatch.setattr(view, "_warm_next_episode", lambda *a: warmed.append(a))
+
+    view._on_prefetch_done(ep.url, "https://cdn/next.mp4", "", None,
+                           view._quality, gen=0)
+    assert len(warmed) == 1
+
+    warmed.clear()
+    future = int(time.time()) + 60  # 60s 后过期 < 4 分钟窗口
+    short_signed = f"https://cdn/next.mp4?expire={future}"
+    view._on_prefetch_done(ep.url, short_signed, "", None, view._quality, gen=0)
+    assert warmed == []
+
+
+def test_prefetch_failure_schedules_retry(_qapp, monkeypatch):
+    """一次取流失败不能永久锁死预取，冷却后允许重试。"""
+    from gui.pages.reader import video_view as module
+
+    view = _view(3)
+    view._current_idx = 0
+    ep = view._episodes[1]
+    key = view._stream_cache_key(ep.url, view._quality)
+
+    view._on_prefetch_done(ep.url, "", "", "boom", view._quality, gen=0)
+    assert key in view._prefetch_retry_at
+    # 真实流程里 _prefetch_episode 会先把 key 记入 attempted；
+    # 失败后仍保留该标记，只靠 retry_at 冷却控制重试。
+    view._prefetch_attempted.add(key)
+
+    started = []
+    monkeypatch.setattr(
+        module.QThreadPool, "globalInstance",
+        lambda: SimpleNamespace(start=started.append),
+    )
+    # 冷却期内不再发起
+    view._prefetch_episode(1)
+    assert started == []
+
+    # 冷却结束 → 允许重试
+    view._prefetch_retry_at[key] = 0.0
+    view._prefetch_episode(1)
+    assert len(started) == 1
+
+
 def test_prefetched_link_ignored_for_ytdlp(_qapp, monkeypatch):
     from gui.pages.reader import video_view as module
 

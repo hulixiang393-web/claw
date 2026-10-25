@@ -317,7 +317,389 @@ class DetailMixin:
                     ]
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] API 目录抓取失败：%s", source.source_id, exc)
+        self._mark_line_menu(source, detail, cfg, url, data)
         return detail
+
+    # ------------------------------------------------------------------ #
+    # API 详情：同作品其它线路（related_episodes）
+    # ------------------------------------------------------------------ #
+    def _mark_line_menu(self, source, detail: Detail, cfg: dict,
+                        url: str, data) -> None:
+        """只标记「可换线路」，**不发任何请求**。
+
+        换线路要在其它采集源里按标题检索、再各请求一次详情（实测 ikanpp
+        第一集约 3.3s）。这段放在详情主链路里会把打开详情从 1.2s 拖到 4.5s，
+        而绝大多数用户根本不换线路。因此这里只置标志位，真正取线路菜单由
+        `fetch_line_menu()` 在后台按需触发（播放界面加载完再把线路菜单补上）。
+        """
+        rel = (cfg.get("chapters") or {}).get("related_episodes") or {}
+        if not rel.get("enabled"):
+            return
+        if self._has_group_menu(source, url):
+            # 搜索分组已经给出「其它采集源」线路菜单 → 不需要再拉同作品线路
+            return
+        if not str(self._jsonpath(data, rel.get("title_path") or "vod_name") or ""):
+            return  # 没有标题就无法按标题检索线路，直接放弃
+        detail.line_menu_available = True
+
+    def fetch_line_menu(self, source, url: str, title: str = "",
+                        current_source: str = "") -> list:
+        """取同作品其它线路的分集（供播放界面按需补线路菜单）。
+
+        只在 `detail.line_menu_available` 为真时调用；不改变当前详情、不阻塞
+        详情加载。返回的 Chapter 带 line_switch_url / line_name / provider。
+        任何异常都返回空列表——线路是锦上添花，不能影响正常播放。
+        """
+        from urllib.parse import parse_qs, urlsplit
+
+        cfg = source.raw.get("api_endpoints", {}).get("detail", {})
+        cfg = cfg if isinstance(cfg, dict) else {}
+        rel = {}
+        detail_api = (source.raw.get("api_endpoints") or {}).get("detail") or {}
+        chapters_api = detail_api.get("chapters") or {}
+        rel = chapters_api.get("related_episodes") or {}
+        if not rel.get("enabled"):
+            return []
+        if self._has_group_menu(source, url):
+            return []
+        if not title:
+            title = (parse_qs(urlsplit(url).query).get("title") or [""])[0]
+        if not title:
+            return []
+        if not current_source:
+            current_source = (
+                parse_qs(urlsplit(url).query).get("source") or [""]
+            )[0]
+        try:
+            return self._line_chapters(source, rel, url, title, current_source)
+        except Exception as exc:  # noqa: BLE001 —— 线路失败不影响主流程
+            log.info("[%s] 线路菜单获取失败：%s", source.source_id, type(exc).__name__)
+            return []
+
+    def _fetch_related_api_episodes(self, source, detail: Detail, cfg: dict,
+                                    url: str, data) -> list:
+        """旧入口（保留兼容）：把其它线路的分集并入当前集列表。
+
+        详情主链路已改为只标记（见 `_mark_line_menu`），这里仅保留给显式需要
+        同步合并的调用方；正常播放界面走 `fetch_line_menu` + 后台任务。
+        """
+        chapters = list(detail.chapters or [])
+        rel = (cfg.get("chapters") or {}).get("related_episodes") or {}
+        if not rel.get("enabled") or self._has_group_menu(source, url):
+            return chapters
+        try:
+            return self._merge_related_api_episodes(source, chapters, rel, url, data)
+        except Exception as exc:  # noqa: BLE001 —— 多线路失败不影响详情主体
+            log.info("[%s] 相关线路获取失败：%s", source.source_id, type(exc).__name__)
+            return chapters
+
+    @staticmethod
+    def _has_group_menu(source, url: str) -> bool:
+        """本作品是否已有搜索分组线路菜单（有则不重复拉同作品其它线路）。"""
+        search_cfg = (source.raw.get("api_endpoints") or {}).get("search") or {}
+        if not (search_cfg.get("group") or {}).get("enabled"):
+            return False
+        try:
+            from urllib.parse import parse_qs, urlsplit
+
+            from ..search_groups import lookup_group
+
+            title = (parse_qs(urlsplit(url).query).get("title") or [""])[0]
+            return len(lookup_group(source.source_id, title, url)) >= 2
+        except Exception:  # noqa: BLE001 —— 分组只是优化，查不到就按无分组处理
+            return False
+
+    def _merge_related_api_episodes(self, source, chapters: list, rel: dict,
+                                    url: str, data) -> list:
+        api_url = str(rel.get("url") or "")
+        if not api_url:
+            return chapters
+        cur_source = str(
+            self._jsonpath(data, rel.get("source_path") or "source") or ""
+        )
+        if not cur_source and chapters:
+            cur_source = str(getattr(chapters[0], "provider", "") or "")
+        # 检索用标题：必须是**当前作品**的标题，不能为空，否则会命中无关作品
+        title = str(
+            self._jsonpath(data, rel.get("title_path") or "vod_name") or ""
+        )
+        if not title:
+            return chapters
+
+        merged = list(chapters)
+        # 当前集标记自身线路来源：换线路后玩家要能看出当前在播哪条线。
+        # **就地改 `chapters` 里的对象**（merged 是同一批引用），否则详情缓存
+        # 里存下的会是「provider 为空」的版本，换线路回来时当前线路在菜单里消失了。
+        for ch in merged:
+            if not getattr(ch, "provider", ""):
+                ch.provider = cur_source
+        merged.extend(
+            self._line_chapters(source, rel, url, title, cur_source,
+                                existing=merged, data=data)
+        )
+        return merged
+
+    def _line_chapters(self, source, rel: dict, url: str, title: str,
+                       cur_source: str, existing=None, data=None) -> list:
+        """取「同作品其它线路」的分集（**只返回其它线路的集**）。
+
+        与当前线路的集完全分离：调用方既可以并入分集列表，也可以只用来构建
+        播放界面的线路菜单。`existing` 用于去重（标题+URL），`data` 仅在需要
+        回退标题时使用。
+        """
+        api_url = str(rel.get("url") or "")
+        if not api_url or not title:
+            return []
+        max_lines = max(1, int(rel.get("max_lines") or 2))
+        skip = {str(v) for v in (rel.get("skip_sources") or []) if v}
+        if cur_source:
+            skip.add(cur_source)
+        catalog = rel.get("provider_catalog") or {}
+        fields_cfg = rel.get("item_fields") or {}
+        id_key = fields_cfg.get("play_id") or "vod_id"
+        seen = {(ch.title or "", ch.url or "") for ch in (existing or [])}
+        out: list = []
+
+        for line_source in self._related_line_sources(rel, skip, max_lines):
+            # ★ 关键：不能用当前线路的 id 去请求别的线路。
+            #   实测 ikanpp /api/detail：json1080 的 vod_id(31027) + source=jisu
+            #   会**静默返回另一部作品**（「窒息的阳光」，单集），且 success=True，
+            #   调用方无法从响应判断对错——换过去就是随便一部片子，还带着广告。
+            #   必须在该线路自己的搜索接口里按标题查到它自己的 vod_id。
+            line_vid = self._resolve_line_vod_id(source, rel, title, line_source)
+            if not line_vid:
+                log.info("[%s] 相关线路 %s 未检索到该作品，跳过",
+                         source.source_id, line_source)
+                continue
+            query = {"id": line_vid, "source": line_source, "title": title}
+            line_data = self._fetch_line_detail(source, api_url, query, rel)
+            if not isinstance(line_data, dict):
+                continue
+            # 二次校验：返回作品必须与当前作品同名（允许「国语版」这类后缀差异），
+            # 否则宁可不并这条线，也不能把无关作品混进分集列表。
+            got_name = str(self._jsonpath(line_data, rel.get("title_path") or "vod_name") or "")
+            if not self._titles_related(title, got_name):
+                log.info("[%s] 相关线路 %s 返回《%s》，与《%s》不匹配，跳过",
+                         source.source_id, line_source, got_name[:20], title[:20])
+                continue
+            items = self._jsonpath(line_data, (rel.get("items") or "episodes"))
+            if not isinstance(items, list) or not items:
+                continue
+            line_id = str(self._jsonpath(line_data, id_key) or line_vid)
+            line_name = str(catalog.get(line_source) or line_source)
+            target_url = self._related_line_url(
+                rel, url, line_id, line_source, data if data is not None else {}
+            )
+            added = 0
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                c_title = str(it.get(rel.get("title") or "name") or "")
+                c_url = str(it.get(rel.get("url_key") or "url") or "")
+                if not c_url or (c_title, c_url) in seen:
+                    continue
+                seen.add((c_title, c_url))
+                chapter = Chapter(title=c_title, url=c_url, provider=line_source)
+                chapter.line_name = line_name
+                chapter.line_switch_url = target_url
+                chapter.line_switch_source = line_source
+                out.append(chapter)
+                added += 1
+            if added:
+                log.info("[%s] 相关线路 %s 并入 %d 集",
+                         source.source_id, line_source, added)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 跨线路定位作品：必须用目标线路自己的 id
+    # ------------------------------------------------------------------ #
+    def _resolve_line_vod_id(self, source, rel: dict, title: str,
+                             line_source: str) -> str:
+        """在目标线路自己的搜索接口里按标题查该作品的 vod_id。
+
+        结果按 (源, 线路, 标题) 缓存，避免每次打开详情都重新搜索。
+        找不到/失败返回 ""（调用方跳过该线路，绝不回退到别的线路 id）。
+        """
+        cache_key = (getattr(source, "source_id", ""), line_source, title)
+        cache = getattr(self, "_line_vod_id_cache", None)
+        if cache is None:
+            cache = self._line_vod_id_cache = {}
+        if cache_key in cache:
+            return cache[cache_key]
+        vid = ""
+        try:
+            vid = self._search_line_vod_id(source, title, line_source)
+        except Exception as exc:  # noqa: BLE001 —— 单条线路搜索失败只跳过该线路
+            log.info("[%s] 线路 %s 搜索失败：%s", source.source_id,
+                     line_source, type(exc).__name__)
+        cache[cache_key] = vid
+        # 缓存有界：只留最近 256 条（详情多开时不无界增长）
+        while len(cache) > 256:
+            cache.pop(next(iter(cache)))
+        return vid
+
+    def _search_line_vod_id(self, source, title: str, line_source: str) -> str:
+        """调聚合站搜索接口（只带目标线路一个源），返回匹配作品的 vod_id。"""
+        from urllib.parse import urljoin
+
+        search_cfg = (source.raw.get("api_endpoints") or {}).get("search") or {}
+        search_url = str(search_cfg.get("url") or "")
+        template = search_cfg.get("body") or {}
+        if not search_url or not template:
+            return ""
+        entries = [
+            dict(item) for item in (template.get("sources") or [])
+            if isinstance(item, dict) and str(item.get("id")) == line_source
+        ]
+        if not entries:
+            return ""
+        body = dict(template)
+        body["query"] = title
+        body["sources"] = entries
+        body["page"] = "1"
+        charset = (source.transports() or {}).get("charset") or "utf-8"
+        text = self._http.post_text(
+            urljoin(source.base_url, search_url),
+            json_body=body,
+            headers=self._endpoint_headers(source, search_cfg),
+            timeout=self._timeout(source),
+            retries=max(0, self._retries(source) - 1),
+            proxy_pool=source.proxy_pool(),
+            encoding=charset,
+        )
+        for event in self._parse_sse_events(text):
+            videos = event.get("videos")
+            if not isinstance(videos, list):
+                continue
+            for video in videos:
+                if not isinstance(video, dict):
+                    continue
+                name = str(video.get("vod_name") or "")
+                vid = str(video.get("vod_id") or "")
+                if not vid or not self._titles_related(title, name):
+                    continue
+                return vid
+        return ""
+
+    @staticmethod
+    def _parse_sse_events(text: str) -> list:
+        """宽松解析 SSE 文本为事件对象列表。
+
+        ikanpp 的超大 videos 事件会被服务器拆成多物理行：只有首行带 `data:`
+        前缀，续行是裸 JSON 片段（可能在多字节字符中间被截断）。因此按**空行**
+        切事件，事件内所有行拼接后再解析，而不是逐行解析。
+        """
+        events = []
+        for block in _re.split(r"\n\s*\n", text or ""):
+            chunk = []
+            for line in block.splitlines():
+                if line.startswith("data:"):
+                    chunk.append(line[5:].lstrip())
+                elif chunk:
+                    chunk.append(line)
+            payload = "".join(chunk).strip()
+            if not payload:
+                continue
+            try:
+                parsed = json.loads(payload)
+            except Exception:  # noqa: BLE001 —— 残缺事件直接丢弃
+                continue
+            if isinstance(parsed, dict):
+                events.append(parsed)
+        return events
+
+    @staticmethod
+    def _titles_related(a: str, b: str) -> bool:
+        """标题是否指向同一作品（容忍「国语版/粤语版」等后缀差异）。"""
+        from ..search_groups import normalize_title
+
+        na, nb = normalize_title(a), normalize_title(b)
+        if not na or not nb:
+            return False
+        if na == nb:
+            return True
+        short, long = (na, nb) if len(na) <= len(nb) else (nb, na)
+        # 短标题太短时不做包含判断（「我和僵尸」这类会产生大量误配）
+        return len(short) >= 4 and short in long
+
+
+    def _related_line_sources(self, rel: dict, skip: set, max_lines: int) -> list:
+        """可选线路标识（按 provider_catalog 或线路候选列表顺序，去掉当前/跳过项）。"""
+        candidates = [str(v) for v in (rel.get("line_sources") or []) if v]
+        if not candidates:
+            candidates = [str(k) for k in (rel.get("provider_catalog") or {})]
+        out = []
+        for cand in candidates:
+            # 先去重/去跳过再计数：跳过项不能占用 max_lines 名额
+            if not cand or cand in skip or cand in out:
+                continue
+            out.append(cand)
+            if len(out) >= max_lines:
+                break
+        return out
+
+    def _fetch_line_detail(self, source, api_url: str, body: dict, rel: dict):
+        """按线路请求一次详情接口，返回 data 节点（失败返回 None）。"""
+        from urllib.parse import urljoin
+
+        try:
+            resp = self._http.post_json(
+                urljoin(source.base_url, api_url),
+                json_body=body,
+                headers=self._endpoint_headers(source, rel),
+                timeout=self._timeout(source),
+                retries=max(0, int(rel.get("retries") or 0)),
+                proxy_pool=source.proxy_pool(),
+            )
+        except Exception as exc:  # noqa: BLE001 —— 单条线路失败只跳过该线路
+            log.info("[%s] 线路详情失败（%s）：%s",
+                     source.source_id, body.get("source"), type(exc).__name__)
+            return None
+        if not isinstance(resp, dict):
+            return None
+        return resp.get("data") if isinstance(resp.get("data"), dict) else resp
+
+    def _related_line_url(self, rel: dict, url: str, line_id: str,
+                          line_source: str, data) -> str:
+        """构造线路切换 URL（替换当前详情 URL 的 id/source，保留 title 等参数）。
+
+        直接拼接而不是 urlencode：站点内 URL 的 title 参数要求**原样中文**
+        （与 detail_url 模板产出的形态一致），编码后的窗口里服务端匹配逻辑
+        与源站模板并不完全等价，改用原样可省掉这一层不确定性。
+        """
+        from urllib.parse import parse_qs, urlsplit, urlunsplit
+
+        parts = urlsplit(url)
+        parsed = parse_qs(parts.query, keep_blank_values=True)
+        order = list(parsed)
+        values = {k: v[0] for k, v in parsed.items()}
+        # 线路 id 写在路径里（/title/{id}），query 里的 id 只是详情接口 body 的
+        # 占位来源——保留旧 id 会与路径打架，这里同步成目标线路的 id
+        values.pop("id", None)
+        path = parts.path
+        tpl = rel.get("resolve_url")
+        if tpl:
+            # 模板给出时按线路标识重建路径（如 /title/{play_id}），未给出的占位
+            # 原样保留，由调用方 URL 的 path 兜底
+            path = (
+                tpl.replace("{play_id}", line_id)
+                .replace("{play_source}", line_source)
+                .replace("{source}", line_source)
+            )
+        if "source" in values or tpl:
+            if "source" not in order:
+                order.append("source")
+            values["source"] = line_source
+        if not values.get("title"):
+            title = str(self._jsonpath(data, rel.get("title_path") or "vod_name") or "")
+            if title:
+                if "title" not in order:
+                    order.append("title")
+                values["title"] = title
+        query = "&".join(
+            f"{k}={values[k]}" for k in order if k != "id" and values.get(k, "") != ""
+        )
+        return urlunsplit((parts.scheme, parts.netloc, path, query, ""))
 
     @staticmethod
     def _jsonpath(node, path: str):

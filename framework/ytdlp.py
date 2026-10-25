@@ -151,8 +151,11 @@ def _ytdlp_supports_js_runtime(binary: str) -> bool:
     """yt-dlp 是否支持 --js-runtimes（旧版不支持，避免传了导致所有调用失败）。"""
     if binary not in _js_support_cache:
         try:
+            from .subprocess_no_window import no_window_kwargs
+
             proc = subprocess.run(
-                [binary, "--help"], capture_output=True, text=True, timeout=20
+                [binary, "--help"], capture_output=True, text=True, timeout=20,
+                **no_window_kwargs(),  # Windows 静默，不弹控制台窗口
             )
             _js_support_cache[binary] = "--js-runtimes" in (proc.stdout or "")
         except Exception:
@@ -237,11 +240,14 @@ class Ytdlp:
         成功即认为可用；失败（浏览器锁定/未安装/未登录）返回 False 触发回落。
         """
         try:
+            from .subprocess_no_window import no_window_kwargs
+
             probe = subprocess.run(
                 [_find_ytdlp(), "--cookies-from-browser", browser,
                  "--simulate", "--no-warnings",
                  "https://www.youtube.com/watch?v=jNQXAC9IVRw"],
                 capture_output=True, text=True, timeout=60,
+                **no_window_kwargs(),  # Windows 静默，不弹控制台窗口
             )
         except Exception:
             return False

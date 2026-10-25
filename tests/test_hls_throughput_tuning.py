@@ -352,8 +352,9 @@ def test_prefetch_limits_are_hard_clamped():
         "enabled": True, "depth": 100, "workers": 100,
     })
     try:
-        assert proxy._pf_cfg["depth"] == 16
-        assert proxy._pf_cfg["workers"] == 8
+        # 上限以常量为准（历史上是 16，后按实测放宽到 64，别再把数字写死）
+        assert proxy._pf_cfg["depth"] == mp._PREFETCH_MAX_DEPTH
+        assert proxy._pf_cfg["workers"] == mp._PREFETCH_MAX_WORKERS
     finally:
         proxy.stop()
 
@@ -593,3 +594,235 @@ def test_prefetch_path_lock_does_not_deadlock_player(monkeypatch, pf_proxy):
     finally:
         lock.release()
     assert future.result(timeout=2) is None
+
+
+# --------------------------------------------------------------------------- #
+# 4. 慢速 CDN 的预取预算（agedm / 18av 实测）
+#
+# 实测（真实缓存分片到达时间 + 清单时长对齐）：
+# - CDN 单连接 ~100KB/s，分片 0.8~3.7MB；2.5MB 的片子要 25s 才下完。
+# - 18av 一集里 61/128 次交付**慢于该分片自身的时长**，最差 23.9s 下 10.4s
+#   的内容；同一 CDN 也有 4.66× 实时的时段 → 抖动来自节点，不是总量不足。
+# - agedm（AGE动漫）走 iframe 解析出的 `3000k/hls/mixed.m3u8`，落盘间隔
+#   7/8/8.2s，中途还出现 20.5s 空档。
+#
+# 旧实现给预取分片**固定 10s 总预算**：这些分片必然超时 → 中止 → 播放器
+# 重下（多等一个 10s）→ 连续 3 次把整场播放的预取熔断，之后只剩单连接
+# 顺序拉片，表现为持续卡顿和掉帧。
+# --------------------------------------------------------------------------- #
+def test_prefetch_budget_scales_with_segment_size():
+    """预算按 Content-Length 换算：小片维持 10s，大分片放宽，封顶 180s。"""
+    assert mp._prefetch_budget(None) == mp._PREFETCH_TIMEOUT
+    assert mp._prefetch_budget(0) == mp._PREFETCH_TIMEOUT
+    small = mp._prefetch_budget(100 * 1024)
+    assert mp._PREFETCH_TIMEOUT < small < 20
+    # 2500KB ÷ 32KB/s ≈ 78s：固定 10s 会把它判超时
+    big = mp._prefetch_budget(2500 * 1024)
+    assert 80 <= big <= 95
+    assert mp._prefetch_budget(50 * 1024 * 1024) == mp._PREFETCH_MAX_TIMEOUT
+
+
+class _ProgressThenStallRaw:
+    """先正常吐一块，随后卡死：慢速 CDN 上「在动但超出预算」的真实形态。"""
+
+    def __init__(self):
+        self.reads = 0
+
+    def read(self, _size):
+        self.reads += 1
+        if self.reads == 1:
+            return b"x" * 4096
+        raise requests.Timeout("stalled after progress")
+
+
+def test_slow_progressing_prefetch_does_not_open_circuit(monkeypatch, pf_proxy):
+    """慢但在动的分片不能记失败——否则 3 次就把整场预取熔断。"""
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+    response = _FakeResponse()
+    response.headers = {"Content-Length": str(100 * 1024)}
+    response.raw = _ProgressThenStallRaw()
+    monkeypatch.setattr(mp, "_fetch_upstream", lambda *a, **k: response)
+    for _ in range(5):
+        proxy._prefetch_one("key", "http://cdn.test/slow.ts", {}, False)
+    assert proxy._pf_failures == 0
+    assert proxy._pf_disabled is False
+    assert proxy._prefetch_enabled() is True
+
+
+def test_no_bytes_prefetch_still_counts_as_failure(monkeypatch, pf_proxy):
+    """一个字节都没到 = 连接坏了，仍然要计数并熔断（别放过真故障）。"""
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+
+    class _StallRaw:
+        def read(self, _size):
+            raise requests.Timeout("no bytes")
+
+    response = _FakeResponse()
+    response.headers = {"Content-Length": str(100 * 1024)}
+    response.raw = _StallRaw()
+    monkeypatch.setattr(mp, "_fetch_upstream", lambda *a, **k: response)
+    for _ in range(3):
+        proxy._prefetch_one("key", "http://cdn.test/dead.ts", {}, False)
+    assert proxy._pf_disabled is True
+
+
+def test_truncated_prefetch_body_still_counts_as_failure(monkeypatch, pf_proxy):
+    """上游提前收尾（体不全）不是「慢」，仍然要计数并熔断。"""
+    proxy = pf_proxy({"enabled": True, "depth": 1, "workers": 1})
+
+    class _ShortRaw:
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, _size):
+            self.reads += 1
+            return b"x" * 4096 if self.reads == 1 else b""
+
+    response = _FakeResponse()
+    response.headers = {"Content-Length": str(100 * 1024)}
+    response.raw = _ShortRaw()
+    monkeypatch.setattr(mp, "_fetch_upstream", lambda *a, **k: response)
+    for _ in range(3):
+        proxy._prefetch_one("key", "http://cdn.test/short.ts", {}, False)
+    assert proxy._pf_disabled is True
+
+
+@pytest.mark.parametrize("sid,min_depth,min_workers", [
+    ("agedm", 8, 3),
+    ("18av", 8, 3),
+    ("omofuna", 6, 2),
+])
+def test_slow_cdn_sources_declare_playback_tuning(sid, min_depth, min_workers):
+    """实测单连接 ~100KB/s 的源必须落盘抗抖参数，否则退回 8s 缓冲 + 4/2 浅预取。
+
+    三者都在这台机器上被实测卡过：agedm（3000k 变体 ÷ 40~250KB/s）、
+    18av（1.05× 实时、61/128 次交付慢于该片时长）、omofuna（分片 4~8s，
+    峰值间隙 12.8s）。
+    """
+    p = Path(__file__).resolve().parent.parent / "sources" / f"{sid}.json"
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    hls = (raw.get("media") or {}).get("hls") or {}
+    prefetch = hls.get("prefetch") or {}
+    assert prefetch.get("enabled") is True, f"{sid} 未开启播放预取"
+    assert min_workers <= int(prefetch.get("workers", 0)) <= mp._PREFETCH_MAX_WORKERS
+    assert min_depth <= int(prefetch.get("depth", 0)) <= mp._PREFETCH_MAX_DEPTH
+    assert int(hls.get("network_caching_ms") or 0) >= 10000, f"{sid} 缓冲太小"
+
+
+def test_hls_cache_floor_skips_mp4_direct(monkeypatch):
+    """源级缓冲键叫 media.hls.* → mp4 直链配了也不该加（白等起播）。"""
+    procs = _install_vlc(monkeypatch)
+    ep.open_with_player("https://cdn.example.com/movie.mp4", caching_ms=15000)
+    assert _caching_of(procs[0].args) == 1500
+
+
+def test_hls_cache_floor_applies_when_format_lies(monkeypatch):
+    """format=mp4 但真实地址是 m3u8（agedm）→ 仍按 HLS 加缓冲。"""
+    procs = _install_vlc(monkeypatch)
+    ep.open_with_player("https://cdn.example.com/3000k/hls/mixed.m3u8",
+                        caching_ms=15000)
+    assert _caching_of(procs[0].args) >= 15000
+
+
+# --------------------------------------------------------------------------- #
+# 4. HLS 分片转发必须跟随上游发包速率（不得出现 64KB 台阶停顿）
+# --------------------------------------------------------------------------- #
+# 真实根因回归：/c/ 分片转发循环此前用阻塞式的 raw.read(64KB)，要把 64KB
+# 攒满才返回。慢 CDN 按 4KB 小包推流时，视频数据以 64KB 为台阶批量到达
+# （每台阶约 300ms 停顿），视频轨道被周期性抽干 → 表现为「声音继续、画面
+# 卡住」。mp4 路径早已改用 _read_available（read1 语义）。此测试固化该修复：
+# 慢上游小包推流时，经代理转发的分片必须增量到达，单个 64KB 块内部的子包
+# 交付间隔不应出现近 64KB 量级的台阶停顿。
+_SLOW_PUSH = 4 * 1024       # 上游每次只推 4KB（模拟慢 CDN 小包）
+_SLOW_SEG = 256 * 1024      # 一片 256KB
+_SLOW_DELAY = 0.02          # 每 4KB 之间 20ms → 单连接 ~200KB/s
+
+
+class _SlowCDN(BaseHTTPRequestHandler):
+    """按 4KB/20ms 小包推流，复现慢 CDN 的发包节奏。"""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):  # noqa: N802
+        if self.path.endswith(".m3u8"):
+            body = (
+                "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n"
+                "#EXTINF:10.0,\n000.ts\n#EXT-X-ENDLIST\n"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Content-Length", str(_SLOW_SEG))
+        self.end_headers()
+        sent = 0
+        while sent < _SLOW_SEG:
+            self.wfile.write(b"\x47" * _SLOW_PUSH)
+            self.wfile.flush()
+            sent += _SLOW_PUSH
+            time.sleep(_SLOW_DELAY)
+
+
+@pytest.fixture
+def slow_upstream():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _SlowCDN)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_hls_segment_delivery_follows_upstream_rate(monkeypatch, slow_upstream,
+                                                    tmp_path):
+    """慢上游下经代理转发的分片必须增量到达，不应出现 ~64KB 台阶停顿。
+
+    read(n) 会凑满 64KB 才返回 → 交付曲线是 64KB 一级的台阶（每级等约 16 个
+    4KB 包 ≈ 320ms）；read1 语义下曲线跟随上游发包速率平滑上升，子包间隔接近
+    上游的 20ms。这里断言：转发后的字节块里，相邻 4KB 子块的交付间隔中位值
+    远小于「攒满 64KB 所需的 16 包时间」（= 16 × 20ms = 320ms），即没有出现
+    台阶停顿。
+    """
+    monkeypatch.setattr(mp, "_get_direct_session", _direct_session)
+    monkeypatch.setattr(mp, "_get_session", _direct_session)
+    cache = MediaCache(root=tmp_path / "v", enabled=True)
+    proxy = MediaProxy(cache=cache, prefetch={"enabled": False})
+    proxy._ensure_server()
+    try:
+        seg_url = [l for l in _get(proxy.build_url(
+            f"{slow_upstream}/index.m3u8", {"User-Agent": "t"}, None))[1]
+            .decode().splitlines() if l.endswith(".ts")][0]
+
+        events = []      # (到达时刻秒, 累积字节)
+        t0 = time.perf_counter()
+        got = 0
+        with requests.get(seg_url, stream=True, timeout=30) as r:
+            for chunk in r.iter_content(_SLOW_PUSH):
+                got += len(chunk)
+                events.append((time.perf_counter() - t0, got))
+                if got >= _SLOW_SEG:
+                    break
+        assert got == _SLOW_SEG, got
+
+        # 相邻子包（4KB）的交付间隔
+        gaps = [(events[i][0] - events[i - 1][0]) * 1000
+                for i in range(1, len(events))]
+        median_gap = sorted(gaps)[len(gaps) // 2]
+        # 阶梯停顿阈值：攒满 64KB 所需时间 ≈ 64/4 × 20ms = 320ms。
+        # 修复后中位间隔应远小于此值；给 5x 余量（64ms）稳妥判定「无台阶」。
+        assert median_gap < 64, (
+            f"分片交付出现台阶停顿：中位子包间隔 {median_gap:.1f}ms，"
+            f"接近 64KB 攒满所需的 ~320ms，视频轨道会被周期性抽干")
+        # 反向确认：最大间隔也不应逼近整段 64KB（保守上限 300ms）
+        assert max(gaps) < 300, f"最大子包间隔 {max(gaps):.1f}ms 疑似台阶停顿"
+    finally:
+        proxy.stop()
+

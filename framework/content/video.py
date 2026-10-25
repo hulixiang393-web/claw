@@ -1660,6 +1660,57 @@ class VideoMixin:
         return self._ytdlp
 
     # ------------------------------------------------------------------ #
+    # 线路列表（同作品多线路）：详情分集带 line_switch_url → 播放界面换线路
+    # ------------------------------------------------------------------ #
+    def _attach_line_sources(self, source: SourceConfig, detail) -> None:
+        """把详情里并入的「同作品其它线路」整理成播放界面的线路列表。
+
+        只为现有 source_list **补位**（已有多线路分组的源——ikanpp 搜索分组产出的
+        「其它采集源」——保持不变）。播放界面换线路时把该线路的任一集 URI 交给
+        player 的线路列表，换线路后详情 URL 也跟着变（见 switch_source_url）。
+
+        仅视频详情生效；无线路切换字段（普通源）时直接返回，零影响。
+        """
+        if source.content_type != "video" or getattr(detail, "source_list", None):
+            return
+        lines = self.line_menu_from_chapters(detail.chapters or [])
+        if lines:
+            detail.source_list = lines
+
+    @staticmethod
+    def line_menu_from_chapters(chapters) -> List[dict]:
+        """把带 line_switch_* 字段的分集整理成播放界面的线路菜单。
+
+        线路菜单的契约与 `source_switch` 一致：每项 `{source_id, sid, name,
+        detail_url, episodes}`，播放界面只认这一份。`episodes` 是该线路的集，
+        供切换时按标题/位置定位到同一集。
+        """
+        lines: List[dict] = []
+        seen: set = set()
+        for chapter in chapters or []:
+            switch_url = getattr(chapter, "line_switch_url", "") or ""
+            line_source = getattr(chapter, "line_switch_source", "") or ""
+            if not switch_url or not line_source or line_source in seen:
+                continue
+            seen.add(line_source)
+            lines.append({
+                "source_id": line_source,
+                "sid": line_source,
+                "name": getattr(chapter, "line_name", "") or line_source,
+                "detail_url": switch_url,
+                # 该线路的集（播放界面按集号/标题定位到当前集）
+                "episodes": [
+                    {
+                        "title": getattr(ch, "title", "") or "",
+                        "url": getattr(ch, "url", "") or "",
+                    }
+                    for ch in chapters
+                    if (getattr(ch, "line_switch_source", "") or "") == line_source
+                ],
+            })
+        return lines
+
+    # ------------------------------------------------------------------ #
     # 换源支持（source_switch）
     # ------------------------------------------------------------------ #
     def _get_source_switch_cfg(self, source: SourceConfig) -> dict:
@@ -1893,6 +1944,14 @@ class VideoMixin:
     def switch_source_url(
         self, source: SourceConfig, target_url: str, deadline=None, context=None
     ) -> tuple:
+        """按「目标详情 URL」换线路：重新抓详情，返回 (新 Detail, 新分集列表)。
+
+        换线路后详情 URL 必须跟着目标走：`Detail.url` 是后续自动轮换
+        （_switch_candidate_episode_urls 从它推导 id/source）、续读进度和
+        「当前在哪条线路」的唯一来源。只改 sid 类的站两者等价，但
+        ikanpp 这类「线路坐标在 query（id/source）」的站，沿用旧 URL 会在
+        下次取流时又切回原线路。
+        """
         context = self._stream_context(context, deadline)
         self._check_stream_context(context, deadline)
         if deadline is None:
@@ -1901,6 +1960,9 @@ class VideoMixin:
             detail = self.fetch_detail(
                 source, target_url, deadline=deadline, context=context
             )
+        target_abs = self._abs_url(source, target_url)
+        if target_abs and detail.url != target_abs:
+            detail.url = target_abs
         return detail, detail.chapters
 
     @staticmethod

@@ -33,26 +33,26 @@ import atexit
 import hashlib
 import inspect
 import ipaddress
+import logging
 import mimetypes
 import os
 import shutil
 from contextlib import nullcontext
 import posixpath
 import re
-import subprocess
-import tempfile
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urljoin, unquote, quote, urlparse
-
 import requests
 from requests.adapters import HTTPAdapter
 
 from .adblock import trusted_media_context, trusted_source_id
 from urllib3.exceptions import HTTPError as UpstreamReadError
+
+_log = logging.getLogger(__name__)
 
 # 无任何请求 N 秒后自动关闭（避免残留进程/端口）。放大到 600s：VLC 暂停/拖动
 # 进度是原地等待不再发请求，若 N 太小看门狗在播放期间误停代理 → URL 失效
@@ -100,6 +100,12 @@ _trusted_source_id = trusted_source_id
 _PREFETCH_MAX_WORKERS = 8
 _PREFETCH_MAX_PENDING = 32
 _PREFETCH_TIMEOUT = 10.0
+# 预取一个分片的**下载阶段**预算按体积换算：32KB/s 视为可接受下限。
+# 慢速 CDN（实测 agedm/18av 单连接 100KB/s 左右、2.5MB 的片子要 25s）上，
+# 旧的「一律 10s 总预算」会把每个大分片判超时→中止→由播放器重下，等于
+# 白白多等一个 10s；连续 3 次还会把整场预取熔断。见 _prefetch_budget。
+_PREFETCH_MIN_RATE = 32 * 1024
+_PREFETCH_MAX_TIMEOUT = 180.0
 _PREFETCH_CANCEL_WAIT = 1.0
 _PREFETCH_FAILURE_LIMIT = 3
 _MANIFEST_CACHE_TTL = 10.0
@@ -140,10 +146,13 @@ _UPSTREAM_DIAGNOSTICS_LOCK = threading.Lock()
 # HLS 分片时间戳重写（ad_block.hls_rules.remux_timestamps）。
 # 部分源的片源是把 mp4 硬切成 TS：分片 PTS/DTS 各自回到 ~0 且边界帧常常不是
 # I 帧，播放器跨分片接不上关键帧 → 表现为周期性"跳帧/花屏一下"。选项开关时
-# 第 2 片起先按序重封装为 PTS 连续的 TS 再交给播放器；播放器的分片磁盘缓存
-# 仍按原始分片落盘，命中后整理，不改变缓存键与命中语义。
+# 第 2 片起把本片时间戳整体平移到前一片结束点之后（**纯字节处理，不起进程**）；
+# 分片磁盘缓存仍按原始分片落盘，命中后整理，不改变缓存键与命中语义。
+#
+# 2026-10 修正：旧实现在这里每片起一次 `ffmpeg -c copy` 重封装，实测 omofuna
+# 一集 46 片就弹 46 个控制台窗口（没加 CREATE_NO_WINDOW），进程启动又让分片
+# 交付变慢 → 掉帧 + 音频欠载。现在只改 TS 的时间戳字段，输出与站点分片同源。
 _REMUX_CTX_MAX = 64
-_REMUX_TIMEOUT = 60.0
 _REMUX_CTX = {}
 _REMUX_LOCKS = {}
 _REMUX_CTX_LOCK = threading.Lock()
@@ -198,7 +207,11 @@ def _is_ts_payload(head: bytes) -> bool:
 
 
 def _locate_ffmpeg() -> str:
-    """定位 ffmpeg（打包内置优先，其次 PATH）；没有就返回空串。"""
+    """定位 ffmpeg（打包内置优先，其次 PATH）；没有就返回空串。
+
+    分片时间轴整理已改为纯字节处理（见 `_ts_shift_bytes`），不再需要 ffmpeg；
+    本函数保留给「外部诊断/未来下载侧」用，播放路径不得再依赖它去起子进程。
+    """
     try:
         from .ffmpeg_merger import _find_ffmpeg
 
@@ -273,43 +286,42 @@ def _stream_key(data, off: int, offsets) -> tuple:
     return pid, data[p + 3]
 
 
-def _ts_shift(src: Path, first_dts: float):
-    """时间戳整理：让本片**首帧**落在 first_dts（秒），并修掉片内错位时间戳。
+def _ts_shift_bytes(data: bytes, first_dts: float):
+    """时间戳整理（纯字节版）：返回 (整理后字节, 本片时长)；不处理返回 None。
 
+    规则与返回值：
     1. 锚点：片内最早的时间戳平移到 first_dts；
     2. 连续性：每个 PES 的 DTS 必须紧跟同流上一个 DTS（帧间隔取片内中位数）；
-       倒退或偏离过远的包按预期时刻重锚，后续包随之顺延。
-    只改 PES 头的 PTS/DTS 与 PCR，帧数与媒体字节内容都不变；否则返回 None。
+       倒退或偏离过远的包按预期时刻重锚，后续包随之顺延；
+    3. **本片起点已不早于 first_dts → 直接返回 None**（时间轴本来就连续，
+       再往后推反而制造向后跳变）；
+    4. 只改 PES 头的 PTS/DTS 与 PCR，帧数与媒体字节内容都不变。
 
     返回**本片时长（秒）**而不是 True：时长是下一片锚点的推进量，而本函数
     本来就要逐包扫一遍取 min_ts，顺手记 max 即可算出（max-min）/90000，
-    实测与 ffprobe 的 format=duration 相差 <1 帧（20ms 量级），因此再起一个
-    ffprobe 子进程纯属浪费（冷启动约 2s，直接卡住播放）。失败返回 None。
+    实测与 ffprobe 的 format=duration 相差 <1 帧（20ms 量级）。
     """
-    try:
-        data = bytearray(src.read_bytes())
-    except OSError:
-        return None
     step = 188
     if len(data) < step * 2:
         return None
+    buf = bytearray(data)
     entries = []          # [(包偏移, [(字段偏移, 原值)])]，按文件顺序
     pcrs = []             # [(包偏移, PCR 字段偏移)]，按文件顺序
     min_ts = None
     max_ts = None
     off = 0
-    while off + step <= len(data):
-        if data[off] != 0x47:
+    while off + step <= len(buf):
+        if buf[off] != 0x47:
             return None
-        q = _read_ts_pcr_offset(data, off, step)
+        q = _read_ts_pcr_offset(buf, off, step)
         if q is not None:
             pcrs.append((off, q))
-        if (data[off + 1] & 0x1F) != 0x1F:
-            offsets = _read_ts_timestamps(data, off, step)
+        if (buf[off + 1] & 0x1F) != 0x1F:
+            offsets = _read_ts_timestamps(buf, off, step)
             if offsets:
                 values = []
                 for p in reversed(offsets):     # 先取再写：DTS 偏移与 PTS 字面向量
-                    values.append((p, _decode_ts5(data, p)))
+                    values.append((p, _decode_ts5(buf, p)))
                 values.reverse()
                 entries.append((off, values))
                 for _p, v in values:
@@ -321,13 +333,17 @@ def _ts_shift(src: Path, first_dts: float):
     duration = (max_ts - min_ts) / 90000.0
     if duration <= 0:
         return None
-    bump = int(round(first_dts * 90000)) - min_ts
+    anchor = int(round(first_dts * 90000))
+    if min_ts >= anchor:
+        # 已经是连续时间轴（或更靠后）：交给播放器，别动。
+        return None
+    bump = anchor - min_ts
 
     # 帧间隔：同流相邻 DTS 差的中位数（90kHz）。样本太少就不做连续性修正。
     diffs = []
     last_by_stream = {}
     for off, values in entries:
-        key = _stream_key(data, off, values)
+        key = _stream_key(buf, off, values)
         dts = values[-1][1]
         prev = last_by_stream.get(key)
         if prev is not None and 0 < dts - prev < 90000 * 3:
@@ -336,11 +352,10 @@ def _ts_shift(src: Path, first_dts: float):
     gap = sorted(diffs)[len(diffs) // 2] if diffs else 0
 
     resid = 0
-    changed = False
     last_by_stream = {}
     delta_by_off = {}
     for off, values in entries:
-        key = _stream_key(data, off, values)
+        key = _stream_key(buf, off, values)
         prev = last_by_stream.get(key)
         if gap and prev is not None:
             # values 是**原始**时间戳（必须先加已累计的 resid 再比较），否则
@@ -352,9 +367,8 @@ def _ts_shift(src: Path, first_dts: float):
         delta = bump + resid
         delta_by_off[off] = delta
         if delta:
-            changed = True
             for p, _v in values:
-                _encode_ts5(data, p, _decode_ts5(data, p) + delta)
+                _encode_ts5(buf, p, _decode_ts5(buf, p) + delta)
         last_by_stream[key] = values[-1][1] + delta
     if pcrs:
         idx = 0
@@ -365,14 +379,25 @@ def _ts_shift(src: Path, first_dts: float):
                 cur_delta = ordered[idx][1]
                 idx += 1
             if cur_delta:
-                _shift_ts_pcr(data, p, cur_delta)
-                changed = True
-    if not changed:
-        return duration
+                _shift_ts_pcr(buf, p, cur_delta)
+    return bytes(buf), duration
+
+
+def _ts_shift(src: Path, first_dts: float):
+    """时间戳整理（文件版，调试/测试用）：就地改写，返回本片时长或 None。"""
     try:
-        src.write_bytes(bytes(data))
+        data = src.read_bytes()
     except OSError:
         return None
+    out = _ts_shift_bytes(data, first_dts)
+    if out is None:
+        return None
+    shifted, duration = out
+    if shifted != data:
+        try:
+            src.write_bytes(shifted)
+        except OSError:
+            return None
     return duration
 
 
@@ -739,6 +764,35 @@ def _manifest_contains_query(text: str, base_url: str) -> bool:
         if urlparse(urljoin(base_url, value)).query:
             return True
     return False
+
+
+def _is_timeout_like(exc: BaseException) -> bool:
+    """是不是「读超时」类异常（含 urllib3 的 ReadTimeoutError）。
+
+    预取用它区分两种失败：慢但在动（超时，不该熔断）vs 真故障（上游提前
+    截断分片体 / 连接重置，要计数）。urllib3 的读超时不是 requests.Timeout
+    的子类，只能按类名兜一层。
+    """
+    if isinstance(exc, requests.Timeout):
+        return True
+    return "timeout" in type(exc).__name__.lower()
+
+
+def _prefetch_budget(total: int | None) -> float:
+    """预取单个分片的下载阶段预算（秒，含建连后的读取）。
+
+    按 Content-Length 换算：`_PREFETCH_MIN_RATE`（32KB/s）视作可接受下限，
+    再以 `_PREFETCH_TIMEOUT` 为下限、`_PREFETCH_MAX_TIMEOUT` 为封顶。
+
+    为什么不能固定 10s：慢速 CDN 上单连接只有 ~100KB/s，2.5MB 的分片要
+    25s；固定预算会让每个大分片都超时中止，既丢掉已下载的字节，也把
+    `_PREFETCH_FAILURE_LIMIT`（3 次）用光，导致整场播放的预取被熔断——
+    之后只能靠播放器的单连接顺序拉片，表现为持续卡顿与掉帧。
+    """
+    if not total or total <= 0:
+        return _PREFETCH_TIMEOUT
+    want = _PREFETCH_TIMEOUT + total / float(_PREFETCH_MIN_RATE)
+    return min(_PREFETCH_MAX_TIMEOUT, max(_PREFETCH_TIMEOUT, want))
 
 
 def _proxy_get(target: str, headers: dict, timeout=30, attempts=2):
@@ -1488,6 +1542,9 @@ class MediaProxy:
         if status in (403, 429):
             with self._pf_lock:
                 self._pf_disabled = True
+            # 熔断是「卡顿原因的唯一现场」：日志里留一行，免得下次只能靠猜。
+            _log.warning("[hls-prefetch] 熔断：上游 %s（403/429 视为风控，"
+                         "本次播放不再预取）", status)
             return
         connection_failure = isinstance(
             exc, (requests.ConnectionError, requests.Timeout)
@@ -1496,8 +1553,13 @@ class MediaProxy:
             return
         with self._pf_lock:
             self._pf_failures += 1
-            if self._pf_failures >= _PREFETCH_FAILURE_LIMIT:
+            reached = self._pf_failures >= _PREFETCH_FAILURE_LIMIT
+            if reached:
                 self._pf_disabled = True
+        if reached:
+            _log.warning("[hls-prefetch] 熔断：连续 %s 次零字节失败（%s），"
+                         "本次播放退回单连接顺序拉片",
+                         _PREFETCH_FAILURE_LIMIT, type(exc).__name__ if exc else "-")
 
     def _note_prefetch_success(self) -> None:
         with self._pf_lock:
@@ -1604,13 +1666,21 @@ class MediaProxy:
                                    total, is_mp4=False)
                     if not tee.start():
                         return
+                    # 已知体积后按体积放宽下载预算（只放宽、不收紧）：
+                    # 建连阶段的 deadline 仍是 _PREFETCH_TIMEOUT。
+                    deadline = max(deadline,
+                                   time.monotonic() + _prefetch_budget(total))
                     while True:
                         if self._prefetch_url_cancelled(canonical, generation):
                             return
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise requests.Timeout("prefetch read timeout")
-                        _set_response_read_timeout(resp, remaining)
+                        # 每读一次的超时取「剩余预算」与「停摆判据」的较小值：
+                        # 慢但在动的连接不该被总预算一刀切掉，真的卡住（10s
+                        # 一个字节都没到）才放弃。
+                        _set_response_read_timeout(
+                            resp, min(remaining, _PREFETCH_TIMEOUT))
                         chunk = _read_available(resp.raw, _READ_CHUNK)
                         if not chunk:
                             break
@@ -1624,6 +1694,12 @@ class MediaProxy:
                         self._note_prefetch_success()
                     return
                 except (requests.ConnectionError, requests.Timeout, UpstreamReadError) as exc:
+                    # 只有「超时且已经写进字节」才算「慢但在动」：这不是预取
+                    # 不可用，不能记失败——慢速 CDN 上 3 次就会把整场播放的
+                    # 预取熔断掉（agedm/18av 实测）。分片体被上游提前截断
+                    # （incomplete body / 连接重置）仍然照常计数，那是真故障。
+                    if _is_timeout_like(exc) and getattr(tee, "written", 0) > 0:
+                        return
                     if attempt:
                         self._note_prefetch_failure(exc=requests.ConnectionError(str(exc)))
                 except Exception as exc:
@@ -2818,51 +2894,45 @@ class MediaProxy:
                 return None
             base = max(ctx["segs"].values())
             ctx["inflight"][seg_name] = True
-        ffmpeg = _locate_ffmpeg()
-        result = None
-        if ffmpeg:
-            result = self._run_remux(ffmpeg, raw, base, req_headers)
+        # 不再依赖 ffmpeg：纯字节平移，无子进程、无控制台窗口。
+        result = self._run_remux("", raw, base, req_headers)
         with ctx["lock"]:
             ctx["inflight"].pop(seg_name, None)
             if result is not None:
                 ctx["segs"][seg_name] = base + result[1]
                 ctx["processed"].add(seg_name)
                 ctx["done"] += 1
+            else:
+                # 本片无需平移（时间轴本来就连续，见 _ts_shift_bytes 的提前返回）
+                # 或无法解析：把它的结束点并入基准，并记为已处理。否则每次命中
+                # 都要把整片再扫一遍，且基准永远停在第 1 片。
+                end = _ts_last_ts(raw) if _is_ts_payload(raw) else None
+                if end and end > 0:
+                    ctx["segs"][seg_name] = max(ctx["segs"].get(seg_name, 0.0), end)
+                ctx["processed"].add(seg_name)
         return None if result is None else result[0]
 
     def _run_remux(self, ffmpeg: str, raw: bytes, base: float,
                    req_headers=None) -> tuple[bytes, float] | None:
-        """ffmpeg 重封装 + 时间戳平移；返回 (输出字节, 实际时长) 或 None。
+        """把本片时间轴平移到 base 之后；返回 (输出字节, 本片时长) 或 None。
 
-        输入是本地临时文件，不访问网络 → 不能带 -headers 之类的 http 协议选项
-        （ffmpeg 会直接报 "Option headers not found" 并拒绝运行）。
+        **不起任何子进程**：只改 TS 里的 PES PTS/DTS 与 PCR。
+
+        历史实现每片跑一次 `ffmpeg -c copy -muxdelay 0.7` 做重封装，再用
+        `_ts_shift` 把输出整体平移到 base。两个问题（实测 omofuna 一集 46 片）：
+        1. 每片一次进程创建（~0.13s 起，冷机更久），且整条清单共用一把串行锁
+           ——分片交付被进程启动拖慢，播放器缓冲见底 → 卡顿/掉帧/音频欠载；
+        2. Windows 下没加 CREATE_NO_WINDOW，**每片弹一个黑色控制台窗口**，
+           窗口创建还会抢焦点，进一步打乱播放器渲染。
+        既然目标只是「整体平移时间戳」，直接改字节即可，复用器不参与——输出
+        与站点原始分片逐字节同源（只动时间戳字段），比重新封装更安全。
+
+        `ffmpeg` 参数保留只为兼容调用约定，已不使用。
         """
-        tmpdir = tempfile.TemporaryDirectory(prefix="claw-remux-")
-        try:
-            root = Path(tmpdir.name)
-            src = root / "in.ts"
-            src.write_bytes(raw)
-            work = root / "out.ts"
-            cmd = [ffmpeg, "-v", "error", "-nostdin",
-                   "-copyts", "-i", str(src), "-map", "0", "-c", "copy",
-                   "-muxdelay", "0.7", "-f", "mpegts", "-y", str(work)]
-            proc = subprocess.run(cmd, capture_output=True, timeout=_REMUX_TIMEOUT)
-            if proc.returncode != 0 or not work.is_file():
-                return None
-            # 时长由 _ts_shift 的逐包扫描一并算出（max-min），不再起 ffprobe
-            # 子进程：省掉每片一次进程创建/冷启动（实测冷启动 ~2s 直接卡播放）。
-            # ffmpeg 的 mpegts 复用器会把时间戳重排（-copyts 对 TS→TS 无效），
-            # 锚点必须按**重封装后的输出**重算并直接落到 base，不能先归零再
-            # 平移——第二步会在已归零的时间轴上再次取模，负数被绕回成 33 位
-            # 时间戳高位，整片被推飞。
-            duration = _ts_shift(work, base)
-            if duration is None or duration <= 0:
-                return None
-            return work.read_bytes(), duration
-        except (OSError, subprocess.SubprocessError):
+        out = _ts_shift_bytes(raw, base)
+        if out is None:
             return None
-        finally:
-            tmpdir.cleanup()
+        return out
 
 
     # ------------------------------------------------------------------ #
@@ -3145,7 +3215,17 @@ class MediaProxy:
                     while True:
                         if fetch_state is not None and cache.fetch_cancelled(fetch_state):
                             raise RuntimeError("media fetch cancelled")
-                        chunk = resp.raw.read(_READ_CHUNK)
+                        # **read1 语义，不能用 raw.read(n)**：
+                        # read(n) 在 http.client 的 BufferedReader 上要凑满 n 字节
+                        # 或 EOF 才返回。CDN 按 4KB/8KB 小包慢速推流时，头几 KB
+                        # 明明已到却被压在缓冲区等剩下的 60KB → 播放器视频轨道
+                        # 被周期性抽干（每 64KB 一个 ~300ms 台阶）→ 反复 rebuffer、
+                        # 表现为「声音继续、画面卡住」。mp4 路径（1684 行）与 m3u8
+                        # 抓取路径（2729 行）早已改用 _read_available；本 HLS 分片
+                        # 循环此前漏改，是播放卡顿的根因。实测慢上游 read 首字节
+                        # 4.50s vs read1 0.00s，交付曲线从台阶变为跟随发包速率平滑
+                        # 上升。
+                        chunk = _read_available(resp.raw, _READ_CHUNK)
                         if not chunk:
                             break
                         handler.wfile.write(_frame(chunk, chunked))

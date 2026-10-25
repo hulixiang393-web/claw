@@ -92,6 +92,38 @@ def test_ts_shift_moves_pcr_with_pes(tmp_path: Path):
     assert max(pcrs) == pytest.approx(9.6)
 
 
+def test_ts_shift_bytes_skips_already_continuous():
+    """本片起点已不早于锚点 → 不动（再往后推会制造向后跳变）。"""
+    assert mp._ts_shift_bytes(_segment(start=10.0), 10.0) is None
+    assert mp._ts_shift_bytes(_segment(start=10.5), 10.0) is None
+
+
+def test_ts_shift_bytes_shifts_when_behind_anchor():
+    out = mp._ts_shift_bytes(_segment(start=1.4), 10.0)
+    assert out is not None
+    data, duration = out
+    assert duration == pytest.approx(0.3)
+    pts, pcrs = _timestamps(data)
+    assert min(pts) == pytest.approx(10.0)
+    assert min(pcrs) == pytest.approx(9.3)
+
+
+def test_remux_runs_without_ffmpeg():
+    """时间轴整理不能依赖 ffmpeg（旧实现在缺 ffmpeg 时整段跳过，还会弹出
+    每个分片一个控制台窗口）。现在必须纯字节完成。"""
+    key = f"test-{uuid.uuid4().hex}"
+    raw = _segment()
+    proxy = object.__new__(mp.MediaProxy)
+    with patch.object(mp, "_locate_ffmpeg", return_value=""):
+        assert proxy._remux_segment_locked(key, "s0.ts", raw, None) is None
+        out = proxy._remux_segment_locked(key, "s1.ts", raw, None)
+    assert out is not None
+    pts, _pcrs = _timestamps(out)
+    assert min(pts) == pytest.approx(1.7)
+    ctx = mp._remux_ctx(key)
+    assert ctx["segs"]["s1.ts"] == pytest.approx(2.0)
+
+
 def test_remux_anchor_uses_first_segment_end():
     key = f"test-{uuid.uuid4().hex}"
     raw = _segment()

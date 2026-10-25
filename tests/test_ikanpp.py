@@ -82,6 +82,13 @@ class _FakeHttp:
     def __init__(self):
         self.last_body = None
         self.last_post_kw = None
+        # 所有详情 POST 的 body（related_episodes 会为其它线路再请求若干次，
+        # last_body 是最后一次；断言「本次详情请求」要看 first_body）
+        self.bodies = []
+
+    @property
+    def first_body(self):
+        return self.bodies[0] if self.bodies else None
 
     def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3,
                  interval_ms=0, encoding=None, proxy_pool=None, direct=False):
@@ -94,6 +101,7 @@ class _FakeHttp:
 
     def post_json(self, url, json_body=None, **kw):
         self.last_body = dict(json_body or {})
+        self.bodies.append(self.last_body)
         return dict(_DETAIL)
 
     def post_text(self, url, json_body=None, **kw):
@@ -356,8 +364,8 @@ def test_fallback_result_detail_keeps_provider_and_m3u8():
     result = Search(http, Parser()).search_one(src, "扑杀天使")[0]
     content = Content(http, Parser(), _Checker())
     detail = content.fetch_detail(src, result.url)
-    assert http.last_body["id"] == "123456"
-    assert http.last_body["source"] == "zuida"
+    assert http.first_body["id"] == "123456"
+    assert http.first_body["source"] == "zuida"
     assert detail.chapters[0].url == _M3U8
 
 
@@ -409,7 +417,9 @@ def test_title_query_is_encoded_and_detail_decodes_special_characters():
     assert query["title"] == ["A&B/#?"]
     assert query["source"] == ["jisu"]
     Content(http, Parser(), _Checker()).fetch_detail(src, result.url)
-    assert http.last_body["title"] == "A&B/#?"
+    # 用首次详情 POST 断言：related_episodes 之后还会发若干线路请求，
+    # last_body 已不是本次详情（其 title 语义也不同）
+    assert http.first_body["title"] == "A&B/#?"
 
 
 # --------------------------------------------------------------------------- #
@@ -419,9 +429,9 @@ def test_fetch_detail_posts_title_from_query():
     http, c = _content()
     src = _source()
     d = c.fetch_detail(src, f"{_BASE}/title/ik020581?title=生化危机：爆发夜&source=jisu")
-    assert http.last_body["id"] == "ik020581"
-    assert http.last_body["title"] == "生化危机：爆发夜"
-    assert http.last_body["source"] == "jisu"
+    assert http.first_body["id"] == "ik020581"
+    assert http.first_body["title"] == "生化危机：爆发夜"
+    assert http.first_body["source"] == "jisu"
     assert d.title == "生化危机：爆发夜2026"
     assert d.cover == "https://img.guangsuimage.com/cover/69b183.jpg"
     assert d.status == "抢先版"

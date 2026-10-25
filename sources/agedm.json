@@ -170,6 +170,14 @@
     "merge": {
       "tool": "ffmpeg",
       "output_format": "mp4"
+    },
+    "hls": {
+      "network_caching_ms": 15000,
+      "prefetch": {
+        "enabled": true,
+        "depth": 10,
+        "workers": 4
+      }
     }
   },
   "constraints": {

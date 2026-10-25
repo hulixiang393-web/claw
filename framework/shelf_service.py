@@ -74,7 +74,12 @@ class ShelfItem:
     online: bool = False          # 本地条目是否有在线收藏对应
     size_bytes: int = 0
     mtime: float = 0.0            # 本地文件最近修改时间（下载时间近似）
-    updated_at: str = ""          # 最近阅读/收藏时间（排序用）
+    updated_at: str = ""          # 最近阅读时间（只用于「最近阅读」排序）
+    # 加入书架的时间（收藏时间 / 本地文件下载时间），**永不随阅读改变**。
+    # 「最近添加」排序只认这个字段：此前该排序拿 updated_at 当次级键，而
+    # updated_at 正是阅读时间，导致点开一本书就把卡片挪走；收藏条目的 mtime
+    # 恒为 0，更使「最近添加」实际退化成「按阅读时间」。
+    added_at: str = ""
     missing: bool = False
     reading_status: str = "reading"
 
@@ -274,10 +279,18 @@ class ShelfService:
         if sort == "name":
             return sorted(items, key=lambda i: (_norm_title(i.title), i.kind))
         if sort == "added":
+            # 「最近添加」= 加入书架的时间倒序，**只用加入时间**。
+            # 不能用 updated_at（阅读时间）参与任何一层比较，否则读一本书
+            # 就会改顺序；收藏条目 mtime 恒为 0，更不能拿它当主键。
+            # 同一时刻批量加入的条目加入时间相同 → 用标题做稳定次级键，
+            # 保证「读完之后位置不变」。
             return sorted(
                 items,
-                key=lambda i: (i.mtime or 0, i.updated_at or ""),
-                reverse=True,
+                key=lambda i: (
+                    -(self._added_epoch(i) or 0.0),
+                    _norm_title(i.title),
+                    i.kind,
+                ),
             )
         # recent：按最近阅读/收藏/下载时间倒序。
         # 用 DSU（装饰-排序-去装饰）：每个 distinct 时间戳只解析一次，避免原实现在
@@ -300,6 +313,17 @@ class ShelfService:
             return i.mtime or 0.0
 
         return sorted(items, key=_recency_key, reverse=True)
+
+    @staticmethod
+    def _added_epoch(item: ShelfItem) -> float:
+        """加入时间的时间戳；本地条目回退文件 mtime。"""
+        stamp = getattr(item, "added_at", "") or ""
+        if stamp:
+            try:
+                return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S").timestamp()
+            except (ValueError, OSError):
+                pass
+        return item.mtime or 0.0
 
     # ------------------------------------------------------------------ #
     # 本地扫描
@@ -468,6 +492,8 @@ class ShelfService:
                 cover=fav.get("cover", ""),
                 tags=list(fav.get("tags") or []),
                 folder=fav.get("folder", ""),
+                # favorited_at 是收藏（加入书架）时间，恒定不变 → 「最近添加」用它
+                added_at=fav.get("favorited_at", ""),
                 updated_at=fav.get("favorited_at", ""),
                 reading_status=fav.get("reading_status", "reading"),
             )

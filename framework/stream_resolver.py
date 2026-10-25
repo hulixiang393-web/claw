@@ -46,6 +46,10 @@ class StreamResolver:
     DEFAULT_CANDIDATE_TIMEOUT = 10.0
     DEFAULT_MAX_CANDIDATES = 6
     DEFAULT_CACHE_TTL = 30.0
+    # 最后一个候选的宽限倍数：冷启动首个请求常超单项超时，重试又立刻成功。
+    # 只放宽单项超时的这个倍数（10s → 20s），不放开到总预算——需要跑满预算
+    # 的源必须显式声明 stream_budget=pipeline。
+    LAST_CANDIDATE_GRACE_FACTOR = 2.0
     SIGNED_QUERY_NAMES = frozenset({
         "auth",
         "authorization",
@@ -300,10 +304,12 @@ class StreamResolver:
             unique.append(candidate)
             if len(unique) >= self._max_candidates:
                 break
-        for candidate in unique:
+        for index, candidate in enumerate(unique):
             context.check()
             pair = self._resolve_candidate(
-                candidate, context, key, normalize_urls=normalize_urls
+                candidate, context, key,
+                normalize_urls=normalize_urls,
+                is_last=(index == len(unique) - 1),
             )
             if pair is not None:
                 context.check()
@@ -324,12 +330,24 @@ class StreamResolver:
                 context.check()
                 return True
 
-    def _resolve_candidate(self, candidate, context, key, normalize_urls=False):
+    def _resolve_candidate(self, candidate, context, key, normalize_urls=False,
+                           is_last=False):
         timeout = self._candidate_timeout
         if isinstance(candidate, dict) and callable(candidate.get("resolver")):
             if candidate.get("budget") == "pipeline":
                 timeout = context.remaining()
             candidate = candidate["resolver"]
+        if callable(candidate) and is_last:
+            # **最后一个候选给一段有上限的宽限**：没下一条线路可换了，此时
+            # 10s 一到就把一个还活着、马上要返回的请求丢掉，只剩「取流失败」。
+            # 冷启动（首次连接：DNS/握手/系统代理探测都还没热身）实测最容易
+            # 超过单项超时，于是表现为「第一次打开播放失败，重试就好」。
+            #
+            # 只放宽到单项超时的 LAST_CANDIDATE_GRACE_FACTOR 倍、且不超过剩余
+            # 总预算：既给冷启动留出余量，又不改变「普通候选不得跑满总预算」
+            # 的既有契约（需要跑满预算的源应显式声明 stream_budget=pipeline）。
+            grace = self._candidate_timeout * self.LAST_CANDIDATE_GRACE_FACTOR
+            timeout = max(timeout, min(grace, context.remaining()))
         if callable(candidate):
             remaining = min(timeout, context.remaining())
             if remaining <= 0:

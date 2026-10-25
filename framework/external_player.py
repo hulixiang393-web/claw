@@ -275,6 +275,24 @@ def _locate_start(episodes: list, start_idx: int, url: str) -> int:
     return 0
 
 
+def player_launch_ok(msg: str) -> bool:
+    """外部播放器是否**真的被拉起**（据此决定要不要记录播放进度）。
+
+    `open_with_player` 返回的是给用户看的提示串，不是成功标志：
+    - ""                    → 没有可播地址（视频取流失败/坏集），什么都没打开
+    - "浏览器打开失败"       → 连兜底浏览器都没打开
+    - "已用外部播放器打开…"  → VLC 进程已拉起
+    - "已在浏览器中打开"     → 浏览器兜底成功（有画面，但无控制会话）
+
+    前两种必须算失败：否则书架会把「根本没播成功」的视频记成「最近阅读」，
+    下次续读还定位到那一集。只有真正启动了播放器才允许写进度。
+    """
+    text = (msg or "").strip()
+    if not text:
+        return False
+    return "失败" not in text
+
+
 def open_with_player(url: str, audio: str = "", referer: str = "",
                      user_agent: str = "", headers: dict | None = None,
                       ad_block: dict | None = None,
@@ -377,10 +395,12 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             # 注意：类型要用**原始媒体 URL** 判定——play_url 走本地代理后是
             # http://127.0.0.1:/s/token，不含 .m3u8/.mp4 特征，会被判成 unknown
             # 拿 2500ms，走代理的慢 HLS 反而缓冲更小（播放卡顿的根因之一）。
+            _kind = ""  # classify 失败时保持空值：按源缓冲只对已知非 mp4 生效
             try:
                 from .media_tuner import classify as _classify
                 # 分类对象：系列路径必须用**真实流地址**（惰性 /e/ URL 判不出类型）
                 _profile = _classify(classify_url or url)
+                _kind = _profile.kind
                 _caching = max(_profile.buffer_ms, 5000) if _profile.kind == "hls" else _profile.buffer_ms
                 # 经本地代理转发（防盗链头）多一跳、更抖，缓冲再加大抗卡顿。
                 # 但只对**分片流**（HLS/DASH）抬高：mp4 直链靠 Range 渐进读取，
@@ -398,7 +418,12 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
             # ≥136KB/s）用默认 8s 缓冲必然反复卡死，需给到 20~30s 扛住带宽缺口。
             # 只按源开（其余源仍是 8s），避免给本来正常的源白加启动延迟。
             # 取 max() 当下限用：配小了也不会把分类算出的更大值降级。
-            if caching_ms and int(caching_ms) > 0:
+            #
+            # 只对**分片流**生效：键名叫 media.hls.*，而 mp4 直链靠 Range 渐进
+            # 读取，大缓冲只会白拖起播（实测 15000ms 要等 15.2s 才开播）。源声明
+            # format=mp4 但实际返回 m3u8 的（如 agedm）按真实分类判定，仍会生效。
+            if (caching_ms and int(caching_ms) > 0
+                    and _kind in ("hls", "dash", "live")):
                 _caching = max(_caching, int(caching_ms))
             # 播放处理（调研 VLC 流播放调优）：除加大网络缓冲外，加 --no-drop-late-frames
             # 让 VLC 不丢晚到的帧（默认丢帧会表现为画面卡顿跳动）；不强制硬件解码——
