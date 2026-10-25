@@ -1318,6 +1318,7 @@ class MainWindow(QMainWindow):
         )
         page.open_requested.connect(self._open_from_search)
         page.search_clicked.connect(self._record_search)
+        page.search_meta.connect(self._record_search_meta)
         page.add_to_shelf_requested.connect(self._on_batch_add_shelf)
         page.batch_download_requested.connect(self._on_batch_download)
 
@@ -1327,6 +1328,16 @@ class MainWindow(QMainWindow):
 
     def _record_search(self, keyword: str, context_url: str = "", folder: str = "") -> None:
         self.search_history.push(keyword, context_url=context_url, folder=folder)
+
+    def _record_search_meta(self, keyword: str, source_ids: list, type: str) -> None:
+        """重搜还原用：把本次实际使用的源/类型写回历史条目。
+
+        优先用 search_meta（精确携带源集合）；普通 push 不传 source_ids
+        时由 SearchHistory 保留旧记录的来源。
+        """
+        self.search_history.push(
+            keyword, source_ids=list(source_ids or []), type=type or ""
+        )
 
     def _ensure_reader(self):
         """返回可用的阅读器；未 READY 时返回 None（延迟构造到 READY）。"""
@@ -1898,16 +1909,35 @@ class MainWindow(QMainWindow):
             })
 
     def _jump_to_search(self, keyword: str) -> None:
-        """跳转搜索 Tab + 预填关键词并自动搜索（ui-home #3 最近搜索一键重搜）。"""
+        """跳转搜索 Tab + 预填关键词并自动搜索（ui-home #3 最近搜索一键重搜）。
+
+        重搜精确还原上一次使用的源与类型：从历史条目读取 source_ids/type，
+        只搜这些源、不混入未使用的源（无记录时回退到当前源菜单选择）。
+        """
         if self.search_history.hidden(keyword):
             return
+        meta = self._search_meta_for(keyword)
         if self._runtime_state != "READY" or self.search is None:
-            self._queue_navigation("search", lambda: self._jump_to_search(keyword))
+            self._queue_navigation(
+                "search",
+                lambda: self._jump_to_search(keyword),
+            )
             return
         self.tabs.setCurrentIndex(self._tab_index["search"])
         page = self.tabs.widget(self._tab_index["search"])
-        if page is not None and hasattr(page, "fill_keyword"):
-            page.fill_keyword(keyword)
+        if page is not None and hasattr(page, "run_search_with"):
+            page.run_search_with(
+                keyword,
+                source_ids=meta.get("source_ids") if meta else None,
+                type=meta.get("type", "") if meta else "",
+            )
+
+    def _search_meta_for(self, keyword: str) -> dict | None:
+        """从历史记录取最近一次该关键词的源/类型（用于重搜还原）。"""
+        for rec in self.search_history.recent(with_meta=True):
+            if rec.get("keyword") == keyword:
+                return rec
+        return None
 
     def _build_placeholder(self, label: str) -> QWidget:
         """未实现界面的占位页。"""

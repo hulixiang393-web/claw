@@ -224,6 +224,8 @@ class _SearchCoverBackfillTask(QRunnable):
 
 class SearchPage(BasePage):
     search_clicked = Signal(str)  # 搜索触发（首页接）
+    # 重搜用：携带本次使用的源与类型，供历史重搜精确还原（避免混入未用源）
+    search_meta = Signal(str, object, str)  # (keyword, source_ids: list, type: str)
     open_requested = Signal(str, str, str)  # (source_id, url, content_type) 打开作品
     # 批量操作（PROJECT_GUIDE.md §6.4）：加入书架 / 加入下载
     add_to_shelf_requested = Signal(object, str)  # list[SearchResult], folder
@@ -264,6 +266,8 @@ class SearchPage(BasePage):
         self._last_columns = 0  # 已应用的网格列数：列数不变时跳过重复列拉伸（避免每批全量重排）
         self._all_action = None  # 源菜单「全部」QAction 引用（就地同步勾选态，不重建菜单）
         self._src_rows: dict = {}  # source_id → 源行 QPushButton（就地同步勾选态，不重建菜单）
+        self._last_search_source_ids: list = []  # 上一次实际搜索使用的源（历史重搜精确还原）
+        self._last_search_type: str = ""  # 上一次搜索选中的类型（历史重搜还原）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -416,10 +420,50 @@ class SearchPage(BasePage):
                 self._reset_source_chips()
             self.refresh()
 
-    def fill_keyword(self, keyword: str) -> None:
-        """外部预填关键词并搜索。"""
+    def fill_keyword(self, keyword: str, source_ids: list | None = None,
+                     type: str = "") -> None:
+        """外部预填关键词并搜索。
+
+        source_ids 非 None 时精确还原这些源（历史重搜，避免混入未用源）：
+        空列表表示「全部」，显式切回全选；type 非空时同步切换类型下拉。
+        source_ids 为 None 则不改动当前源菜单（按现有选择搜索）。
+        """
         self.keyword_input.setText(keyword)
+        if type:
+            idx = self.type_combo.findData(type)
+            if idx >= 0:
+                self.type_combo.setCurrentIndex(idx)
+        if source_ids is not None:
+            self._apply_source_selection(source_ids)
         self._on_search()
+
+    def run_search_with(self, keyword: str, source_ids: list | None = None,
+                        type: str = "") -> None:
+        """历史重搜入口：精确还原上一次使用的源与类型后搜索。
+
+        与 fill_keyword 等价，独立命名便于 App 层表达「重搜」语义。
+        """
+        self.fill_keyword(keyword, source_ids=source_ids, type=type)
+
+    def _apply_source_selection(self, source_ids: list) -> None:
+        """把源菜单选择精确设置为给定源集合（求交集到当前可见类型源）。
+
+        给定集合为空 → 全选；否则仅勾选集合内且当前类型下可见的源。
+        就地更新菜单状态不触发自动搜索。
+        """
+        enabled = self._sources_for_current_type()
+        enabled_ids = {s.source_id for s in enabled}
+        wanted = [sid for sid in (source_ids or []) if sid in enabled_ids]
+        if not wanted:
+            self._all_selected = True
+            self._selected_sources.clear()
+        else:
+            self._all_selected = False
+            self._selected_sources = set(wanted)
+        self._sync_all_action()
+        self._sync_source_rows()
+        self._update_src_button_label()
+        # 注意：不调用 _clear_results_for_source_change，重搜会自行清空旧结果。
 
     def _sources_for_current_type(self):
         selected_type = self.type_combo.currentData() or ""
@@ -474,7 +518,14 @@ class SearchPage(BasePage):
             self.status_label.setText("没有可搜索的源")
             return
 
+        # 记录本次实际搜索的源与类型（历史重搜精确还原，避免混入未用源）
+        self._last_search_source_ids = [s.source_id for s in sources]
+        self._last_search_type = self.type_combo.currentData() or ""
+
         self.search_clicked.emit(keyword)
+        self.search_meta.emit(
+            keyword, self._last_search_source_ids, self._last_search_type
+        )
         self._build_status_bar(sources)
         self.status_bar.setVisible(True)
         self._pending_count = len(sources)
