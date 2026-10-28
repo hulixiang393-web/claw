@@ -8,7 +8,7 @@
   "$metadata": {
     "adult": true,
     "homepage": "https://18mh.net/",
-    "description": "禁漫天堂 - 成人漫画源",
+    "description": "禁漫天堂 - 成人漫画源（jm-v4 版式）",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -37,6 +37,7 @@
   "endpoints": {
     "discovery": {
       "list_url": "/comic/all",
+      "note": "2026-10 站点换版为 jm-v4 版式：旧版 ul.dx-novel-list / .detail-page__catalog-item 全部消失，列表改为 ul.jm-grid--book > li.jm-card（每页固定 20 张，SSR 全量输出、封面在 img[data-src]、title 取 h3.jm-card__title 内 a），分页仍是 /comic/all/page/{n}（页顶 pager 的 data-link/data-page）。",
       "list_paginator": {
         "type": "increment",
         "start": 1,
@@ -101,21 +102,30 @@
       },
       "works_list_item": {
         "root_selector": {
-            "css": "ul.dx-novel-list li, ul.dx-comic-list li, .comic-list li, .book-list li"
+          "css": "ul.jm-grid--book > li.jm-card"
         },
         "fields": {
           "title": {
-            "css": "h2, h3, .title, .book-title"
+            "css": "h3.jm-card__title a"
           },
           "url": {
-            "css": "a[href*='/comic/detail/']",
+            "css": "a.jm-card__cover",
             "attr": "href"
           },
           "cover": {
             "fallback": [
-              {"css": "img", "attr": "data-src"},
-              {"css": "img", "attr": "data-original"},
-              {"css": "img", "attr": "src"}
+              {
+                "css": "img.jm-card__img",
+                "attr": "data-src"
+              },
+              {
+                "css": "img.jm-card__img",
+                "attr": "data-original"
+              },
+              {
+                "css": "img.jm-card__img",
+                "attr": "src"
+              }
             ]
           }
         }
@@ -125,26 +135,36 @@
       "base_url": "/comic/search/{keyword}",
       "method": "GET",
       "keyword_param": "keyword",
+      "note": "搜索结果不是卡片网格，而是 a.jm-rrow 行式条目（/static 的 jm-sr-pg 分页，实测 /comic/search/{kw}/page/{n} 仍可用）。",
       "paginator": {
         "url_template": "/comic/search/{keyword}/page/{page}"
       },
       "item": {
         "root_selector": {
-            "css": "ul.dx-novel-list li, ul.dx-comic-list li, .comic-list li, .book-list li"
+          "css": "a.jm-rrow"
         },
         "fields": {
           "title": {
-            "css": "h2, h3"
+            "css": ".jm-rrow__title"
           },
           "url": {
-            "css": "a[href*='/comic/detail/']",
+            "css": "a.jm-rrow",
             "attr": "href"
           },
           "cover": {
             "fallback": [
-              {"css": "img", "attr": "data-src"},
-              {"css": "img", "attr": "data-original"},
-              {"css": "img", "attr": "src"}
+              {
+                "css": "img.jm-rrow__img",
+                "attr": "data-src"
+              },
+              {
+                "css": "img.jm-rrow__img",
+                "attr": "data-original"
+              },
+              {
+                "css": "img.jm-rrow__img",
+                "attr": "src"
+              }
             ]
           }
         }
@@ -153,23 +173,31 @@
     "detail": {
       "fields": {
         "title": {
-          "css": "h1"
+          "css": "h1.jm-dt-title"
         },
         "author": {
-          "css": "a[href*='/comic/all/author/']"
+          "css": ".jm-dt-meta a[href*='/comic/all/author/']"
         },
         "cover": {
-          "css": "meta[property='og:image']",
-          "attr": "content"
+          "fallback": [
+            {
+              "css": "img.jm-dt-cover__img",
+              "attr": "data-src"
+            },
+            {
+              "css": "meta[property='og:image']",
+              "attr": "content"
+            }
+          ]
         },
         "summary": {
-          "css": ".detail-intro__text"
+          "css": ".jm-dt-desc__p"
         },
         "status": {
-          "css": "span.detail-page__cover-corner-badge"
+          "css": ".jm-dt-pill--st"
         },
         "tags": {
-          "css": "a.detail-page__tag"
+          "css": ".jm-dt-tags a.jm-dt-chip"
         }
       }
     },
@@ -177,31 +205,31 @@
       "page": {
         "list": {
           "root_selector": {
-            "css": "a.detail-page__catalog-item"
+            "css": ".jm-dt-chap a.jm-dt-ch"
           },
           "chapter_order": "asc",
-          "title_clean": true,
+          "title_clean": false,
+          "note": "jm-v4 的目录项是 .jm-dt-chap 内的 a.jm-dt-ch（span.jm-dt-ch__no 为『第 N 话』/『第N章』，span.jm-dt-ch__t 为章节名）。整串取 text_content 时两者无分隔会粘成『第 1 话AI Generated』，因此 title 用 span.jm-dt-ch__t，章节序号由 span.jm-dt-ch__no 的『第N话』提供（框架 _extract_chapter_number 也识别『第 1 话』）。",
           "fields": {
             "title": {
-              "css": "span.detail-page__chapter-title"
+              "css": "span.jm-dt-ch__no, span.jm-dt-ch__t"
             },
             "url": {
-              "css": "a.detail-page__catalog-item",
+              "css": "a.jm-dt-ch",
               "attr": "href"
             }
           }
         },
         "body": {
-          "root_selector": {
-            "css": "img[data-src]"
+          "selector": {
+            "css": ".jm-rd-read"
           },
-          "fields": {
-            "url": {
-              "css": "img[data-src]",
-              "attr": "data-src"
-            }
-          }
-        }
+          "image_selector": {
+            "css": ".jm-rd-stage--comic"
+          },
+          "note": "阅读页（/comic/chapter/{id}/{page}）版式改为 .jm-rd-stage--comic，图片仍是懒加载 data-src（xi.dzuxta.cn 带 auth_key 的加密图，沿用 decryption.targets.image 的 AES-CBC 解密）。漫画页正文规则键是 body.selector / body.image_selector（列表条目才用 root_selector/fields）；selector 取 .jm-rd-read 而不是 .jm-rd-stage--comic：stage 只有图片、text_content 为空，会让框架误判『未解析到正文 → 走正文解密』直接报错；.jm-rd-read 混入的『前一章/返回书页/下一章』导航文字在阅读器里并入图片流之前显示，不影响整话图片渲染。"
+        },
+        "ad_block": true
       }
     }
   },
@@ -227,6 +255,14 @@
         "padding": "none",
         "input": "bytes",
         "output": "bytes"
+      },
+      "chapter": {
+        "strategy": "translit",
+        "map": [
+          "前一章",
+          "返回书页",
+          "下一章"
+        ]
       }
     }
   },

@@ -25,3 +25,8 @@ nav_screenshot.png
 .DS_Store
 Thumbs.db
 data/cookies/
+
+# 调试/排查残留（不属于产品代码，勿入库）
+# $dst/ 是 Java 反编译产物（.class/META-INF），_workbuddy-patch/ 是补丁调试临时目录
+$dst/
+_workbuddy-patch/

@@ -141,8 +141,14 @@ def test_jptt_http_list_and_data_src_playback():
 
 
 def test_18mh_cover_config_keeps_lazy_image_fallbacks():
+    """2026-10 站点换版（jm-v4）：列表卡片与搜索行都仍用懒加载封面。"""
     source = _source("18mh")
-    cover = source.get_search_config()["item"]["fields"]["cover"]
-    assert [item["attr"] for item in cover["fallback"]] == [
+    search_cover = source.get_search_config()["item"]["fields"]["cover"]
+    assert [item["attr"] for item in search_cover["fallback"]] == [
         "data-src", "data-original", "src"
     ]
+    works_cover = source.get_discovery_config()["works_list_item"]["fields"]["cover"]
+    assert [item["attr"] for item in works_cover["fallback"]] == [
+        "data-src", "data-original", "src"
+    ]
+    assert works_cover["fallback"][0]["css"] == "img.jm-card__img"

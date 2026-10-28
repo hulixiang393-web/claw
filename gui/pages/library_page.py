@@ -1126,9 +1126,10 @@ class LibraryPage(BasePage):
             self._cards_by_key[book_key] = card
             if self._metadata_enriched and rec.get("content_type") != "video":
                 self._apply_badge(card, book_key)
-        # clicked 信号携带 rec 参数 → 首参吞掉它，闭包 it=item 才能拿到条目
+        # clicked 信号携带 rec 参数 → 首参吞掉它，闭包 it=item/card 才能拿到条目
+        # 与卡片本身（选集菜单锚在卡片附近，而不是光标处）。
         card.clicked.connect(
-            lambda _rec, it=item: self._on_card_clicked(it)
+            lambda _rec, it=item, c=card: self._on_card_clicked(it, source_card=c)
         )
         if not item["rec"].get("locked_folder"):
             card.menu_requested.connect(
@@ -2081,11 +2082,12 @@ class LibraryPage(BasePage):
         self.refresh()
 
     # ------------------------------------------------------------------ #
-    def _on_card_clicked(self, item: dict) -> None:
+    def _on_card_clicked(self, item: dict, source_card=None) -> None:
         """点击书架卡片。item = {"rec": 记录, "members"?=系列成员列表}。
 
         系列合并卡（members>1）→ 弹成员选集列表，逐个打开；
         单本 → 原打开逻辑（本地优先加载，无本地走网络）。
+        source_card：被点击的卡片（用来把选集菜单锚在卡片附近，而不是光标处）。
         """
         locked_folder = item.get("rec", {}).get("locked_folder")
         if locked_folder:
@@ -2093,12 +2095,23 @@ class LibraryPage(BasePage):
             return
         members = item.get("members")
         if members:
-            self._pick_series_member(item["rec"], members)
+            # 锚点用关键字传入；老调用/测试的 _pick_series_member 覆盖签名不带
+            # anchor 时退化为原调用（菜单回退到光标位置，不因签名差异报错）。
+            try:
+                self._pick_series_member(item["rec"], members, anchor=source_card)
+            except TypeError:
+                self._pick_series_member(item["rec"], members)
             return
         self._open_rec(item["rec"])
 
-    def _pick_series_member(self, leader: dict, members: list[dict]) -> None:
-        """系列合并卡：弹出该系列各话/各季成员列表，选一个打开。"""
+    def _pick_series_member(self, leader: dict, members: list[dict], anchor=None) -> None:
+        """系列合并卡：弹出该系列各话/各季成员列表，选一个打开。
+
+        菜单必须锚在**被点击的卡片**上方/附近。旧实现用 `menu.exec()` 默认
+        显示在光标处，卡片在滚动区里时菜单常弹到窗口别处（缩放/滚轮后尤为
+        明显，看起来像"下拉框位置错了"）。这里按卡片在屏幕上的位置定位，
+        并夹在屏幕可用区域内，保证不越界。
+        """
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
@@ -2112,7 +2125,42 @@ class LibraryPage(BasePage):
                 lambda checked=False, mm=m: self._open_rec(mm)
             )
         menu.setTitle(f"《{leader.get('title', '')}》选集")
-        menu.exec()  # 默认显示在光标处
+        pos = self._series_menu_pos(menu, anchor)
+        if pos is None:
+            menu.exec()  # 无可用锚点（极端情况）→ 退回光标位置
+        else:
+            menu.exec(pos)
+
+    @staticmethod
+    def _series_menu_pos(menu, anchor):
+        """选集菜单的屏幕坐标：卡片下方优先，放不下则翻到卡片上方。"""
+        import shiboken6
+        from PySide6.QtCore import QPoint
+        from PySide6.QtWidgets import QApplication
+
+        if anchor is None or not shiboken6.isValid(anchor):
+            return None
+        try:
+            top_left = anchor.mapToGlobal(QPoint(0, 0))
+        except Exception:  # noqa: BLE001
+            return None
+        card_w = anchor.width()
+        card_h = anchor.height()
+        size = menu.sizeHint()
+        screen = QApplication.screenAt(top_left) or QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen is not None else None
+        # 横向：菜单左边缘对齐卡片左边缘，右侧越界则右对齐卡片
+        x = top_left.x()
+        if area is not None:
+            x = min(x, area.right() - size.width())
+            x = max(x, area.left())
+        # 纵向：优先卡片下沿，放不下翻到卡片上沿
+        y = top_left.y() + card_h
+        if area is not None:
+            if y + size.height() > area.bottom():
+                y = top_left.y() - size.height()
+            y = max(area.top(), min(y, area.bottom() - size.height()))
+        return QPoint(x, y)
 
     def _open_rec(self, rec: dict) -> None:
         """打开单个书架记录：本地优先加载（视频播本地、epub 读本地），无本地才走网络。

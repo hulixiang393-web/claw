@@ -78,6 +78,20 @@ def _sheet_ids(page):
     return {c.work.source_id for c in page.grid_container.findChildren(WorkCard)}
 
 
+def _shown_ids(page):
+    """网格里当前显示的结果来源（隐藏的复用卡片不算）。
+
+    2026-10 性能修复后筛选走增量显隐：卡片不再销毁重建（否则每次点 chips
+    都要重拉一遍封面、勾选态也会丢），所以断言用「可见卡片」而不是
+    findChildren 的全量集合。
+    """
+    return {
+        c.work.source_id
+        for c in page.grid_container.findChildren(WorkCard)
+        if not c.isHidden()
+    }
+
+
 def test_workcard_default_not_source_filterable(app):
     """发现页默认卡片：source_filterable=False，无来源可点 label。"""
     card = WorkCard(SearchResult(title="X", url="u-x", source_id="site_a", source_name="站点A"))
@@ -119,20 +133,34 @@ def test_filter_on_source_click(app):
     assert page._filter_source == "site_a"
     assert page.filter_label.text() == "仅看 站点A"
     assert page.filter_bar_widget.isVisible() is True
-    assert _sheet_ids(page) == {"site_a"}
+    assert _shown_ids(page) == {"site_a"}
 
     # 再次点击同源 → 取消筛选
     page._set_filter("site_a")
     assert page._filter_source == ""
     assert page.filter_bar_widget.isVisible() is False
-    assert _sheet_ids(page) == {"site_a", "site_b"}
+    assert _shown_ids(page) == {"site_a", "site_b"}
 
     # 重新筛选后通过 × 清除筛选恢复
     page._set_filter("site_b")
-    assert _sheet_ids(page) == {"site_b"}
+    assert _shown_ids(page) == {"site_b"}
     page._clear_filter()
     assert page._filter_source == ""
-    assert _sheet_ids(page) == {"site_a", "site_b"}
+    assert _shown_ids(page) == {"site_a", "site_b"}
+
+
+def test_filter_reuses_cards_without_rebuilding(app):
+    """筛选切换不再重建卡片：同一批 WorkCard 对象复用（勾选态/封面都不丢）。"""
+    page = _make_page(app)
+    page._results = _results()
+    page._results_display = list(page._results)
+    page._shown_count = len(page._results)
+    page._show_results()
+    before = {c.work.url: id(c) for c in page.grid_container.findChildren(WorkCard)}
+    page._set_filter("site_a")
+    after = {c.work.url: id(c) for c in page.grid_container.findChildren(WorkCard)}
+    assert after == before  # 没有任何卡片被丢弃重建
+    assert page.grid_layout.count() == 2  # 只剩 site_a 两张占格子（隐藏卡已摘出布局）
 
 
 def test_filter_load_more_keeps_source(app):
@@ -147,7 +175,7 @@ def test_filter_load_more_keeps_source(app):
     page._set_filter("site_a")
     page._shown_count = 0  # 模拟首屏只渲染了一部分、后续走滚动加载
     page._load_more_results()
-    assert _sheet_ids(page) == {"site_a"}
+    assert _shown_ids(page) == {"site_a"}
 
 
 def test_filter_chips_row(app):
@@ -169,13 +197,13 @@ def test_filter_chips_row(app):
     assert page._filter_source == "site_a"
     assert page._source_chip_btns["site_a"].isChecked() is True
     assert page._source_chip_btns["site_b"].isChecked() is False
-    assert _sheet_ids(page) == {"site_a"}
+    assert _shown_ids(page) == {"site_a"}
 
     # 点「全部」→ 恢复全量，chip 全部取消
     page._all_chip_btn.click()
     assert page._filter_source == ""
     assert page._all_chip_btn.isChecked() is True
-    assert _sheet_ids(page) == {"site_a", "site_b"}
+    assert _shown_ids(page) == {"site_a", "site_b"}
 
     # 增量刷新：删除一个来源后 chips 行同步移除该按钮
     page._results = [page._results[0], page._results[2]]  # 只剩 site_a×2

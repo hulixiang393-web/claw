@@ -266,6 +266,7 @@ class DetailMixin:
 
         extractors = cfg.get("field_extractors") or {}
         title = self._jsonpath(data, extractors.get("title")) or ""
+        actor = self._extract_names(data, extractors.get("actor"))
         detail = Detail(
             source_id=source.source_id,
             content_type=source.content_type,
@@ -275,14 +276,17 @@ class DetailMixin:
             cover=str(self._jsonpath(data, extractors.get("cover")) or ""),
             status=str(self._jsonpath(data, extractors.get("status")) or ""),
             summary=str(self._jsonpath(data, extractors.get("summary")) or ""),
-            actor=str(self._jsonpath(data, extractors.get("actor")) or ""),
+            actor=" / ".join(actor) or str(self._jsonpath(data, extractors.get("actor")) or ""),
         )
-        # 标签（可空，逗号分隔列表）
-        tags = self._jsonpath(data, extractors.get("tags"))
-        if isinstance(tags, list):
-            detail.tags = [str(t) for t in tags]
-        elif tags:
-            detail.tags = [str(t) for t in str(tags).split(",")]
+        # 标签（可空，逗号分隔列表；也支持对象列表取指定字段名）
+        tags_spec = extractors.get("tags")
+        tags = self._extract_names(data, tags_spec)
+        if not tags and isinstance(tags_spec, str):
+            raw_tags = self._jsonpath(data, tags_spec)
+            if isinstance(raw_tags, str) and raw_tags:
+                tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+        if tags:
+            detail.tags = tags
 
         # 章节列表
         chapters_cfg = cfg.get("chapters") or {}
@@ -317,6 +321,22 @@ class DetailMixin:
                     ]
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] API 目录抓取失败：%s", source.source_id, exc)
+        # 单章即全片（单集视频 API 源）：详情页自身就是唯一分集，接口若不返回
+        # 章节列表则按 content.<type>.single_chapter 补一条，避免播放页「无分集」。
+        if not detail.chapters:
+            block_key = (
+                "chapter" if source.content_type == "novel"
+                else "page" if source.content_type == "comic"
+                else "episode"
+            )
+            block = (self._content_block(source) or {}).get(block_key) or {}
+            if block.get("single_chapter"):
+                detail.chapters.append(
+                    Chapter(
+                        title=detail.title or "全本",
+                        url=self._abs_url(source, url),
+                    )
+                )
         self._mark_line_menu(source, detail, cfg, url, data)
         return detail
 
@@ -700,6 +720,36 @@ class DetailMixin:
             f"{k}={values[k]}" for k in order if k != "id" and values.get(k, "") != ""
         )
         return urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+
+    @staticmethod
+    def _extract_names(node, spec):
+        """列表字段（标签/演员）取值：支持字符串 JSONPath 或 {path, key} 对象列表。
+
+        API 详情通常返回对象数组（如 labels=[{id,labelName}]），纯 JSONPath
+        无法投影字段名；配置 ``{"path": "labels", "key": "labelName"}`` 即可
+        取出名字列表。字符串 spec 或数据不是列表时返回 []，由调用方回退。
+        """
+        if not spec:
+            return []
+        if isinstance(spec, dict):
+            items = DetailMixin._jsonpath(node, spec.get("path"))
+            key = spec.get("key") or ""
+        else:
+            items = DetailMixin._jsonpath(node, spec)
+            key = ""
+        if not isinstance(items, list):
+            return []
+        names = []
+        for it in items:
+            if isinstance(it, dict):
+                val = it.get(key) if key else next(
+                    (it[k] for k in ("name", "title") if it.get(k)), ""
+                )
+            else:
+                val = it
+            if val not in (None, ""):
+                names.append(str(val))
+        return names
 
     @staticmethod
     def _jsonpath(node, path: str):

@@ -1840,8 +1840,15 @@ class MediaProxy:
             self._active = max(0, self._active - 1)
 
     def _cache_obj(self):
-        """返回已注入的缓存实例或懒加载单例（缓存被禁用时返回 None 用。）。"""
-        return self._cache
+        """返回缓存实例（懒加载单例；缓存不可用时 None）。
+
+        早期实现直接 `return self._cache`，而 `self._cache` 只在 _ensure_cache
+        被调用后才被赋值——预取路径（_maybe_prefetch / _prefetch_one /
+        _prefetch_head）读到的永远是 None，于是**预取从来没有真正跑过**：
+        配置开着也没用，分片全部由播放器现拉，上游一抖就断流（多源卡顿的
+        结构性原因）。这里统一走 _ensure_cache，两条路径拿到同一个实例。
+        """
+        return self._ensure_cache()
 
     def _ensure_cache(self):
         if self._cache is None:
@@ -2235,6 +2242,25 @@ class MediaProxy:
         """第 idx 集的惰性 URL（绝对地址，不含 #标题 fragment）。"""
         base = self._base_url(public_base)
         return f"{base}/e/{key}/{int(idx)}"
+
+    def series_episode_cached(self, key: str, idx: int,
+                              public_base: str | None = None) -> bool:
+        """该集的流映射是否已在系列 memo 里（播放端不会再跑 resolver）。
+
+        供「提前预加载下一集」判断：memo 命中时 /e/<key>/<idx> 直接 302，
+        预取毫无收益，不该再打一次站点请求。未知 key / 越界一律 False，
+        调用方保持「不确定就当没缓存」的保守语义。
+        """
+        endpoint_base = self._base_url(public_base)
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            ser = self._series.get(key)
+            if ser is None or not (0 <= idx < int(ser["count"])):
+                return False
+            return ser["memo"].get((endpoint_base, idx)) is not None
 
     def _serve_series(self, handler, path: str,
                       public_base: str | None = None) -> None:
@@ -3393,7 +3419,65 @@ class MediaProxy:
             self._note_segment(segs, uri, base, cache_on, cache_key)
         if cache_on and cache_key is not None:
             self._set_seg_order(cache_key, segs)
+            # 起播预取：清单一到就先拉头部若干片，不等播放器逐段请求。
+            # 只靠 _maybe_prefetch（跟随「播放器请求了第 N 片」）推进时，窗口
+            # 永远贴着播放进度；一旦某片上游卡住数秒，缓冲里没有更远的储备，
+            # 播放立刻中断（18mh 实测单段 3~12.5s）。这里在起播时先填满一段
+            # 「安全垫」，让窗口领先于播放位置。
+            self._prefetch_head(cache_key, segs)
         return "\n".join(out)
+
+    def _prefetch_head(self, cache_key: str, segs: list[str]) -> None:
+        """清单解析完成时预取头部若干片（起播安全垫）。
+
+        与 _maybe_prefetch 的区别：不依赖播放器已经请求过某片，直接在后台
+        按并发上限排队，避免起播后最初几段仍要等待上游。
+
+        并发用 min(workers, 2)：起播瞬间就打满一路并发去拉源站，实测会被
+        上游当成抓取（18mh 连拉 8+ 并发后返回 429）。播放靠节奏抢带宽即可，
+        不需要在开始的一两秒内榨干连接。
+        """
+        if not self._prefetch_enabled() or self._pf_cancel.is_set():
+            return
+        cache = self._cache_obj()
+        if cache is None or not cache.enabled or not segs:
+            return
+        with self._lock:
+            ctx = self._cache_ctx.get(cache_key)
+        if ctx is None:
+            return
+        with self._pf_lock:
+            generation = self._pf_generation
+        headers = dict(ctx[1])
+        headers["Accept-Encoding"] = "identity"
+        force_proxy = _tuple_force_proxy(ctx)
+        head = segs[: max(1, self._pf_cfg["depth"])]
+        # 起播阶段限制预取排队数量：head 全排队会在播放开始前先打一串请求
+        budget = max(1, min(int(self._pf_cfg["workers"]), 2))
+        queued = 0
+        for u in head:
+            if queued >= budget:
+                break
+            canonical = cache.key_of(u)
+            if cache.hls_segment_final(cache_key, u).is_file():
+                continue
+            with self._pf_lock:
+                if len(self._pf_futures) >= _PREFETCH_MAX_PENDING:
+                    break
+                if canonical in self._pf_scheduled:
+                    continue
+                self._pf_scheduled.add(canonical)
+                self._pf_cancelled_urls[canonical] = threading.Event()
+            try:
+                fut = self._ensure_pf_pool().submit(
+                    self._prefetch_one, cache_key, u, dict(headers), force_proxy,
+                    generation)
+            except RuntimeError:
+                return
+            with self._pf_lock:
+                self._pf_futures.add(fut)
+            fut.add_done_callback(self._prefetch_future_done)
+            queued += 1
 
     @staticmethod
     def _note_segment(segs: list[str], uri: str, base: str,

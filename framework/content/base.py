@@ -12,6 +12,22 @@ from .shared import (
 )
 
 
+def _parser_abs(base_url: str, value: str) -> str:
+    """parser 的 URL 绝对化（与 Parser._abs 同语义，只给 extract 复用）。"""
+    from framework.parser import Parser
+
+    return Parser._abs(base_url, value)
+
+
+def _unescape_text(value: str) -> str:
+    """还原 HTML5 命名实体（lxml 只解标准 XML 实体，`&lpar;` 之类会残留）。"""
+    import html as _html
+
+    if not value or "&" not in value:
+        return value
+    return _html.unescape(value)
+
+
 class ContentBase:
     def __init__(
         self,
@@ -562,6 +578,12 @@ class ContentBase:
         for _pat, _repl in (fields.get("title_clean") or []):
             if _pat:
                 title = title.replace(_pat, _repl)
+        # HTML 实体还原：lxml 只解标准实体，`&lpar;` / `&comma;` / `&rpar;`
+        # 这类 HTML5 命名实体会原样留在属性值里（xvideos 的 og:title 就是
+        # `&lpar;Madison Ivy&comma; Xander Corvus&rpar;`）。标题/作者/简介/
+        # 状态都是给人看的文本，统一走一次 html.unescape；二次 unescape 对
+        # 已解开的 `&` 无害（不会还原成标签）。
+        title = _unescape_text(title)
         # 书名修正：若 title 像是站点名（短/非书名），尝试 og:novel:book_name
         book_fields = fields.get("book_name")
         if book_fields:
@@ -578,11 +600,11 @@ class ContentBase:
             content_type=source.content_type,
             url=abs_url,
             title=title,
-            author=self._parser.extract_first(doc, fields.get("author")),
+            author=_unescape_text(self._parser.extract_first(doc, fields.get("author"))),
             cover=cover,
-            status=self._parser.extract_first(doc, fields.get("status")),
-            summary=self._parser.extract_first(doc, fields.get("summary")),
-            actor=self._parser.extract_first(doc, fields.get("actor")),
+            status=_unescape_text(self._parser.extract_first(doc, fields.get("status"))),
+            summary=_unescape_text(self._parser.extract_first(doc, fields.get("summary"))),
+            actor=_unescape_text(self._parser.extract_first(doc, fields.get("actor"))),
         )
         # 标题/作者文本解密（番茄等：列表/详情书名作者被 PUA 字体混淆，需 translit
         # 还原；解密配置与 discovery 列表同源：decryption.targets.title/author）。
@@ -610,13 +632,17 @@ class ContentBase:
                     source, detail.summary, target="summary", html=html,
                     font_urls=font_urls,
                 )
-        # 标签（可空）
+        # 标签（可空）。文本字段不能走 extract(..., base_url)：parser 会对**所有**
+        # 结果做 URL 绝对化，标签文字会被拼成 https://站点/porn 这种伪链接
+        # （xvideos 等源实测）。需要链接形态时在源配置里写 attr: "href"。
         tags = self._parser.extract(doc, fields.get("tags"))
-        detail.tags = tags
+        detail.tags = [_unescape_text(t) for t in tags]
         # 图文集（视频页截图序列等）：detail.fields.gallery 多值选择器 → 绝对 URL
-        detail.gallery = self._parser.extract(
-            doc, fields.get("gallery"), source.base_url
-        )
+        detail.gallery = [
+            _parser_abs(source.base_url, value)
+            for value in self._parser.extract(doc, fields.get("gallery"))
+            if value
+        ]
         # 字段清洗：fields.clean.{field} 为 [pattern, repl] 替换对列表；
         # pattern 以 "re:" 开头按正则替换（如 summary 去"最新章节推荐地址"尾巴）
         for _key, _pairs in (fields.get("clean") or {}).items():

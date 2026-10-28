@@ -74,7 +74,7 @@ def _make_page():
     mgr.add(SourceConfig.from_dict({**SRC, "$id": "site_c", "$name": "站点C"}))
     page = SearchPage(mgr, Search(http=None, parser=Parser()))
     # 轻量卡片替身，避免真实 WorkCard 的封面加载/网络
-    page._make_card = lambda r: QFrame()
+    page._make_card = lambda r, defer_cover=False: QFrame()
     return page
 
 

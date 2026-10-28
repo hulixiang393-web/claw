@@ -242,6 +242,9 @@ class SearchPage(BasePage):
         self._results = []
         self._filter_source = ""
         self._saved_unfiltered_shown = None  # 进入来源筛选前的渲染进度（清除筛选后恢复）
+        self._saved_unfiltered_visible = None  # 进入筛选前的可见卡片 url 集合（清除后恢复显隐）
+        self._card_pool: dict = {}  # url → 网格里已建好的 WorkCard（筛选重排/重建时复用）
+        self._card_pool_source = None  # 卡片池绑定的结果列表 id（换词/换源后须丢弃池）
         self._source_chip_btns: dict = {}  # source_id → source chip QPushButton（结果来源筛选行）
         self._source_chip_row = None  # 来源筛选 chips 行 widget（构建后赋值）
         self._chip_ready = False  # 来源筛选行已构建（防御早于 _build 的调用）
@@ -487,6 +490,7 @@ class SearchPage(BasePage):
         epoch = self._search_epoch
         self._filter_source = ""
         self._saved_unfiltered_shown = None
+        self._saved_unfiltered_visible = None
         self.filter_bar_widget.setVisible(True)
         self._reset_source_chips()
         self.status_label.setText("搜索中...")
@@ -1092,30 +1096,57 @@ class SearchPage(BasePage):
         self._last_columns = cols
         self.apply_column_stretch(self.grid_layout, cols)
 
-    def _append_card(self, r, cols) -> None:
-        """建一张结果卡片并放进网格（按 cols 列排列）。
+    def _append_card(self, r, cols, defer_cover: bool = False) -> None:
+        """建一张结果卡片（或复用已建的）并放进网格（按 cols 列排列）。
 
         只负责「建卡 + 放网格 + 计数」；cols 必须由调用方在循环前
         用 _columns() 算好传入（助手内不再重算，防滚动条宽度变化导致
         与外部列数不一致、卡片错乱）。
+
+        defer_cover=True：建卡时不立即拉封面（筛选切换只重排已有卡片时用）。
+        来源筛选是「同一批结果的子集」，卡片沿用建时的状态：勾选态不会被
+        重置，已加载的封面也不会重新下载。
         """
         row, col = divmod(self._work_count, cols)
-        card = self._make_card(r)
+        card = self._card_pool.get(getattr(r, "url", "") or "")
+        if card is None:
+            card = self._make_card(r, defer_cover=defer_cover)
+            if getattr(r, "url", ""):
+                self._card_pool[r.url] = card
         self.grid_layout.addWidget(card, row, col)
+        # addWidget 之后必须显式 setVisible(True)：卡片入网格时父容器显示状态
+        # 未定，Qt 会把它置为 hidden，只 addWidget 不显示（结果区只剩空白格子）
+        card.setVisible(True)
         self._work_count += 1
 
     def _show_results(self) -> None:
-        """按当前筛选重建结果网格（来源角标筛选用）。"""
+        """按当前筛选重建结果网格（来源角标 / chips 筛选用）。
+
+        有筛选时只显示该源卡片、取消筛选时按 _shown_count 恢复全量批；
+        增量路径（_show_filtered / _restore_unfiltered）覆盖翻页与清除这两个
+        热路径，本方法兜底给其余调用方（窗口列数变化等）。
+        """
         ratio = self._scroll_ratio()
         self._clear_grid()
+        self._card_pool_source = id(self._current_display())  # 卡片池跟随这份结果列表
+        # 全量列表只铺「已加载批」；筛选只铺该来源的卡片，但仍受已加载批限制，
+        # 否则每点一次 chips 就把上千条结果全建卡（建卡 + 封面并发 = 点击卡死）
         display = self._filtered_display()
-        cols = self._columns()
-        # 筛选时全量渲染（结果通常较少）；无筛选时只渲染已加载批
-        shown = display if self._filter_source else display[:self._shown_count]
+        if self._filter_source:
+            # 筛选态重建：未筛中的结果也要建卡（建好即隐藏），否则取消筛选时
+            # 只有被筛中的那部分卡片，另一半结果就凭空消失了
+            shown = self._current_display()[:self._shown_count]
+            matched = {r.url for r in display if getattr(r, "url", "")}
+        else:
+            shown = display[:self._shown_count]
+            matched = None
         for r in shown:
-            self._append_card(r, cols)
-        self._shown_count = len(shown)
-        self._apply_column_stretch(cols)
+            self._append_card(r, self._columns(), defer_cover=bool(self._filter_source))
+        if matched is not None:
+            for url, card in self._card_pool.items():
+                if url not in matched:
+                    self._hide_card(card)
+        self._apply_column_stretch(self._columns())
         self._update_batch_status()
         # 筛选切换同样按比例恢复，不跳回顶部
         self._restore_scroll_ratio(ratio)
@@ -1133,13 +1164,15 @@ class SearchPage(BasePage):
     # ------------------------------------------------------------------ #
     # 勾选批量（PROJECT_GUIDE.md §6.4）
     # ------------------------------------------------------------------ #
-    def _make_card(self, r):
+    def _make_card(self, r, defer_cover: bool = False):
         """创建勾选模式卡片并连接信号。
 
         封面随卡片创建立即加载（CoverLoader 全局限流异步，不阻塞 UI；
         与发现页一致——发现页滚动丝滑即源于此，不做滚动 mapTo 全扫）。
+        defer_cover=True：先不拉封面（筛选切换只重排已有卡片时用，避免
+        重排瞬间再排一轮封面请求）。
         """
-        card = WorkCard(r, selectable=True)
+        card = WorkCard(r, selectable=True, defer_cover=defer_cover)
         card.clicked.connect(lambda _, rr=r: self._emit_open(rr))
         card.checked.connect(self._on_card_checked)
         card.set_source_filterable(True)
@@ -1235,6 +1268,13 @@ class SearchPage(BasePage):
         self._clear_selection()
 
     def _clear_grid(self) -> None:
+        """清空网格并丢弃卡片池（换词/换源/重建：旧卡片都不再复用）。
+
+        只修 `_card_pool = {}` 是不够的：每次重建都把池换成一个新 dict，
+        筛选时「池是否已失效」必须看它是否仍绑定当前结果列表，不能只看池非空。
+        """
+        self._card_pool = {}
+        self._card_pool_source = None
         while self.grid_layout.count():
             child = self.grid_layout.takeAt(0)
             w = child.widget()
@@ -1328,31 +1368,174 @@ class SearchPage(BasePage):
         """来源筛选（chips 按钮 / 卡片来源角标共用）。"""
         if source_id != self._filter_source:
             if not self._filter_source:
-                # 首次进入筛选：保存未筛选时的渲染进度，清除筛选后恢复用
+                # 首次进入筛选：保存未筛选时的渲染进度与可见卡片，清除筛选后恢复用
                 self._saved_unfiltered_shown = self._shown_count
+                self._saved_unfiltered_visible = {
+                    getattr(c, "work", None) and c.work.url
+                    for c in self._visible_cards()
+                }
             self._filter_source = source_id
             src = self._manager.get(self._filter_source)
             self.filter_label.setText(f"仅看 {src.source_name}")
         else:
-            # 再次点击同源 → 取消筛选，恢复未筛选时的渲染进度
+            # 再次点击同源 → 取消筛选
             self._filter_source = ""
-            self.filter_label.setText("")
-            if self._saved_unfiltered_shown is not None:
-                self._shown_count = self._saved_unfiltered_shown
-                self._saved_unfiltered_shown = None
         self.filter_bar_widget.setVisible(bool(self._filter_source))
         self._sync_chip_checked()
-        self._show_results()
+        if self._filter_source:
+            self._show_filtered()
+        else:
+            self._restore_unfiltered()
 
     def _clear_filter(self) -> None:
         self._filter_source = ""
         self.filter_label.setText("")
         self.filter_bar_widget.setVisible(True)
-        if self._saved_unfiltered_shown is not None:
-            self._shown_count = self._saved_unfiltered_shown
-            self._saved_unfiltered_shown = None
         self._sync_chip_checked()
+        self._restore_unfiltered()
+
+    # ---- 筛选显隐（增量：只改 setVisible，不重建卡片、不重拉封面）---- #
+    def _visible_cards(self) -> list:
+        """当前可见的结果卡片（隐藏的复用卡不算）。
+
+        判据是 Python 侧 `isHidden()` 而不是 `isVisibleTo`：卡片可见性由筛选
+        显隐控制，父容器没真正 show（离屏/尚未显示）时 `isVisibleTo` 会把全部
+        卡片判成不可见，重排就会一张不剩。
+        """
+        if not self._card_pool:
+            return []
+        return [card for card in self._card_pool.values() if not card.isHidden()]
+
+    def _hide_card(self, card) -> None:
+        """把卡片置为不可见（筛选掉），两种隐藏语义都覆盖。"""
+        card.hide()
+        card.setProperty("filterHidden", True)
+
+    def _show_card(self, card) -> None:
+        """恢复卡片可见，并清掉「被筛选隐藏」的临时标志。"""
+        card.setProperty("filterHidden", False)
+        card.show()
+        card.setVisible(True)  # 双保险：父容器更新期间 show() 可能被折叠
+
+    def _render_missing_cards(self, display, cols: int, defer_cover: bool = True) -> None:
+        """把 display 里「还没建卡」的结果补进网格并置顶，保证筛选结果不空。
+
+        筛选后可见条数由 _shown_count 框住（懒加载语义不变），但已加载批的
+        末尾可能恰好没有目标来源 → 沿用旧的全量渲染让该源独占整屏，这里改为
+        只补足一屏，不把上千条结果一次性建卡。
+        """
+        saved_shown = self._shown_count
+        pending = [r for r in display if getattr(r, "url", "") not in self._card_pool]
+        if not pending:
+            return
+        screen = max(1, int(self._page_size))
+        for r in pending[:screen]:
+            self._append_card(r, cols, defer_cover=defer_cover)
+        # 渲染进度按「可见条数」回填：多铺出来的卡片也要计入 _shown_count，
+        # 否则下一次滚动加载会从旧下标重复 append 同一批结果
+        self._shown_count = max(saved_shown, min(len(display), screen))
+        # 新补的卡片必须先脱离 hidden 状态，否则上一轮筛选留下的 hidden 会
+        # 让它在 _visible_cards() 里被当成隐藏卡，重排时又摘出布局
+        for r in pending[:screen]:
+            card = self._card_pool.get(getattr(r, "url", "") or "")
+            if card is not None:
+                card.show()
+
+    def _show_filtered(self) -> None:
+        """进入/切换来源筛选：隐藏其它源卡片并按需补卡，不重建网格。
+
+        旧实现每次点击都 _clear_grid + 为筛中结果「全量」建卡：几百上千张
+        卡片同步构造（每张 5+ 个 QLabel、全套 QSS 解析）会让主线程卡住数秒，
+        清空时又是整批 deleteLater；而现在网格里的卡片本来就是可复用的，
+        改显隐 + 重新排布即可，勾选态和已加载封面都原样保留。
+        """
+        ratio = self._scroll_ratio()
+        # 卡片池还没绑定结果列表（结果刚被替换、网格尚未重建）→ 先按结果重建
+        # 一遍网格，拿到与当前结果一一对应的卡片池；否则复用旧卡片会画出过期结果
+        if self._card_pool_source != id(self._current_display()):
+            self._show_results()
+            # 重建路径铺完卡片后按筛选结果收敛显隐（复用刚建好的卡片，不再重建）
+            matched_after = {r.url for r in self._filtered_display() if getattr(r, "url", "")}
+            for url, card in self._card_pool.items():
+                if url not in matched_after:
+                    self._hide_card(card)
+            self._relayout_pooled()
+            self._update_batch_status()
+            return
+        display = self._filtered_display()
+        matched = {r.url for r in display if getattr(r, "url", "")}
+
+        # 先改显隐再重排（顺序不能反）：卡片还挂在布局里时 show()/setVisible
+        # 会被父容器的批量更新状态吞掉，事后仍是 hidden，重排就一张都拿不到；
+        # 先摘出布局再 show，状态才真正生效。
+        for url, card in self._card_pool.items():
+            if url in matched:
+                self._show_card(card)
+            else:
+                self._hide_card(card)
+        self._render_missing_cards(display, self._columns())
+        self.grid_container.setUpdatesEnabled(False)
+        try:
+            self._relayout_pooled()
+            self._apply_column_stretch(self._columns())
+        finally:
+            self.grid_container.setUpdatesEnabled(True)
+            self.grid_container.update()
+        self._update_batch_status()
+        self._restore_scroll_ratio(ratio)
+
+    def _restore_unfiltered(self) -> None:
+        """取消筛选：恢复进筛选前的显隐与渲染进度（同样不重建卡片）。"""
+        stale = self._card_pool and self._card_pool_source != id(self._current_display())
+        if self._card_pool and not stale:
+            # 未重建过网格（增量路径）→ 只恢复显隐
+            ratio = self._scroll_ratio()
+            if self._saved_unfiltered_shown is not None:
+                self._shown_count = self._saved_unfiltered_shown
+            visible = self._saved_unfiltered_visible
+            self.grid_container.setUpdatesEnabled(False)
+            try:
+                if visible:
+                    for url, card in self._card_pool.items():
+                        card.setVisible(url in visible)
+                else:
+                    for url, card in self._card_pool.items():
+                        card.setVisible(True)
+                        card.show()
+                self._relayout_pooled()
+                self._apply_column_stretch(self._columns())
+            finally:
+                self.grid_container.setUpdatesEnabled(True)
+                self.grid_container.update()
+            # 复用卡片被 takeAt 摘出过布局后 Qt 仍保持 hidden 状态，重排后逐张补齐
+            for card in self._visible_cards():
+                card.show()
+                card.update()
+            self._saved_unfiltered_shown = None
+            self._saved_unfiltered_visible = None
+            self._update_batch_status()
+            self._restore_scroll_ratio(ratio)
+            return
+        # 网格已被重建（如列数变化）→ 退回重建路径；此时 _shown_count 已由
+        # 上面恢复成进筛选前的值，_show_results 只铺这一批
+        self._saved_unfiltered_visible = None
         self._show_results()
+
+    def _relayout_pooled(self) -> None:
+        """把当前可见的复用卡片按列重新排布，不留空洞。
+
+        隐藏的卡片必须先从网格里摘掉（留在布局里会继续占格子，筛选结果就被
+        挤成满屏空位）。用 takeAt 逐个移除、再 addWidget 重排，不销毁卡片。
+        """
+        cols = self._columns()
+        while self.grid_layout.count():
+            self.grid_layout.takeAt(0)
+        self._work_count = 0
+        self._last_columns = 0  # 重排后需重新应用一次列拉伸
+        for card in self._visible_cards():
+            row, col = divmod(self._work_count, cols)
+            self.grid_layout.addWidget(card, row, col)
+            self._work_count += 1
 
     def _on_scroll(self, value: int) -> None:
         """滚动到 80% → 渲染下一批结果（懒加载，与发现页一致）。
@@ -1505,6 +1688,7 @@ class SearchPage(BasePage):
         self._pending_count = 0
         self._filter_source = ""
         self._saved_unfiltered_shown = None
+        self._saved_unfiltered_visible = None
         self.filter_bar_widget.setVisible(True)
         self.batch_bar.setVisible(False)
         self.select_all_check.blockSignals(True)

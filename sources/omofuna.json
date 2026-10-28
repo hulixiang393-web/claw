@@ -83,12 +83,17 @@
     "content": {
       "render_config": {
         "wait_until": "domcontentloaded",
-        "timeout_ms": 60000,
-        "extra_delay_ms": 12000
+        "timeout_ms": 30000,
+        "extra_delay_ms": 6000,
+        "slow_fallback_rounds": 1
       },
       "episode": {
         "play_url": {
-          "render": "playwright_fallback"
+          "render": "playwright_fallback",
+          "probe": {
+            "mode": "skip",
+            "note": "直连必 403（vip.dytt-hot.com 校验 Host/时效），同一地址经本地媒体代理 200。探测在这里只会白等约 3s、再把可用线路写进死线缓存，故跳过；地址可用性交给播放器/代理首次请求判定。"
+          }
         },
         "list": {
           "root_selector": {"css": ".play-list-content li"},

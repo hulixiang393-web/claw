@@ -26,7 +26,7 @@ import threading
 import time
 import webbrowser
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
 from PySide6.QtWidgets import (
@@ -119,6 +119,100 @@ def _signed_url_remaining_ttl(values) -> float:
     return max(0.0, min(expiries) - time.time() - 5.0)
 
 
+# ---------------------------------------------------------------------- #
+# 「同一集」识别（续播对位）
+#
+# 续播位置**不能按 URL 全等定位**：同一集换线路（omofuna 的 /play/1/11.html →
+# /play/3/11.html）、CDN 换域名、m3u8 每次新签 auth_key，URL 都会变样。旧的
+# `record["chapter_url"] == 当前集 URL` 判定在换线路后恒为假 → 位置被丢弃，
+# 从头重播（用户看到的就是「明明看过还从头放」）。
+#
+# 这里按两级归一化比对：
+#   1. 集号签名 (第几集, 集名后缀)：标题「第01集」/「11集」都归到 (11, "")，
+#      「第1集 上」/「第1集 下」归到 (1, "上") / (1, "下")，不会互相串。
+#   2. 取不到集号时，比「去掉易变查询参数后的 URL」：单集视频的签名 m3u8
+#      路径稳定、只有 query 变，这一级就能命中。
+# ---------------------------------------------------------------------- #
+_EPISODE_NUMBER_RES = (
+    re.compile(r"第\s*(\d{1,4})\s*[集话話期回]"),
+    re.compile(r"(\d{1,4})\s*[集话話期回]"),
+    re.compile(r"(?i)\bEP?\s*[._\-]?\s*(\d{1,4})\b"),
+    re.compile(r"^\s*(\d{1,4})\s*$"),
+)
+_URL_TAIL_NUMBER_RE = re.compile(r"(?<!\d)(\d{1,4})$")
+# 易变查询参数：防盗链签名、时间戳、线路号。比对身份时一律剔除。
+_VOLATILE_QUERY_KEYS = frozenset({
+    "auth_key", "authkey", "expire", "expires", "expires_at", "key", "rand",
+    "sign", "signature", "sid", "t", "time", "token", "ts", "v",
+})
+# 集名后缀去噪：标点、序数外壳与数字（数字已单独抽成集号，留着比不出区别，
+# 只会让「11集」和「第11集」这类同一集的两种写法对不上）
+_TITLE_NOISE_RE = re.compile(r"[\s\-_—·.、,，:：()（）\[\]【】第集话話期回\d]+")
+
+
+def _episode_signature(url: str = "", title: str = "") -> tuple:
+    """返回 (集号 | None, 集名后缀)：同一集的稳定签名。"""
+    label = (title or "").strip()
+    number = None
+    rest = label
+    for pattern in _EPISODE_NUMBER_RES:
+        match = pattern.search(label)
+        if match:
+            number = int(match.group(1))
+            rest = label[:match.start()] + label[match.end():]
+            break
+    if number is None:
+        # URL 尾段的集号：先去扩展名再取末尾数字，"b.m3u8" 里的 8 不能当集号
+        tail = urlsplit(url or "").path.rsplit("/", 1)[-1]
+        stem = tail.rsplit(".", 1)[0] if "." in tail else tail
+        match = _URL_TAIL_NUMBER_RE.search(stem)
+        if match:
+            number = int(match.group(1))
+    return number, _TITLE_NOISE_RE.sub("", rest)
+
+
+def _url_identity(url: str) -> str:
+    """去掉易变查询参数后的 URL 身份（路径 + 稳定参数）。"""
+    try:
+        parts = urlsplit((url or "").strip())
+    except ValueError:
+        return ""
+    if not parts.path:
+        return ""
+    kept = sorted(
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() not in _VOLATILE_QUERY_KEYS
+    )
+    suffix = f"?{urlencode(kept)}" if kept else ""
+    return (parts.path.rstrip("/") or "/") + suffix
+
+
+def _same_episode(a_url: str = "", a_title: str = "", b_url: str = "",
+                  b_title: str = "", single: bool = False) -> bool:
+    """两个 URL/标题是否指向同一集（容忍换线路/换 CDN/换签名）。
+
+    single：该作品只有一集——此时「哪一集」无需判断，URL 怎么变都是同一集。
+    """
+    if a_url and a_url == b_url:
+        return True
+    signature_a = _episode_signature(a_url, a_title)
+    signature_b = _episode_signature(b_url, b_title)
+    # 集号冲突 → 一定不是同一集。这条**先于** single 生效：连载型单集作品换集后
+    # 集号会变，不能因为「只有一集」就把上一集的秒数套到新集上。
+    if (signature_a[0] is not None and signature_b[0] is not None
+            and signature_a[0] != signature_b[0]):
+        return False
+    if single:
+        return True
+    # 签名比对必须有实义信息（集号或集名后缀）：两边都空 = 无从判断，不能当同一集，
+    # 否则「无标题、URL 又不像」的两个不同分集会被误判成同一集而错位续播。
+    if signature_a == signature_b and (signature_a[0] is not None or signature_a[1]):
+        return True
+    identity_a = _url_identity(a_url)
+    return bool(identity_a) and identity_a == _url_identity(b_url)
+
+
 class VideoView(QWidget):
     """视频分集 + VLC 内嵌播放视图（现代化交互，支持多播放源换源）。"""
 
@@ -154,6 +248,16 @@ class VideoView(QWidget):
     # 预取失败后的重试间隔（秒）：4 分钟窗口内允许少量重试，避免一次
     # 网络抖动就把该集的预取永久锁死；也避免每 5 秒进度回调都重试压站。
     PREFETCH_RETRY_S = 30.0
+    # 同一集同一位置的重试上限与位置容差：进度回写本来就是 5s 一条，容差
+    # 小于它才会真的挡住「暂停在窗口里反复触发」。
+    PREFETCH_MAX_ATTEMPTS = 3
+    PREFETCH_LATCH_TOLERANCE_S = 2.0
+    # 兜底巡检周期（毫秒）：VLC 在「缓冲/暂停/静音」时可能整段不发进度，
+    # 只靠 on_progress 驱动会让 4 分钟窗口整段空转。巡检只读一次 VLC 状态，
+    # 已锁存或已缓存时不做任何网络请求。
+    PREFETCH_TICK_MS = 20000
+    # 每集只显示一次「已提前准备好下一集」提示（避免抖动刷屏）
+    PREFETCH_NOTICE_ONCE = True
 
     # 快捷键帮助内容（? 键浮层）
     _HELP_TEXT = (
@@ -206,6 +310,11 @@ class VideoView(QWidget):
         self._prefetch_idx = -2  # 正在预拉下一集（<0 空闲）
         self._prefetch_attempted: set = set()
         self._prefetch_retry_at: dict = {}  # key → 允许下次预取的时间点
+        self._prefetch_hopeless: set = set()  # 冷却期外仍应跳过的 key（见 _mark_hopeless）
+        # 预取锁存：{(集下标, 画质): (触发时的 (seconds, duration), 发起次数)}。
+        # 同一集在同一个播放位置只触发一次，进度在窗口内来回晃（暂停/回拖）
+        # 不会反复取流；位置显著变化或冷却到期才会再发起。
+        self._prefetch_state: dict = {}
         self._quality = "best"
         self._quality_options: list = []
         self._detail_url_for_play = ""  # 无分集时记录详情 URL
@@ -240,6 +349,11 @@ class VideoView(QWidget):
         from framework.media_tuner import MediaTuner
 
         self._tuner = MediaTuner()  # 卡顿统计/缓冲升级（每次 load 重置）
+        # 卡顿后自动加缓冲并重播（本会话内最多 3 级）。此前 MediaTuner 只被
+        # 创建和 reset，没人把 buffering 事件喂进来、也没人触发升级，
+        # 于是「自适应缓冲」从头到尾没生效过——多源卡顿的共性原因之一。
+        self._tuner_busy = False      # 正在升级重播（防重入）
+        self._buffer_upgrade_ms = 0   # 本会话已升到的缓冲值（0=用默认画像）
         self._hide_timer = QTimer(self)  # 控制条自动隐藏
         self._hide_timer.setInterval(3000)
         self._hide_timer.timeout.connect(self._hide_controls)
@@ -1333,6 +1447,16 @@ class VideoView(QWidget):
                 if ep.url == start_ep_url:
                     idx = i
                     break
+            else:
+                # URL 全等没命中不等于「不是这一集」：换过线路的续读 URL 与本轮
+                # 详情页的分集 URL 天然不同（…/play/1/11.html vs …/play/3/11.html），
+                # 只比字符串会让续读集位回落到第 1 集。按同一集身份再找一次。
+                for i, ep in enumerate(detail.chapters):
+                    if _same_episode(start_ep_url, "", getattr(ep, "url", ""),
+                                     getattr(ep, "title", ""),
+                                     single=len(detail.chapters) == 1):
+                        idx = i
+                        break
         self._current_idx = idx if detail.chapters else -1
         self._update_cast_button()
         self._sync_overlay_state(playing=False)
@@ -1349,7 +1473,12 @@ class VideoView(QWidget):
             self._stream_task = task
             QThreadPool.globalInstance().start(task)
             return
-        if detail.chapters and restore_location and detail.chapters[idx].url == start_ep_url:
+        if detail.chapters and restore_location and (
+                detail.chapters[idx].url == start_ep_url
+                or _same_episode(start_ep_url, "",
+                                 getattr(detail.chapters[idx], "url", ""),
+                                 getattr(detail.chapters[idx], "title", ""),
+                                 single=len(detail.chapters) == 1)):
             self._load_episode(idx)
             return
         if detail.chapters:
@@ -1483,6 +1612,7 @@ class VideoView(QWidget):
             self._player.release()
             self.play_btn.setText("▶")
         self._external_active = False  # 外播会话结束（换视频/换源/停止）
+        self._stop_prefetch_ticker()
         self._sync_overlay_state(playing=False)
         self.buffer_spinner.hide()
         self.control_bar.show()  # 停播后未播放状态 → 控制条常驻
@@ -1708,6 +1838,8 @@ class VideoView(QWidget):
         if hasattr(self, "_prefetch_attempted"):
             self._prefetch_attempted.clear()
         self._prefetch_retry_at.clear()
+        self._prefetch_hopeless.clear()
+        self._prefetch_state.clear()
         self._prefetch_cache.clear()
 
     def _invalidate_stream_cache(self, ep_url=None, quality=None) -> None:
@@ -1720,6 +1852,8 @@ class VideoView(QWidget):
             self._stream_cache.clear()
             self._prefetch_cache.clear()
             self._prefetch_retry_at.clear()
+            self._prefetch_hopeless.clear()
+            self._prefetch_state.clear()
             return
         for key in list(self._stream_cache) + list(self._prefetch_cache):
             key_url = key[1] if len(key) == 4 else key[0]
@@ -1731,6 +1865,11 @@ class VideoView(QWidget):
             self._stream_cache.pop(key, None)
             self._prefetch_cache.pop(key, None)
             self._prefetch_retry_at.pop(key, None)
+            self._prefetch_hopeless.discard(key)
+            for latch_key in [k for k in self._prefetch_state if k[1] == key_quality]:
+                idx = int(latch_key[0])
+                if 0 <= idx < len(self._episodes) and self._episodes[idx].url == key_url:
+                    self._prefetch_state.pop(latch_key, None)
 
     def _on_quality_changed(self, text: str) -> None:
         if not text or text == self._quality or self._current_idx < 0:
@@ -1843,6 +1982,10 @@ class VideoView(QWidget):
             return
         if self._stream_task is not None:
             self._stream_task = None
+        # 该集的前后端已在解析 → 预取那一路无事可做。不取消的话后端会再跑
+        # 一次解析、写一次缓存，既白耗一次请求，也把「预取」变成「和播放
+        # 抢同一个站点的请求」。取消后 _on_prefetch_done 不会再回调。
+        self._cancel_prefetch_for(ep_url, quality)
         if err or not video:
             if self._is_current_stream(ep_url, quality):
                 self._show_status(f"获取播放流失败：{_safe_error_text(err) if err else '无播放地址'}")
@@ -1866,6 +2009,7 @@ class VideoView(QWidget):
         """
         if self.isVisible():
             self._play(video, audio, title)
+            self._start_prefetch_ticker()
         else:
             self._pending_play = (video, audio, title)
 
@@ -1875,6 +2019,7 @@ class VideoView(QWidget):
             video, audio, title = self._pending_play
             self._pending_play = None
             self._play(video, audio, title)
+            self._start_prefetch_ticker()
 
     def _play(self, video: str, audio: str, title: str) -> None:
         """播放 = 调用外部播放器（VLC 桌面版优先，浏览器兜底）。
@@ -1955,12 +2100,16 @@ class VideoView(QWidget):
             # 没拉起播放器：只提示，不置 _has_played、不记录进度
             self._show_status(f"播放失败：{msg or '未获取到可播放地址'}")
             self._sync_overlay_state(playing=False)
+            self._stop_prefetch_ticker()
             return
         self._show_status(f"{msg}：{title or video}")
         self.play_btn.setText("▶")
         self._sync_overlay_state(playing=False)
         self.control_bar.show()  # 外部播放器接管画面 → 控制条常驻
         self._external_active = True  # 外播会话在 → App 内快捷键转发 VLC
+        # 真正的播放已开始 → 打开兜底巡检（VLC 缓冲/暂停时可能整段不发
+        # 进度，只靠 on_progress 会让 4 分钟窗口整段空转）。
+        self._start_prefetch_ticker()
         if msg:
             self._notify_last_episode()  # 末集/单集：提示不再有下一集
 
@@ -2011,13 +2160,17 @@ class VideoView(QWidget):
             if (is_hls and declared):
                 prefetch = dict(hls["prefetch"])
             elif is_hls:
-                # 默认仅前瞻 4 片、2 路并发；足够覆盖短时抖动且不放大请求。
-                prefetch = {"enabled": True, "depth": 4, "workers": 2}
+                # 未声明 prefetch 的 HLS 源：前瞻 10 片、3 路并发。
+                # 旧默认 4 片/2 路是按「小分片、低延迟」估的，遇到 2MB 级
+                # 分片 + 上游偶发数秒抖动（18mh 实测单片 4.7s）时缓冲两下
+                # 就耗尽，表现为播放卡顿。10 片 ≈ 一分多钟缓冲，仍远低于
+                # 源侧上限（_PREFETCH_MAX_DEPTH=64），不会放大请求。
+                prefetch = {"enabled": True, "depth": 10, "workers": 3}
             else:
                 prefetch = {"enabled": False}
             configure(
                 bool(prefetch.get("enabled", False)),
-                depth=prefetch.get("depth", 4),
+                depth=prefetch.get("depth", 10),
                 workers=prefetch.get("workers", 3),
             )
         except Exception:
@@ -2967,14 +3120,26 @@ class VideoView(QWidget):
         episodes = tuple(self._episodes)
         index = max(0, self._current_idx)
         chapter_url = episodes[index].url if episodes else detail.url
+        chapter_title = (getattr(episodes[index], "title", "") if episodes
+                         else getattr(detail, "title", ""))
+        single = len(episodes) <= 1
         location = {}
         lookup = getattr(self, "progress_lookup", None)
         record = lookup(library_url) if lookup else None
-        if record and record.get("chapter_url") == chapter_url:
+        matched = False
+        if record:
+            # 同一集就续播——不要求 URL 全等（换线路/CDN/签名都会让 URL 变样，
+            # 见 _same_episode）；否则换条线路看过的集会被当成「没看过」重播。
+            matched = _same_episode(
+                record.get("chapter_url") or "", record.get("chapter_title") or "",
+                chapter_url, chapter_title, single=single,
+            )
+        if matched:
             location = dict(record.get("location") or {})
             if "seconds" not in location and record.get("position") is not None:
                 location["position"] = record["position"]
-        elif getattr(self, "_restore_episode_url", "") == chapter_url:
+        elif _same_episode(getattr(self, "_restore_episode_url", "") or "", "",
+                           chapter_url, chapter_title, single=single):
             location = dict(getattr(self, "_pending_location", None) or {})
             if "seconds" not in location and self._pending_position is not None:
                 location["position"] = self._pending_position
@@ -3004,6 +3169,10 @@ class VideoView(QWidget):
                     self.position_changed.emit(payload)
                 except RuntimeError:
                     pass
+            # 预取判定的唯一时基。**必须放在进度回写之后**：回写是用户可见的
+            # 进度记忆，预取只是加速，任何一侧出错都不能连累另一侧。这里用
+            # 信号而不是直接调用 _prefetch_next，是因为 PlaybackMonitor 在
+            # 后台线程回调，跨线程直接改视图状态属线程归属违规。
             try:
                 self._progress_position.emit(
                     int(idx), float(position["seconds"]), float(position["duration"])
@@ -3180,26 +3349,47 @@ class VideoView(QWidget):
 
     # ------------------------------------------------------------------ #
     def _on_progress_position(self, idx: int, seconds: float, duration: float) -> None:
-        if duration <= 0 or idx != self._current_idx:
+        """进度时基入口（主线程槽）：进窗口才预取，且同一位置只预取一次。"""
+        self._maybe_prefetch_next(idx, float(seconds), float(duration))
+
+    def _prefetch_next(self, idx: int = -1) -> None:
+        """「准备下一集」的唯一入口：先判可行性（缓存/放弃/冷却），再串行取流。
+
+        窗口内的首次触发（_maybe_prefetch_next）与冷却到期后的重试
+        （_prefetch_tick）都走这里，保证「要不要发请求」只有一处判定。
+        """
+        if idx < 0:
+            idx = self._current_idx
+        if self._source is None:
             return
         if not (0 <= idx < len(self._episodes) - 1):
             return
-        remaining = duration - seconds
-        if 0 <= remaining <= self.PREFETCH_BEFORE_END_S:
-            self._prefetch_next(idx)
-
-    def _prefetch_next(self, idx: int = -1) -> None:
-        """后台解析并缓存下一集播放链接（命中缓存/无下一集/正在预拉则跳过）。"""
-        if idx < 0:
-            idx = self._current_idx
-        self._prefetch_episode(idx + 1)
+        next_idx = idx + 1
+        key = self._prefetch_key_for_episode(next_idx)
+        if key is None:
+            return
+        if self._stream_cache_get(key) is not None or self._series_memo_ready(next_idx):
+            return
+        if key in self._prefetch_hopeless:
+            return
+        retry_at = self._prefetch_retry_at.get(key)
+        if retry_at is not None:
+            if time.monotonic() < retry_at:
+                return  # 失败冷却中
+            self._prefetch_retry_at.pop(key, None)  # 冷却到期 → 允许再试
+        # 冷却到期的重试也要清掉 attempted（_prefetch_episode 见到它就直接返回）
+        self._prefetch_attempted.discard(key)
+        self._prefetch_episode(next_idx)
 
     def _prefetch_episode(self, idx: int) -> None:
         """后台预拉指定集播放流（串行防反爬限流，命中/越界/在拉则跳过）。
 
         与旧 _prefetch_next 同参数同回调：实际在预拉中（_prefetch_idx >= 0）
         或已缓存则跳过；预拉完成后由 _on_prefetch_done 写缓存并解锁。
-        失败后按 PREFETCH_RETRY_S 冷却重试，避免一次网络抖动永久放弃。
+
+        **串行是硬约束**：预取请求与正在播放的取流共用源站配额，并发会让
+        本集的分片/取流抢带宽，表现为「预取一开播就卡」。所以同时只允许
+        一个预取任务在跑，其余请求等在巡检/下一次进度回调里再补。
         """
         if self._source is None:
             return
@@ -3209,20 +3399,170 @@ class VideoView(QWidget):
         key = self._stream_cache_key(ep.url, self._quality)
         if self._stream_cache_get(key) is not None:
             return
-        if key in self._prefetch_attempted:
-            retry_at = self._prefetch_retry_at.get(key)
-            if retry_at is None or time.monotonic() < retry_at:
-                return
-            self._prefetch_retry_at.pop(key, None)
+        # 媒体代理里已有该集的惰性流映射 → 播放端不会再跑 resolver，
+        # 预取毫无收益（也避免在受限站点上白打一个请求）。
+        if self._series_memo_ready(idx):
+            return
+        if key in self._prefetch_hopeless:
+            return  # 本集在当前线路/画质下确定取不到流，直到换集/换源才重试
         if self._prefetch_idx >= 0:
             return  # 已有其他集在预拉（串行）
+        # 每个 (集, 画质) 一生只发起一次取流：失败由 _on_prefetch_failed 写
+        # 冷却/放弃标记，冷却到点后由 _prefetch_tick 或下一次进度回调重试。
+        # 冷却结束后的重试**不能**依赖「再次进入窗口」——真实进度到那时已经
+        # 过了窗口，旧实现就是卡在这里，看起来像预取根本没跑。
+        if key in self._prefetch_attempted:
+            return
+        retry_at = self._prefetch_retry_at.get(key)
+        if retry_at is not None:
+            if time.monotonic() < retry_at:
+                return  # 失败冷却中
+            self._prefetch_retry_at.pop(key, None)
         self._prefetch_attempted.add(key)
         self._prefetch_idx = idx
+        self._prefetch_quality = self._quality
         task = _FetchStreamTask(self._content, self._source, ep.url, self._quality,
                                 gen=self._stream_gen, prefetch=True)
         task.signals.finished.connect(self._on_prefetch_done)
         self._prefetch_task = task
-        QThreadPool.globalInstance().start(task)
+        try:
+            QThreadPool.globalInstance().start(task)
+        except Exception:  # noqa: BLE001 —— 线程池拒绝时不能让标记卡死串行锁
+            self._prefetch_idx = -2
+            self._prefetch_task = None
+            raise
+
+    def _series_memo_ready(self, idx: int) -> bool:
+        """该集的流映射是否已在媒体代理里（有则播放端不会再跑 resolver）。"""
+        if not self._series_key or self._source_needs_merged():
+            return False
+        try:
+            from framework.media_proxy import MediaProxy
+
+            return MediaProxy.instance().series_episode_cached(self._series_key, idx)
+        except Exception:  # noqa: BLE001 —— 纯优化判定，取不到就当没缓存
+            return False
+
+    def _prefetch_key_for_episode(self, idx: int):
+        if not (0 <= idx < len(self._episodes)):
+            return None
+        return self._stream_cache_key(self._episodes[idx].url, self._quality)
+
+    def _cancel_prefetch_for(self, ep_url: str, quality: str) -> None:
+        """取消正在跑的那一路预取（仅当它正是 ep_url/quality）。
+
+        用途：用户在窗口内手动点/自动续播切到这一集时，前端已经拿到了流，
+        后端再解析一遍纯属重复请求。取消要**真正 interrupt 网络请求**
+        （task.cancel() 会 cancel StreamBudget），否则只是白等它跑完。
+        """
+        task = getattr(self, "_prefetch_task", None)
+        if task is None:
+            return
+        if getattr(task, "_url", None) != ep_url:
+            return
+        cancel = getattr(task, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:  # noqa: BLE001 —— 取消失败不影响播放
+                log.debug("[prefetch] 取消在途预取失败", exc_info=True)
+        self._prefetch_task = None
+        self._prefetch_idx = -2
+
+    def _prefetch_latched(self, source_idx: int, seconds: float) -> bool:
+        """该集在「这个播放位置」是否已经触发过预取。
+
+        锁存的意义：进度回写是 5 秒一条，用户暂停在片尾或回拖两下就会在
+        窗口边界反复进出。没有锁存时每次进出都重新取流，既压站又可能把
+        正在播放的本集拖慢——这正是「提前 4 分钟预加载」实际不生效的原因
+        之一（一次成功之后又被打回未取）。
+        """
+        entry = self._prefetch_state.get((source_idx, self._quality))
+        if not entry:
+            return False
+        latched_pos, attempts = entry
+        if attempts >= self.PREFETCH_MAX_ATTEMPTS:
+            return True
+        return abs(float(seconds) - float(latched_pos[0])) < self.PREFETCH_LATCH_TOLERANCE_S
+
+    def _prefetch_latch_at(self, source_idx: int, seconds: float, duration: float,
+                        attempts: int | None = None) -> None:
+        key = (source_idx, self._quality)
+        previous = self._prefetch_state.get(key)
+        count = (previous[1] if previous else 0) if attempts is None else attempts
+        self._prefetch_state[key] = ((float(seconds), float(duration)), count)
+
+    def _maybe_prefetch_next(self, idx: int, seconds: float, duration: float) -> None:
+        """进度时基：进入片尾窗口且未锁存时，串行预拉下一集。
+
+        只做判定与调度，不碰播放路径：取流在线程池里跑，单次请求也不会
+        阻塞主线程；且本集已经在播，多出来的只有一次轻量 HTTP。
+        """
+        if duration <= 0 or idx != self._current_idx:
+            return
+        if not (0 <= idx < len(self._episodes) - 1):
+            return
+        remaining = duration - seconds
+        if not (0 <= remaining <= self.PREFETCH_BEFORE_END_S):
+            return
+        if self._prefetch_latched(idx, seconds):
+            return
+        self._prefetch_latch_at(idx, seconds, duration)
+        self._prefetch_next(idx)
+
+    def _prefetch_tick(self) -> None:
+        """兜底巡检：进度回调可能整段缺席（缓冲/暂停/静音/画面卡住）。
+
+        只读一次 VLC 状态，**已锁存或已缓存时不做任何网络请求**；位置明显
+        变化（用户回拖或续播定位后前进）时清掉锁存，让窗口重新生效。
+        """
+        if self._source is None or self._selection_mode:
+            return
+        if not (0 <= self._current_idx < len(self._episodes) - 1):
+            return
+        from framework.external_player import player_session, player_status
+
+        try:
+            if player_session() is None:
+                return  # 没有外播会话（未播放/已关闭）→ 巡检无事可做
+            status = player_status(timeout=0.5)
+        except Exception:  # noqa: BLE001 —— 巡检失败静默，下一轮再来
+            return
+        if not status:
+            return
+        seconds, duration = status.get("seconds"), status.get("duration")
+        if not isinstance(seconds, (int, float)) or not isinstance(duration, (int, float)):
+            return
+        idx = self._current_idx
+        entry = self._prefetch_state.get((idx, self._quality))
+        if entry is not None:
+            latched_pos = entry[0][0]
+            # 位置往回走了不止一个容差 → 用户回拖了，旧锁存作废
+            if seconds < latched_pos - self.PREFETCH_LATCH_TOLERANCE_S:
+                self._prefetch_state.pop((idx, self._quality), None)
+        window_hit = duration - float(seconds) <= self.PREFETCH_BEFORE_END_S
+        if not window_hit:
+            return
+        # 锁存读的是「上一次触发的播放位置」，必须在本轮判定之前取值。
+        latched = self._prefetch_latched(idx, float(seconds))
+        self._maybe_prefetch_next(idx, float(seconds), float(duration))
+        if latched:
+            # 位置没变但上一轮失败过：锁存不挡重试，冷却到期就补一次。
+            self._prefetch_next(idx)
+
+    def _start_prefetch_ticker(self) -> None:
+        timer = getattr(self, "_prefetch_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(int(self.PREFETCH_TICK_MS))
+            timer.timeout.connect(self._prefetch_tick)
+            self._prefetch_timer = timer
+        timer.start()
+
+    def _stop_prefetch_ticker(self) -> None:
+        timer = getattr(self, "_prefetch_timer", None)
+        if timer is not None:
+            timer.stop()
 
     def _prefetch_cache_ttl(self, video: str, audio: str) -> float:
         """预取链接的缓存时长：必须覆盖「提前 4 分钟」的预取窗口。
@@ -3282,21 +3622,29 @@ class VideoView(QWidget):
 
     def _on_prefetch_done(self, ep_url, video, audio, err, quality, gen=None) -> None:
         self._prefetch_idx = -2
+        self._prefetch_task = None
         if gen is not None and gen != self._stream_gen:
             return
         key = self._stream_cache_key(ep_url, quality)
         if err or not video:
-            # 失败：冷却后再给一次机会（窗口内最多重试几次）
-            self._prefetch_retry_at[key] = (
-                time.monotonic() + float(self.PREFETCH_RETRY_S)
-            )
+            self._on_prefetch_failed(ep_url, quality, err)
             return
         self._prefetch_retry_at.pop(key, None)
+        self._prefetch_hopeless.discard(key)
         ttl = self._prefetch_cache_ttl(video, audio)
         if ttl <= 0:
             self._prefetch_cache.pop(key, None)
             return
         self._prefetch_cache[key] = (time.monotonic() + ttl, video, audio)
+        # 取到链接后：锁存位置保留（同位置不再重复判定），但重试额度归零——
+        # 用户之后回拖进窗口还有完整额度；缓存/映射命中时 _prefetch_next 会
+        # 直接短路，不会因为额度归零而多发请求。
+        # 锁存键是**触发时的当前集**（其下一集才是 ep_url），所以比较要用 idx+1。
+        for latch_key in [k for k in self._prefetch_state if k[1] == quality]:
+            if self._prefetch_key_for_episode(int(latch_key[0]) + 1) == key:
+                position = self._prefetch_state[latch_key][0]
+                self._prefetch_state[latch_key] = (position, 0)
+        self._prefetch_attempted.discard(key)
         # 覆盖整个预取窗口才预热代理：签名链接若会在窗口内过期，预热反而
         # 会让自动续播拿到过期地址。
         window = float(self.PREFETCH_BEFORE_END_S) + float(
@@ -3304,6 +3652,60 @@ class VideoView(QWidget):
         )
         if ttl >= window:
             self._warm_next_episode(ep_url, video, audio)
+        # 旁路把「下一集链接已就绪」告诉用户：播放位置记忆是自动的、看不见
+        # 的，没有反馈就无法判断预取到底有没有工作。来源是探测器（无分集
+        # 自动续播）时不提示，避免自动续播刷屏。
+        idx = next((i for i, ep in enumerate(self._episodes) if ep.url == ep_url), -1)
+        if idx >= 0 and not getattr(self, "_prefetch_from_probe", False):
+            self._notify_prefetched(idx)
+
+    def _on_prefetch_failed(self, ep_url: str, quality: str, err) -> None:
+        """预取失败：按尝试次数指数退避，直到额度用完才彻底放弃该集。
+
+        旧的「一次失败冷却 30 秒」在真正失败的站点上是空转：冷却结束后的
+        下一次触发不会自动来到（进度回调可能已经跑完窗口）。这里把重试
+        也放进锁存计数里，窗口内最多 PREFETCH_MAX_ATTEMPTS 次，且每次
+        退避翻倍，避免在受限站点上反复打请求。
+        """
+        key = self._stream_cache_key(ep_url, quality)
+        source_idx = next(
+            (i for i, ep in enumerate(self._episodes) if ep.url == ep_url), -1
+        )
+        latch_key = (source_idx, quality) if source_idx >= 0 else None
+        attempts = 0
+        position = (0.0, 0.0)
+        if latch_key is not None and latch_key in self._prefetch_state:
+            position, attempts = self._prefetch_state[latch_key]
+        attempts += 1
+        if attempts >= self.PREFETCH_MAX_ATTEMPTS:
+            self._prefetch_retry_at.pop(key, None)
+            self._prefetch_hopeless.add(key)
+            if latch_key is not None:
+                self._prefetch_state[latch_key] = (position, attempts)
+            self._show_prefetch_failure(ep_url, err)
+            return
+        delay = float(self.PREFETCH_RETRY_S) * (2 ** (attempts - 1))
+        self._prefetch_retry_at[key] = time.monotonic() + delay
+        if latch_key is not None:
+            self._prefetch_state[latch_key] = (position, attempts)
+
+    def _notify_prefetched(self, idx: int) -> None:
+        """轻量反馈：下一集链接已提前取好（不打断播放，只在状态行提示）。"""
+        title = ""
+        if 0 <= idx < len(self._episodes):
+            title = getattr(self._episodes[idx], "title", "") or f"第{idx + 1}集"
+        try:
+            self._show_status(f"下一集已就绪：{title}")
+        except Exception:  # noqa: BLE001 —— 提示失败不影响播放
+            pass
+
+    def _show_prefetch_failure(self, ep_url: str, err) -> None:
+        """预取彻底失败：只在用户停在片尾、马上要切集时才提示真正的手动点集。
+
+        不弹对话框、不改播放状态——播放中的本集完全不受影响。
+        """
+        detail = _safe_error_text(err) if err else "无可用地址"
+        log.info("[prefetch] 下一集链接预取放弃：%s（%s）", ep_url, detail)
 
     def _next_available_sid(self) -> str:
         """返回当前源之后的第一个可用源 sid（无则空）。"""

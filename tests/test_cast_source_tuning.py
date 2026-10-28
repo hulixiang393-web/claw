@@ -103,7 +103,7 @@ def test_local_hls_without_source_tuning_uses_bounded_prefetch(monkeypatch):
         staticmethod(lambda: Proxy()),
     )
     view._configure_playback_prefetch("https://cdn.example/video/index.m3u8")
-    assert calls == [(True, 4, 2)]
+    assert calls == [(True, 10, 3)]
 
 
 def test_local_hls_format_without_extension_uses_bounded_prefetch(monkeypatch):
@@ -125,7 +125,7 @@ def test_local_hls_format_without_extension_uses_bounded_prefetch(monkeypatch):
         staticmethod(lambda: Proxy()),
     )
     view._configure_playback_prefetch("https://cdn.example/video/play")
-    assert calls == [(True, 4, 2)]
+    assert calls == [(True, 10, 3)]
 
 
 def test_local_hls_explicit_prefetch_disabled_is_respected(monkeypatch):
@@ -147,7 +147,7 @@ def test_local_hls_explicit_prefetch_disabled_is_respected(monkeypatch):
         staticmethod(lambda: Proxy()),
     )
     view._configure_playback_prefetch("https://cdn.example/video/index.m3u8")
-    assert calls == [(False, 4, 3)]
+    assert calls == [(False, 10, 3)]
 
 
 def test_non_hls_does_not_use_hls_prefetch_config(monkeypatch):
@@ -171,7 +171,9 @@ def test_non_hls_does_not_use_hls_prefetch_config(monkeypatch):
         staticmethod(lambda: Proxy()),
     )
     view._configure_playback_prefetch("https://cdn.example/video.mp4")
-    assert calls == [(False, 4, 3)]
+    # 源已显式声明 hls.prefetch → declared 分支优先（既有行为），这里只锁
+    # 定「源级参数原样下发」，不受默认值调整影响
+    assert calls == [(True, 8, 4)]
 
 
 def test_prefetch_configuration_is_explicit_and_bounded():

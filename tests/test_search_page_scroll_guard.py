@@ -90,7 +90,7 @@ def _make_page():
     mgr = SourceManager()
     mgr.add(SourceConfig.from_dict(SRC))
     page = SearchPage(mgr, Search(http=None, parser=Parser()))
-    page._make_card = lambda r: QFrame()
+    page._make_card = lambda r, defer_cover=False: QFrame()
     return page
 
 

@@ -123,8 +123,16 @@
             "attr": "href"
           },
           "cover": {
-            "css": "script",
-            "regex": "loadBannerDirect\\('([^']+)'"
+            "fallback": [
+              {
+                "css": "div.blog-background",
+                "attr": "z-bg-loader-url"
+              },
+              {
+                "css": "script",
+                "regex": "loadBannerDirect\\('([^']+)'"
+              }
+            ]
           }
         }
       }
@@ -154,8 +162,16 @@
             "attr": "href"
           },
           "cover": {
-            "css": "script",
-            "regex": "loadBannerDirect\\('([^']+)'"
+            "fallback": [
+              {
+                "css": "div.blog-background",
+                "attr": "z-bg-loader-url"
+              },
+              {
+                "css": "script",
+                "regex": "loadBannerDirect\\('([^']+)'"
+              }
+            ]
           }
         }
       }
@@ -168,8 +184,20 @@
           "attr": "content"
         },
         "cover": {
-          "css": "meta[property='og:image']",
-          "attr": "content"
+          "fallback": [
+            {
+              "css": "meta[property='og:image']",
+              "attr": "content"
+            },
+            {
+              "css": ".post-content img[data-xkrkllgl]",
+              "attr": "data-xkrkllgl"
+            },
+            {
+              "css": ".post-content img",
+              "attr": "src"
+            }
+          ]
         },
         "summary": {
           "css": "meta[name='description']",

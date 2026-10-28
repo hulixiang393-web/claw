@@ -8,7 +8,7 @@
   "$metadata": {
     "adult": true,
     "homepage": "https://18mh.net",
-    "description": "禁漫天堂 - 视频源（HLS m3u8，AES 加密流）",
+    "description": "禁漫天堂 - 视频源（jm-v4 版式，HLS m3u8 加密流）",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -38,6 +38,7 @@
   "endpoints": {
     "discovery": {
       "list_url": "/mv/all",
+      "note": "2026-10 站点换版：旧版 ul.dx-video-list 消失，视频列表改为 ul.jm-grid--video > li.jm-vcard（每页 20 条，封面 img.jm-vcard__img[data-src]，标题 h3.jm-vcard__title a，详情链接在 a.jm-vcard__cover 的 href）。",
       "list_item": {
         "categories": [
           {
@@ -84,21 +85,30 @@
       },
       "works_list_item": {
         "root_selector": {
-            "css": "ul.dx-video-list li, .video-list li, .movie-list li"
+          "css": "ul.jm-grid--video > li.jm-vcard"
         },
         "fields": {
           "title": {
-            "css": "h2, h3, .title, .video-title"
+            "css": "h3.jm-vcard__title a"
           },
           "url": {
-            "css": "a[href*='/mv/detail/']",
+            "css": "a.jm-vcard__cover",
             "attr": "href"
           },
           "cover": {
             "fallback": [
-              {"css": "img", "attr": "data-src"},
-              {"css": "img", "attr": "data-original"},
-              {"css": "img", "attr": "src"}
+              {
+                "css": "img.jm-vcard__img",
+                "attr": "data-src"
+              },
+              {
+                "css": "img.jm-vcard__img",
+                "attr": "data-original"
+              },
+              {
+                "css": "img.jm-vcard__img",
+                "attr": "src"
+              }
             ]
           }
         }
@@ -108,26 +118,36 @@
       "base_url": "/mv/search/{keyword}",
       "method": "GET",
       "keyword_param": "keyword",
+      "note": "视频搜索结果同样是 a.jm-rrow 行式条目，分页 /mv/search/{kw}/page/{n} 实测可用。",
       "paginator": {
         "url_template": "/mv/search/{keyword}/page/{page}"
       },
       "item": {
         "root_selector": {
-            "css": "ul.dx-video-list li, .video-list li, .movie-list li"
+          "css": "a.jm-rrow"
         },
         "fields": {
           "title": {
-            "css": "h2"
+            "css": ".jm-rrow__title"
           },
           "url": {
-            "css": "a[href*='/mv/detail/']",
+            "css": "a.jm-rrow",
             "attr": "href"
           },
           "cover": {
             "fallback": [
-              {"css": "img", "attr": "data-src"},
-              {"css": "img", "attr": "data-original"},
-              {"css": "img", "attr": "src"}
+              {
+                "css": "img.jm-rrow__img",
+                "attr": "data-src"
+              },
+              {
+                "css": "img.jm-rrow__img",
+                "attr": "data-original"
+              },
+              {
+                "css": "img.jm-rrow__img",
+                "attr": "src"
+              }
             ]
           }
         }
@@ -136,25 +156,28 @@
     "detail": {
       "fields": {
         "title": {
-          "css": "h1"
+          "fallback": [
+            {
+              "css": "h1.jm-crumb__title"
+            },
+            {
+              "css": ".jm-vd-title"
+            }
+          ]
         },
         "tags": {
           "css": "meta[property='video:tag']",
           "attr": "content"
         }
-      }
+      },
+      "note": "jm-v4 详情页标题从 <h1> 改为 h1.jm-crumb__title（另有同文本的 div.jm-vd-title），标签仍是 meta[video:tag]。"
     },
     "content": {
       "episode": {
         "single_chapter": true,
         "note": "详情页即单个视频（/mv/detail/{id}），无分集列表。此前 list.root_selector 抓详情页所有 /mv/detail/ 链接当选集（max_items=1 取第一个），详情页推荐/相关视频排在前面就播成了别的视频——改 single_chapter 用详情 URL 作唯一分集，点谁播谁，并复用 fetch_detail 已缓存的详情页 HTML 提取 m3u8。",
         "play_url": {
-          "http_chain": [
-            {
-              "regex": "\"url\"\\s*:\\s*\"([^\"]*m3u8[^\"]*)\"",
-              "name": "signed_m3u8"
-            }
-          ]
+          "note": "jm-v4 播放器不再把 m3u8 明文写进 HTML：player-container 是 Dean Edwards packer 混淆 JS，eval 后 document.write 出 /media/m3u8?url=<urlencoded 真实 m3u8>&exp=<ts> 代理地址，签名由站点下发；详情页 __INITIAL_STATE__（videoDetail.url / view_url / backend_video）里也有同一代理地址。因此不写自定义正则：交给框架通用候选扫描（会把 \\\\/ 还原成 /，命中的就是 https://xv.dzuxta.cn/media/m3u8?url=... 这个现成可播的代理地址）；自定义 regex 只能抠到 url= 后面的裸 m3u8，反而丢掉代理与签名。"
         }
       }
     }
@@ -187,6 +210,16 @@
   "diagnostics": {
     "selfcheck": {
       "strategy": "off"
+    }
+  },
+  "media": {
+    "format": "hls",
+    "hls": {
+      "prefetch": {
+        "enabled": true,
+        "depth": 12,
+        "workers": 4
+      }
     }
   }
 }

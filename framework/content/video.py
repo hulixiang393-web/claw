@@ -8,8 +8,44 @@ from __future__ import annotations
 from .shared import (
     Chapter, ContentMissingError, StreamCancelledError, _AD_IMAGE_RE,
     _re, inspect, json, log,
-    time, urljoin, urlsplit,
+    threading, time, urljoin, urlsplit,
 )
+
+
+def _signed_url_remaining_ttl(values) -> float:
+    """从带时效签名的 URL 推断剩余可用时长（秒）；0 = 无法判断。
+
+    渲染结果缓存用它兜住「签名 10 分钟就过期」的地址：缓存 TTL 不能比
+    签名寿命还长，否则续播/重播会拿到过期地址。
+    """
+    from urllib.parse import parse_qs
+
+    expiries = []
+    for value in values:
+        if not value:
+            continue
+        try:
+            query = parse_qs(urlsplit(str(value)).query)
+        except Exception:  # noqa: BLE001
+            continue
+        for name in ("expire", "expires", "expires_at", "x-amz-expires",
+                     "auth_key", "sign", "deadline"):
+            raw = (query.get(name) or [""])[0]
+            if not raw:
+                continue
+            # auth_key 形如 "<ts>-<hash>-0-<hash>"，取首段时间戳
+            head = str(raw).split("-", 1)[0]
+            try:
+                stamp = float(head)
+            except (TypeError, ValueError):
+                continue
+            if stamp > 1e12:      # 毫秒
+                stamp /= 1000.0
+            if stamp > 0:
+                expiries.append(stamp)
+    if not expiries:
+        return 0.0
+    return max(0.0, min(expiries) - time.time() - 5.0)
 
 
 class VideoMixin:
@@ -339,6 +375,7 @@ class VideoMixin:
         #   - fetch=true 或出现 referer 时：把提取到的串当 URL 请求其页面
         #   - force_mp4_0: URL 里 mp4= 值强制为 0（取 HLS 变体）
         #   - decode: caesar_unquote = Caesar 移位(自动测3~5)+URL 解码
+        #   - decode: url_unquote = 纯 URL 解码（MacCMS encrypt=1 的 player.url）
         #   - decode: base64_shift_json = Base64 字节逐位移位后解析 JSON；
         #     shift_regex 从当前文本提取移位值（Rou.video）
         #   - rewrite: [{"regex": "...", "replacement": "..."}] 对提取值
@@ -346,10 +383,22 @@ class VideoMixin:
         #   - 最后一步提取出的串即播放地址（http 开头）
         chain_cfg = play_cfg.get("http_chain")
         if chain_cfg:
-            return self._fetch_http_chain(
-                source, episode_url, html, chain_cfg,
-                deadline=deadline, context=context
-            )
+            # http_chain 失败要能降级到常规候选链（player_aaaa / regex）：站点
+            # 播放页结构一旦变化，链条第一步就匹配不上，直接抛错会让整个源不可用。
+            # 只有 StreamCancelledError（预算耗尽）必须原样上抛，不降级。
+            try:
+                return self._fetch_http_chain(
+                    source, episode_url, html, chain_cfg,
+                    deadline=deadline, context=context
+                )
+            except StreamCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 —— 记一笔，继续走常规链路
+                log.info(
+                    "[%s] 阶段=取流，http_chain 失败，异常类型=%s",
+                    source.source_id,
+                    self._safe_exception_summary(exc),
+                )
 
         # 换源站：从 player_aaaa JS 配置提取真实播放地址（ps=0 直接用 / ps=1 走 parse 转码）。
         # 播放页无 player_aaaa（MacCMS 变体：var now 直链等）→ 回退下方 play_url.regex 规则
@@ -495,12 +544,19 @@ class VideoMixin:
         render_url = abs_ep
         iframe_selector = play_cfg.get("iframe_selector")
         if iframe_selector:
-            html = self._get(source, episode_url, deadline=deadline, context=context)
+            html = self._get_play_page_html(source, episode_url, abs_ep,
+                                            deadline=deadline, context=context)
             doc = self._parser.parse(html)
             iframe_url = self._parser.extract_first(doc, iframe_selector, abs_ep)
             if not iframe_url or not iframe_url.startswith(("https://", "http://")):
                 raise ContentMissingError("未获取到播放 iframe", source_id=source.source_id)
             render_url = iframe_url
+        # 渲染结果短期缓存：同一集重播/来回切集/预取撞点集时，渲染要花
+        # 8~15s（浏览器启动 + iframe 解析站），没必要重来一遍。只缓存成功
+        # 的非空结果；TTL 取源级 render_config.cache_ttl_s（缺省 600s）。
+        cached = self._rendered_play_cache_get(source, abs_ep)
+        if cached:
+            return cached
         recovery_options = {}
         is_agedm = source.source_id == "agedm"
         if is_agedm and rc.get("recover_navigation_timeout") is True:
@@ -525,7 +581,48 @@ class VideoMixin:
             raise ContentMissingError(
                 f"渲染未获取到视频源（{episode_url}）", source_id=source.source_id
             )
+        self._rendered_play_cache_set(source, abs_ep, vurl, rc)
         return vurl
+
+    # 渲染结果缓存（{(source_id, abs_ep): (expire_monotonic, url)}）。
+    _RENDERED_CACHE_MAX = 24
+
+    def _rendered_play_cache_get(self, source: SourceConfig, abs_ep: str) -> str:
+        cache = getattr(self, "_rendered_play_cache", None)
+        if not cache:
+            return ""
+        key = (source.source_id, abs_ep)
+        hit = cache.get(key)
+        if not hit:
+            return ""
+        if hit[0] <= time.monotonic():
+            cache.pop(key, None)
+            return ""
+        return hit[1]
+
+    def _rendered_play_cache_set(self, source: SourceConfig, abs_ep: str,
+                                 url: str, rc: dict) -> None:
+        if not url:
+            return
+        # 带时效签名的地址缓存太久会在播放时过期：按 URL 里的 expire/expires
+        # 推算剩余时长，剩余不足 30s 就不缓存（下次现场渲染）。
+        try:
+            ttl = float(rc.get("cache_ttl_s") or 600.0)
+        except (TypeError, ValueError):
+            ttl = 600.0
+        remaining = _signed_url_remaining_ttl((url,))
+        if remaining > 0:
+            if remaining < 30.0:
+                return
+            ttl = min(ttl, remaining)
+        if ttl <= 0:
+            return
+        cache = getattr(self, "_rendered_play_cache", None)
+        if cache is None:
+            cache = self._rendered_play_cache = {}
+        cache[(source.source_id, abs_ep)] = (time.monotonic() + ttl, url)
+        while len(cache) > int(self._RENDERED_CACHE_MAX):
+            cache.pop(next(iter(cache)))
 
     def _fetch_play_url_http_once(
         self, source: SourceConfig, episode_url: str, abs_ep: str,
@@ -537,7 +634,11 @@ class VideoMixin:
         失败返回 ""，由调用方决定是否转渲染。
         """
         try:
-            html = self._get(source, episode_url, deadline=deadline, context=context)
+            # 走播放页缓存：这条路与 _fetch_play_url_candidates_once / 转渲染
+            # 兜底抓的是**同一个页面**，不共用缓存就会白白多抓一遍
+            # （omofuna 后半段集数 url 为空，每集因此多花 1~3s）。
+            html = self._get_play_page_html(source, episode_url, abs_ep,
+                                            deadline=deadline, context=context)
         except Exception:  # noqa: BLE001
             return ""
         try:
@@ -895,6 +996,12 @@ class VideoMixin:
                         # 解码后 JS 内 `\"` 还原为 `"`（供后续 <source src="..."> 匹配）
                         val = dec.replace('\\"', '"')
                         break
+            elif decode == "url_unquote":
+                # 纯 URL 编码解码（MacCMS encrypt=1：player.url 是整串 percent-encoded，
+                # 解码后才是解析器外壳/直链）。
+                import urllib.parse as _up
+
+                val = _up.unquote(val)
             elif decode == "base64_shift_json":
                 import base64 as _b64
 
@@ -1131,12 +1238,82 @@ class VideoMixin:
                 add(match.group(1))
 
         normalized = html.replace("\\/", "/").replace('\\"', '"')
+        # 签名包装地址（/media/m3u8?url=…&exp=…&token=…）必须整串带签名取用：
+        # 上面 .m3u8(?:\?…)? 的通用候选只会截到 url= 里的裸 m3u8，丢掉 exp/token
+        # 后站点侧代理直接 403（18mh 视频实测）。这里先把完整的带参地址收进来，
+        # 保证候选表里「带签名」的排在裸地址之前。
+        play_host = ""
+        try:
+            play_host = (urlsplit(abs_ep).hostname or "").lower()
+        except Exception:  # noqa: BLE001
+            play_host = ""
+
+        def wrapped_url(value: str) -> str:
+            """把 /media/m3u8?url=… 这类包装地址落到**站点自己的**代理上。
+
+            站点播放器用的是相对路径（\\/media\\/m3u8?url=…），按页面 host 补全；
+            页面里另有 CDN 域的绝对包装地址（xv.dzuxta.cn/media/m3u8），
+            实测该条 403/挂起，不能当播放地址用——同路径一律归到站点域。
+
+            页面里同时存在两种形态：干净的 `…&token=…` 与拼坏的
+            `…&token=…?auth_key=…&via_m=…`（两个查询串硬接，第二个 `?` 后
+            整段成了 token 值的一部分）。后者实测 403，这里把接错的第二段
+            查出来归并成合法查询串。
+            """
+            if not value.startswith(("http://", "https://", "//")):
+                value = urljoin(abs_ep, value)
+            if value.startswith("//"):
+                value = "https:" + value
+            try:
+                parts = urlsplit(value)
+            except Exception:  # noqa: BLE001
+                return value
+            query = parts.query
+            # 接错的第二段：token 值里出现 "?k=v" → 把问号起的内容并成独立参数
+            query = _re.sub(r"\?([A-Za-z0-9_]+)=", r"&\1=", query)
+            is_wrapper = parts.path.endswith("/media/m3u8")
+            if (
+                play_host
+                and is_wrapper
+                and (parts.hostname or "").lower() != play_host
+            ):
+                return f"https://{play_host}{parts.path}" + (f"?{query}" if query else "")
+            if query != parts.query:
+                return parts._replace(query=query).geturl()
+            return value
+
+        for match in _re.finditer(
+            r'((?:https?://[^"\'\s<>]+)?/media/m3u8\?url=[^"\'\s<>]+)', normalized, _re.I
+        ):
+            add(wrapped_url(match.group(1)))
+
+        def add_bare(value: str) -> None:
+            # 裸地址若本身就是 CDN 域包装（…/media/m3u8?url=…），同样归到站点域
+            if "/media/m3u8" in value:
+                add(wrapped_url(value))
+            else:
+                add(value)
+
+        for match in _re.finditer(
+            r'(https?%3A%2F%2F[^"\'\s<>]+?\.m3u8[^"\'\s<>]*)'
+            r'(?:&(?:exp|token|auth_key|expires|signature|sig)=[^"\'\s<>&]+)+',
+            normalized, _re.I,
+        ):
+            from urllib.parse import unquote as _unquote
+
+            add(wrapped_url(_unquote(match.group(0))))
         for match in _re.finditer(
             r'((?:https?://|//)[^"\'\s<>]+?\.m3u8(?:\?[^"\'\s<>]*)?)',
             normalized,
             _re.I,
         ):
-            add(match.group(1))
+            value = match.group(1)
+            # 该分支会把同一条串里 url= 后面的裸 m3u8 也抓出来（后面还跟着
+            # &exp=&token=），属于签名丢失的重复项，交给上面的包装分支处理
+            if "/media/m3u8" in value:
+                add_bare(value)
+            else:
+                add(value)
         return values
 
     def _fetch_play_url_candidates_once(
@@ -1158,11 +1335,44 @@ class VideoMixin:
             ]
         html = self._video_html_cache.get((source.source_id, abs_ep))
         if html is None:
-            html = self._get(source, episode_url, deadline=deadline, context=context)
+            html = self._get_play_page_html(source, episode_url, abs_ep,
+                                           deadline=deadline, context=context)
         self._check_stream_context(context, deadline)
         return self._extract_play_url_candidates(
             html, source, switch_cfg, play_cfg, abs_ep, episode_url
         )
+
+    # 播放页 HTML 短 TTL 缓存：omofuna 实测单页 TTFB 0.4~2.0s（站点本身就慢），
+    # 用户来回切同一集/预取与点集撞同一集时没必要再抓一次。只缓存最近几页，
+    # TTL 内复用；取流结果本身另有 stream_resolver 缓存，这里只省 HTML。
+    _PLAY_PAGE_TTL = 120.0
+    _PLAY_PAGE_MAX = 6
+
+    def _get_play_page_html(self, source: SourceConfig, episode_url: str,
+                            abs_ep: str, deadline=None, context=None) -> str:
+        """取播放页 HTML（带短 TTL 缓存 + 同 URL 并发合并）。"""
+        cache = getattr(self, "_play_page_cache", None)
+        if cache is None:
+            cache = self._play_page_cache = {}
+        now = time.monotonic()
+        hit = cache.get((source.source_id, abs_ep))
+        if hit and hit[0] > now:
+            return hit[1]
+        lock = getattr(self, "_play_page_lock", None)
+        if lock is None:
+            lock = self._play_page_lock = threading.Lock()
+        # 同一 URL 的并发取流（点集 + 提前预取）只发一次请求：抓取在锁内做，
+        # 后到的线程等前者完成直接吃缓存。不同 URL 不互相阻塞。
+        with lock:
+            hit = cache.get((source.source_id, abs_ep))
+            if hit and hit[0] > time.monotonic():
+                return hit[1]
+            html = self._get(source, episode_url, deadline=deadline, context=context)
+            cache[(source.source_id, abs_ep)] = (
+                time.monotonic() + float(self._PLAY_PAGE_TTL), html)
+            while len(cache) > int(self._PLAY_PAGE_MAX):
+                cache.pop(next(iter(cache)))
+            return html
 
     @staticmethod
     def _safe_url(url: str) -> str:
@@ -1300,11 +1510,12 @@ class VideoMixin:
                         self._fetch_play_url_candidates_once,
                         (source, current), context, deadline
                     )
-                    for play in plays:
+                    # 候选可达性逐个探测（顺序语义：取消后不再探测下一个）。
+                    usable_flags = self._probe_candidates_parallel(
+                        source, plays, current, deadline=deadline, context=context
+                    )
+                    for play, usable in zip(plays, usable_flags):
                         self._check_stream_context(context, deadline)
-                        usable = self._call_with_context(
-                            self._play_url_probe, (source, play), context, deadline
-                        )
                         if usable:
                             # 探测只证明「能访问」，不证明「能播」：解析器外壳页
                             # （.../player/?url=<id>）同样 200，播放器打开只会黑屏。
@@ -1363,6 +1574,88 @@ class VideoMixin:
             source_id=source.source_id,
         )
 
+    def _probe_candidates_parallel(
+        self, source: SourceConfig, plays: list, episode_url: str,
+        deadline=None, context=None, max_workers: int = 4,
+    ) -> list:
+        """按顺序探测候选地址，返回与 plays 对齐的可用性布尔列表。
+
+        顺序语义必须保留：context 取消（用户停止/预算耗尽）后不得再探测下一个
+        候选，否则会多发请求并掩盖取消。命中第一个可用候选即短路返回。
+
+        源可声明 content.episode.play_url.probe = {"mode": "skip"} 关闭探测——
+        适用于「直连必然 403、只有本地代理能播」的 CDN（omofuna 实测：直连
+        恒定 403，同一地址经代理 200）。这种源上探测纯属白等 3s 再判死，
+        还会把好线路写进死线缓存。
+        """
+        if self._probe_disabled(source):
+            return [True] * len(plays)
+        results: list = []
+        for url in plays:
+            if context is not None:
+                self._check_stream_context(context, deadline)
+            ok = self._play_url_probe_for_episode(
+                source, url, episode_url, deadline=deadline, context=context
+            )
+            results.append(bool(ok))
+            if ok:
+                results.extend([False] * (len(plays) - len(results)))
+                return results
+            if context is not None:
+                context.check()
+        return results
+
+    @staticmethod
+    def _probe_disabled(source: SourceConfig) -> bool:
+        """源是否声明「跳过播放地址探测」（content.episode.play_url.probe.mode）。"""
+        try:
+            block = ((source.raw or {}).get("endpoints") or {}).get("content") or {}
+            episode = block.get("episode") or {}
+            probe = (episode.get("play_url") or {}).get("probe") or {}
+            return str(probe.get("mode") or "").lower() == "skip"
+        except Exception:  # noqa: BLE001 —— 配置异常按「不跳过」处理
+            return False
+
+    def _play_url_probe_for_episode(
+        self, source: SourceConfig, url: str, episode_url: str,
+        deadline=None, context=None,
+    ) -> bool:
+        """按「播放页」Referer 探测候选地址（防盗链 CDN 可能只认播放页）。
+
+        把当前播放页作为 Referer 传给 `_play_url_probe`（源级 headers 不变，
+        只对本次探测生效）；实现签名不同时自动降级。
+        """
+        original = getattr(self, "_headers", None)
+        abs_ep = self._abs_url(source, episode_url) if episode_url else ""
+
+        def _headers_with_episode(src):
+            headers = dict(original(src) if original else {})
+            if abs_ep:
+                headers["X-Episode-Referer"] = abs_ep
+            return headers
+
+        try:
+            self._headers = _headers_with_episode
+            # 只按「实现签名」挑调用形式，不靠异常猜：子类/测试可能用
+            # `_play_url_probe(source, url)` 或 `(source, url, context=None)` 覆盖，
+            # 传 deadline 会抛 TypeError 并被误判成「探测失败」。
+            try:
+                params = inspect.signature(self._play_url_probe).parameters
+                accepts = set(params.keys())
+                call_kwargs = {}
+                if "deadline" in accepts:
+                    call_kwargs["deadline"] = deadline
+                if "context" in accepts:
+                    call_kwargs["context"] = context
+                return self._play_url_probe(source, url, **call_kwargs)
+            except (TypeError, ValueError):
+                return self._play_url_probe(source, url)
+        finally:
+            if original is not None:
+                self._headers = original
+            else:
+                self.__dict__.pop("_headers", None)
+
     def _play_url_probe(self, source: SourceConfig, url: str, deadline=None, context=None) -> bool:
         """轻量探测播放 URL 是否可访问：HTTP<400 且响应非空即视为可用。
 
@@ -1383,6 +1676,10 @@ class VideoMixin:
         if not url or not url.startswith(("http://", "https://")):
             return False
         headers = dict(self._headers(source))
+        # 探测尽量带播放页 Referer（防盗链 CDN 可能只认播放页）。
+        episode_ref = str(headers.pop("X-Episode-Referer", "") or "")
+        if episode_ref.startswith(("http://", "https://")):
+            headers["Referer"] = episode_ref
         # 探测只做可达性判断，不白等：超时取源配置但上限可配
         # （sources_runtime.play_url_probe_timeout_cap，秒），缺省 5s；
         # 限制在 [1, 30]。慢 CDN 尽快失败换线路比白等更流畅。
@@ -1461,34 +1758,72 @@ class VideoMixin:
 
         # 当前集在新线路分集列表中的位置（精确 URL 匹配，回退 URL 末段集数号）
         idx = self._episode_index_in_chapters(episode_url, base_chs)
-        out: list = []
-        seen: set = set()
-        for switch_index, line in enumerate(base_detail.source_list or [], 1):
-            cand_sid = str(line.get("sid") or "")
-            if not cand_sid or cand_sid == cur_sid:
-                continue
+        # 其它线路的分集列表**并行**取：每条线路要一次详情页请求（omofuna 实测
+        # 单页 TTFB 1~2s），串行三条就是 3~6s，而串行还是**默认线路失败时**才走，
+        # 正是用户最急着出画面的时刻。并发上限取源 constraints.max_concurrency
+        # （缺省 3），共享线程池，不额外开线程。
+        try:
+            max_parallel = int((source.raw.get("constraints") or {}).get("max_concurrency") or 3)
+        except (TypeError, ValueError, AttributeError):
+            max_parallel = 3
+        max_parallel = max(1, min(4, max_parallel))
+        return self._switch_candidate_episode_urls_parallel(
+            source, detail_url, idx, cur_sid,
+            [str(line.get("sid") or "") for line in (base_detail.source_list or [])],
+            deadline=deadline, context=context, max_parallel=max_parallel,
+        )
+
+    def _switch_candidate_episode_urls_parallel(
+        self, source: SourceConfig, detail_url: str, idx, cur_sid: str,
+        sids: list, deadline=None, context=None, max_parallel: int = 3,
+    ) -> list:
+        """并行取各其它线路分集，按 sid 顺序返回「同集」URL 列表。
+
+        顺序语义保留：结果按 sids 原序排列（换线路优先级不变）；
+        失败/空列表的线路直接跳过；context 取消立即停止派新任务。
+        """
+        pending = [sid for sid in sids if sid and sid != cur_sid]
+        if not pending:
+            return []
+        results: dict = {}
+        lock = threading.Lock()
+
+        def worker(sid: str) -> None:
             try:
-                self._check_stream_context(context, deadline)
+                if context is not None:
+                    self._check_stream_context(context, deadline)
                 if deadline is None and context is None:
-                    _, chs = self.switch_source(source, detail_url, cand_sid)
+                    _, chs = self.switch_source(source, detail_url, sid)
                 else:
                     _, chs = self.switch_source(
-                        source, detail_url, cand_sid, deadline=deadline, context=context
-                    )
-                self._check_stream_context(context, deadline)
+                        source, detail_url, sid, deadline=deadline, context=context)
             except StreamCancelledError:
-                raise
+                return
             except Exception as exc:  # noqa: BLE001
-                log.info(
-                    "[%s] 阶段=换线，线路序号=%d，异常类型=%s",
-                    source.source_id,
-                    switch_index,
-                    self._safe_exception_summary(exc),
-                )
-                continue
+                log.info("[%s] 阶段=换线，sid=%s，异常类型=%s",
+                         source.source_id, sid, self._safe_exception_summary(exc))
+                return
             if not chs:
-                continue
+                return
             u = chs[idx].url if idx is not None and idx < len(chs) else chs[0].url
+            if u:
+                with lock:
+                    results[sid] = u
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max(1, int(max_parallel)),
+                                thread_name_prefix="switch-line") as pool:
+            futures = [pool.submit(worker, sid) for sid in pending]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:  # noqa: BLE001 —— worker 内已兜底
+                    pass
+        out: list = []
+        seen: set = set()
+        for sid in pending:
+            u = results.get(sid)
             if u and u not in seen:
                 seen.add(u)
                 out.append(u)
@@ -2037,30 +2372,62 @@ class VideoMixin:
             filled[k] = val
         sign_cfg = cfg.get("sign") or {}
         strategy = sign_cfg.get("strategy")
-        if strategy:
-            from framework.signers import get_signer
-
-            signer = get_signer(strategy, self._http)
-            filled = signer.sign(filled)
-        qs = urlencode(filled)
-        abs_url = urljoin(source.base_url, api_url)
-        if "?" in api_url:
-            abs_url = f"{abs_url}&{qs}"
-        else:
-            abs_url = f"{abs_url}?{qs}"
         timeout = self._timeout(source)
         retries = self._retries(source)
         if context is not None:
             timeout = min(timeout, context.remaining())
             retries = 0
             self._check_stream_context(context)
-        resp = self._http.get_json(
-            abs_url,
-            headers=self._endpoint_headers(source, cfg),
-            timeout=timeout,
-            retries=retries,
-            proxy_pool=source.proxy_pool(),
-        )
+        method = (cfg.get("method") or "GET").upper()
+        if method == "POST":
+            # JSON POST 取流（69tv 类：接口只接受 POST，GET 返回 405）。
+            # body 与 params 共用 {id}/{bvid}/{cid}/{quality} 占位符替换，
+            # 接口所需请求头仍走端点级覆盖（_endpoint_headers）。
+            from framework import utils
+
+            placeholders = {
+                "id": ep_id,
+                "bvid": bvid,
+                "cid": cid,
+                "quality": str(q_value),
+            }
+            if q_param and q_param not in placeholders:
+                placeholders[q_param] = str(q_value)
+            body_filled = utils.fill_json(cfg.get("body") or {}, **placeholders)
+            for k, v in params.items():
+                body_filled.setdefault(k, utils.fill_json(v, **placeholders))
+            if strategy:
+                from framework.signers import get_signer
+
+                signer = get_signer(strategy, self._http)
+                body_filled = signer.sign(body_filled)
+            resp = self._http.post_json(
+                urljoin(source.base_url, api_url),
+                json_body=body_filled,
+                headers=self._endpoint_headers(source, cfg),
+                timeout=timeout,
+                retries=retries,
+                proxy_pool=source.proxy_pool(),
+            )
+        else:
+            if strategy:
+                from framework.signers import get_signer
+
+                signer = get_signer(strategy, self._http)
+                filled = signer.sign(filled)
+            qs = urlencode(filled)
+            abs_url = urljoin(source.base_url, api_url)
+            if "?" in api_url:
+                abs_url = f"{abs_url}&{qs}"
+            else:
+                abs_url = f"{abs_url}?{qs}"
+            resp = self._http.get_json(
+                abs_url,
+                headers=self._endpoint_headers(source, cfg),
+                timeout=timeout,
+                retries=retries,
+                proxy_pool=source.proxy_pool(),
+            )
         self._check_stream_context(context, deadline)
         rpath = cfg.get("response_path") or ""
         node = resp

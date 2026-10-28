@@ -191,13 +191,23 @@ def test_bookstack_discovery_search_detail_chapters_and_body():
 
 
 def test_18mh_novel_chapters_keep_site_number_for_common_sorting():
+    """2026-10 换版后目录为 a.jm-dt-ch（span.jm-dt-ch__no 章号 + span.jm-dt-ch__t 章名）。"""
     source = _source("18mh-novel")
     chapter_list = source.raw["endpoints"]["content"]["chapter"]["list"]
 
     assert chapter_list["chapter_order"] == "asc"
+    assert chapter_list["root_selector"] == {"css": ".jm-dt-chap a.jm-dt-ch"}
     assert chapter_list["fields"]["title"] == {
-        "css": ".detail-page__catalog-left"
+        "css": "span.jm-dt-ch__no, span.jm-dt-ch__t"
     }
+    assert chapter_list["fields"]["url"] == {"css": "a.jm-dt-ch", "attr": "href"}
+
+
+def test_18mh_novel_body_uses_jm_v4_ssr_container():
+    source = _source("18mh-novel")
+    body = source.raw["endpoints"]["content"]["chapter"]["body"]
+
+    assert body["selector"] == {"css": ".jm-rd-text"}
 
 
 def test_shuyous_config_has_discovery_detail_toc_body_and_same_chapter_rule():

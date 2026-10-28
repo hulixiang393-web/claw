@@ -1,0 +1,152 @@
+{
+  "$schema_version": 2,
+  "$id": "69tv",
+  "$type": "video",
+  "$name": "69TV 影视",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "adult": true,
+    "homepage": "https://69tv.fun/",
+    "description": "69TV 影视（Nuxt3 SSR + JSON API）。分类结构按原站「频道」制作：最新影片(-1)/免费试看(0)/自拍(11)/动画(10)/欧美(9)/Fc2(8)/黑料(7)/无码(6)/无码中文(5)/素人(4)/有码中文(3)/有码(2)/绿帽NTR(1)，列表页 /movies/{频道id}?page={page}（每页 30 条，SSR 直出卡片）。原站「热门标签」是详情页标签过滤，不作为分类；详情标签/演员由详情接口返回。业务接口在独立域名（window.__NUXT__.config.public.apiBase，当前 https://6t9vcb.69tv.fun）：POST /api/vod/movies 列表/搜索（搜索分页参数 pageNum，page 无效）、POST /api/vod/content 详情、POST /api/vod/play 取流（返回带 token+expires 的 b-cdn m3u8，GET 会 405）。搜索接口快速连发约 6 次以上会返回反爬响应，故 pageSize=60、max_pages=3。apiBase 若轮换，需从首页运行时配置重新读取。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "成人",
+      "日本",
+      "有码",
+      "无码",
+      "hls",
+      "api"
+    ],
+    "last_verified": "2026-10-26"
+  },
+  "transports": {
+    "base_url": "https://69tv.fun",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://69tv.fun/",
+      "Origin": "https://69tv.fun"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 500,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/movies/-1?page={page}",
+      "render": "http",
+      "list_paginator": {
+        "type": "increment",
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          { "title": "最新影片", "url": "/movies/-1?page={page}" },
+          { "title": "免费试看", "url": "/movies/0?page={page}" },
+          { "title": "自拍", "url": "/movies/11?page={page}" },
+          { "title": "动画", "url": "/movies/10?page={page}" },
+          { "title": "欧美", "url": "/movies/9?page={page}" },
+          { "title": "Fc2", "url": "/movies/8?page={page}" },
+          { "title": "黑料", "url": "/movies/7?page={page}" },
+          { "title": "无码", "url": "/movies/6?page={page}" },
+          { "title": "无码中文", "url": "/movies/5?page={page}" },
+          { "title": "素人", "url": "/movies/4?page={page}" },
+          { "title": "有码中文", "url": "/movies/3?page={page}" },
+          { "title": "有码", "url": "/movies/2?page={page}" },
+          { "title": "绿帽NTR", "url": "/movies/1?page={page}" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "div.group.cursor-pointer" },
+        "fields": {
+          "title": { "css": "h3" },
+          "url": { "css": "a[href*='/movies/content/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "src" },
+          "update": { "css": "div.bottom-2" }
+        }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "每个 /movies/content/{id} 是单个视频（无分集/选集）。详情与播放地址都来自独立 API 域名，POST JSON 取流：/api/vod/play 返回 data.vodPlayUrl（带 token/expires 的 m3u8，约 5 分钟有效期，过期需重新请求）。"
+      }
+    }
+  },
+  "api_endpoints": {
+    "search": {
+      "url": "https://6t9vcb.69tv.fun/api/vod/movies",
+      "method": "POST",
+      "body": {
+        "keyword": "{keyword}",
+        "pageNum": "{page}",
+        "pageSize": 60
+      },
+      "response_path": "data.lists",
+      "item_fields": {
+        "title": "vodName",
+        "url": "/movies/content/{vodId}",
+        "cover": "vodPic",
+        "update": "createTime"
+      }
+    },
+    "detail": {
+      "url": "https://6t9vcb.69tv.fun/api/vod/content",
+      "method": "POST",
+      "body": { "vodId": "{id}" },
+      "field_extractors": {
+        "title": "vodName",
+        "cover": "vodPic",
+        "summary": "vodContent",
+        "status": "createTime",
+        "actor": { "path": "actors", "key": "actorName" },
+        "tags": { "path": "labels", "key": "labelName" }
+      }
+    },
+    "episode": {
+      "url": "https://6t9vcb.69tv.fun/api/vod/play",
+      "method": "POST",
+      "body": { "vodId": "{id}" },
+      "field_extractors": {
+        "play_url": "data.vodPlayUrl"
+      },
+      "headers": {
+        "Accept": "application/json, text/plain, */*"
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    },
+    "hls": {
+      "workers": 4
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 3,
+      "max_results": 200
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": "div.group.cursor-pointer" }
+    }
+  }
+}

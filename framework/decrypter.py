@@ -379,11 +379,45 @@ class Decrypter:
         return str(resp[response_field])
 
     # ------------------------------------------------------------------ #
+    # 「纯 URL 解码」类 JS 的 Python 等价快路径。
+    # 很多 MacCMS 站（omofuna 等）的 player.url 只是 percent-encoded 整串，
+    # 源配置里写的解密脚本就是 `decodeURIComponent(d)`。这种函数用 Playwright
+    # 执行一次要 **1.26s**（渲染线程排队 + 浏览器 eval），而 Python 的
+    # unquote 是微秒级。只认「函数体只做一次解码、原样返回」这一种形状，
+    # 其它任何脚本仍走真实 JS 执行——不复刻 JS 语义，只跳过等价情况。
+    _UNQUOTE_JS_PATTERNS = (
+        re.compile(
+            r"^\s*function\s+\w*\s*\(\s*(\w+)\s*\)\s*\{\s*"
+            r"return\s+(?:decodeURIComponent|unescape|decodeURI)\s*\(\s*\1\s*\)\s*;?\s*\}\s*;?\s*$"
+        ),
+        re.compile(
+            r"^\s*(?:(?:const|let|var)\s+\w+\s*=\s*)?"
+            r"\(?\s*(\w+)\s*\)?\s*=>\s*"
+            r"(?:decodeURIComponent|unescape|decodeURI)\s*\(\s*\1\s*\)\s*;?\s*$"
+        ),
+    )
+
+    @classmethod
+    def unquote_only_script(cls, script: str) -> bool:
+        """脚本是否等价于「一次 URL 解码返回」（可用 Python 直接算）。"""
+        text = (script or "").strip()
+        if not text or len(text) > 200:
+            return False
+        return any(p.match(text) for p in cls._UNQUOTE_JS_PATTERNS)
+
     def _js_custom(self, cfg: dict, content: str) -> str:
         """执行源自定义 JS 解密函数（文本）。data 为文本串，result 须为字符串。"""
         script = cfg.get("script") or ""
         if not script:
             raise DecryptError("decryption.js_custom 缺少 script")
+        if self.unquote_only_script(script):
+            # 纯 URL 解码：Python 等价，省掉一次 1.2s 的 Playwright 往返。
+            from urllib.parse import unquote
+
+            try:
+                return unquote(content)
+            except Exception as exc:  # noqa: BLE001 —— 退回真实 JS 执行
+                log.debug("unquote 快路径失败，回落 JS 执行：%s", exc)
         try:
             result = _evaluate_js(script, cfg.get("entry") or "decrypt",
                                   content, cfg.get("params"), is_bytes=False)

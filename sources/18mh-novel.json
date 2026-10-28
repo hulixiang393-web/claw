@@ -8,7 +8,7 @@
   "$metadata": {
     "adult": true,
     "homepage": "https://18mh.net",
-    "description": "禁漫天堂 - 小说源（SPA 渲染正文）",
+    "description": "禁漫天堂 - 小说源（jm-v4 版式，正文 SSR 直出）",
     "lang": "zh-CN",
     "region": "cn",
     "tags": [
@@ -38,6 +38,7 @@
   "endpoints": {
     "discovery": {
       "list_url": "/novel/all",
+      "note": "2026-10 站点换版为 jm-v4：旧版 ul.dx-novel-list 消失，小说列表改为 ul.jm-grid--book > li.jm-card（每页 20 张，封面 img.jm-card__img[data-src]，标题 h3.jm-card__title a，详情链接在 a.jm-card__cover 的 href）。",
       "list_item": {
         "categories": [
           {
@@ -81,6 +82,22 @@
             "url": "/novel/all/kxhx"
           },
           {
+            "title": "历史架空",
+            "url": "/novel/all/lsjk"
+          },
+          {
+            "title": "西方魔幻",
+            "url": "/novel/all/xfmh"
+          },
+          {
+            "title": "仙侠修真",
+            "url": "/novel/all/xzxs"
+          },
+          {
+            "title": "娱乐明星",
+            "url": "/novel/all/ylmx"
+          },
+          {
             "title": "东方玄幻",
             "url": "/novel/all/dfxh"
           }
@@ -88,21 +105,21 @@
       },
       "works_list_item": {
         "root_selector": {
-            "css": "ul.dx-novel-list li, ul.dx-novel-list > li, .novel-list li, .book-list li"
+            "css": "ul.jm-grid--book > li.jm-card"
         },
         "fields": {
           "title": {
-            "css": "h2, h3, .title, .book-title"
+            "css": "h3.jm-card__title a"
           },
           "url": {
-            "css": "a[href*='/novel/detail/']",
+            "css": "a.jm-card__cover",
             "attr": "href"
           },
           "cover": {
             "fallback": [
-              {"css": "img", "attr": "data-src"},
-              {"css": "img", "attr": "data-original"},
-              {"css": "img", "attr": "src"}
+              {"css": "img.jm-card__img", "attr": "data-src"},
+              {"css": "img.jm-card__img", "attr": "data-original"},
+              {"css": "img.jm-card__img", "attr": "src"}
             ]
           }
         }
@@ -112,26 +129,27 @@
       "base_url": "/novel/search/{keyword}",
       "method": "GET",
       "keyword_param": "keyword",
+      "note": "搜索结果改为 a.jm-rrow 行式条目（页内 pager 为 jm-sr-pg，分页 /novel/search/{kw}/page/{n} 与漫画/视频同构）。",
       "paginator": {
         "url_template": "/novel/search/{keyword}/page/{page}"
       },
       "item": {
         "root_selector": {
-            "css": "ul.dx-novel-list li, ul.dx-novel-list > li, .novel-list li, .book-list li"
+            "css": "a.jm-rrow"
         },
         "fields": {
           "title": {
-            "css": "h2"
+            "css": ".jm-rrow__title"
           },
           "url": {
-            "css": "a[href*='/novel/detail/']",
+            "css": "a.jm-rrow",
             "attr": "href"
           },
           "cover": {
             "fallback": [
-              {"css": "img", "attr": "data-src"},
-              {"css": "img", "attr": "data-original"},
-              {"css": "img", "attr": "src"}
+              {"css": "img.jm-rrow__img", "attr": "data-src"},
+              {"css": "img.jm-rrow__img", "attr": "data-original"},
+              {"css": "img.jm-rrow__img", "attr": "src"}
             ]
           }
         }
@@ -140,41 +158,51 @@
     "detail": {
       "fields": {
         "title": {
-          "css": "h1"
+          "css": "h1.jm-dt-title"
         },
         "author": {
-          "css": "a[href*='/novel/all/author/']"
+          "css": ".jm-dt-meta a[href*='/novel/all/author/']"
+        },
+        "cover": {
+          "fallback": [
+            {"css": "img.jm-dt-cover__img", "attr": "data-src"},
+            {"css": "meta[property='og:image']", "attr": "content"}
+          ]
         },
         "summary": {
           "css": "meta[name='description']",
           "attr": "content"
         },
         "status": {
-          "css": "span.detail-page__cover-corner-badge"
+          "css": ".jm-dt-pill--st"
         }
-      }
+      },
+      "note": "详情页标题从无 class 的 <h1> 变为 h1.jm-dt-title（漫画/小说共用同一套 jm-dt-* 版式）；简介仍取 meta[name=description]。"
     },
     "content": {
       "chapter": {
         "list": {
           "root_selector": {
-            "css": "a.detail-page__catalog-item"
+            "css": ".jm-dt-chap a.jm-dt-ch"
           },
           "chapter_order": "asc",
+          "title_clean": false,
+          "note": "目录项 a.jm-dt-ch 里 span.jm-dt-ch__no 是『第N章』、span.jm-dt-ch__t 是章名，整串 text_content 会粘成『第1章协议』；旧配置用 .detail-page__catalog-left 一次取到含序号的串。新版取『第N章』+章名（css 逗号并列），名称由 describe_chapter 归一，章号供标题『第1章 协议』与窗口回退用。章节地址改为 /novel_chapter/{book_id}/{n}.html。",
           "fields": {
             "title": {
-              "css": ".detail-page__catalog-left"
+              "css": "span.jm-dt-ch__no, span.jm-dt-ch__t"
             },
             "url": {
-              "css": "a.detail-page__catalog-item",
+              "css": "a.jm-dt-ch",
               "attr": "href"
             }
           }
         },
         "body": {
           "selector": {
-            "css": ".dx-container.app-content"
-          }
+            "css": ".jm-rd-text"
+          },
+          "note": "正文在 /novel_chapter/{id}/{n}.html，SSR 直出 p 段落（容器 .article.jm-rd-text[data-rd-text]，章节名 h2.jm-rd-ttl）；旧版 .dx-container.app-content 已不存在，也不再需要 Playwright 渲染。"
         }
       }
     }

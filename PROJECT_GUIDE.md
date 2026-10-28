@@ -300,10 +300,43 @@
 - 播放源检测、质量选择和外部播放器回退。
 - HLS/DASH/MP4 等候选流解析、广告帧/广告图片过滤。
 - 播放位置记录和重新打开续播。
-- 下一集预取：当前集结束前 4 分钟（`PREFETCH_BEFORE_END_S`）后台解析下一集播放链接，缓存时长覆盖预取窗口（普通链接 6 分钟，带时效签名按 `expire` 计算），并预热媒体代理 series memo；手动下一集与播完自动续播都应直接命中，不再现场解析。预取失败按 `PREFETCH_RETRY_S` 冷却重试，不能一次失败就永久放弃。
+- 下一集预取：当前集结束前 4 分钟（`PREFETCH_BEFORE_END_S`）后台解析下一集播放链接，缓存时长覆盖预取窗口（普通链接 6 分钟，带时效签名按 `expire` 计算），并预热媒体代理 series memo；手动下一集与播完自动续播都应直接命中，不再现场解析。完整规则见 §6.9.1。
 - 投屏/外部播放相关入口按当前环境和播放器能力启用。
 
 限制：站点需要登录、付费、验证码、特殊 DRM 或外部播放器时，框架只能显示实际可取得的流和失败原因，不承诺绕过访问控制。
+
+### 6.9.1 下一集预取（提前 4 分钟）的完整契约
+
+实现位置：`gui/pages/reader/video_view.py` 的 `_prefetch_*` / `_progress_position` 槽，
+媒体代理侧 `framework/media_proxy.py::series_episode_cached`。
+
+预取的唯一目标是「用户切到下一集时不再等取流」，所以整条链路必须满足
+**不延误本集播放**：
+
+1. **时基两路**：进度回写（`on_progress` → `_progress_position` 信号，主线程槽）
+   是主驱动；`PREFETCH_TICK_MS`（20s）巡检是兜底——VLC 在缓冲/暂停/静音时
+   可能整段不发进度，只靠前者会让 4 分钟窗口整段空转。巡检只读一次
+   `player_status()`，没有外播会话立即返回。
+2. **锁存**：`(当前集下标, 画质) → (触发位置, 已用重试次数)`。同一集在同一个
+   播放位置只触发一次；位置回拖超过 `PREFETCH_LATCH_TOLERANCE_S`（2s）才重新
+   判定。没有锁存时，进度在窗口边界来回进出会反复取流，这是「预取实际没生效」
+   的根因之一。锁存键是**触发时的当前集**，命中下一集的缓存要用 `idx + 1` 比较。
+3. **串行**：同时只允许一路预取（`_prefetch_idx >= 0` 即挡）。预取请求与本集
+   取流共用源站配额，并发会抢带宽，表现为「预取一开就卡」。
+4. **不重复解析同一集**：进入下一集时 `_on_stream_loaded` 调
+   `_cancel_prefetch_for` 取消正在跑的同一集预取（`task.cancel()` 会 interrupt
+   网络请求）；媒体代理 memo 里已有该集映射（`series_episode_cached`）时预取
+   直接跳过——播放端不会再跑 resolver，预取无收益。
+5. **失败语义**：`PREFETCH_MAX_ATTEMPTS`（3）次，每次退避翻倍
+   （`PREFETCH_RETRY_S` 起），额度用完写 `_prefetch_hopeless`，该集在换集/换源
+   （`_cancel_stream_tasks`）前不再尝试。冷却到点的重试由巡检或下一次进窗口
+   补发——不能只依赖「再次进入窗口」，真实进度那时早跑完窗口了。
+6. **缓存 TTL**：普通链接按 `窗口 + PREFETCH_CACHE_MARGIN_S` 缓存；带时效签名
+   按 `expire` 推算；TTL 覆盖不了窗口时只缓存、不预热代理（否则自动续播会
+   拿到过期地址）。取到链接后把它写进 `_stream_cache`，下一集点开即命中。
+
+验收：`tests/test_video_prefetch_timing.py` 覆盖窗口边界、锁存、巡检兜底与
+重试提额、串行、memo 命中跳过、与本集取流去重。
 
 ### 6.10 EPUB 阅读器
 
@@ -513,6 +546,12 @@ HTML 发现通常配置：
 
 漫画需要声明章节列表、图片选择器、页码/下一页规则、懒加载属性和图片解密。视频需要声明选集、播放页/API、流地址字段、质量、Referer/Cookie、HLS/DASH 或外部播放器策略。对于可直接播放的 `.m3u8`、`.mpd`、`.mp4` 等 URL，不要再次当作 HTML 页面抓取。
 
+`api_endpoints` 的请求方式跟随站点真实接口，不要假定都是 GET：
+
+- `method`／`body`：`search`、`detail`、`episode` 均支持 `POST` 加 JSON `body`，body 里的 `{id}`、`{keyword}`、`{page}`、`{bvid}`、`{cid}`、`{quality}` 占位符由框架替换；接口只接受 POST 时（如 `69tv` 的 `/api/vod/play`，GET 返回 405），必须声明 `method: "POST"`。
+- `field_extractors`：值为 JSONPath 字符串；对象列表字段（标签、演员）用 `{"path": "labels", "key": "labelName"}` 取出名字列表，避免把对象序列化进标题或标签。
+- 接口返回不含章节的单集视频源：声明 `content.episode.single_chapter: true`，详情接口无章节时框架会补唯一分集（详情 URL），播放页不再空白。
+
 ### 7.9 render / Playwright
 
 只有静态请求无法得到真实 DOM、需要执行 JavaScript、WAF 挑战或动态接口时才使用 Playwright。常用 `render_config`：`wait_for`、`wait_until`、`timeout_ms`、`extra_delay_ms`、`filter_keyword`、浏览器上下文/请求头配置。
@@ -530,6 +569,31 @@ HTML 发现通常配置：
 解密配置描述目标、策略、输入字段和参数。可作用于章节、图片、封面或播放地址。框架负责调用和错误隔离，不能假定所有站点使用同一种算法；必须通过真实样本确认密钥、IV、编码、填充、压缩和响应路径。
 
 解密失败必须返回可诊断错误或空结果，不能把密文展示成正文。严禁将第三方付费访问控制或 DRM 绕过逻辑写成默认功能。
+
+### 7.10.1 取流速度的三条硬约束（2026-10 实测）
+
+取流链上真正能省的只有「本该不做的事」，其余都是站点 TTFB，不能靠调参改善：
+
+1. **纯 URL 解码不要走 Playwright**。decryption.targets.video_url.strategy=js_custom
+   的脚本若是单次 decodeURIComponent(d) 形状，ramework/decrypter.py 直接按
+   Python unquote 计算（Decrypter.unquote_only_script 只认这一种形状，其它一律
+   仍走真实 JS）。实测 omofuna 单次 JS 解密往返 **1.26s**，快路径 **0.012s**。
+2. **播放页 HTML 一次取流只抓一遍**。_get_play_page_html 带 120s TTL 缓存并按
+   URL 合并并发请求；_fetch_play_url_http_once 与转渲染兜底都必须走它，否则
+   playwright_fallback 源会为同一页抓两遍（每集多 1~3s）。
+3. **渲染结果要缓存**。playwright_fallback 走到渲染时单次要 8~15s（浏览器启动 +
+   iframe 解析站），同一集重播/切回/预取撞点集不该重来。_rendered_play_cache_*
+   按源级 content.render_config.cache_ttl_s（缺省 600s）缓存成功结果，带时效
+   签名的地址按 expire/expires/auth_key 推算剩余时长，剩余 < 30s 不缓存。
+
+另外两条：**播放地址探测可按源关闭**（content.episode.play_url.probe.mode=skip，
+用于直连必 403、只有本地代理能播的 CDN，如 omofuna 的 vip.dytt-hot.com —— 探测
+纯属白等 3s 并把可用线路写进死线缓存）；**换线路候选并行取**（
+_switch_candidate_episode_urls_parallel，默认线路失败时才触发，串行 3 条 = 3~6s，
+正是用户最急着出画面的时刻）。
+
+验收：	ests/test_stream_speed.py（快路径判定与等价性、播放页缓存/并发合并、
+候选并行、渲染缓存与签名寿命）。
 
 ### 7.11 constraints 与 diagnostics
 
@@ -557,6 +621,7 @@ HTML 发现通常配置：
 | `18j` | `ad_block.hls_rules.drop_leading_block`；片头仅在短时长、首个分界、媒体主机切换、未加密到 AES-128 切换等独立信号同时满足时删除，并受 `max_duration`/`max_ratio` 限制 | 仅按第一段短时长会误删正片；规则变化还可能使音视频时间戳异常 |
 | `ikanpp` | `ad_block.block_url_regex` 过滤暴风源 `/video/adjump/` 中插广告；`hls_rules.drop_short_blocks` 兜底识别「被 DISCONTINUITY 夹住、时长极短、占比极小」的广告块（广告与正片**同主机同目录**、URL 无广告词，只有「短」这一个结构特征） | 暴风广告不是稳定的固定时长，且广告 CDN 会轮换域名，单靠 URL 特征会漏；反过来，要求「主机切换」也识别不到真实广告（2026-10 实测：json1080 源广告块与正片同主机，旧 `drop_inserted_blocks` 一条都没命中，广告原样播放）。短块规则必须同时保留时长上限、占比上限和「清单内至少两个正片块」三重约束，放宽任一条都可能误删正片 |
 | `xuandm`、`avgood`、`bilibili`、`kanav`、`omofuna` | 继续使用各自已声明的通用 URL/HTML/HLS 规则 | 删除 `ad_block` 会让播放、下载和投屏行为不一致 |
+| `xvideos` | 列表/搜索的 `root_selector.exclude` 同时剔除频道卡（`.thumb-block-profile`）与付费卡（卡内含 `.is-premium`）；标签页分页按站点 0 索引，统一用 `?page=N`；取流只匹配 `html5player.setVideoHLS('…')` | 频道卡点进去是用户主页、付费卡（`?premium=1` tab）打开也只有预告，用户明确要求「只保留免费」；分页若用路径式 `/{N}` 会与站点 0 索引错位、第二页起全部重复第一页（实测 `/tags/xvedio/1` 与基底同页）；相关视频的缩略图预览是 `preview.mp4`，宽匹配 `.m3u8`/`.mp4` 会把预览当正片 |
 
 #### 7.12.2 HLS 代理、密钥和预取
 
@@ -605,6 +670,8 @@ HTML 发现通常配置：
 | `quanben` | 发现/搜索封面通过详情回填 | 先保留卡片，再异步补封面；回填失败不删除卡片 |
 | `xuandm` | 选集顺序声明为 `desc`，播放地址从嵌入 JSON 提取 | 这是源的真实顺序，不得由通用默认排序覆盖；播放 URL 要做候选和有效性验证 |
 | `zongheng` | 支持 `auth` 声明的登录/授权字段 | 凭据只来自运行时安全存储，不能写进源 JSON、测试夹具或日志 |
+| `69tv` | 发现走 SSR HTML（原站 13 个频道 `/movies/{id}?page=N`，每页 30 条）；详情、搜索、取流走独立 API 域名 `POST` JSON：`/api/vod/content`、`/api/vod/movies`（搜索分页参数是 `pageNum`）、`/api/vod/play`（GET 405，返回带 token/expires 的 m3u8） | API 域名来自首页运行时配置 `window.__NUXT__.config.public.apiBase`，轮换后需更新；详情接口不给章节，靠 `single_chapter` 补唯一分集；搜索快速连发约 6 次以上会触发站点反爬，`max_pages` 与 `pageSize` 保持保守 |
+| `lxxlxx` | 标签/榜单列表是路径式分页且第 1 页无页码（`/tags/X/`），第 N 页是 `/tags/X/N/`；分类 URL 统一写 `/tags/X//`，由 `page_placeholder: "(?<=/)(?=/$)"` 在末尾两个斜杠之间插入页码；取流用 `content.episode.play_url.http_chain` 三段：详情页 `/vjs/{vid}.js` → `m4-player-*.gotojs.xyz` 播放器脚本 → `<source src=...mp4>` | 分类 URL 不能写成 `/tags/X/{page}/`（第 1 页 `/1/` 是 404），也不能构造缺尾斜杠的 `/tags/X/N`（站点 301 到 http 后被阻断）。三段链必须逐跳按响应内容提取（`-en/-cn/-zhs` 语言域的播放器与 CDN 主机各不相同，不得写死主机名），链尾 mp4 声明 `fetch: false` 不再回源；媒体域按地域限制访问，取流成功但播放 404 属 CDN 侧限制，需换出口网络验证 |
 
 以上表格不是新增功能清单，而是防误删清单。新增源若出现 `decryption`、`render`/`render_config`、`api_endpoints`、`media`、`ad_block`、`auth`、`cover_backfill` 或自定义章节顺序，必须在本节登记其目的、调用入口和验收方式。
 
@@ -775,6 +842,26 @@ HTML 发现通常配置：
 - `"已用外部播放器打开…"` / `"已在浏览器中打开"` → 成功，允许记录。
 
 不要在 `_on_stream_loaded` 里只凭「video 非空」就记进度：拿到地址不等于播出来了。
+
+### 10.1.2 视频续播的「同一集」判定
+
+续播位置按**集身份**对位，不按 URL 全等：多线路源（omofuna 的 `/play/1/11.html?sid=1`
+→ 换线路后 `/play/3/11.html?sid=3`）、CDN 换域名、m3u8 每次新签 `auth_key`，都会让
+同一集的 URL 变样。只比字符串的后果是「换条线路看过的集被当成没看过，从头重播」——
+这正是用户侧最容易被报成「记不住播放位置」的现象。
+
+判定收敛在 `gui/pages/reader/video_view.py` 的 `_same_episode()`，两条归一化：
+
+- **集号签名** `(第几集, 集名后缀)`：`第01集` / `11集` → `(11, "")`；`第1集 上` /
+  `第1集 下` → `(1, "上")` / `(1, "下")`，不会互相串。集号冲突时**直接判否**，
+  这条先于「单集作品」的放宽生效（连载型单集换集不能继承上一集秒数）。
+- **URL 身份**：取不到集号时，比去掉易变查询参数（`auth_key`/`sign`/`expire`/
+  `token`/`sid` 等）后的路径。单集视频的签名 m3u8 靠这一级命中。
+
+`load()` 定位续读集位同样走这套判定：URL 全等没命中只是「换过线路」，不是「不是
+这一集」，否则续读会静默回落到第 1 集。`_progress_options()` 只在同一集成立时
+回填 `seconds/position`，不同集必须返回空 location——宁可从头播，也不要把上一集
+的秒数套到错集上。
 
 ### 10.2 自检
 

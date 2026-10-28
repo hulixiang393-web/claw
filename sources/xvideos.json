@@ -1,0 +1,158 @@
+{
+  "$schema_version": 2,
+  "$id": "xvideos",
+  "$type": "video",
+  "$name": "XVideos",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "adult": true,
+    "homepage": "https://www.xvideos.com",
+    "description": "XVideos - 成人视频站（免费 tab）。列表 = 标签页 /tags/{tag}（0 索引：第 1 页无后缀、第 2 页 /1），标签入口默认 /tags/xvedio；搜索 = /?k= 免费 tab（付费 tab 是 ?premium=1，本源不请求）。只保留免费视频：列表根节点用 exclude 剔除 (a) 频道卡 .thumb-block-profile、(b) 付费卡（卡内含 .is-premium 角标）；详情页本身就是免费页，付费条目在免费 tab 里不会出现，二次保险由 exclude 提供。取流直连 HTML：html5player.setVideoHLS(...) 给 HLS 自适应主清单（含 250p~1080p 变体），setVideoUrlHigh/Low 给 mp4 备份；实测 m3u8 与 mp4 都无需 Referer/Cookie 即可 200，故不以 yt-dlp 取流（省 ~10s 子进程）。",
+    "lang": "en",
+    "region": "us",
+    "tags": [
+      "视频",
+      "成人",
+      "免费",
+      "标签",
+      "hls",
+      "mp4"
+    ],
+    "last_verified": "2026-10-28"
+  },
+  "transports": {
+    "base_url": "https://www.xvideos.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.xvideos.com/"
+    },
+    "timeout": 20,
+    "retries": 2,
+    "interval_ms": 600
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/tags/xvedio",
+      "list_paginator": {
+        "type": "increment",
+        "start": 1,
+        "step": 1,
+        "param": "page"
+      },
+      "list_item": {
+        "categories": [
+          { "title": "xvedio（标签）", "url": "/tags/xvedio" },
+          { "title": "免费视频（最新）", "url": "/" },
+          { "title": "免费视频（最多观看）", "url": "/?o=mv" },
+          { "title": "免费视频（评分最高）", "url": "/?o=tr" },
+          { "title": "免费视频（近一周）", "url": "/?d=week" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": {
+          "css": "div.thumb-block",
+          "exclude": [
+            { "css": "div.thumb-block.thumb-block-profile" },
+            { "xpath": "//div[contains(concat(' ', normalize-space(@class), ' '), ' thumb-block ') and .//*[contains(@class, 'is-premium')]]" }
+          ]
+        },
+        "fields": {
+          "title": { "css": "p.title a", "attr": "title" },
+          "url": { "css": "p.title a", "attr": "href" },
+          "cover": { "css": "img", "attr": "data-src" },
+          "author": { "css": "p.metadata a[href^='/']:not([href*='/tags/'])" },
+          "duration": { "css": "span.duration", "fallback": [{ "css": "p.title .duration" }] },
+          "views": { "css": "p.metadata .sprfluous" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/",
+      "method": "GET",
+      "keyword_param": "k",
+      "item": {
+        "root_selector": {
+          "css": "div.thumb-block",
+          "exclude": [
+            { "css": "div.thumb-block.thumb-block-profile" },
+            { "xpath": "//div[contains(concat(' ', normalize-space(@class), ' '), ' thumb-block ') and .//*[contains(@class, 'is-premium')]]" }
+          ]
+        },
+        "fields": {
+          "title": { "css": "p.title a", "attr": "title" },
+          "url": { "css": "p.title a", "attr": "href" },
+          "cover": { "css": "img", "attr": "data-src" },
+          "author": { "css": "p.metadata a[href^='/']:not([href*='/tags/'])" },
+          "update": { "css": "span.duration" }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/video\\.\\w+/",
+      "fields": {
+        "title": { "css": "meta[property='og:title']", "attr": "content", "fallback": [{ "css": "h2.page-title" }] },
+        "title_clean": [["10 min", ""], ["720p", ""], ["1080p", ""], ["480p", ""], ["360p", ""]],
+        "cover": { "css": "meta[property='og:image']", "attr": "content" },
+        "summary": { "css": "meta[name='description']", "attr": "content" },
+        "author": { "css": ".main-uploader a" },
+        "tags": { "css": ".video-tags-list a[href^='/tags/']" },
+        "status": { "css": "span.video-hd-mark" }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "详情页即播放页（单集视频，无分集列表）：播放地址在 html5player.setVideoHLS('...m3u8')，regex 优先取 HLS 自适应主清单；主清单缺失时框架通用候选会退到 html5player.setVideoUrlHigh 的 mp4 直链。.",
+        "play_url": {
+          "regex": "html5player\\.setVideoHLS\\('([^']+)'\\)",
+          "note": "只取播放器脚本里的 m3u8；不要改成 '.m3u8' 宽匹配——相关视频卡片 JSON（video_related）里没有 m3u8，但缩略图预览是 preview.mp4，宽匹配容易把预览/相关条目当正片。"
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    },
+    "hls": {
+      "network_caching_ms": 10000,
+      "prefetch": {
+        "enabled": true,
+        "depth": 4,
+        "workers": 2
+      }
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 10,
+      "max_results": 300
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    },
+    "max_concurrency": 2
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": {
+        "css": "div.thumb-block"
+      }
+    }
+  }
+}
