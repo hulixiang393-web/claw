@@ -256,6 +256,9 @@ class VideoView(QWidget):
     # 只靠 on_progress 驱动会让 4 分钟窗口整段空转。巡检只读一次 VLC 状态，
     # 已锁存或已缓存时不做任何网络请求。
     PREFETCH_TICK_MS = 20000
+    # 预取成功后「预热」下一集的磁盘分片数：切集时 VLC 的第一个分片
+    # 直接命中本地文件，省掉 master/variant 清单与首片的上游往返。
+    PREFETCH_PRIME_SEGMENTS = 3
     # 每集只显示一次「已提前准备好下一集」提示（避免抖动刷屏）
     PREFETCH_NOTICE_ONCE = True
 
@@ -3611,11 +3614,19 @@ class VideoView(QWidget):
             if callable(request_headers):
                 headers = request_headers() or {}
             ad_block = dict((self._source.raw or {}).get("ad_block") or {})
-            MediaProxy.instance().warm_series_episode(
+            proxy = MediaProxy.instance()
+            sid = trusted_media_context(getattr(self._source, "source_id", ""))
+            proxy.warm_series_episode(
                 self._series_key, idx, video, audio, headers, ad_block,
-                source_id=trusted_media_context(
-                    getattr(self._source, "source_id", "")
-                ),
+                source_id=sid,
+            )
+            # 只预热「解析结果」不够：VLC 切到下一集时仍要现拉 master/variant
+            # 清单与首片（omofuna 实测 3.1s + 2.5s，占切集卡顿的绝大部分）。
+            # 这里顺手把首几片落进代理磁盘缓存，切集时播放器直接命中本地文件。
+            proxy.prime_episode_segments(
+                video, headers, ad_block,
+                force_proxy=self._force_proxy_enabled(), source_id=sid,
+                segments=self.PREFETCH_PRIME_SEGMENTS,
             )
         except Exception:  # noqa: BLE001 —— 纯优化，失败时照常走 resolver
             pass

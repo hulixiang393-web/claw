@@ -2243,6 +2243,151 @@ class MediaProxy:
         base = self._base_url(public_base)
         return f"{base}/e/{key}/{int(idx)}"
 
+    def prime_episode_segments(self, video: str, headers: dict | None = None,
+                               ad_block: dict | None = None,
+                               force_proxy: bool = False, source_id=None,
+                               segments: int = 3) -> bool:
+        """把一集的 HLS 首几个分片**提前落到代理磁盘缓存**（切集免等首片）。
+
+        为什么需要：`warm_series_episode` 只预热了「解析结果」（字符串），
+        VLC 切到下一集时仍要现拉 master/variant 清单 + 首片，实测
+        omofuna 这三步 3.1s + 2.5s，占切集卡顿的绝大部分。预取阶段顺手
+        拉首几片，切集时播放器直接命中本地文件。
+
+        实现复用代理自己的转发会话（与 /s/ 同一条路径：同样的 headers、
+        ad_block、force_proxy），保证拿到的分片与播放时完全一致（广告
+        过滤后的片序也算同一套）。全程 try 包裹，失败只是没预热。
+
+        segments：预热片数（1~8，默认 3）。只取清单里前几个**非广告**分片。
+        """
+        if not video or "m3u8" not in video.lower():
+            return False
+        if not self._prefetch_enabled():
+            return False
+        cache = self._cache_obj()
+        if cache is None or not getattr(cache, "enabled", False):
+            return False
+        try:
+            count = max(1, min(8, int(segments)))
+        except (TypeError, ValueError):
+            count = 3
+        hdrs = dict(headers or {})
+        hdrs["Accept-Encoding"] = "identity"
+        try:
+            media = self._fetch_hls_playlist(video, hdrs, ad_block, force_proxy)
+        except Exception:  # noqa: BLE001 —— 清单取不到：不预热
+            return False
+        if not media:
+            return False
+        key = cache.key_of(video)
+        getter = getattr(cache, "hls_segment_final", None)
+        if not callable(getter):
+            return False
+        scheduled = 0
+        for seg_url in media[:count]:
+            try:
+                canonical = cache.key_of(seg_url)
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                if getter(key, seg_url).is_file():
+                    continue  # 已在磁盘：无需重复下载
+            except Exception:  # noqa: BLE001
+                pass
+            with self._pf_lock:
+                if canonical in self._pf_scheduled:
+                    continue
+                self._pf_scheduled.add(canonical)
+                self._pf_cancelled_urls[canonical] = threading.Event()
+                generation = self._pf_generation
+            try:
+                fut = self._ensure_pf_pool().submit(
+                    self._prefetch_one, key, seg_url, dict(hdrs),
+                    force_proxy, generation)
+            except RuntimeError:
+                break
+            with self._pf_lock:
+                self._pf_futures.add(fut)
+            fut.add_done_callback(self._prefetch_future_done)
+            scheduled += 1
+        return scheduled > 0
+
+    def _fetch_hls_playlist(self, url: str, headers: dict,
+                            ad_block: dict | None,
+                            force_proxy: bool) -> list[str]:
+        """取 HLS 清单并返回前几个媒体分片的**绝对 URL**（含变体下降一层）。
+
+        用 `_rewrite_m3u8` 同一套解析（cache_on=False），因为它已经实现了
+        变体下降、URI= 标签、广告过滤的全部边界，自己再写一套必然与播放路径
+        不一致——不一致会让预热做完了却命中不了缓存。
+        返回的是**重写后的本机代理 URL**用不上，这里要的是上游真实地址，
+        所以取 `segs`：`_rewrite_m3u8` 内部收集的原始分片序。
+        """
+        try:
+            text = self._fetch_text_upstream(url, headers, force_proxy)
+        except Exception:  # noqa: BLE001
+            return []
+        if not text:
+            return []
+        segs = self._m3u8_media_segments(text, url, ad_block)
+        if segs:
+            return segs
+        # 主清单：下降到第一个（最高码率）变体
+        media_url = self._m3u8_first_variant(text, url)
+        if media_url and media_url != url:
+            return self._fetch_hls_playlist(media_url, headers, ad_block, force_proxy)
+        return []
+
+    def _fetch_text_upstream(self, url: str, headers: dict,
+                             force_proxy: bool) -> str:
+        """取上游文本（m3u8 用）。失败返回 ""。"""
+        resp = _fetch_upstream(url, headers, force_proxy=force_proxy,
+                               timeout=(_PREFETCH_TIMEOUT, _PREFETCH_TIMEOUT))
+        try:
+            if resp is None or resp.status_code >= 400:
+                return ""
+            return resp.text or ""
+        finally:
+            close = getattr(resp, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    @staticmethod
+    def _m3u8_first_variant(text: str, base: str) -> str:
+        """主清单里第一条变体（最高码率惯例）的绝对 URL；非主清单返回 ""。"""
+        has_stream_inf = any(
+            ln.strip().startswith("#EXT-X-STREAM-INF")
+            for ln in text.splitlines())
+        if not has_stream_inf:
+            return ""
+        for ln in text.splitlines():
+            s = ln.strip()
+            if s and not s.startswith("#"):
+                return urljoin(base, s)
+        return ""
+
+    def _m3u8_media_segments(self, text: str, base: str,
+                             ad_block: dict | None) -> list[str]:
+        """媒体清单里的分片绝对 URL（广告过滤后）。非媒体清单返回 []。"""
+        if any(ln.strip().startswith("#EXT-X-STREAM-INF")
+               for ln in text.splitlines()):
+            return []
+        if ad_block:
+            try:
+                text = self._filter_ad_segments(text, base, ad_block)
+            except Exception:  # noqa: BLE001 —— 过滤失败用原始清单
+                pass
+        out = []
+        for ln in text.splitlines():
+            s = ln.strip()
+            if s and not s.startswith("#"):
+                out.append(urljoin(base, s))
+        return out
+
+
     def series_episode_cached(self, key: str, idx: int,
                               public_base: str | None = None) -> bool:
         """该集的流映射是否已在系列 memo 里（播放端不会再跑 resolver）。
