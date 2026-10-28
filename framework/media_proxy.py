@@ -156,6 +156,10 @@ _REMUX_CTX_MAX = 64
 _REMUX_CTX = {}
 _REMUX_LOCKS = {}
 _REMUX_CTX_LOCK = threading.Lock()
+# 本片起点比锚点靠后多少秒以内视为「时间轴本来连续」（正常分片只差一帧量级）。
+# 超过它说明源片在清单中间发生了跳跃（站点把两段片源硬拼），必须拉直，
+# 否则播放器在拼接处卡住并丢帧/丢音。
+_REMUX_MAX_FORWARD_JUMP = 2.0
 
 
 def _remux_ctx(key: str):
@@ -333,10 +337,20 @@ def _ts_shift_bytes(data: bytes, first_dts: float):
     duration = (max_ts - min_ts) / 90000.0
     if duration <= 0:
         return None
-    anchor = int(round(first_dts * 90000))
+    # first_dts 已经是 90kHz ticks（与 min_ts 同基），不能再乘 90000。
+    # 曾写成 `first_dts * 90000`，而调用方传的是 ticks → 多乘 90000 倍，
+    # 每片被推到 25 小时开外，播放器只能丢帧/丢音（「卡顿恢复后必跳帧」）。
+    anchor = int(round(float(first_dts)))
     if min_ts >= anchor:
-        # 已经是连续时间轴（或更靠后）：交给播放器，别动。
-        return None
+        # 本片起点不早于锚点。两种情况要区分开：
+        #   a) 只差一点（正常连续）→ 交给播放器，别动；
+        #   b) 差很多 = 源片向后突跳（站点把两段片源硬拼进同一清单，
+        #      实测某集第 9 片从 30.9s 直接跳到 211.5s）→ 播放器只能卡住
+        #      丢帧。此时仍按锚点编号，把这段缺口从播放时间轴上抹掉。
+        jump_seconds = (min_ts - anchor) / 90000.0
+        if jump_seconds <= _REMUX_MAX_FORWARD_JUMP:
+            return None
+        # 往下走：bump 为负，把整片拉回到锚点开始（等同于"删掉这段空白"）
     bump = anchor - min_ts
 
     # 帧间隔：同流相邻 DTS 差的中位数（90kHz）。样本太少就不做连续性修正。
@@ -3005,9 +3019,11 @@ class MediaProxy:
             # 路径早就有同样的 _is_ts_payload 守卫，这里补齐保持一致。
             return False
         if _remux_marker(path).exists():
+            # 单位：ctx 一律存 90kHz ticks（_ts_last_ts 返回秒，必须换算）。
             end = _ts_last_ts(data)
             with ctx["lock"]:
-                ctx["segs"][seg_name] = end if end and end > 0 else 1e-6
+                ctx["segs"][seg_name] = (
+                    float(end) * 90000.0 if end and end > 0 else 1e-6)
                 ctx["processed"].add(seg_name)
             return False
         out = self._remux_segment(cache_key, seg_name, data, None)
@@ -3051,12 +3067,33 @@ class MediaProxy:
 
     def _remux_segment_locked(self, cache_key: str, seg_name: str, raw: bytes,
                               req_headers) -> bytes | None:
-        """_remux_segment 的实现体（调用方已持 _remux_serial 锁）。"""
+        """_remux_segment 的实现体（调用方已持 _remux_serial 锁）。
+
+        **单位约定（踩过坑，务必保持）**：`ctx["segs"][name]` 与
+        `_ts_shift_bytes(base=...)` 都用 **90kHz 时间基**；`_ts_last_ts()`
+        返回的是**秒**，必须乘 90000 才能进 ctx。早期实现直接把秒存进 ctx，
+        于是 base 恒为 0~1e-6，每片都被平移到 0 附近 → 各片时间轴互相重叠，
+        播放器只能丢帧/丢音（这正是「卡顿恢复后必跳帧」的根因）。
+
+        `_ts_shift_bytes` 返回 (字节, 本片时长秒)：时长为 0 表示没拿到有效
+        时间跨度，此时退化为「本片末尾并入基准」，不能让基准停滞。
+        """
+        hz = 90000.0
         ctx = _remux_ctx(cache_key)
+
+        def _end_ticks(data: bytes) -> float | None:
+            """本片最晚时间戳（90kHz ticks）；无法解析返回 None。"""
+            if not _is_ts_payload(data):
+                return None
+            end = _ts_last_ts(data)
+            if not end or end <= 0:
+                return None
+            return float(end) * hz
+
         with ctx["lock"]:
             if not ctx["segs"]:
-                end = _ts_last_ts(raw) if _is_ts_payload(raw) else None
-                ctx["segs"][seg_name] = end if end and end > 0 else 1e-6
+                end = _end_ticks(raw)
+                ctx["segs"][seg_name] = end if end else 1e-6
                 ctx["processed"].add(seg_name)
                 ctx["inflight"][seg_name] = False
                 ctx["done"] = 1
@@ -3070,15 +3107,21 @@ class MediaProxy:
         with ctx["lock"]:
             ctx["inflight"].pop(seg_name, None)
             if result is not None:
-                ctx["segs"][seg_name] = base + result[1]
+                out_bytes, seg_seconds = result
+                if seg_seconds and seg_seconds > 0:
+                    ctx["segs"][seg_name] = base + float(seg_seconds) * hz
+                else:
+                    # 平移成功但算不出时长：用输出片自己的末尾兜底，避免基准停滞
+                    end = _end_ticks(out_bytes)
+                    ctx["segs"][seg_name] = end if end else base
                 ctx["processed"].add(seg_name)
                 ctx["done"] += 1
             else:
                 # 本片无需平移（时间轴本来就连续，见 _ts_shift_bytes 的提前返回）
                 # 或无法解析：把它的结束点并入基准，并记为已处理。否则每次命中
                 # 都要把整片再扫一遍，且基准永远停在第 1 片。
-                end = _ts_last_ts(raw) if _is_ts_payload(raw) else None
-                if end and end > 0:
+                end = _end_ticks(raw)
+                if end:
                     ctx["segs"][seg_name] = max(ctx["segs"].get(seg_name, 0.0), end)
                 ctx["processed"].add(seg_name)
         return None if result is None else result[0]

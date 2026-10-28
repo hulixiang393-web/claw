@@ -298,6 +298,39 @@ class VideoMixin:
             self._fetch_play_url_once, (source, episode_url), context, deadline
         )
 
+    def _render_skipped(self, source: SourceConfig, play_cfg: dict,
+                        switch_cfg: dict, html: str) -> bool:
+        """该线路的解析器是否已知不可用（play_url.render_skip_from 命中 from）。
+
+        判定读 player_aaaa 的 `from` 字段（MacCMS 的线路类型：mp4/bfzym3u8/
+        hls…）。源把「解析器已失效的线路类型」写进 render_skip_from 后，
+        命中即不渲染、直接判失败换线路——不能因为一条坏线路把整次取流
+        拖到几十秒。
+        """
+        skip = play_cfg.get("render_skip_from")
+        if not skip:
+            return False
+        if isinstance(skip, str):
+            skip = [skip]
+        try:
+            wanted = {str(s).strip().lower() for s in skip if str(s).strip()}
+        except Exception:  # noqa: BLE001
+            return False
+        if not wanted or not html:
+            return False
+        regex = (switch_cfg or {}).get(
+            "play_regex", r"var\s+player_aaaa\s*=\s*(\{.*?\})(?:\s*</script>|;)")
+        try:
+            match = _re.search(regex, html, _re.S)
+            if not match:
+                return False
+            raw = (match.group(1) if match.groups() else match.group(0))
+            raw = raw.replace("\\\\/", "/").replace("\\\\\"", '"')
+            player = json.loads(raw)
+        except Exception:  # noqa: BLE001 —— 解析不了就当没命中
+            return False
+        return str(player.get("from") or "").strip().lower() in wanted
+
     def _fetch_play_url_once(
         self, source: SourceConfig, episode_url: str, deadline=None, context=None
     ) -> str:
@@ -348,6 +381,15 @@ class VideoMixin:
                 value = ""
             if self._is_playable_direct(value):
                 return value
+            # 该线路的解析器已失效（render_skip_from 命中）→ 直接判失败，
+            # 让上层换线路。omofuna 精品线路（from=mp4，只有不透明 id）实测
+            # 渲染 47s 仍拿不到流（解析站 429/空壳），继续渲染等于把好线路
+            # 一起拖死：用户看到的就是「取不到播放流」。
+            if self._render_skipped(source, play_cfg, switch_cfg, abs_ep):
+                raise ContentMissingError(
+                    f"该线路解析器不可用，已跳过（{abs_ep}）",
+                    source_id=source.source_id,
+                )
             return self._fetch_play_url_rendered(
                 source, episode_url, abs_ep, block, play_cfg,
                 deadline=deadline, context=context,
@@ -551,6 +593,17 @@ class VideoMixin:
             if not iframe_url or not iframe_url.startswith(("https://", "http://")):
                 raise ContentMissingError("未获取到播放 iframe", source_id=source.source_id)
             render_url = iframe_url
+        # 已知失效线路（play_url.render_skip_from 命中 player_aaaa.from）：
+        # 渲染也是白等（omofuna 精品线路实测 47s 仍然拿不到），直接判失败
+        # 换线路，别让一条坏线路把整次取流拖死。
+        if self._render_skipped(
+                source, play_cfg, block.get("source_switch") or {},
+                self._get_play_page_html(source, episode_url, abs_ep,
+                                         deadline=deadline, context=context)):
+            raise ContentMissingError(
+                f"该线路解析器不可用，已跳过（{episode_url}）",
+                source_id=source.source_id,
+            )
         # 渲染结果短期缓存：同一集重播/来回切集/预取撞点集时，渲染要花
         # 8~15s（浏览器启动 + iframe 解析站），没必要重来一遍。只缓存成功
         # 的非空结果；TTL 取源级 render_config.cache_ttl_s（缺省 600s）。
