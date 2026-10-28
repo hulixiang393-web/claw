@@ -116,9 +116,11 @@ def test_episodes_none_single_mrl(monkeypatch):
     # 多集卡顿根治 flag：关掉播放列表自动 preparse / 元数据联网抓取
     assert args[3:6] == _PREPARSE_ARGS
     assert args[6].startswith("--network-caching=")
-    assert args[7:11] == _CONTROL_ARGS
-    assert args[11] == "P:https://cdn.example.com/hls/a.m3u8"
-    assert len(args) == 12
+    # 控制接口区按内容定位：全局 flag（preparse / 音频抗丢）增减不应让断言失败
+    ctl = args.index(_CONTROL_ARGS[0])
+    assert args[ctl:ctl + 4] == _CONTROL_ARGS
+    assert args[ctl + 4] == "P:https://cdn.example.com/hls/a.m3u8"
+    assert len(args) == ctl + 5
     assert "--no-random" not in args
     assert "--no-playlist-autostart" not in args
     assert ep._control_state == {
@@ -171,11 +173,12 @@ def test_episodes_full_series_in_order_with_titles(monkeypatch):
     ep.open_with_player(eps[2][0], episodes=eps)
     args = procs[0].args
     assert args[3:6] == _PREPARSE_ARGS
-    assert args[7:11] == _CONTROL_ARGS
-    assert args[11] == "--no-random"
+    ctl = args.index(_CONTROL_ARGS[0])
+    assert args[ctl:ctl + 4] == _CONTROL_ARGS
+    assert args[ctl + 4] == "--no-random"
     # 起始项是第 3 集（非首项）→ 需 no-playlist-autostart + 握手定位
-    assert args[12] == "--no-playlist-autostart"
-    assert args[13:] == [
+    assert args[ctl + 5] == "--no-playlist-autostart"
+    assert args[ctl + 6:] == [
         "P:https://cdn.example.com/hls/a.m3u8#第1集 章节a",
         "P:https://cdn.example.com/hls/b.m3u8#第2集 章节b",
         "P:https://cdn.example.com/hls/c.m3u8#第3集 章节c",
@@ -207,8 +210,10 @@ def test_handshake_receives_start_idx_and_whole_series(monkeypatch):
         (2, "P:https://cdn.example.com/hls/c.m3u8#第3集"),
     ]
     assert cb is ready
-    # 传的必须就是真正入列的那些 MRL（args 去掉全局选项/flag 的尾部）
-    assert [m for _i, m in series] == procs[0].args[13:]
+    # 传的必须就是真正入列的那些 MRL（args 里 --no-playlist-autostart 之后的尾部）
+    a0 = procs[0].args
+    tail_start = a0.index("--no-playlist-autostart") + 1
+    assert [m for _i, m in series] == a0[tail_start:]
 
 
 def test_handshake_failure_does_not_fall_back_to_browser(monkeypatch):
@@ -343,9 +348,10 @@ def test_series_all_urls_empty_falls_back_to_single(monkeypatch):
     ep.open_with_player("https://cdn.example.com/hls/a.m3u8", episodes=eps)
     args = procs[0].args
     assert args[3:6] == _PREPARSE_ARGS
-    assert args[7:11] == _CONTROL_ARGS
-    assert args[11] == "P:https://cdn.example.com/hls/a.m3u8"
-    assert len(args) == 12
+    ctl = args.index(_CONTROL_ARGS[0])
+    assert args[ctl:ctl + 4] == _CONTROL_ARGS
+    assert args[ctl + 4] == "P:https://cdn.example.com/hls/a.m3u8"
+    assert len(args) == ctl + 5
     assert "--no-random" not in args
 
 
@@ -589,8 +595,10 @@ def test_terminate_clears_control_state(monkeypatch):
     monkeypatch.setattr(ep.secrets, "token_hex", lambda n: "NEWPWD")
     ep.open_with_player("https://cdn.example.com/hls/b.m3u8")
     assert procs[0].terminated == 1
-    # 控制接口四项在 args[7:11]（前面多了 3 个 preparse flag）
-    assert procs[1].args[7:11] == [
+    # 控制接口四项按内容定位（前面还有 preparse / 音频抗丢等全局 flag）
+    args1 = procs[1].args
+    ctl = args1.index("--extraintf=http")
+    assert args1[ctl:ctl + 4] == [
         "--extraintf=http", "--http-host=127.0.0.1",
         "--http-port=8091", "--http-password=NEWPWD",
     ]

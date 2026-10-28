@@ -443,6 +443,19 @@ def open_with_player(url: str, audio: str = "", referer: str = "",
                 "--no-auto-preparse", "--no-metadata-network-access",
                 "--preparse-timeout=1",
                 f"--network-caching={_caching}",
+                # ---- 卡顿恢复后「跳帧 + 丢音」的播放侧加固 ----
+                # 数据通道已逐项验证干净（669 片 0 缺包、音频包数逐片一致、
+                # PCR 与 PTS 零漂移、跨片 DTS 单调），所以丢音发生在 VLC：
+                # 输入饥饿后 aout 落后于主时钟，VLC 只能丢音频追帧（视频侧
+                # 靠 --no-drop-late-frames 已经不丢，音频没有对应开关）。
+                #
+                # --clock-jitter=0：关闭 VLC 对输入时钟的抖动平滑。走本地代理
+                # 时时间戳本身连续（我们已重写对齐），平滑反而会累积相位误差，
+                # 饥饿恢复瞬间被判定为「迟到」→ 丢音频。关掉后直接用时间戳。
+                "--clock-jitter=0",
+                # --audio-time-stretch：明确开启变速追帧（默认即开，这里写死
+                # 防止外部配置/便携版 vlcrc 把它关掉——关掉就是硬丢音频）。
+                "--audio-time-stretch",
             ]
             # VLC HTTP 控制接口（App 内按键 → player_command 转发 VLC 命令）：
             # 随机空闲端口 + 随机密码，放全局选项区、任何 MRL 之前。basic auth
