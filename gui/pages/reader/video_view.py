@@ -2280,9 +2280,13 @@ class VideoView(QWidget):
         player.buffering.connect(self._on_player_buffering)
         # 状态信号是 ▶/⏸ 图标的唯一真相来源：点击只改一次，缓冲→播放、
         # 播放→暂停（键盘/媒体键/自动暂停）、播放→结束都必须能刷新图标。
+        # 连接失败不能拖垮播放器创建（历史上就是这类硬依赖导致「播放失败」）。
         state_sig = getattr(player, "state_changed", None)
         if state_sig is not None:
-            state_sig.connect(self._on_player_state)
+            try:
+                state_sig.connect(self._on_player_state)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
         self._player = player
         try:
             player.rehook()
@@ -2406,6 +2410,9 @@ class VideoView(QWidget):
             player = self._ensure_player(hdrs)
             self._call_player_play(player, play_url, audio_url, title, kind, caching_ms)
         except Exception as exc:  # noqa: BLE001 —— libvlc 缺失/挂载失败
+            # 必须落日志：只弹 UI 的话现场完全无法定位（历史上一次「播放失败」
+            # 就是这样查不到痕迹的）。
+            log.warning("内嵌播放器起播失败：%s", exc, exc_info=True)
             self._has_played = False
             self._show_status(f"播放失败：{_safe_error_text(exc)}")
             self._sync_overlay_state(playing=False)

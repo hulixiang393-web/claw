@@ -45,6 +45,80 @@ def _normalize_state(st) -> int:
     if hasattr(st, "value"):  # vlc.State 枚举（可能非 IntEnum）
         return int(st.value)
     return int(st)
+
+
+# 状态上报用的**离散事件**表。
+#
+# 踩过的坑（现场故障）：python-vlc 3.0.21203 里**没有**
+# `EventType.MediaPlayerStateChanged` 这个常量，libvlc 的状态变化是由一组
+# 离散事件（Opening/Playing/Paused/Stopped/EndReached…）表达的。直接写
+# `em.event_attach(vlc.EventType.MediaPlayerStateChanged, ...)` 会在
+# `_ensure_player` 阶段抛 AttributeError —— 播放器根本没建起来，界面只会
+# 显示「播放失败」。所以这里按表绑定、缺失就跳过：任何一个版本的枚举差异
+# 都不允许把整条播放链路打断。
+_STATE_EVENT_TABLE = (
+    ("MediaPlayerNothingSpecial", _ST_NOTHING),
+    ("MediaPlayerOpening", _ST_OPENING),
+    ("MediaPlayerPlaying", _ST_PLAYING),
+    ("MediaPlayerPaused", _ST_PAUSED),
+    ("MediaPlayerStopped", _ST_STOPPED),
+    ("MediaPlayerEndReached", _ST_ENDED),
+    ("MediaPlayerEncounteredError", _ST_ERROR),
+)
+
+# 部分 python-vlc 版本额外提供「合并式」状态事件；有就顺手接上
+_STATE_UNION_EVENTS = ("MediaPlayerStateChanged", "MediaStateChanged")
+
+
+def _make_state_cb(emit, code: int):
+    """生成「离散事件 → 固定状态码」的回调。"""
+    def _cb(_event=None):
+        try:
+            emit(int(code))
+        except Exception:  # noqa: BLE001
+            pass
+    return _cb
+
+
+def _make_union_state_cb(emit):
+    """生成「合并式事件 → 读取 u.new_state」的回调（字段缺失即忽略）。"""
+    def _cb(event=None):
+        try:
+            st = getattr(getattr(event, "u", None), "new_state", None)
+            if st is None:
+                return
+            emit(_normalize_state(st))
+        except Exception:  # noqa: BLE001
+            pass
+    return _cb
+
+
+def _attach_state_events(event_type, attach, emit) -> list:
+    """按表把状态事件接到 emit 上，返回成功绑定的名字。
+
+    可单独调用（不依赖 libvlc），便于用假枚举覆盖各版本差异。
+    """
+    attached = []
+    for name, code in _STATE_EVENT_TABLE:
+        ev = getattr(event_type, name, None)
+        if ev is None:
+            continue
+        try:
+            attach(ev, _make_state_cb(emit, code))
+        except Exception:  # noqa: BLE001 —— 单个事件绑不上不影响其它
+            continue
+        attached.append(name)
+    for name in _STATE_UNION_EVENTS:
+        ev = getattr(event_type, name, None)
+        if ev is None:
+            continue
+        try:
+            attach(ev, _make_union_state_cb(emit))
+        except Exception:  # noqa: BLE001
+            continue
+        attached.append(name)
+    return attached
+
 # 本地代理转发用 requests Session（keep-alive）：HLS 分片逐段请求复用连接，
 # 避免每段一次 TCP+TLS 握手（本地代理播放加速关键）。
 _PROXY_SESSION = None
@@ -883,7 +957,10 @@ class VlcPlayer(QObject):
         em.event_attach(vlc.EventType.MediaPlayerTimeChanged, self._cb_time)
         em.event_attach(vlc.EventType.MediaPlayerLengthChanged, self._cb_length)
         em.event_attach(vlc.EventType.MediaPlayerBuffering, self._cb_buffering)
-        em.event_attach(vlc.EventType.MediaPlayerStateChanged, self._cb_state)
+        # 状态事件按表绑定：python-vlc 没有 MediaPlayerStateChanged，
+        # 硬写常量会让播放器构造直接失败（见 _STATE_EVENT_TABLE 注释）。
+        _attach_state_events(vlc.EventType, em.event_attach,
+                             self._bridge.state_changed.emit)
 
     def _cb_ended(self, event):
         self._bridge.ended.emit()
@@ -907,12 +984,5 @@ class VlcPlayer(QObject):
         """缓冲百分比事件（0~100）：UI 显示缓冲浮层/驱动卡顿自愈。"""
         try:
             self._bridge.buffering.emit(int(event.u.new_cache))
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _cb_state(self, event):
-        """播放状态变化事件：UI 靠它把 ▶/⏸ 图标跟真实状态对齐。"""
-        try:
-            self._bridge.state_changed.emit(_normalize_state(event.u.new_state))
         except Exception:  # noqa: BLE001
             pass
