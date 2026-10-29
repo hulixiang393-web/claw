@@ -219,24 +219,50 @@ def test_offscreen_home_filters_counts_and_reopen(_qapp, tmp_path):
 
 
 def test_local_video_app_saves_and_restores(_qapp, tmp_path, monkeypatch):
+    """本地视频：进度落盘 → 再次打开续播到该秒数；0 秒不覆盖已存进度。"""
+    import gui.local_video_player as lvp
     from gui.app import MainWindow
 
     progress = ReadingProgress(tmp_path / "progress.json")
-    state = {"port": 2}
-    monkeypatch.setattr(player, "_control_state", state)
     calls = []
-    monkeypatch.setattr(player, "open_with_player", lambda target, **kw: calls.append((target, kw)))
+
+    class _FakePlayer:
+        def __init__(self, parent=None, **kw):
+            calls.append({"kw": kw, "path": None, "start": None})
+
+        def play(self, path, start_seconds=None):
+            calls[-1]["path"] = path
+            calls[-1]["start"] = start_seconds
+            # 真播放器开播即 handoff（落一次「最近阅读」），桩保持同语义
+            cb = calls[-1]["kw"].get("on_handoff")
+            if cb is not None:
+                cb()
+
+        def show(self):
+            pass
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lvp, "LocalVideoPlayer", _FakePlayer)
     window = SimpleNamespace(reading_progress=progress)
     window._on_local_progress = lambda payload: MainWindow._on_local_progress(window, payload)
     record = {"key": "D:/videos", "episode_paths": ["D:/videos/1.mp4"], "title": "本地视频", "url": "book", "folder": "private"}
     MainWindow._play_local_video(window, record)
-    assert progress.resume("D:/videos") is None
-    calls[0][1]["on_progress"](0, {"seconds": 321, "duration": 900, "session_id": id(state)})
+    # 还没播到任何位置：不得凭空产生进度
+    assert progress.resume("D:/videos")["location"] is None
+    calls[0]["kw"]["on_progress"](321, 900, 321 / 900)
     assert ReadingProgress(progress.path).resume("D:/videos")["library_url"] == "book"
     window.reading_progress = ReadingProgress(progress.path)
     MainWindow._play_local_video(window, record)
-    assert calls[1][1]["resume_positions"][0]["seconds"] == 321
-    calls[1][1]["on_progress"](0, {"seconds": 0, "duration": 900, "session_id": id(state)})
+    assert calls[1]["start"] == 321
+    calls[1]["kw"]["on_progress"](0, 900, 0.0)
     assert window.reading_progress.resume("D:/videos")["location"]["seconds"] == 321
 
 

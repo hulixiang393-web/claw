@@ -404,6 +404,27 @@ media）。**不再有** `pl_play` 指挥外部进程那条路径。
 实例**）。已删除 `tests/test_video_series_playlist.py`——它锁的是已移除的惰性
 系列/握手架构，且会真实创建 libvlc 并发出播放请求。
 
+**本地视频（书架里打开）走同一个引擎**：`gui/local_video_player.py` 的
+`LocalVideoPlayer`（QDialog + `VlcPlayer`）。
+
+- 全屏用**窗口自身** `showFullScreen()`，**不 reparent** → HWND 全程不变，
+  不需要 `rehook`。VideoView 那条 reparent 全屏必须重挂，本地播放没必要。
+- 回调：`on_progress(seconds, duration, position)`（2s 节流）、`on_handoff()`
+  （开播落一次「最近阅读」）、`on_finished()`（播完）。
+- 同一时刻只留一个本地播放窗口：换视频先 `close()` 旧的，避免两路音频叠加。
+- App 退出：`aboutToQuit` → `_shutdown_local_player()`（先关窗口再
+  `shutdown_vlc()`，避免两者抢同一个 Instance 的释放顺序）。
+- 父级传非 `QWidget`（测试里的轻量窗口替身）时退化为无父窗口，不抛 TypeError。
+
+**进度回写的归属校验**（`reader_page._on_progress_signal` 与
+`app.MainWindow._on_local_progress` 同一套规则）：
+
+- 内嵌播放的 payload 带 `engine: "embedded"` → 跳过外播会话校验，只按
+  「这部作品/这一集」与观读状态（`_local_progress_allowed`）判定。
+- 不带该标记的（外播历史路径、其它来源）仍必须 `session_id == id(player_session())`。
+
+验收：`tests/test_local_video_player.py`（16 项，桩掉 `VlcPlayer`，不创建实例）。
+
 ### 6.10 EPUB 阅读器
 
 实现位置：`gui/pages/reader/epub_view.py`。

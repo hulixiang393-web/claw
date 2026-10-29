@@ -1045,6 +1045,9 @@ class MainWindow(QMainWindow):
 
         QApplication.instance().aboutToQuit.connect(self.reader.flush_progress)
         QApplication.instance().aboutToQuit.connect(self.reader.shutdown_video)
+        # 本地视频内嵌窗口：退出前 close（释放它的 MediaPlayer，避免与
+        # shutdown_vlc 抢同一实例的释放顺序）
+        QApplication.instance().aboutToQuit.connect(self._shutdown_local_player)
         from framework.vlc_player import shutdown_vlc
 
         QApplication.instance().aboutToQuit.connect(shutdown_vlc)
@@ -1622,9 +1625,6 @@ class MainWindow(QMainWindow):
             if dlg.exec() != QDialog.Accepted:
                 return
             target = paths[combo.currentIndex()]
-        from framework.external_player import open_with_player, flush_player_progress
-
-        flush_player_progress()
         key = key or str(Path(target).resolve())
         can_resume = MainWindow._local_progress_allowed(self, rec.get("url") or "")
         resume = self.reading_progress.resume(key) if self.reading_progress is not None and can_resume else None
@@ -1635,8 +1635,11 @@ class MainWindow(QMainWindow):
             "library_url": rec.get("url") or "", "folder": rec.get("folder") or "",
         }
 
-        def changed(idx, position):
-            self._on_local_progress({**metadata, "location": position})
+        def changed(seconds, duration, position):
+            self._on_local_progress({**metadata, "location": {
+                "seconds": seconds, "duration": duration,
+                "chapter_url": target, "engine": "embedded",
+            }})
 
         def handed_off():
             if self.reading_progress is not None and MainWindow._local_progress_allowed(self, metadata["library_url"]):
@@ -1646,17 +1649,52 @@ class MainWindow(QMainWindow):
                     folder=metadata["folder"], detail_url=target,
                 )
 
-        open_with_player(target, on_progress=changed, resume_positions={0: location}, on_handoff=handed_off)
+        # 内嵌播放：不再拉起外部播放器进程，画面在本 App 的子窗口里。
+        # 同一时刻只留一个本地播放窗口（换视频先关旧的，避免两路音频叠加）。
+        previous = getattr(self, "_local_player", None)
+        if previous is not None:
+            try:
+                previous.close()
+            except Exception:  # noqa: BLE001 —— 已释放：继续开新的
+                pass
+        from gui.local_video_player import LocalVideoPlayer
+
+        player = LocalVideoPlayer(
+            self, on_progress=changed, on_handoff=handed_off,
+            title=metadata["title"],
+        )
+        self._local_player = player
+        player.play(target, start_seconds=location.get("seconds"))
+        player.show()
+        player.raise_()
+        player.activateWindow()
+
+    def _shutdown_local_player(self) -> None:
+        """App 退出：关掉本地视频内嵌窗口（幂等，没有窗口就什么都不做）。"""
+        player = getattr(self, "_local_player", None)
+        if player is None:
+            return
+        try:
+            player.close()
+        except Exception:  # noqa: BLE001 —— 已释放：忽略
+            pass
+        self._local_player = None
 
     def _on_local_progress(self, payload):
-        from framework.external_player import player_session
-
+        """本地视频进度回写（内嵌播放器：按 engine 标记放行，无外播会话）。"""
         if not MainWindow._local_progress_allowed(self, payload.get("library_url") or ""):
             return
         location = payload.get("location") or {}
-        session = player_session()
-        if self.reading_progress is None or session is None or location.get("session_id") != id(session):
+        if self.reading_progress is None:
             return
+        embedded = location.get("engine") == "embedded"
+        if not embedded:
+            # 外部播放器时代的入口（含历史调用/其它来源）：仍要求会话匹配
+            from framework.external_player import player_session
+
+            session = player_session()
+            if session is None or location.get("session_id") != id(session):
+                return
         seconds, duration = location.get("seconds"), location.get("duration")
         if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (seconds, duration)):
             return

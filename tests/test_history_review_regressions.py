@@ -464,22 +464,49 @@ def test_seek_target_uses_saved_progress_not_fixed_offset(resume, expected, monk
 
 
 def test_local_browser_handoff_preserves_privacy_and_precision(_qapp, tmp_path, monkeypatch):
+    """本地视频：续播位置精确对齐到同一集；换集不复用上一集的进度。"""
+    import gui.local_video_player as lvp
     from gui.app import MainWindow
 
-    monkeypatch.setattr(player, "_locate_vlc", lambda: None)
-    monkeypatch.setattr(player.webbrowser, "open", lambda url: True)
-    monkeypatch.setattr(player, "_progress_monitor", None)
-    monkeypatch.setattr(player, "_last_proc", None)
-    monkeypatch.setattr(player, "_control_state", None)
+    played = []
+
+    class _FakePlayer:
+        def __init__(self, parent=None, **kw):
+            self.init = kw
+
+        def play(self, path, start_seconds=None):
+            played.append((path, start_seconds))
+            # 真播放器开播即 handoff（落一次「最近阅读」），桩要同语义
+            cb = self.init.get("on_handoff")
+            if cb is not None:
+                cb()
+
+        def show(self):
+            pass
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lvp, "LocalVideoPlayer", _FakePlayer)
     progress = ReadingProgress(tmp_path / "progress.json")
     window = SimpleNamespace(reading_progress=progress)
     record = {"key": "D:/videos", "episode_paths": ["D:/videos/1.mp4"], "title": "本地作品", "url": "book"}
     MainWindow._play_local_video(window, record)
+    assert played[0] == ("D:/videos/1.mp4", None)
     assert progress.resume("D:/videos")["location"] is None
     progress.save("", "D:/videos", "video", "D:/videos/1.mp4", "第一集", location={"seconds": 123, "duration": 900})
     MainWindow._play_local_video(window, record)
+    assert played[1] == ("D:/videos/1.mp4", 123)
     assert progress.resume("D:/videos")["location"]["seconds"] == 123
     MainWindow._play_local_video(window, {**record, "episode_paths": ["D:/videos/2.mp4"]})
+    # 换了文件 → 不得沿用上一集的秒数
+    assert played[2] == ("D:/videos/2.mp4", None)
     assert progress.resume("D:/videos")["location"] is None
     store = LibraryStore(tmp_path / "library.json")
     store.create_folder("private", locked=True)
