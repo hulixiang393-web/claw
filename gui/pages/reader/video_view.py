@@ -24,6 +24,7 @@ import logging
 import re
 import threading
 import time
+import weakref
 import webbrowser
 from types import SimpleNamespace
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
@@ -53,6 +54,63 @@ from framework.transcode_session import TranscodeSession
 from gui.components.hover_title import HoverTitle
 
 log = logging.getLogger(__name__)
+
+
+class _ViewEventRelay(QObject):
+    """QApplication 级事件中继：把全局事件转发给**仍然存活**的 VideoView。
+
+    为什么不让 VideoView 自己 `app.installEventFilter(self)`：过滤器挂在
+    全局 app 上，视图一旦被 Python 回收（换作品、切换阅读页、测试里反复
+    新建），app 的过滤器链里就留下**悬空指针**，之后任意一次
+    `processEvents()` 都可能访问越界直接崩进程（实测：连跑多个测试文件时
+    Windows fatal exception: access violation，栈在 processEvents 里）。
+
+    这里由**常驻单例**持有过滤器，视图只以弱引用登记：视图消失后回调自动
+    失效（weakref 取到 None 就跳过），永不产生悬空指针。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._views: list = []
+
+    def register(self, view) -> None:
+        self._views = [ref for ref in self._views if ref() is not None]
+        if all(ref() is not view for ref in self._views):
+            self._views.append(weakref.ref(view))
+
+    def eventFilter(self, obj, event):  # noqa: N802 —— Qt 接口
+        live = []
+        handled = False
+        for ref in list(self._views):
+            view = ref()
+            if view is None:
+                continue
+            live.append(ref)
+            try:
+                if view._event_filter_impl(obj, event):
+                    handled = True
+            except RuntimeError:
+                continue  # 视图底层对象已失效：跳过
+        self._views = live
+        return handled
+
+
+_RELAY: "_ViewEventRelay | None" = None
+
+
+def _event_relay() -> "_ViewEventRelay | None":
+    """取（必要时创建并安装）全局事件中继单例。"""
+    global _RELAY
+    if _RELAY is not None:
+        return _RELAY
+    app = QApplication.instance()
+    if app is None:
+        return None
+    _RELAY = _ViewEventRelay()
+    app.installEventFilter(_RELAY)
+    return _RELAY
+
+
 from gui.pages.reader.video_common import (
     _safe_error_text,
     _cast_history_path,
@@ -423,10 +481,11 @@ class VideoView(QWidget):
         body = QVBoxLayout()
         body.setSpacing(8)
 
-        # 播放面板（内嵌 libvlc 画面区）。必须是**原生窗口**：libvlc 通过
-        # set_hwnd(winId()) 把视频渲染到这个 HWND 上，非原生窗口拿不到句柄。
+        # 播放面板（内嵌 libvlc 画面区）。原生窗口属性**不在这里设**：
+        # libvlc 需要的是「set_hwnd 那一刻有稳定句柄」，构造期就强制原生窗口
+        # 会让每个 VideoView 都创建原生 surface（offscreen/无播放场景下白建，
+        # 析构窗口树时还会访问越界）。改由 _ensure_player 在挂载前设置。
         self._video_frame = _PlayPanel(self)
-        self._video_frame.setAttribute(Qt.WA_NativeWindow, True)
         self._video_frame.setMinimumHeight(320)
         self._video_frame.setFocusPolicy(Qt.StrongFocus)
         body.addWidget(self._video_frame, stretch=5)
@@ -484,11 +543,12 @@ class VideoView(QWidget):
         # 内嵌播放：控件在开播前先禁用（无流时拖进度/调音量无意义），
         # _play 成功后会解禁并接线到播放器。
         self._disable_embedded_controls()
-        # 全局事件过滤器：鼠标唤出控制条 + 全屏窗键盘/关闭兜底
-        # （class 方法才进 Qt 事件分发；实例属性赋值在 PySide6 永不回调）
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
+        # 全局事件过滤器：鼠标唤出控制条 + 全屏窗键盘/关闭兜底。
+        # 由常驻中继单例安装、本视图以弱引用登记——视图被回收后回调自动
+        # 失效，不会在 app 的过滤器链里留下悬空指针（见 _ViewEventRelay）。
+        relay = _event_relay()
+        if relay is not None:
+            relay.register(self)
 
     def _build_overlays(self) -> None:
         """视频区覆盖层：中央播放钮 / 缓冲 spinner / 帮助浮层。"""
@@ -2031,6 +2091,12 @@ class VideoView(QWidget):
         """
         from framework.vlc_player import VlcPlayer
 
+        # libvlc 要 set_hwnd(winId())：挂载前确保画面控件是原生窗口
+        # （构造期不设，见 __init__ 里播放面板的注释）。
+        try:
+            self._video_frame.setAttribute(Qt.WA_NativeWindow, True)
+        except (RuntimeError, AttributeError):
+            pass
         referer = (hdrs or {}).get("Referer", "")
         ua = (hdrs or {}).get("User-Agent", "")
         player = self._player
