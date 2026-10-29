@@ -279,3 +279,89 @@ def test_play_shows_loading_indicator_before_first_segment(build, monkeypatch):
 
     assert view.buffer_spinner.isHidden() is False
     assert view.buffer_spinner.value() == 0
+
+
+# ---------------------------------------------------------------------- #
+# 缓冲/状态事件的刷新节流（「进播放界面、按按键异常卡顿」回归）
+# ---------------------------------------------------------------------- #
+def _count_repositions(view, monkeypatch):
+    calls = []
+    monkeypatch.setattr(view, "_reposition_overlays",
+                        lambda *a, **k: calls.append(1))
+    return calls
+
+
+def test_repeated_buffering_percent_is_ignored(build, monkeypatch):
+    """libvlc 起播会连发几十条同值 buffering 事件：同值必须直接丢弃。"""
+    view = build()
+    _install(view, _FakePlayer(state=2))
+    fed = []
+    view._tuner = SimpleNamespace(on_buffering=fed.append, reset=lambda: None)
+
+    for _ in range(20):
+        view._on_player_buffering(7)
+    view._on_player_buffering(8)
+
+    assert fed == [7, 8]
+
+
+def test_buffer_indicator_does_not_relayout_overlays(build, monkeypatch):
+    """刷新加载条不得触发整层重排（_reposition_overlays 里的 adjustSize
+    在缓冲事件洪水下就是卡顿主因）。"""
+    view = build()
+    _install(view, _FakePlayer(state=2))
+    calls = _count_repositions(view, monkeypatch)
+
+    view._show_buffer_indicator(30)
+    view._show_buffer_indicator(31)
+    view._show_buffer_indicator(-1)
+
+    assert calls == []
+    assert view.buffer_spinner.value() == 31
+
+
+def test_repeated_state_events_are_ignored(build, monkeypatch):
+    view = build()
+    _install(view, _FakePlayer(state=3))
+    view._on_player_state(3)                 # 先建立基线
+    calls = _count_repositions(view, monkeypatch)
+
+    for _ in range(10):
+        view._on_player_state(3)
+
+    assert calls == []
+    assert view.play_btn.text() == "⏸"
+
+
+def test_overlay_sync_skips_relayout_when_visibility_unchanged(build, monkeypatch):
+    view = build()
+    _install(view, _FakePlayer(state=3))
+    view._sync_overlay_state(playing=True)   # 基线：这一次会把中央键收起来
+    calls = _count_repositions(view, monkeypatch)
+
+    view._sync_overlay_state(playing=True)   # 显隐没变 → 不重排
+    assert calls == []
+    view._sync_overlay_state(playing=False)  # 要显示 → 必须重排一次
+    assert calls == [1]
+    view._sync_overlay_state(playing=False)  # 已经显示了 → 不再重排
+    assert calls == [1]
+
+
+def test_play_button_text_not_reset_when_unchanged(build, monkeypatch):
+    """进度轮询每秒调一次 _update_play_button：文本没变不能反复 setText。"""
+    view = build()
+    _install(view, _FakePlayer(state=3))
+    view._update_play_button()
+    writes = []
+    real_set_text = view.play_btn.setText
+
+    def spy(text):
+        writes.append(text)
+        real_set_text(text)
+
+    monkeypatch.setattr(view.play_btn, "setText", spy)
+
+    for _ in range(5):
+        view._update_play_button()
+
+    assert writes == []

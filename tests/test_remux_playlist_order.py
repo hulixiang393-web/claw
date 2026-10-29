@@ -42,6 +42,7 @@ def _ctx(key):
         ctx["segs"].clear()
         ctx["processed"].clear()
         ctx["inflight"].clear()
+        ctx["last_end"] = None
     return ctx
 
 
@@ -60,7 +61,8 @@ def test_base_is_playlist_predecessor_not_max():
     assert base == 10 * HZ          # 旧实现会返回 500*HZ（未来分片）
 
 
-def test_base_is_none_for_first_playlist_segment():
+def test_no_base_for_first_segment_of_session():
+    """会话第一片没有任何基准 → 原样直通（由它自己当整条链的起点）。"""
     proxy = _proxy(ORDER)
     ctx = _ctx("order-base-2")
     with ctx["lock"]:
@@ -68,21 +70,26 @@ def test_base_is_none_for_first_playlist_segment():
     assert proxy._remux_base_for(ctx, "k", "u0") is None
 
 
-def test_base_is_none_when_predecessor_not_processed():
-    """真乱序（前一片还没整理）→ 基准未知，调用方必须让本片直通。"""
+def test_missing_predecessor_falls_back_to_session_tail():
+    """关键回归（ts 乱跳）：前一片查不到时，必须退回「本会话已整理到的末尾」，
+    绝不能返回 None 让本片用源站原始时间轴——那会和已被平移的邻居混用两套
+    时间轴，播放器就一会儿播这里一会儿播那里。
+    """
     proxy = _proxy(ORDER)
     ctx = _ctx("order-base-3")
     with ctx["lock"]:
         ctx["segs"]["u5"] = 500 * HZ
-    assert proxy._remux_base_for(ctx, "k", "u2") is None
+        ctx["last_end"] = 42 * HZ
+
+    assert proxy._remux_base_for(ctx, "k", "u2") == 42 * HZ
 
 
-def test_base_is_none_without_known_order():
+def test_missing_order_falls_back_to_session_tail():
     proxy = _proxy(ORDER)
-    ctx = _ctx("order-base-4")
+    ctx = _ctx("order-base-5")
     with ctx["lock"]:
-        ctx["segs"]["u1"] = 10 * HZ
-    assert proxy._remux_base_for(ctx, "unknown-key", "u2") is None
+        ctx["last_end"] = 7 * HZ
+    assert proxy._remux_base_for(ctx, "unknown-key", "u2") == 7 * HZ
 
 
 RAW_TS = b"\x47" + bytes(187) * 2
@@ -116,6 +123,36 @@ def test_in_order_segment_uses_predecessor_end():
     proxy._remux_segment_locked(key, "u2", RAW_TS, None)
 
     assert bases == [10 * HZ]
+
+
+def test_session_tail_advances_with_shifted_segment():
+    proxy = _proxy(ORDER)
+    key = "k"
+    ctx = _ctx(key)
+    with ctx["lock"]:
+        ctx["segs"]["u1"] = 10 * HZ
+    proxy._run_remux = lambda ff, raw, base, hdrs=None: (b"out", 4.0)
+
+    proxy._remux_segment_locked(key, "u2", RAW_TS, None)
+
+    with ctx["lock"]:
+        assert ctx["last_end"] == (10 + 4) * HZ
+
+
+def test_unknown_segment_never_passes_through_raw():
+    """乱跳回归：位置查不到的分片也必须接在本会话末尾，不得原样直通。"""
+    proxy = _proxy(ORDER)
+    key = "k"
+    ctx = _ctx(key)
+    with ctx["lock"]:
+        ctx["last_end"] = 14 * HZ
+    bases = []
+    proxy._run_remux = lambda ff, raw, base, hdrs=None: bases.append(base)
+
+    # 带 query 的分片名在顺序表里查不到（真实场景：/c/<key>/seg.ts%3Ftoken=…）
+    proxy._remux_segment_locked(key, "seg.ts?token=abc", RAW_TS, None)
+
+    assert bases == [14 * HZ]
 
 
 if __name__ == "__main__":  # pragma: no cover

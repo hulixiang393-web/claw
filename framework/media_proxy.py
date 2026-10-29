@@ -169,7 +169,7 @@ def _remux_ctx(key: str):
             if len(_REMUX_CTX) >= _REMUX_CTX_MAX:
                 _REMUX_CTX.pop(next(iter(_REMUX_CTX)))
             ctx = {"lock": threading.Lock(), "segs": {}, "processed": set(),
-                   "inflight": {}, "done": 0}
+                   "inflight": {}, "done": 0, "last_end": None}
             _REMUX_CTX[key] = ctx
         return ctx
 
@@ -3022,8 +3022,9 @@ class MediaProxy:
             # 单位：ctx 一律存 90kHz ticks（_ts_last_ts 返回秒，必须换算）。
             end = _ts_last_ts(data)
             with ctx["lock"]:
-                ctx["segs"][seg_name] = (
-                    float(end) * 90000.0 if end and end > 0 else 1e-6)
+                val = float(end) * 90000.0 if end and end > 0 else 1e-6
+                ctx["segs"][seg_name] = val
+                ctx["last_end"] = val
                 ctx["processed"].add(seg_name)
             return False
         out = self._remux_segment(cache_key, seg_name, data, None)
@@ -3051,30 +3052,36 @@ class MediaProxy:
             return None
 
     def _remux_base_for(self, ctx: dict, cache_key: str, seg_name: str):
-        """本片的时间轴基准 = **播放清单里的前一片**的结束点（90kHz ticks）。
+        """本片的时间轴基准（90kHz ticks）。
 
-        为什么不能用 `max(ctx["segs"].values())`：并行预取与拖动会让靠后的分片
-        先于靠前的分片被整理，max 会取到「未来分片」的结束点，于是先到的靠前
-        分片被整体推到未来分片之后——**清单顺序没变、时间轴却被打乱**，播放器
-        只能靠丢帧追上，用户看到的就是「频繁跳帧」。按清单序取前一片，基准
-        永远与源站播放顺序一致。
+        优先级：
+        1. **清单里的前一片**的结束点——播放顺序即时间轴顺序，这是准绳；
+        2. 位置查不到（分片 URL 带 query/来自子清单等）或前一片还没整理过时，
+           退化为**本会话最近一次整理到的末尾**。
 
-        返回 None 表示「基准未知」（前一片还没整理过，属真乱序/跳播）：
-        调用方应让本片按源站原时间轴直通，不要凭空造一个基准。
+        为什么绝不能返回 None（=让本片按源站原始时间轴直通）：
+        那会和已经整理过的邻居混用两套时间轴——邻居被平移到连续轴上、这一片
+        却还停在源站原值，播放器看到时间戳忽前忽后，就是用户报的
+        「ts 片段乱跳，一会儿播这里一会儿播那里」。要么整条会话都整理，
+        要么整条都不整理，绝不允许同一段播放里混两套时间轴。
+
+        用 max(已处理集合) 也不行：并行预取/拖动会让靠后分片先到，max 取到
+        「未来分片」的结束点，靠前分片被推到未来之后（旧的「频繁跳帧」成因）。
         """
         try:
             order = (self._seg_order or {}).get(cache_key)
             pos_map = (self._seg_pos or {}).get(cache_key) or {}
         except AttributeError:  # 极早期的实例状态（测试桩）
-            return None
-        if not order or not pos_map:
-            return None
-        idx = pos_map.get(seg_name)
-        if idx is None or idx <= 0:
-            return None
-        prev = order[idx - 1]
+            order, pos_map = None, {}
+        if order and pos_map:
+            idx = pos_map.get(seg_name)
+            if idx is not None and idx > 0:
+                with ctx["lock"]:
+                    prev_end = ctx["segs"].get(order[idx - 1])
+                if prev_end is not None:
+                    return prev_end
         with ctx["lock"]:
-            return ctx["segs"].get(prev)
+            return ctx.get("last_end")
 
     def _remux_segment(self, cache_key: str, seg_name: str, raw: bytes,
                        req_headers) -> bytes | None:
@@ -3117,9 +3124,11 @@ class MediaProxy:
             return float(end) * hz
 
         with ctx["lock"]:
-            if not ctx["segs"]:
+            if not ctx["segs"] and ctx.get("last_end") is None:
                 end = _end_ticks(raw)
                 ctx["segs"][seg_name] = end if end else 1e-6
+                if end:
+                    ctx["last_end"] = end
                 ctx["processed"].add(seg_name)
                 ctx["inflight"][seg_name] = False
                 ctx["done"] = 1
@@ -3130,15 +3139,16 @@ class MediaProxy:
         # 基准 = 清单里前一片的结束点（见 _remux_base_for 的成因说明）。
         base = self._remux_base_for(ctx, cache_key, seg_name)
         if base is None:
-            # 前一片还没整理过（真乱序/直接跳播）：本片按源站原时间轴直通，
-            # 只把自己的结束点并入基准。凭空造基准会把这一片推到错误位置，
-            # 播放器随即丢帧——宁可不整理，也不能打乱顺序。
+            # 本会话的第一片（还没有任何基准）：按源站原时间轴直通，并把它
+            # 的结束点登记为整条会话的起点。之后每一片都以它为准接上去，
+            # 绝不会再出现「一片原始、一片平移」的混用。
             end = _end_ticks(raw)
             with ctx["lock"]:
                 ctx["inflight"].pop(seg_name, None)
                 if end:
                     ctx["segs"][seg_name] = max(
                         ctx["segs"].get(seg_name, 0.0), end)
+                    ctx["last_end"] = end
                 ctx["processed"].add(seg_name)
             return None
         # 不再依赖 ffmpeg：纯字节平移，无子进程、无控制台窗口。
@@ -3153,6 +3163,7 @@ class MediaProxy:
                     # 平移成功但算不出时长：用输出片自己的末尾兜底，避免基准停滞
                     end = _end_ticks(out_bytes)
                     ctx["segs"][seg_name] = end if end else base
+                ctx["last_end"] = ctx["segs"][seg_name]
                 ctx["processed"].add(seg_name)
                 ctx["done"] += 1
             else:
@@ -3162,6 +3173,7 @@ class MediaProxy:
                 end = _end_ticks(raw)
                 if end:
                     ctx["segs"][seg_name] = max(ctx["segs"].get(seg_name, 0.0), end)
+                    ctx["last_end"] = end
                 ctx["processed"].add(seg_name)
         return None if result is None else result[0]
 

@@ -1193,15 +1193,24 @@ class VideoView(QWidget):
           5s 藏条，无法操作）——这同时修掉「暂停/切集按钮卡顿像没响应」。
         - 全屏播放中：启动 5s 空闲隐藏计时（沉浸态）。
         - 窗口化：控制条始终可见、指针不隐藏（见 _hide_controls）。
+
+        只在**显隐真的变了**的时候才重排覆盖层：`_reposition_overlays()` 里有
+        `adjustSize()`，状态事件连发时反复重排会把 UI 线程拖死（按键卡顿）。
         """
-        self.center_play_btn.setVisible(not playing)
+        want_visible = not playing
+        # 判定用 isHidden()（控件自己的显隐标志）：isVisible() 还受父窗口是否
+        # 显示影响，未显示的父窗口会让它恒为 False，于是每次都判成「变了」。
+        changed = self.center_play_btn.isHidden() == want_visible
+        self.center_play_btn.setVisible(want_visible)
         if not playing:
-            if not self.control_bar.isVisible():
+            if self.control_bar.isHidden():
                 self.control_bar.show()
+                changed = True
             self._hide_timer.stop()
         elif self._fs_win is not None and self._has_played:
             self._hide_timer.start()
-        self._reposition_overlays()
+        if changed:
+            self._reposition_overlays()
 
     def _reposition_overlays(self) -> None:
         """覆盖层随画面区尺寸变化居中（resizeEvent 兜底 + 全屏切换后）。
@@ -2402,6 +2411,9 @@ class VideoView(QWidget):
             self._tuner.reset()
         except Exception:  # noqa: BLE001
             pass
+        # 新会话：清空缓冲/状态去重缓存，否则上一集的 100% 会让首片缓冲事件被吞掉
+        self._last_buffer_pct = -1
+        self._last_vlc_state = -1
         try:
             self._show_buffer_indicator(0)
         except Exception:  # noqa: BLE001
@@ -2510,6 +2522,11 @@ class VideoView(QWidget):
     _VLC_BUFFERING = 2
     _VLC_PLAYING = 3
     _VLC_PAUSED = 4
+    # 去重缓存：libvlc 的 buffering 事件是按「缓存填充每变一点」发的，起播阶段
+    # 一秒能发几十上百次；每次都重排覆盖层 = UI 线程被自己的重绘淹没
+    # （现场表现就是「进播放界面/按按键异常卡顿」）。
+    _last_buffer_pct = -1
+    _last_vlc_state = -1
 
     @staticmethod
     def _normalize_buffer_percent(value) -> int:
@@ -2530,26 +2547,53 @@ class VideoView(QWidget):
             v *= 100.0
         return max(0, min(100, int(round(v))))
 
+    def _center_buffer_bar(self) -> None:
+        """只把加载条摆到画面正中。
+
+        刻意不调用 `_reposition_overlays()`：那里有 `help_overlay.adjustSize()`，
+        会触发整层布局重算；缓冲事件一秒几十次时这条路径本身就是卡顿源。
+        """
+        bar = getattr(self, "buffer_spinner", None)
+        if bar is None:
+            return
+        frame = self._video_frame
+        try:
+            w, h = frame.width(), frame.height()
+        except (RuntimeError, AttributeError):
+            return
+        if w <= 0 or h <= 0:
+            return
+        bar.move((w - bar.width()) // 2, max(0, (h - bar.height()) // 2))
+
     def _show_buffer_indicator(self, percent: int = -1) -> None:
-        """显示/更新画面中央的加载进度条（percent<0 表示只显示不改数值）。"""
+        """显示/更新画面中央的加载进度条（percent<0 表示只显示不改数值）。
+
+        幂等 + 去重：值没变就只重绘不重排，已可见就不再 show/raise。
+        """
         bar = getattr(self, "buffer_spinner", None)
         if bar is None:
             return
         try:
-            if percent >= 0:
-                bar.setValue(max(0, min(100, int(percent))))
-            bar.setFormat("缓冲中 %p%" if bar.value() > 0 else "载入中…")
-            if not bar.isVisible():
+            value = bar.value() if percent < 0 else max(0, min(100, int(percent)))
+            hidden = bar.isHidden()
+            if value != bar.value():
+                bar.setValue(value)
+            # format() 返回的是模板串（"缓冲中 %p%"），比较模板而不是渲染文本
+            fmt = "缓冲中 %p%" if value > 0 else "载入中…"
+            if bar.format() != fmt:
+                bar.setFormat(fmt)
+            if hidden:
+                self._center_buffer_bar()
                 bar.show()
-            bar.raise_()
-            self._reposition_overlays()
+                bar.raise_()
         except (RuntimeError, AttributeError):
             return
         # 缓冲不是「暂停」：中央播放键必须保持隐藏。之前这里走的是
         # _sync_overlay_state(playing=False)，于是缓冲时中央按钮与进度条
         # 叠在一起，看起来像「播放被停了」。
         try:
-            self.center_play_btn.setVisible(False)
+            if not self.center_play_btn.isHidden():
+                self.center_play_btn.hide()
         except (RuntimeError, AttributeError):
             pass
         try:
@@ -2562,9 +2606,11 @@ class VideoView(QWidget):
         bar = getattr(self, "buffer_spinner", None)
         if bar is not None:
             try:
-                bar.hide()
+                if not bar.isHidden():
+                    bar.hide()
             except RuntimeError:
                 pass
+        self._last_buffer_pct = -1
         self._sync_overlay_state(playing=self._player_is_active())
 
     def _player_state(self) -> int:
@@ -2609,6 +2655,11 @@ class VideoView(QWidget):
         pct = self._normalize_buffer_percent(percent)
         if pct < 0:
             return
+        # 去重：libvlc 起播阶段会连发几十上百条 buffering 事件（值常常重复），
+        # 逐条刷新控件和卡顿统计就是纯浪费 —— 同值直接丢，UI 只跟变化走。
+        if pct == self._last_buffer_pct:
+            return
+        self._last_buffer_pct = pct
         # 喂给自适应缓冲器：此前 MediaTuner 只被创建/重置、从没接收过缓冲
         # 事件，于是「卡顿 3 次自动加大缓冲」这条自愈链路一次都没生效过。
         try:
@@ -2629,6 +2680,10 @@ class VideoView(QWidget):
             st = int(state)
         except (TypeError, ValueError):
             return
+        # 同一状态重复到达（libvlc 会重复发）不必重排覆盖层
+        if st == self._last_vlc_state:
+            return
+        self._last_vlc_state = st
         try:
             if st == self._VLC_PLAYING:
                 self._hide_buffer_indicator()
@@ -2642,7 +2697,8 @@ class VideoView(QWidget):
                 self._sync_overlay_state(playing=False)
             elif st in (0, 1):          # Nothing / Opening：还在起播
                 self._show_buffer_indicator(-1)
-                self.center_play_btn.setVisible(False)
+                if not self.center_play_btn.isHidden():
+                    self.center_play_btn.hide()
             else:                        # Stopped / Ended / Error
                 self._hide_buffer_indicator()
                 self._sync_overlay_state(playing=False)
@@ -3448,15 +3504,21 @@ class VideoView(QWidget):
 
         「缓冲中」也算播放中（图标保持 ⏸）：libvlc 的 is_playing() 在缓冲、
         起播、seek 重缓冲期间都是 False，直接用它会让图标在缓冲时翻回 ▶。
+
+        只在图标真的变了才 setText：`setText` 会触发按钮布局与重绘，进度轮询
+        每秒都会调用本函数，重复设置就是白烧 UI 线程（按键卡顿的来源之一）。
         """
         if self._cast_active:
-            self.play_btn.setText("⏸" if self._cast_state == "playing" else "▶")
-            return
-        if self._player is not None and self._has_played:
+            text = "⏸" if self._cast_state == "playing" else "▶"
+        elif self._player is not None and self._has_played:
             try:
-                self.play_btn.setText("⏸" if self._player_is_active() else "▶")
+                text = "⏸" if self._player_is_active() else "▶"
             except Exception:  # noqa: BLE001 —— 播放器释放竞态
-                self.play_btn.setText("▶")
+                text = "▶"
+        else:
+            return
+        if self.play_btn.text() != text:
+            self.play_btn.setText(text)
 
     def _cast_toggle_play_pause(self) -> None:
         session = self._cast_session
