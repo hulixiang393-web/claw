@@ -491,11 +491,14 @@ def test_cast_start_failure_keeps_local_player_and_reports_error(_qapp, monkeypa
 
 
 def test_local_player_stopped_only_after_tv_reports_playing(_qapp, monkeypatch):
-    """start 保留本地 VLC；仅会话回调（电视 PLAYING）在主线程停本地播放。"""
+    """start 保留本地播放；仅会话回调（电视 PLAYING）在主线程停本地播放。
+
+    内嵌播放器改版后「停本地播放」= 释放内嵌播放器（不再是终止外部进程），
+    但**时机与线程归属不变**：只有电视确实报 PLAYING 才停，且必须回到主线程。
+    """
     view = _view(_video_detail(3), idx=0)
-    view._external_active = True
     terminated = []
-    monkeypatch.setattr(ep, "_terminate_previous",
+    monkeypatch.setattr(view, "_stop_player",
                         lambda: terminated.append(threading.get_ident()))
     # 轮询恒报 STOPPED：后台轮询不会先触发本地停播，停播只走下面的手动回调
     _session, captured, _seen = _start_cast(
@@ -510,7 +513,6 @@ def test_local_player_stopped_only_after_tv_reports_playing(_qapp, monkeypatch):
     assert terminated == []                              # 尚未落地（排队中）
     _drain()
     assert terminated == [threading.get_ident()]         # 回到主线程才执行
-    assert view._external_active is False
 
 
 def test_cast_start_network_runs_in_background_thread(_qapp, monkeypatch):
@@ -1494,9 +1496,9 @@ def test_transcode_playing_is_the_only_point_that_stops_local_player(_qapp, monk
     from gui.pages.reader import video_view as vv
 
     view = _view(_video_detail(1), idx=0)
-    view._external_active = True
     stopped = []
-    monkeypatch.setattr(ep, "_terminate_previous", lambda: stopped.append(True))
+    # 内嵌播放器：停本地播放 = 释放播放器（_stop_player）
+    monkeypatch.setattr(view, "_stop_player", lambda: stopped.append(True))
     session = _FakeSession()
     view._cast_session = session
     view._cast_renderer = _renderer()

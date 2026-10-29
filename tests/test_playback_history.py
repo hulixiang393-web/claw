@@ -295,6 +295,7 @@ def test_reader_restarts_uncollected_video_at_saved_episode(_qapp, tmp_path, mon
 
 
 def test_offscreen_video_progress_uncollected_and_old_session(_qapp, tmp_path, monkeypatch):
+    """内嵌播放的进度回写：不问会话、按作品归属、陈旧外播会话仍被拒。"""
     from framework.content import Detail, Chapter
     from gui.pages.reader_page import ReaderPage
 
@@ -306,16 +307,17 @@ def test_offscreen_video_progress_uncollected_and_old_session(_qapp, tmp_path, m
     reader.video_view._episodes = detail.chapters
     reader.video_view._current_idx = 0
     options = reader.video_view._progress_options()
-    state = {"port": 1}
-    monkeypatch.setattr(player, "_control_state", state)
-    options["on_progress"](0, {"seconds": 123, "duration": 900, "session_id": id(state)})
+    # 内嵌播放器：进度自带 engine=embedded，无需外播会话
+    options["on_progress"](0, {"seconds": 123, "duration": 900})
     assert ReadingProgress(progress.path).resume("book")["location"]["seconds"] == 123
+    # 换作品后同一回调不得写到上一部
     reader.video_view._detail = Detail(source_id="demo", url="other", title="另一部", content_type="video")
-    options["on_progress"](0, {"seconds": 124, "duration": 900, "session_id": id(state)})
+    options["on_progress"](0, {"seconds": 124, "duration": 900})
     assert progress.resume("other") is None
     assert progress.resume("book")["location"]["seconds"] == 124
-    monkeypatch.setattr(player, "_control_state", dict(state))
-    options["on_progress"](0, {"seconds": 200, "duration": 900, "session_id": id(state)})
+    # 外部播放器路径的「陈旧会话」守卫仍在：会话不匹配的迟到回写必须丢弃
+    stale = {"seconds": 200, "duration": 900, "chapter_url": "ep"}
+    reader._on_progress_signal((detail, "第一集", "ep", 0.5, None, stale))
     assert progress.resume("book")["location"]["seconds"] == 124
     reader.deleteLater()
     _qapp.processEvents()

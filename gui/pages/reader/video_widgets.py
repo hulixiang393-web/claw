@@ -10,19 +10,19 @@ from gui.components.hover_title import HoverTitle
 
 
 class _PlayPanel(QWidget):
-    """外部播放器方案的播放面板（占位几何区，不做视觉占位）。
+    """内嵌 libvlc 的画面区。
 
-    独立播放器进程接管画面，本区不显示任何内容——播放入口 =
-    覆盖层中央「▶ 播放」按钮。这里只承接交互：
-    - 单击/双击面板 → 拉起外部播放器；移动鼠标 → 唤出控制条
-    - 保持布局占位与键盘焦点（快捷键仍生效）
+    libvlc 通过 set_hwnd(winId()) 把视频直接渲染到本控件（外层已设
+    WA_NativeWindow，非原生窗口拿不到稳定 HWND）。本控件自身不画任何
+    内容，只负责：承载视频画面、单击/双击交互、移动鼠标唤出控制条、
+    保持键盘焦点。
     """
 
     def __init__(self, view, parent=None):
         super().__init__(parent)
         self._view = view
-        # 无视觉占位：透明，画面区只显示中央播放按钮
-        self.setStyleSheet("background: transparent;")
+        # 黑底：libvlc 出首帧前是空洞，浅色底会闪白
+        self.setStyleSheet("background: #000;")
         # 无按键移动也触发 mouseMoveEvent → 控制条隐藏后滑动即唤出
         self.setMouseTracking(True)
 
@@ -48,8 +48,8 @@ class _PlayPanel(QWidget):
     def mouseDoubleClickEvent(self, event):  # noqa: N802
         self._view._click_pending = False
         if event.button() == Qt.LeftButton:
-            # 外部播放器方案：双击面板 = 拉起外部播放器打开当前集
-            self._view._open_external()
+            # 双击画面 = 全屏切换（与主流播放器一致）
+            self._view._toggle_fullscreen()
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event):  # noqa: N802

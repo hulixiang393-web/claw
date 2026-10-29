@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""分片重封装时间轴回归：首片锚点取真实结束时间，PCR 与 PES 同步平移。"""
+"""分片重封装时间轴回归：首片锚点取真实结束时间，PCR 与 PES 同步平移。
+
+**单位约定（与 framework.media_proxy 一致）**：
+- `ctx["segs"][name]` 与 `_ts_shift_bytes(base=...)` 一律 **90kHz ticks**
+- `_ts_last_ts()` 返回**秒**，进 ctx 前必须乘 90000
+- 早期实现把秒当 ticks 用，导致 base 恒为 0、各片时间轴重叠 → 播放器丢帧丢音
+"""
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +13,8 @@ from unittest.mock import patch
 import pytest
 
 import framework.media_proxy as mp
+
+HZ = 90000
 
 
 def _encode_ts5(value: int) -> bytes:
@@ -83,7 +91,8 @@ def _timestamps(data: bytes) -> tuple[list[float], list[float]]:
 def test_ts_shift_moves_pcr_with_pes(tmp_path: Path):
     path = tmp_path / "seg.ts"
     path.write_bytes(_segment())
-    duration = mp._ts_shift(path, 10.0)
+    # base 用 90kHz ticks（10.0s）
+    duration = mp._ts_shift(path, 10.0 * HZ)
     assert duration == pytest.approx(0.3)
     pts, pcrs = _timestamps(path.read_bytes())
     assert min(pts) == pytest.approx(10.0)
@@ -94,12 +103,25 @@ def test_ts_shift_moves_pcr_with_pes(tmp_path: Path):
 
 def test_ts_shift_bytes_skips_already_continuous():
     """本片起点已不早于锚点 → 不动（再往后推会制造向后跳变）。"""
-    assert mp._ts_shift_bytes(_segment(start=10.0), 10.0) is None
-    assert mp._ts_shift_bytes(_segment(start=10.5), 10.0) is None
+    assert mp._ts_shift_bytes(_segment(start=10.0), 10.0 * HZ) is None
+    assert mp._ts_shift_bytes(_segment(start=10.5), 10.0 * HZ) is None
+
+
+def test_ts_shift_bytes_pulls_back_huge_forward_jump():
+    """源片在清单中间向后狂跳（实测 30.9s → 211.5s）时必须拉直。
+
+    这种拼接缺口只靠 `min_ts >= anchor → None` 会被放过，播放器在拼接处
+    只能卡住并丢帧/丢音。超过 `_REMUX_MAX_FORWARD_JUMP` 的跳变要按锚点重编。
+    """
+    out = mp._ts_shift_bytes(_segment(start=211.5), 30.9 * HZ)
+    assert out is not None
+    data, _duration = out
+    pts, _pcrs = _timestamps(data)
+    assert min(pts) == pytest.approx(30.9)
 
 
 def test_ts_shift_bytes_shifts_when_behind_anchor():
-    out = mp._ts_shift_bytes(_segment(start=1.4), 10.0)
+    out = mp._ts_shift_bytes(_segment(start=1.4), 10.0 * HZ)
     assert out is not None
     data, duration = out
     assert duration == pytest.approx(0.3)
@@ -121,7 +143,8 @@ def test_remux_runs_without_ffmpeg():
     pts, _pcrs = _timestamps(out)
     assert min(pts) == pytest.approx(1.7)
     ctx = mp._remux_ctx(key)
-    assert ctx["segs"]["s1.ts"] == pytest.approx(2.0)
+    # ctx 存 ticks：1.7s 段末 + 0.3s 片长 = 2.0s
+    assert ctx["segs"]["s1.ts"] == pytest.approx(2.0 * HZ)
 
 
 def test_remux_anchor_uses_first_segment_end():
@@ -138,11 +161,11 @@ def test_remux_anchor_uses_first_segment_end():
             patch.object(mp.MediaProxy, "_run_remux", fake_run_remux):
         assert proxy._remux_segment_locked(key, "s0.ts", raw, None) is None
         ctx = mp._remux_ctx(key)
-        assert ctx["segs"]["s0.ts"] == pytest.approx(1.7)
+        assert ctx["segs"]["s0.ts"] == pytest.approx(1.7 * HZ)
         assert "s0.ts" in ctx["processed"]
         assert proxy._remux_segment_locked(key, "s1.ts", raw, None) == raw
         assert proxy._remux_segment_locked(key, "s2.ts", raw, None) == raw
-    assert bases == [pytest.approx(1.7), pytest.approx(2.0)]
+    assert bases == [pytest.approx(1.7 * HZ), pytest.approx(2.0 * HZ)]
 
 
 def test_marked_segment_skips_remux_and_registers_end(tmp_path: Path):
@@ -156,5 +179,5 @@ def test_marked_segment_skips_remux_and_registers_end(tmp_path: Path):
         assert proxy._serve_remux_from_file(
             object(), key, "s0.ts", "http://example/seg.ts", path) is False
     ctx = mp._remux_ctx(key)
-    assert ctx["segs"]["s0.ts"] == pytest.approx(1.7)
+    assert ctx["segs"]["s0.ts"] == pytest.approx(1.7 * HZ)
     assert "s0.ts" in ctx["processed"]

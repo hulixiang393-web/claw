@@ -359,9 +359,17 @@ class ReaderPage(BasePage):
         if not self._progress_allowed(book_url):
             return
         if getattr(detail, "content_type", "") == "video":
-            from framework.external_player import player_session
-            session = player_session()
-            if session is None or not isinstance(location, dict) or location.get("session_id") != id(session):
+            # 视频进度的归属校验：内嵌播放器与会话无关（引擎自报 engine），
+            # 外部播放器则要求「进度来自**当前**控制会话」——否则上一次会话
+            # 的迟到回写会把新播放的位置写脏。两条路径都接受，按 engine 分流。
+            embedded = isinstance(location, dict) and location.get("engine") == "embedded"
+            if not embedded:
+                from framework.external_player import player_session
+                session = player_session()
+                if (session is None or not isinstance(location, dict)
+                        or location.get("session_id") != id(session)):
+                    return
+            if not isinstance(location, dict):
                 return
             seconds, duration = location.get("seconds"), location.get("duration")
             if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (seconds, duration)):

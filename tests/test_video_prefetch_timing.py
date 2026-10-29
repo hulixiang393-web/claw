@@ -303,19 +303,14 @@ def test_prefetched_link_ignored_for_ytdlp(_qapp, monkeypatch):
 # ---------------------------------------------------------------------- #
 def test_prefetch_tick_retries_after_cooldown(_qapp, monkeypatch):
     """失败冷却结束后由巡检补一次重试（进度回调此时可能已跑完窗口）。"""
-    import framework.external_player as player
-
     view = _view(3)
     view._current_idx = 0
     ep = view._episodes[1]
     key = view._stream_cache_key(ep.url, view._quality)
     view._prefetch_state[(0, view._quality)] = ((400.0, 600.0), 1)
     view._prefetch_retry_at[key] = 0.0  # 冷却已到期
-    monkeypatch.setattr(player, "player_session", lambda: {"ok": True})
-    monkeypatch.setattr(
-        player, "player_status",
-        lambda timeout=1.0: {"seconds": 400.0, "duration": 600.0},
-    )
+    view._player = _fake_embedded_player(400.0, 600.0)
+    view._has_played = True
     calls = []
     monkeypatch.setattr(view, "_prefetch_next", lambda idx=-1: calls.append(idx))
     view._prefetch_tick()
@@ -340,19 +335,24 @@ def test_prefetch_tick_silent_outside_window(_qapp, monkeypatch):
 
 
 def test_prefetch_tick_stops_without_player_session(_qapp, monkeypatch):
-    """没有外播会话（未播放/已关窗）时巡检直接返回，不读状态。"""
-    import framework.external_player as player
-
+    """没有内嵌播放器 / 未开播时巡检直接返回，不读状态。"""
     view = _view(3)
     view._current_idx = 0
-    monkeypatch.setattr(player, "player_session", lambda: None)
-    read = []
-    monkeypatch.setattr(player, "player_status",
-                        lambda timeout=1.0: read.append(1) or None)
+    view._player = None
+    view._has_played = False
     calls = []
     monkeypatch.setattr(view, "_prefetch_next", lambda idx=-1: calls.append(idx))
     view._prefetch_tick()
-    assert calls == [] and read == []
+    assert calls == []
+
+
+def _fake_embedded_player(seconds: float, duration: float):
+    """内嵌播放器桩：只提供巡检/进度需要的读接口。"""
+    return SimpleNamespace(
+        get_time=lambda: int(seconds * 1000),
+        get_length=lambda: int(duration * 1000),
+        is_playing=lambda: True,
+    )
 
 
 def test_prefetch_tick_rewinds_latch_after_seek_back(_qapp, monkeypatch):
@@ -361,16 +361,11 @@ def test_prefetch_tick_rewinds_latch_after_seek_back(_qapp, monkeypatch):
     600s 的片子：从 580s（窗口内）回拖到 400s（仍在窗口内但位置变化），
     锁存若不失效就会一直挡着。
     """
-    import framework.external_player as player
-
     view = _view(3)
     view._current_idx = 0
     view._prefetch_state[(0, view._quality)] = ((580.0, 600.0), 0)
-    monkeypatch.setattr(player, "player_session", lambda: {"ok": True})
-    monkeypatch.setattr(
-        player, "player_status",
-        lambda timeout=1.0: {"seconds": 400.0, "duration": 600.0},
-    )
+    view._player = _fake_embedded_player(400.0, 600.0)
+    view._has_played = True
     calls = []
     monkeypatch.setattr(view, "_prefetch_next", lambda idx=-1: calls.append(idx))
     view._prefetch_tick()

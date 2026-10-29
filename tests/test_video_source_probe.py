@@ -289,11 +289,13 @@ def _finish_probe(task, results):
 
 @pytest.mark.parametrize("finish_before_play", [False, True])
 def test_probe_results_survive_normal_play(_qapp, monkeypatch, finish_before_play):
-    from framework import external_player
-
     view, tasks = _probe_view(monkeypatch)
-    monkeypatch.setattr(external_player, "open_with_player", lambda *a, **kw: "")
-    monkeypatch.setattr(view, "_build_series_playlist", lambda *a: None)
+    # 内嵌播放：桩掉播放器创建，避免测试里真的建 libvlc 实例
+    monkeypatch.setattr(view, "_ensure_player",
+                        lambda hdrs=None: SimpleNamespace(
+                            play=lambda *a, **kw: None,
+                            rehook=lambda: None))
+    monkeypatch.setattr(view, "_embedded_play_url", lambda v, a, h, ad: (v, a))
     monkeypatch.setattr(view, "_force_proxy_enabled", lambda: False)
     monkeypatch.setattr(view, "_source_network_caching_ms", lambda: 8000)
     try:

@@ -364,6 +364,46 @@
 `tests/test_vlc_audio_flags.py`（只断言参数，**不启动 VLC**——启动播放器会抢
 用户焦点，任何验证都必须在纯 Python 层完成）。
 
+### 6.9.3 内嵌播放器（外播 → 内嵌的架构约定）
+
+播放**不再拉起外部 VLC 进程**，画面由 `framework/vlc_player.VlcPlayer`
+（libvlc `set_hwnd`）嵌进 `VideoView._video_frame`。外部播放器时代的第二窗口、
+HTTP 控制接口、惰性系列握手全部退场。
+
+**播放链路（唯一入口 `VideoView._play`）**
+
+1. 取源 `request_headers()` → `_configure_playback_prefetch(video)`（HLS 预取）。
+2. `_progress_options()` 读一次续播位置：`seconds` 优先，否则用 `position` 比例
+   落到 `_pending_seek_s/_pending_seek_ratio`；同时取出回写回调 `_progress_cb`。
+   **只能取一次**（该函数有「消费即清」语义）。
+3. `_embedded_play_url()` 决定直连或走本地代理：HLS、带 Referer/Cookie、
+   强制代理三种情况都走 `MediaProxy.build_url`（广告过滤 + 分片缓存 + 补头）。
+4. `_ensure_player(hdrs)` 取/建播放器（referer/UA 变化才重建）→ `play(url, audio)`。
+5. 成功才置 `_has_played=True` 并解禁控制条；`play()` 抛异常不记播放。
+
+**进度与预取的两个驱动源**
+
+- 事件：`time_changed` → `_on_player_time`（主驱动）。
+- 兜底：`PROGRESS_POLL_MS`（1s）定时读 `get_time/get_length`，覆盖不发
+  TimeChanged 的容器。
+- 回写节流 `POSITION_SAVE_INTERVAL_S`（2s）；**预取时基不节流**（锁存负责去重）。
+  回写时 payload 带 `engine: "embedded"`，`reader_page` 据此跳过外播会话校验。
+
+**续播 seek** 必须等时长到手：`_on_player_length` 里按比例 `set_position`；
+目标落在片尾 1s 内则从头播（跳到末尾等于立刻结束）。
+
+**自动续集**：`ended` → `_on_media_ended` → 下一集；末集只提示。
+
+**切集**：`_select_episode` → `_load_episode` → `_play`（播放器实例复用，只换
+media）。**不再有** `pl_play` 指挥外部进程那条路径。
+
+**释放**：`_stop_player()` 只 `release()`（停网络/断代理/放解码器，实例留着）；
+`shutdown_video()` 才 `close()`。
+
+验收：`tests/test_embedded_player.py`（21 项，全部用桩对象，**绝不创建 libvlc
+实例**）。已删除 `tests/test_video_series_playlist.py`——它锁的是已移除的惰性
+系列/握手架构，且会真实创建 libvlc 并发出播放请求。
+
 ### 6.10 EPUB 阅读器
 
 实现位置：`gui/pages/reader/epub_view.py`。
