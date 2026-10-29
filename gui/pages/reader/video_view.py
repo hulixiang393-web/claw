@@ -29,7 +29,11 @@ import webbrowser
 from types import SimpleNamespace
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
-from PySide6.QtCore import Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer
+from PySide6.QtGui import QCursor
+
+from PySide6.QtCore import (
+    Qt, QEvent, Signal, QThreadPool, QRunnable, QObject, QTimer, QPoint,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -42,6 +46,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QStyle,
+    QStyleOptionSlider,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -133,6 +139,104 @@ from gui.pages.reader.video_tasks import (
     _RecommendTask,
 )
 from gui.pages.reader.video_widgets import _PlayPanel, _GridCard
+
+
+class _SeekSlider(QSlider):
+    """进度条：hover 时显示当前指针位置对应的时间（拖动预览）。
+
+    原生 QSlider 没有「悬停提示时间」能力。这里不用 QToolTip（全屏 frameless
+    顶层窗口上它常被压在后面/不显示），改为挂一个悬浮 QLabel 气泡到当前窗口
+    并 raise_() 到最前，窗口化与全屏都能稳定显示。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self._total_ms = 0
+        self._bubble = None
+        self.setMouseTracking(True)
+
+    def _ratio_at(self, pos: "QPoint | None" = None) -> float:
+        if pos is None:
+            pos = self.mapFromGlobal(QCursor.pos())
+        try:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            groove = self.style().subControlRect(
+                QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self
+            )
+            if groove.width() > 0:
+                x = pos.x() - groove.x()
+                return max(0.0, min(1.0, x / float(groove.width())))
+        except Exception:  # noqa: BLE001 —— 样式不可用时退回整控件宽度
+            pass
+        w = self.width()
+        return max(0.0, min(1.0, pos.x() / float(w))) if w > 0 else 0.0
+
+    def _ensure_bubble(self):
+        """气泡标签挂在当前窗口上（窗口化/全屏切换后自动重建父级）。"""
+        win = self.window()
+        b = self._bubble
+        if b is None or b.parent() is not win:
+            if b is not None:
+                b.deleteLater()
+            b = QLabel(win)
+            b.setStyleSheet(
+                "background: rgba(20,20,20,215); color: #fff;"
+                " padding: 2px 8px; border-radius: 6px; font-size: 12px;"
+            )
+            b.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            b.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            b.hide()
+            self._bubble = b
+        return b
+
+    def _show_bubble(self, text: str, x_in_widget: int) -> None:
+        b = self._ensure_bubble()
+        # 只有文本变化才重算尺寸（adjustSize 会触发布局）；否则只做廉价 move。
+        if b.text() != text:
+            b.setText(text)
+            b.adjustSize()
+        win = self.window()
+        gp = self.mapTo(win, QPoint(int(x_in_widget), 0))
+        x = max(0, min(win.width() - b.width(), gp.x() - b.width() // 2))
+        y = gp.y() - b.height() - 6
+        if y < 0:  # 靠近窗口顶部则翻到进度条下方
+            y = gp.y() + self.height() + 6
+        b.move(x, y)
+        if not b.isVisible():
+            b.show()       # 仅从隐藏变显示时 raise 一次（高频 raise 会重绘整窗）
+            b.raise_()
+
+    def _hide_bubble(self) -> None:
+        if self._bubble is not None:
+            try:
+                self._bubble.hide()
+            except RuntimeError:
+                self._bubble = None
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        super().mouseMoveEvent(event)
+        now = time.monotonic()
+        # 16ms 节流：高频 MouseMove 不必每帧都重算文本/移动气泡
+        if now - getattr(self, "_last_move_ts", 0.0) < 0.016:
+            return
+        self._last_move_ts = now
+        ratio = self._ratio_at(event.position().toPoint())
+        total_ms = self._total_ms
+        cur_ms = int(ratio * total_ms)
+        if total_ms > 0:
+            tip = f"{_fmt_hms(cur_ms / 1000.0)} / {_fmt_hms(total_ms / 1000.0)}"
+        else:
+            tip = f"{int(ratio * 100)}%"
+        self._show_bubble(tip, event.position().toPoint().x())
+
+    def leaveEvent(self, event):  # noqa: N802
+        self._hide_bubble()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event):  # noqa: N802
+        self._hide_bubble()
+        super().hideEvent(event)
 
 
 # 时效签名 URL 的过期参数名（与 StreamResolver.SIGNED_QUERY_NAMES 对齐）
@@ -411,8 +515,8 @@ class VideoView(QWidget):
         # 于是「自适应缓冲」从头到尾没生效过——多源卡顿的共性原因之一。
         self._tuner_busy = False      # 正在升级重播（防重入）
         self._buffer_upgrade_ms = 0   # 本会话已升到的缓冲值（0=用默认画像）
-        self._hide_timer = QTimer(self)  # 控制条自动隐藏
-        self._hide_timer.setInterval(3000)
+        self._hide_timer = QTimer(self)  # 控制条自动隐藏（空闲 5s）
+        self._hide_timer.setInterval(5000)
         self._hide_timer.timeout.connect(self._hide_controls)
 
         # ---- 投屏（DLNA）状态：idle / preparing_stream / connecting /
@@ -644,19 +748,20 @@ class VideoView(QWidget):
         self.next_btn = self._icon_btn("⏭", "下一集", self._on_next_ep)
         cb.addWidget(self.next_btn)
 
-        self.progress = QSlider(Qt.Horizontal)
+        self.progress = _SeekSlider()
         self.progress.setRange(0, 1000)
-        # 细进度条 hover 变粗（现代播放器模式 P6）
+        # 固定粗细进度条：不再用 QSlider:hover 改 groove/handle 尺寸——
+        # 那种 hover 几何变化会让 Qt 每次鼠标进出都重解析样式并重排重绘，
+        # 正是「显示/隐藏进度条一下明显卡顿」的来源。hover 时间由气泡提供。
         self.progress.setStyleSheet(
-            "QSlider::groove:horizontal { height: 4px; background: palette(mid);"
-            " border-radius: 2px; }"
+            "QSlider::groove:horizontal { height: 8px; background: palette(mid);"
+            " border-radius: 4px; }"
             "QSlider::sub-page:horizontal { background: palette(highlight);"
-            " border-radius: 2px; }"
-            "QSlider::handle:horizontal { width: 12px; margin: -4px 0;"
-            " background: palette(highlight); border-radius: 6px; }"
-            "QSlider:hover::groove:horizontal { height: 10px; border-radius: 5px; }"
-            "QSlider:hover::handle:horizontal { width: 14px; margin: -2px 0; }"
+            " border-radius: 4px; }"
+            "QSlider::handle:horizontal { width: 14px; margin: -3px 0;"
+            " background: palette(highlight); border-radius: 7px; }"
         )
+        self.progress.setToolTip("")
         cb.addWidget(self.progress, stretch=1)
 
         # 进度条：拖动 = seek 到对应比例（内嵌播放器直接 set_position）
@@ -842,7 +947,11 @@ class VideoView(QWidget):
         self.quality_menu.menuAction().setVisible(bool(self._quality_options))
 
     def _refresh_ep_menu(self) -> None:
-        """重建选集菜单：当前集打勾，点击即切换（播放器内操作，全屏可用）。"""
+        """首次构建选集菜单：每集一项，点击即切换（播放器内操作，全屏可用）。
+
+        仅在有作品/换集数时调用一次；切集**不**重建菜单（见 _update_ep_check），
+        否则上百集每次切集都 clear+addAction 会明显卡顿、破坏秒级响应。
+        """
         self.ep_menu.clear()
         self._ep_actions = []
         for i, ep in enumerate(self._episodes):
@@ -852,6 +961,11 @@ class VideoView(QWidget):
             act.triggered.connect(lambda _=False, _i=i: self._select_episode(_i))
             self._ep_actions.append(act)
         self.ep_menu.menuAction().setVisible(bool(self._episodes))
+
+    def _update_ep_check(self) -> None:
+        """切集后只刷新勾选态（O(集数) 轻量，不重建菜单/信号）。"""
+        for i, act in enumerate(self._ep_actions):
+            act.setChecked(i == self._current_idx)
 
     def _select_episode(self, idx: int) -> None:
         """播放器内选集：外播会话优先指挥 VLC 切集，否则加载该集。
@@ -870,7 +984,7 @@ class VideoView(QWidget):
         # 内嵌播放器：切集 = 取流后换 media（播放器实例复用，不重开进程、
         # 不重建 libvlc 实例），进度由 _stop_player 的 release 收尾。
         self._load_episode(idx)
-        self._refresh_ep_menu()
+        self._update_ep_check()  # 仅刷新勾选，不重建菜单（避免卡顿）
 
     def _refresh_source_menu(self) -> None:
         """重建播放源菜单：站内多线路（⇄）。
@@ -903,21 +1017,32 @@ class VideoView(QWidget):
     # 控制条自动隐藏
     # ------------------------------------------------------------------ #
     def _wake_controls(self) -> None:
-        """鼠标移动/触碰 → 让控制条与全屏顶栏可见。
+        """鼠标移动/触碰 → 恢复指针，并重启全屏空闲隐藏计时。
 
-        控制条是**停靠**在画面下方的常驻行（见 _build_ui），不参与自动隐藏：
-        自动隐藏叠在画面里的控制条正是「按钮全没了」的观感来源。这里只负责
-        把指针从隐藏态恢复，并把全屏顶栏叫回来。
+        - 窗口化：控制条常驻、指针永不隐藏——直接修掉「缩小窗口里操作时鼠标
+          会消失」的 bug。
+        - 全屏：控制条与进度条/时间条**始终可见**（这里刚修掉「全屏时间条
+          不显示」），只有鼠标指针在空闲 5s 后隐藏，移动即恢复。
         """
-        if self._fs_win is not None and not self._fs_titlebar.isVisible():
-            self._fs_titlebar.show()
-        if self._player is not None and self._player.is_playing():
+        if (self._fs_win is not None and self._has_played
+                and self._player is not None and self._player.is_playing()):
+            self._hide_timer.start()  # 重新计时 5s 指针隐藏窗口
+        # 任何状态鼠标一动就恢复箭头；仅当前不是箭头时才设，避免高频 move 抖动
+        if self.cursor().shape() != Qt.ArrowCursor:
             self.setCursor(Qt.ArrowCursor)
 
     def _hide_controls(self) -> None:
-        """空闲定时器：只隐藏鼠标指针（控制条常驻，不隐藏）。"""
-        if self._player is not None and self._player.is_playing():
-            self.setCursor(Qt.BlankCursor)
+        """空闲定时器：仅「全屏 + 播放中」隐藏鼠标指针。
+
+        控制条/进度条/时间条在窗口化与全屏都常驻不隐藏（保证全屏也能看到并
+        hover 时间条）；暂停或未播放时不隐藏指针。退出全屏/暂停时
+        _sync_overlay_state 会停表，避免指针卡在隐藏态。
+        """
+        if self._fs_win is None:
+            return  # 窗口化：指针常驻
+        if self._player is None or not self._has_played or not self._player.is_playing():
+            return  # 暂停/未播放：指针常驻
+        self.setCursor(Qt.BlankCursor)
 
     def _adjust_cast_volume(self, delta: int) -> None:
         """投屏态音量键 → 电视端 SetVolume（CI）。
@@ -1048,8 +1173,20 @@ class VideoView(QWidget):
     # 覆盖层（中央按钮 / spinner / 帮助）
     # ------------------------------------------------------------------ #
     def _sync_overlay_state(self, playing: bool) -> None:
-        """根据播放状态切换中央播放按钮/缓冲 spinner 显隐。"""
+        """根据播放状态切换中央播放按钮/缓冲 spinner 显隐，并联控制条。
+
+        - 暂停/未播放：控制条常驻可见，停止空闲隐藏计时（否则暂停后仍会
+          5s 藏条，无法操作）——这同时修掉「暂停/切集按钮卡顿像没响应」。
+        - 全屏播放中：启动 5s 空闲隐藏计时（沉浸态）。
+        - 窗口化：控制条始终可见、指针不隐藏（见 _hide_controls）。
+        """
         self.center_play_btn.setVisible(not playing)
+        if not playing:
+            if not self.control_bar.isVisible():
+                self.control_bar.show()
+            self._hide_timer.stop()
+        elif self._fs_win is not None and self._has_played:
+            self._hide_timer.start()
         self._reposition_overlays()
 
     def _reposition_overlays(self) -> None:
@@ -1668,6 +1805,10 @@ class VideoView(QWidget):
                 log.warning("内嵌播放器 release 失败", exc_info=True)
         self._has_played = False
         self._player_length_ms = 0
+        try:
+            self.progress._total_ms = 0
+        except (RuntimeError, AttributeError):
+            pass
         self._pending_seek_s = None
         self._pending_seek_ratio = None
         self.play_btn.setText("▶")
@@ -1951,7 +2092,8 @@ class VideoView(QWidget):
             self._locked_source_id = self._current_sid
         self._current_idx = idx
         self._paint_card_selection()  # 当前集卡片选中态跟随
-        self._refresh_ep_menu()  # 选集菜单当前集打勾跟随
+        self._update_ep_check()  # 仅刷新勾选，不重建菜单（切集秒级响应）
+        self._refresh_fs_title()  # 全屏顶栏标题跟随
         ep = self._episodes[idx]
         self.episode_changed.emit((self._detail, ep.title, ep.url))  # 进度记忆
         key = self._stream_cache_key(ep.url, self._quality)
@@ -2195,6 +2337,10 @@ class VideoView(QWidget):
         elif isinstance(resume.get("position"), (int, float)) and 0 < resume["position"] < 1:
             self._pending_seek_ratio = float(resume["position"])
         self._player_length_ms = 0
+        try:
+            self.progress._total_ms = 0
+        except (RuntimeError, AttributeError):
+            pass
         self._last_pos_save_ts = 0.0
 
         if not video:
@@ -2221,9 +2367,8 @@ class VideoView(QWidget):
         # 内嵌等价于「play() 没抛异常」）。
         self._has_played = True
         self._enable_embedded_controls()
-        self._sync_overlay_state(playing=True)
         self.control_bar.show()
-        self._hide_timer.start()
+        self._sync_overlay_state(playing=True)  # 全屏才启动 5s 空闲隐藏
         self._start_progress_ticker()
         self._start_prefetch_ticker()
         self._notify_last_episode()
@@ -2237,6 +2382,11 @@ class VideoView(QWidget):
             self._player_length_ms = int(length_ms or 0)
         except (TypeError, ValueError):
             self._player_length_ms = 0
+        # 同步给进度条 hover 时间提示（否则 hover 只显示百分比）
+        try:
+            self.progress._total_ms = self._player_length_ms
+        except (RuntimeError, AttributeError):
+            pass
         if self._player_length_ms <= 0 or self._player is None:
             return
         target = self._pending_seek_s
@@ -2266,6 +2416,10 @@ class VideoView(QWidget):
                 duration_ms = 0
             if duration_ms > 0:
                 self._player_length_ms = duration_ms
+                try:
+                    self.progress._total_ms = duration_ms
+                except (RuntimeError, AttributeError):
+                    pass
         if duration_ms <= 0 or not (0 <= time_ms <= duration_ms):
             return
         seconds = time_ms / 1000.0
@@ -3153,7 +3307,8 @@ class VideoView(QWidget):
         self._selection_mode = False
         self._current_idx = idx
         self._paint_card_selection()
-        self._refresh_ep_menu()
+        self._update_ep_check()
+        self._refresh_fs_title()
         self.episode_changed.emit((self._detail, ep.title, ep.url))
         self._cast_duration = 0  # 新一集时长未读到，等下一轮轮询回填
 
@@ -3359,6 +3514,9 @@ class VideoView(QWidget):
                 else:
                     player.resume()
                     self._sync_overlay_state(playing=True)
+                self.control_bar.show()       # 操作即唤回，避免卡在隐藏态
+                self.setCursor(Qt.ArrowCursor)  # 操作中指针必须可见
+                self._update_play_button()    # 图标立即切 ▶/⏸（秒级反馈）
                 return
             except Exception:  # noqa: BLE001 —— 播放器已释放：落到重新播放
                 log.warning("内嵌播放器暂停/恢复失败，改为重新播放", exc_info=True)
@@ -3392,6 +3550,7 @@ class VideoView(QWidget):
         fs_title.setStyleSheet("color: white; font-size: 15px; font-weight: bold;")
         fs_title.setWordWrap(True)
         tb.addWidget(fs_title, stretch=1)
+        self._fs_title_label = fs_title  # 全屏下切集时同步刷新标题
         fs_close = QPushButton("✕ 退出全屏")
         fs_close.setStyleSheet(
             "QPushButton { background: rgba(255,255,255,40); color: white;"
@@ -3406,16 +3565,29 @@ class VideoView(QWidget):
         # 能暂停/拖进度/倍速/切集。只搬画面的话控制条会留在主窗口里。
         self._player_box.setParent(fs)
         lay.addWidget(self._player_box, stretch=1)
-        self.fs_btn.setText("⛶")
         self._fs_win = fs
+        self._sync_fs_button()  # 同一按钮切到「退出全屏」态
         # 退出途径：Esc / 双击 / 控制栏按钮 / 关闭窗口
         # （键盘/关闭/双击均在全局 eventFilter 里兜底——实例属性赋值在
         #   PySide6 不进 Qt 虚表永不回调，属无效代码，见 eventFilter 注释）
         fs.showFullScreen()
+        self.control_bar.show()
+        self._fs_titlebar.show()
         self._reposition_overlays()
         if self._player is not None:
             self._player.rehook()
         self._wake_controls()
+
+    def _refresh_fs_title(self) -> None:
+        """全屏下切集时刷新顶栏标题（窗口化忽略）。"""
+        if self._fs_win is None:
+            return
+        label = getattr(self, "_fs_title_label", None)
+        if label is not None:
+            try:
+                label.setText(self._fs_title_text())
+            except RuntimeError:
+                pass
 
     def _fs_title_text(self) -> str:
         """全屏顶栏标题：作品名 + 当前集。"""
@@ -3445,7 +3617,16 @@ class VideoView(QWidget):
         if self._player is not None:
             self._player.rehook()
         self._reposition_overlays()
+        self._sync_fs_button()  # 同一按钮切回「全屏」态
+        self._hide_timer.stop()  # 退出全屏不再自动隐藏
+        self.control_bar.show()  # 控制条回到常驻可见
         self.setCursor(Qt.ArrowCursor)
+
+    def _sync_fs_button(self) -> None:
+        """全屏/退出全屏共用同一按钮：按当前是否全屏切换图标与提示。"""
+        in_fs = self._fs_win is not None
+        self.fs_btn.setText("⤡" if in_fs else "⛶")
+        self.fs_btn.setToolTip("退出全屏（F）" if in_fs else "全屏（F）")
 
     def _on_fs_close(self, event):
         """全屏窗被关闭（Alt+F4 等）→ 自动回主视图，视频不丢失。"""
