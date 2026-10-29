@@ -187,6 +187,7 @@
       "/video/adjump(?:/|$)"
     ],
     "hls_rules": {
+      "remux_timestamps": {"enabled": true},
       "drop_short_blocks": {
         "enabled": true,
         "max_duration": 30,

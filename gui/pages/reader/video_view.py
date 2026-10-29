@@ -694,11 +694,25 @@ class VideoView(QWidget):
         )
         self.center_play_btn.clicked.connect(self._toggle_play_pause)
 
-        # 缓冲 spinner（播放启动到首帧期间显示）
+        # 缓冲进度条（播放启动到首帧期间显示）
+        # 用**确定进度**而不是不定动画：libvlc 的 MediaPlayerBuffering 事件
+        # 本身就带缓存填充百分比，之前只拿它做 show/hide、控件又是
+        # setRange(0,0) 的忙碌动画，所以「加载进度」在界面上完全读不出来
+        # （用户看到的就是一个转圈小方块，不知道加载到哪一步）。
         self.buffer_spinner = QProgressBar(self._overlay_root)
-        self.buffer_spinner.setRange(0, 0)  # 不定模式（忙碌动画）
-        self.buffer_spinner.setFixedSize(56, 56)
-        self.buffer_spinner.setTextVisible(False)
+        self.buffer_spinner.setRange(0, 100)
+        self.buffer_spinner.setValue(0)
+        self.buffer_spinner.setFixedSize(240, 22)
+        self.buffer_spinner.setTextVisible(True)
+        self.buffer_spinner.setFormat("载入中…")
+        self.buffer_spinner.setAlignment(Qt.AlignCenter)
+        self.buffer_spinner.setStyleSheet(
+            "QProgressBar { background: rgba(0,0,0,170); color: white;"
+            " border: 1px solid rgba(255,255,255,90); border-radius: 11px;"
+            " font-size: 12px; text-align: center; }"
+            "QProgressBar::chunk { background: rgba(255,255,255,170);"
+            " border-radius: 10px; }"
+        )
         self.buffer_spinner.hide()
 
         # 状态浮层（play_label 契约保留）：仅加载/错误时显示，覆盖在视频区内
@@ -1201,7 +1215,9 @@ class VideoView(QWidget):
             return
         cy = (h - 96) // 2
         self.center_play_btn.move((w - 96) // 2, max(0, cy))
-        self.buffer_spinner.move((w - 56) // 2, max(0, (h - 56) // 2))
+        bar = self.buffer_spinner
+        self.buffer_spinner.move((w - bar.width()) // 2,
+                                 max(0, (h - bar.height()) // 2))
         self.help_overlay.adjustSize()
         self.help_overlay.move((w - self.help_overlay.width()) // 2,
                                (h - self.help_overlay.height()) // 2)
@@ -2262,12 +2278,33 @@ class VideoView(QWidget):
         player.time_changed.connect(self._on_player_time)
         player.length_changed.connect(self._on_player_length)
         player.buffering.connect(self._on_player_buffering)
+        # 状态信号是 ▶/⏸ 图标的唯一真相来源：点击只改一次，缓冲→播放、
+        # 播放→暂停（键盘/媒体键/自动暂停）、播放→结束都必须能刷新图标。
+        state_sig = getattr(player, "state_changed", None)
+        if state_sig is not None:
+            state_sig.connect(self._on_player_state)
         self._player = player
         try:
             player.rehook()
         except Exception:  # noqa: BLE001 —— HWND 未就绪时 play 里会再挂
             pass
         return player
+
+    @staticmethod
+    def _call_player_play(player, play_url: str, audio_url: str, title: str,
+                          kind: str, caching_ms: int) -> None:
+        """调用播放器的 play()，并把源级 network_caching 传下去。
+
+        旧签名/测试桩只接受 (url, audio, title, kind)：这类实现不带该关键字，
+        退化为不覆盖缓冲值即可——不能为一个调优参数把播放链路整体打断。
+        """
+        try:
+            player.play(play_url, audio_url, title, kind=kind,
+                        network_caching_ms=caching_ms)
+        except TypeError as exc:
+            if "network_caching_ms" not in str(exc):
+                raise
+            player.play(play_url, audio_url, title, kind=kind)
 
     def _embedded_play_url(self, video: str, audio: str, hdrs: dict,
                            ad_block: dict) -> tuple[str, str]:
@@ -2352,9 +2389,22 @@ class VideoView(QWidget):
         # 就没了（classify 会落到 unknown 档，缓冲偏小 → HLS 频繁卡）。
         kind = "hls" if "m3u8" in (video or "").lower() else (
             "mp4" if ".mp4" in (video or "").lower() else "")
+        # 源级 network_caching_ms 下发给播放器：HLS 缺省 5000ms 对按连接限速
+        # 的 CDN 太浅，缓冲一见底就重缓冲（用户可见的「频繁跳帧/卡一下」）。
+        caching_ms = self._source_network_caching_ms()
+        # 新播放会话：清掉上一集的卡顿统计，并立刻显示 0% 的加载条
+        # （VLC 的缓冲事件要等首片到达才来，之前这段是纯黑屏无反馈）。
+        try:
+            self._tuner.reset()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._show_buffer_indicator(0)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             player = self._ensure_player(hdrs)
-            player.play(play_url, audio_url, title, kind=kind)
+            self._call_player_play(player, play_url, audio_url, title, kind, caching_ms)
         except Exception as exc:  # noqa: BLE001 —— libvlc 缺失/挂载失败
             self._has_played = False
             self._show_status(f"播放失败：{_safe_error_text(exc)}")
@@ -2449,17 +2499,149 @@ class VideoView(QWidget):
         except (RuntimeError, TypeError):
             pass
 
-    def _on_player_buffering(self, percent: int) -> None:
-        """缓冲进度 → 中央 spinner（内嵌时可观察）。"""
+    # VLC 状态码（与 framework.vlc_player 内部常量一致，避免跨模块耦合）
+    _VLC_BUFFERING = 2
+    _VLC_PLAYING = 3
+    _VLC_PAUSED = 4
+
+    @staticmethod
+    def _normalize_buffer_percent(value) -> int:
+        """把 libvlc 的缓冲百分比归一成 0~100；无法解析返回 -1。
+
+        口径不统一是实测存在的：libvlc 3.x 的 MediaPlayerBuffering 事件里
+        `new_cache` 多数构建是 0~100 的百分比，但也有构建给 0~1 的浮点比例。
+        只按其中一种解读，另一种就会表现为「进度条永远停在 1%」或「一开始
+        就满格」。这里按数值大小判别：<=1 视为比例，其余视为百分比。
+        """
         try:
-            if 0 <= int(percent) < 100:
-                self.buffer_spinner.show()
-                self._sync_overlay_state(playing=False)
+            v = float(value)
+        except (TypeError, ValueError):
+            return -1
+        if v <= 0:
+            return 0
+        if v <= 1.0:
+            v *= 100.0
+        return max(0, min(100, int(round(v))))
+
+    def _show_buffer_indicator(self, percent: int = -1) -> None:
+        """显示/更新画面中央的加载进度条（percent<0 表示只显示不改数值）。"""
+        bar = getattr(self, "buffer_spinner", None)
+        if bar is None:
+            return
+        try:
+            if percent >= 0:
+                bar.setValue(max(0, min(100, int(percent))))
+            bar.setFormat("缓冲中 %p%" if bar.value() > 0 else "载入中…")
+            if not bar.isVisible():
+                bar.show()
+            bar.raise_()
+            self._reposition_overlays()
+        except (RuntimeError, AttributeError):
+            return
+        # 缓冲不是「暂停」：中央播放键必须保持隐藏。之前这里走的是
+        # _sync_overlay_state(playing=False)，于是缓冲时中央按钮与进度条
+        # 叠在一起，看起来像「播放被停了」。
+        try:
+            self.center_play_btn.setVisible(False)
+        except (RuntimeError, AttributeError):
+            pass
+        try:
+            self._hide_timer.stop()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _hide_buffer_indicator(self) -> None:
+        """收起加载进度条，并同步覆盖层到当前真实播放状态。"""
+        bar = getattr(self, "buffer_spinner", None)
+        if bar is not None:
+            try:
+                bar.hide()
+            except RuntimeError:
+                pass
+        self._sync_overlay_state(playing=self._player_is_active())
+
+    def _player_state(self) -> int:
+        """读一次 libvlc 状态码（-1 = 未知/播放器未就绪）。"""
+        player = self._player
+        if player is None:
+            return -1
+        getter = getattr(player, "get_state", None)
+        if not callable(getter):
+            return -1
+        try:
+            return int(getter())
+        except Exception:  # noqa: BLE001 —— 播放器释放竞态
+            return -1
+
+    def _player_is_active(self) -> bool:
+        """UI 口径的「正在播」：播放中与缓冲中都算。
+
+        `is_playing()` 在 VLC 里只有 Playing 状态为真——缓冲、起播、seek 后
+        的重缓冲期间都是 False。图标若直接绑它，缓冲时就会把 ⏸ 翻成 ▶，
+        用户点了播放却看到「播放」图标，正是「图标显示不正确」的根因。
+        """
+        player = self._player
+        if player is None:
+            return False
+        probe = getattr(player, "is_active", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception:  # noqa: BLE001
+                return False
+        state = self._player_state()
+        if state >= 0:
+            return state in (self._VLC_BUFFERING, self._VLC_PLAYING)
+        try:
+            return bool(player.is_playing())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _on_player_buffering(self, percent: int) -> None:
+        """缓冲进度 → 画面中央的加载进度条（显示真实百分比）。"""
+        pct = self._normalize_buffer_percent(percent)
+        if pct < 0:
+            return
+        # 喂给自适应缓冲器：此前 MediaTuner 只被创建/重置、从没接收过缓冲
+        # 事件，于是「卡顿 3 次自动加大缓冲」这条自愈链路一次都没生效过。
+        try:
+            self._tuner.on_buffering(pct)
+        except Exception:  # noqa: BLE001 —— 统计失败不能影响播放
+            pass
+        try:
+            if pct >= 100:
+                self._hide_buffer_indicator()
             else:
-                self.buffer_spinner.hide()
-                self._sync_overlay_state(playing=True)
+                self._show_buffer_indicator(pct)
         except Exception:  # noqa: BLE001 —— 覆盖层异常不影响播放
             pass
+
+    def _on_player_state(self, state: int) -> None:
+        """VLC 状态迁移 → 播放/暂停图标 + 加载进度条的唯一真相来源。"""
+        try:
+            st = int(state)
+        except (TypeError, ValueError):
+            return
+        try:
+            if st == self._VLC_PLAYING:
+                self._hide_buffer_indicator()
+                self._sync_overlay_state(playing=True)
+            elif st == self._VLC_BUFFERING:
+                # 缓冲中：进度条在，中央播放键不在，图标保持「播放中」
+                self._show_buffer_indicator(-1)
+                self._sync_overlay_state(playing=True)
+            elif st == self._VLC_PAUSED:
+                self._hide_buffer_indicator()
+                self._sync_overlay_state(playing=False)
+            elif st in (0, 1):          # Nothing / Opening：还在起播
+                self._show_buffer_indicator(-1)
+                self.center_play_btn.setVisible(False)
+            else:                        # Stopped / Ended / Error
+                self._hide_buffer_indicator()
+                self._sync_overlay_state(playing=False)
+        except (RuntimeError, AttributeError):
+            pass
+        self._update_play_button()
 
     def _on_player_error(self, message: str) -> None:
         """播放器报错：提示并允许重试（不静默黑屏）。"""
@@ -2499,13 +2681,23 @@ class VideoView(QWidget):
         player = self._player
         if player is None or not self._has_played:
             return
+        # 状态兜底对账：个别封装/格式不投递状态事件，每秒校一次图标，
+        # 保证 ▶/⏸ 不会长期停在错误的一面。
+        self._update_play_button()
         try:
-            if not player.is_playing():
+            if not self._player_is_active():
                 return
             time_ms = int(player.get_time() or 0)
             length_ms = int(player.get_length() or 0)
         except Exception:  # noqa: BLE001 —— 播放器释放竞态
             return
+        # 时间已经在推进 = 首帧已出：加载条必须收起（缓冲事件缺失时的兜底）
+        if time_ms > 0:
+            try:
+                if self.buffer_spinner.isVisible():
+                    self._hide_buffer_indicator()
+            except (RuntimeError, AttributeError):
+                pass
         if length_ms > 0 and length_ms != self._player_length_ms:
             self._on_player_length(length_ms)
         if time_ms > 0:
@@ -3245,14 +3437,17 @@ class VideoView(QWidget):
         self.vol_slider.setToolTip(tip)
 
     def _update_play_button(self) -> None:
-        """播放键图标：投屏中跟电视状态；本地播放跟内嵌播放器的播放/暂停。"""
+        """播放键图标：投屏中跟电视状态；本地播放跟内嵌播放器的真实状态。
+
+        「缓冲中」也算播放中（图标保持 ⏸）：libvlc 的 is_playing() 在缓冲、
+        起播、seek 重缓冲期间都是 False，直接用它会让图标在缓冲时翻回 ▶。
+        """
         if self._cast_active:
             self.play_btn.setText("⏸" if self._cast_state == "playing" else "▶")
             return
-        player = self._player
-        if player is not None and self._has_played:
+        if self._player is not None and self._has_played:
             try:
-                self.play_btn.setText("⏸" if player.is_playing() else "▶")
+                self.play_btn.setText("⏸" if self._player_is_active() else "▶")
             except Exception:  # noqa: BLE001 —— 播放器释放竞态
                 self.play_btn.setText("▶")
 
@@ -3508,11 +3703,15 @@ class VideoView(QWidget):
         player = self._player
         if player is not None and self._current_play and self._has_played:
             try:
-                if player.is_playing():
+                # 判定用 _player_is_active()（播放中/缓冲中都算在播），
+                # 与图标口径一致：否则缓冲中按一下会走 resume() 分支，
+                # 实际什么都没发生，图标却在 ▶/⏸ 之间来回跳。
+                if self._player_is_active():
                     player.pause()
                     self._sync_overlay_state(playing=False)
                 else:
                     player.resume()
+                    self._hide_buffer_indicator()
                     self._sync_overlay_state(playing=True)
                 self.control_bar.show()       # 操作即唤回，避免卡在隐藏态
                 self.setCursor(Qt.ArrowCursor)  # 操作中指针必须可见

@@ -23,6 +23,28 @@ from PySide6.QtCore import Qt, QObject, Signal
 
 _INSTANCE = None  # 模块级单例 vlc.Instance
 _INSTANCE_LOCK = threading.Lock()  # 预热/首播可能并发创建，防竞态
+# libvlc 状态码常量（与 vlc.State 枚举值一致，避免各版本枚举差异）
+_ST_NOTHING = 0
+_ST_OPENING = 1
+_ST_BUFFERING = 2
+_ST_PLAYING = 3
+_ST_PAUSED = 4
+_ST_STOPPED = 5
+_ST_ENDED = 6
+_ST_ERROR = 7
+
+
+def _normalize_state(st) -> int:
+    """把 python-vlc 各版本的状态返回统一成 int 状态码。
+
+    `get_state()` 返回 vlc.State 枚举，事件里 `u.new_state` 可能直接是枚举
+    实例或原始小端 uint32 字节 —— 三种形态都要能读成 0~7。
+    """
+    if isinstance(st, bytes):
+        return int.from_bytes(st, "little")
+    if hasattr(st, "value"):  # vlc.State 枚举（可能非 IntEnum）
+        return int(st.value)
+    return int(st)
 # 本地代理转发用 requests Session（keep-alive）：HLS 分片逐段请求复用连接，
 # 避免每段一次 TCP+TLS 握手（本地代理播放加速关键）。
 _PROXY_SESSION = None
@@ -394,6 +416,7 @@ class _VlcBridge(QObject):
     time_changed = Signal(int)
     length_changed = Signal(int)
     buffering = Signal(int)  # 0~100；100 表示缓冲完成恢复播放
+    state_changed = Signal(int)  # VLC 状态码（见 VlcPlayer.get_state）
 
 
 class VlcPlayer(QObject):
@@ -405,6 +428,11 @@ class VlcPlayer(QObject):
     time_changed = Signal(int)
     length_changed = Signal(int)
     buffering = Signal(int)  # 缓冲百分比 0~100（100=恢复播放）
+    # VLC 播放状态变化（0=Nothing 1=Opening 2=Buffering 3=Playing 4=Paused
+    # 5=Stopped 6=Ended 7=Error）。UI 的播放/暂停图标必须跟这个信号走：
+    # 只靠点击时读一次 is_playing() 会漏掉「缓冲→播放」「播放→结束」
+    # 「缓冲中暂停」等状态迁移，图标就会停在错误的一面。
+    state_changed = Signal(int)
     # 内部：watchdog 子线程 → 主线程调度代理重播（winId/set_hwnd 必须主线程）
     _proxy_retry = Signal(str, str)
 
@@ -429,6 +457,7 @@ class VlcPlayer(QObject):
         self._bridge.time_changed.connect(self.time_changed)
         self._bridge.length_changed.connect(self.length_changed)
         self._bridge.buffering.connect(self.buffering)
+        self._bridge.state_changed.connect(self.state_changed)
         self._proxy_retry.connect(self._retry_with_proxy)
         self._install_events()
         # 构造即强制 native 窗口（winId 返回真实 HWND）
@@ -475,7 +504,7 @@ class VlcPlayer(QObject):
     # 播放控制
     # ------------------------------------------------------------------ #
     def play(self, video_url: str, audio_url: str = "", title: str = "",
-             kind: str = "") -> None:
+             kind: str = "", network_caching_ms: int = 0) -> None:
         """播放。单流直接 set_mrl；DASH 双流用 input-slave 挂音频轨。
 
         直连优先，看门狗（_start_play_watchdog）在 VLC 直连卡 Opening/Error
@@ -491,6 +520,12 @@ class VlcPlayer(QObject):
 
         缓冲调优：按媒体类型（HLS/DASH/MP4/直播）经 MediaTuner.classify
         选择初始 network-caching（media 级覆盖实例级），见 media_tuner.py。
+
+        `network_caching_ms`：源级 `media.hls.network_caching_ms` 覆盖值。
+        >0 时优先于 classify 的画像值——源作者比自己更清楚该 CDN 的抖动幅度
+        （omofuna 12000 / ikanpp 30000）。此前这个源级配置只被外侧播放器读到，
+        内嵌播放器一直用 classify 的 HLS 缺省 5000 → 缓冲偏浅，网络一抖就
+        见底重缓冲，用户看到的就是「频繁跳帧」。
         """
         if not video_url:
             self._bridge.error.emit("无播放地址")
@@ -517,12 +552,21 @@ class VlcPlayer(QObject):
         # kind 是裸类型名（"hls"/"mp4"/…）时转成 classify 认的前缀形式，
         # 其余情况（空串/未给）按 URL 自己判。
         profile = classify(f"kind:{kind}" if kind else video_url)
+        # 源级 network_caching 覆盖画像值（>0 才算显式声明）：分片流抗抖动
+        # 需要更深缓冲，现场「频繁跳帧」的直接成因就是缓冲浅于源站分片间隔。
+        buffer_ms = profile.buffer_ms
+        try:
+            override = int(network_caching_ms or 0)
+        except (TypeError, ValueError):
+            override = 0
+        if override > 0:
+            buffer_ms = max(buffer_ms, override)
         # media 级网络缓存：对分片流（HLS/DASH）抗网络抖动，卡顿自愈时逐级提高
         # media 级硬件解码：--avcodec-hw 是 media 级变量——**实例级参数不生效**
         # （libvlc 老帖/Qt Forum 实测确认），必须在 media_new 后 add_option。
         # d3d11va 直连 GPU 解码（RTX/核显均支持），软解 1080p+ 是全程掉帧根因。
         opts = [
-            f"network-caching={profile.buffer_ms}",
+            f"network-caching={buffer_ms}",
             "avcodec-hw=d3d11va",
         ]
         if self._referer:
@@ -792,14 +836,22 @@ class VlcPlayer(QObject):
         字节 / int），统一归一化；失败返回 -1。
         """
         try:
-            st = self._player.get_state()
-            if isinstance(st, bytes):
-                return int.from_bytes(st, "little")
-            if hasattr(st, "value"):  # vlc.State 枚举（可能非 IntEnum）
-                return int(st.value)
-            return int(st)
+            return _normalize_state(self._player.get_state())
         except Exception:  # noqa: BLE001
             return -1
+
+    def is_active(self) -> bool:
+        """是否处于「用户认为正在播」的状态（播放中 / 缓冲中）。
+
+        `is_playing()` 在 VLC 里只在 Playing 状态为真，缓冲、起播、seek 后的
+        重新缓冲期间都是 False。UI 若直接拿它决定图标，就会在缓冲时把 ⏸ 翻成
+        ▶（用户点了播放却看到「播放」图标，以为没点上）。判定必须以
+        get_state() 为准：Playing/Buffering 都算「正在播」。
+        """
+        return self.get_state() in (_ST_BUFFERING, _ST_PLAYING)
+
+    def is_paused(self) -> bool:
+        return self.get_state() == _ST_PAUSED
 
     def close(self) -> None:
         """释放本播放器（App 退出前逐个调用；实例由 shutdown_vlc 最后释放）。"""
@@ -831,6 +883,7 @@ class VlcPlayer(QObject):
         em.event_attach(vlc.EventType.MediaPlayerTimeChanged, self._cb_time)
         em.event_attach(vlc.EventType.MediaPlayerLengthChanged, self._cb_length)
         em.event_attach(vlc.EventType.MediaPlayerBuffering, self._cb_buffering)
+        em.event_attach(vlc.EventType.MediaPlayerStateChanged, self._cb_state)
 
     def _cb_ended(self, event):
         self._bridge.ended.emit()
@@ -854,5 +907,12 @@ class VlcPlayer(QObject):
         """缓冲百分比事件（0~100）：UI 显示缓冲浮层/驱动卡顿自愈。"""
         try:
             self._bridge.buffering.emit(int(event.u.new_cache))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _cb_state(self, event):
+        """播放状态变化事件：UI 靠它把 ▶/⏸ 图标跟真实状态对齐。"""
+        try:
+            self._bridge.state_changed.emit(_normalize_state(event.u.new_state))
         except Exception:  # noqa: BLE001
             pass

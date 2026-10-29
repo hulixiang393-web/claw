@@ -3050,6 +3050,32 @@ class MediaProxy:
         except OSError:
             return None
 
+    def _remux_base_for(self, ctx: dict, cache_key: str, seg_name: str):
+        """本片的时间轴基准 = **播放清单里的前一片**的结束点（90kHz ticks）。
+
+        为什么不能用 `max(ctx["segs"].values())`：并行预取与拖动会让靠后的分片
+        先于靠前的分片被整理，max 会取到「未来分片」的结束点，于是先到的靠前
+        分片被整体推到未来分片之后——**清单顺序没变、时间轴却被打乱**，播放器
+        只能靠丢帧追上，用户看到的就是「频繁跳帧」。按清单序取前一片，基准
+        永远与源站播放顺序一致。
+
+        返回 None 表示「基准未知」（前一片还没整理过，属真乱序/跳播）：
+        调用方应让本片按源站原时间轴直通，不要凭空造一个基准。
+        """
+        try:
+            order = (self._seg_order or {}).get(cache_key)
+            pos_map = (self._seg_pos or {}).get(cache_key) or {}
+        except AttributeError:  # 极早期的实例状态（测试桩）
+            return None
+        if not order or not pos_map:
+            return None
+        idx = pos_map.get(seg_name)
+        if idx is None or idx <= 0:
+            return None
+        prev = order[idx - 1]
+        with ctx["lock"]:
+            return ctx["segs"].get(prev)
+
     def _remux_segment(self, cache_key: str, seg_name: str, raw: bytes,
                        req_headers) -> bytes | None:
         """把本片整理成"接上前一片"的 TS；失败/不适用返回 None。
@@ -3100,8 +3126,21 @@ class MediaProxy:
                 return None
             if seg_name in ctx["processed"]:
                 return None
-            base = max(ctx["segs"].values())
             ctx["inflight"][seg_name] = True
+        # 基准 = 清单里前一片的结束点（见 _remux_base_for 的成因说明）。
+        base = self._remux_base_for(ctx, cache_key, seg_name)
+        if base is None:
+            # 前一片还没整理过（真乱序/直接跳播）：本片按源站原时间轴直通，
+            # 只把自己的结束点并入基准。凭空造基准会把这一片推到错误位置，
+            # 播放器随即丢帧——宁可不整理，也不能打乱顺序。
+            end = _end_ticks(raw)
+            with ctx["lock"]:
+                ctx["inflight"].pop(seg_name, None)
+                if end:
+                    ctx["segs"][seg_name] = max(
+                        ctx["segs"].get(seg_name, 0.0), end)
+                ctx["processed"].add(seg_name)
+            return None
         # 不再依赖 ffmpeg：纯字节平移，无子进程、无控制台窗口。
         result = self._run_remux("", raw, base, req_headers)
         with ctx["lock"]:
