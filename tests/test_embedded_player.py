@@ -43,7 +43,7 @@ class _FakePlayer:
         self._time = 0
         self._playing = False
 
-    def play(self, url, audio="", title=""):
+    def play(self, url, audio="", title="", kind=""):
         self.calls.append(("play", url, audio))
         self._playing = True
 
@@ -310,6 +310,56 @@ def test_open_external_without_stream_only_hints(_qapp, monkeypatch):
     monkeypatch.setattr(view, "_show_status", hints.append)
     view._open_external()
     assert hints, "无当前流时必须给反馈，不能静默"
+
+
+# ---------------------------------------------------------------------- #
+# 控制条位置：必须停在原生视频窗口**外面**
+# ---------------------------------------------------------------------- #
+def test_control_bar_docked_outside_native_video_surface(_qapp):
+    """控制条不能是原生画面控件的后代。
+
+    libvlc 用 set_hwnd 把视频渲染到画面控件的 HWND，并在其中创建自己的
+    子窗口（Direct3D 输出）。原生子窗口永远盖在同一窗口里 Qt 绘制的兄弟/
+    子控件之上 —— 控制条一旦挂在画面控件内部，开播后整条会被视频盖住，
+    用户看到的就是「全屏/倍速/进度/上下集/暂停/投屏按钮全不见了」。
+    """
+    view = _view()
+    assert view.control_bar.parent() is view._player_box
+    assert view._video_frame.parent() is view._player_box
+    assert not view._video_frame.isAncestorOf(view.control_bar), \
+        "控制条被放回原生画面内部了：开播后会被 libvlc 的输出窗口盖住"
+
+
+def test_all_player_controls_present_and_enabled(_qapp):
+    """开播前后这些控件都要在、要可用（含投屏/全屏/倍速/进度）。"""
+    view = _view()
+    view.show()
+    _qapp.processEvents()
+    names = ("play_btn", "prev_btn", "next_btn", "progress", "time_label",
+             "vol_btn", "vol_slider", "speed_combo", "fs_btn", "settings_btn",
+             "cast_btn")
+    for name in names:
+        w = getattr(view, name, None)
+        assert w is not None, f"缺少控件 {name}"
+        assert w.isVisibleTo(view), f"{name} 不可见"
+        if name != "cast_btn":  # 投屏按钮随「有无源/当前集」禁用，另测
+            assert w.isEnabled(), f"{name} 被禁用"
+
+
+def test_fullscreen_moves_whole_player_box(_qapp, monkeypatch):
+    """全屏要把画面 + 控制条一起搬走，否则全屏里没法操作。"""
+    view = _view()
+    _install(view, _FakePlayer())
+    monkeypatch.setattr(view, "_wake_controls", lambda: None)
+    view._toggle_fullscreen()
+    try:
+        assert view._fs_win is not None
+        assert view._player_box.parent() is view._fs_win
+        assert view.control_bar.isVisibleTo(view._fs_win)
+    finally:
+        view._exit_fullscreen()
+    assert view._fs_win is None
+    assert view.control_bar.isVisibleTo(view)
 
 
 # ---------------------------------------------------------------------- #

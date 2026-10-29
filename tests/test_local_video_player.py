@@ -36,8 +36,9 @@ class _FakeVlc:
         self.error = _Signal()
         type(self).instances.append(self)
 
-    def play(self, url, audio="", title=""):
+    def play(self, url, audio="", title="", kind=""):
         self.calls.append(("play", url))
+        self.kind = kind
         self._playing = True
 
     def pause(self):

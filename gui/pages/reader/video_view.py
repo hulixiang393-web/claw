@@ -481,29 +481,41 @@ class VideoView(QWidget):
         body = QVBoxLayout()
         body.setSpacing(8)
 
-        # 播放面板（内嵌 libvlc 画面区）。原生窗口属性**不在这里设**：
-        # libvlc 需要的是「set_hwnd 那一刻有稳定句柄」，构造期就强制原生窗口
-        # 会让每个 VideoView 都创建原生 surface（offscreen/无播放场景下白建，
-        # 析构窗口树时还会访问越界）。改由 _ensure_player 在挂载前设置。
-        self._video_frame = _PlayPanel(self)
+        # 播放器整体容器：**画面 + 控制条**上下两行，一起进全屏。
+        # 为什么控制条不叠在画面里：libvlc 会用 set_hwnd 把视频渲染到画面
+        # 控件的 HWND 上，并在其中创建自己的子窗口（Direct3D 输出）。原生
+        # 子窗口总是盖在同一窗口里 Qt 绘制的兄弟/子控件之上 —— 控制条若还
+        # 挂在画面控件内部，一开播就整条被视频盖住看不见（用户实际现象：
+        # 全屏/倍速/进度/上下集/暂停/投屏按钮全部消失）。停靠到画面下方就
+        # 完全避开这层 z-order 冲突。
+        self._player_box = QWidget(self)
+        pbox = QVBoxLayout(self._player_box)
+        pbox.setContentsMargins(0, 0, 0, 0)
+        pbox.setSpacing(0)
+
+        # 画面区（内嵌 libvlc）。原生窗口属性**不在这里设**：libvlc 需要的是
+        # 「set_hwnd 那一刻有稳定句柄」，构造期就强制原生窗口会让每个
+        # VideoView 都创建原生 surface。改由 _ensure_player 挂载前设置。
+        self._video_frame = _PlayPanel(self, parent=self._player_box)
         self._video_frame.setMinimumHeight(320)
         self._video_frame.setFocusPolicy(Qt.StrongFocus)
-        body.addWidget(self._video_frame, stretch=5)
+        pbox.addWidget(self._video_frame, stretch=1)
 
         # ---- 覆盖层：中央播放按钮 / 缓冲 spinner / 帮助浮层 ----
         self._build_overlays()
 
-        # ---- 沉浸式控制条：悬浮叠加在视频画面内部（随视频走，不动自动隐藏）----
-        self.control_bar = QWidget(self._overlay_root)
+        # ---- 控制条：停靠在画面下方（不叠进原生视频窗口）----
+        self.control_bar = QWidget(self._player_box)
         self.control_bar.setObjectName("videoControlBar")
         self.control_bar.setStyleSheet(
-            "QWidget#videoControlBar { background: rgba(0,0,0,150);"
-            " border-radius: 8px; }"
+            "QWidget#videoControlBar { background: rgba(20,20,20,235); }"
         )
         cb = QHBoxLayout(self.control_bar)
-        cb.setContentsMargins(8, 4, 8, 4)
+        cb.setContentsMargins(10, 6, 10, 6)
         cb.setSpacing(6)
         self._build_control_bar(cb)
+        pbox.addWidget(self.control_bar)
+        body.addWidget(self._player_box, stretch=5)
 
         # ---- 可滚动卡片网格区（分集在上，相关推荐在下）----
         self._cards_scroll = QScrollArea()
@@ -539,10 +551,11 @@ class VideoView(QWidget):
 
         self._right_layout = body  # 全屏退出后把视频区插回（body 第 0 位）
         layout.addLayout(body, stretch=1)
-        self._reposition_overlays()  # 初始定位控制条/覆盖层
-        # 内嵌播放：控件在开播前先禁用（无流时拖进度/调音量无意义），
-        # _play 成功后会解禁并接线到播放器。
-        self._disable_embedded_controls()
+        self._reposition_overlays()  # 初始定位覆盖层
+        # 控制条一律**可用**（不再有外播时代那套"禁用并注明"）：没开播时点
+        # 进度/音量/倍速只是空操作，比灰掉更不容易让人以为坏了。开播时
+        # _enable_embedded_controls 会把当前音量下发给播放器。
+        self._enable_embedded_controls()
         # 全局事件过滤器：鼠标唤出控制条 + 全屏窗键盘/关闭兜底。
         # 由常驻中继单例安装、本视图以弱引用登记——视图被回收后回调自动
         # 失效，不会在 app 的过滤器链里留下悬空指针（见 _ViewEventRelay）。
@@ -890,24 +903,20 @@ class VideoView(QWidget):
     # 控制条自动隐藏
     # ------------------------------------------------------------------ #
     def _wake_controls(self) -> None:
-        """鼠标移动/触碰 → 显示控制条 + 重置隐藏定时器。"""
-        if not self.control_bar.isVisible():
-            self.control_bar.show()
-            if self._fs_win is not None:
-                self._fs_titlebar.show()
-        self._hide_timer.start()
+        """鼠标移动/触碰 → 让控制条与全屏顶栏可见。
+
+        控制条是**停靠**在画面下方的常驻行（见 _build_ui），不参与自动隐藏：
+        自动隐藏叠在画面里的控制条正是「按钮全没了」的观感来源。这里只负责
+        把指针从隐藏态恢复，并把全屏顶栏叫回来。
+        """
+        if self._fs_win is not None and not self._fs_titlebar.isVisible():
+            self._fs_titlebar.show()
         if self._player is not None and self._player.is_playing():
             self.setCursor(Qt.ArrowCursor)
 
     def _hide_controls(self) -> None:
-        """3s 无操作 → 隐藏控制条（仅播放中隐藏；菜单打开时除外）。"""
-        if self.settings_btn.menu().isVisible():
-            self._hide_timer.start()
-            return
+        """空闲定时器：只隐藏鼠标指针（控制条常驻，不隐藏）。"""
         if self._player is not None and self._player.is_playing():
-            self.control_bar.hide()
-            if self._fs_win is not None:
-                self._fs_titlebar.hide()
             self.setCursor(Qt.BlankCursor)
 
     def _adjust_cast_volume(self, delta: int) -> None:
@@ -1044,26 +1053,18 @@ class VideoView(QWidget):
         self._reposition_overlays()
 
     def _reposition_overlays(self) -> None:
-        """覆盖层随视频区尺寸变化居中（resizeEvent 兜底 + 全屏切换后）。"""
+        """覆盖层随画面区尺寸变化居中（resizeEvent 兜底 + 全屏切换后）。
+
+        控制条已停靠在画面下方（见 _build_ui），这里不再给它算几何。
+        """
         frame = self._video_frame
         self._overlay_root.setGeometry(frame.rect())
         w, h = frame.width(), frame.height()
         if w <= 0 or h <= 0:
             return
-        # 沉浸控制条：悬浮在视频画面底部中央（YouTube/B站 风格）。
-        # 先量尺寸：矮播放框（<196）时中央按钮与它重叠 → 上移按钮避让
-        self.control_bar.adjustSize()
-        cb_w = min(w - 32, 920)
-        self.control_bar.resize(cb_w, self.control_bar.height())
-        self.control_bar.move((w - cb_w) // 2, h - self.control_bar.height() - 12)
-        # 控制条上方安全区（留 12 间距）
-        cb_vtop = h - self.control_bar.height() - 24
         cy = (h - 96) // 2
-        if cy + 96 > cb_vtop:
-            cy = max(0, (cb_vtop - 96) // 2)
-        self.center_play_btn.move((w - 96) // 2, cy)
-        self.buffer_spinner.move((w - 56) // 2,
-                                 max(0, (min(cb_vtop, h) - 56) // 2))
+        self.center_play_btn.move((w - 96) // 2, max(0, cy))
+        self.buffer_spinner.move((w - 56) // 2, max(0, (h - 56) // 2))
         self.help_overlay.adjustSize()
         self.help_overlay.move((w - self.help_overlay.width()) // 2,
                                (h - self.help_overlay.height()) // 2)
@@ -2201,9 +2202,13 @@ class VideoView(QWidget):
             self._sync_overlay_state(playing=False)
             return
         play_url, audio_url = self._embedded_play_url(video, audio, hdrs, ad_block)
+        # 媒体类型提示必须按**上游原始 URL** 判：包成代理 URL 后扩展名线索
+        # 就没了（classify 会落到 unknown 档，缓冲偏小 → HLS 频繁卡）。
+        kind = "hls" if "m3u8" in (video or "").lower() else (
+            "mp4" if ".mp4" in (video or "").lower() else "")
         try:
             player = self._ensure_player(hdrs)
-            player.play(play_url, audio_url, title)
+            player.play(play_url, audio_url, title, kind=kind)
         except Exception as exc:  # noqa: BLE001 —— libvlc 缺失/挂载失败
             self._has_played = False
             self._show_status(f"播放失败：{_safe_error_text(exc)}")
@@ -3053,11 +3058,18 @@ class VideoView(QWidget):
 
     # ---- cast_active 控制路由 ---- #
     def _apply_cast_controls(self, on: bool) -> None:
-        """投屏中启用进度/时间/上下集并提示；恢复时回到外播禁用基线。"""
+        """投屏中启用进度/时间/上下集并提示；结束投屏回到本地播放基线。
+
+        注意结束投屏时**不能**一律禁用：本地可能还在播（投屏成功前不停本地），
+        那种情况下进度/音量/倍速必须保持可用，否则停投屏就等于把控制条废掉。
+        """
         if not on:
-            self._disable_embedded_controls()
+            if self._player is not None and self._has_played:
+                self._enable_embedded_controls()
+            else:
+                self._disable_embedded_controls()
             self.play_btn.setText("▶")
-            self.prev_btn.setToolTip("上一集")  # _disable_embedded_controls 不覆盖它
+            self.prev_btn.setToolTip("上一集")
             return
         for w in (self.play_btn, self.prev_btn, self.next_btn,
                   self.progress, self.time_label):
@@ -3390,10 +3402,10 @@ class VideoView(QWidget):
         fs_close.clicked.connect(self._video_frame.setFocus)
         tb.addWidget(fs_close)
         lay.addWidget(self._fs_titlebar)
-        # 视频区进全屏（覆盖层/沉浸控制条是其子控件，自动跟随）；
-        # 全屏状态下也能操作，不再被主窗口盖住
-        self._video_frame.setParent(fs)
-        lay.addWidget(self._video_frame, stretch=1)
+        # 整个播放器容器（画面 + 控制条）进全屏：控制条跟着走，全屏里照样
+        # 能暂停/拖进度/倍速/切集。只搬画面的话控制条会留在主窗口里。
+        self._player_box.setParent(fs)
+        lay.addWidget(self._player_box, stretch=1)
         self.fs_btn.setText("⛶")
         self._fs_win = fs
         # 退出途径：Esc / 双击 / 控制栏按钮 / 关闭窗口
@@ -3422,9 +3434,9 @@ class VideoView(QWidget):
             return
         fs = self._fs_win
         self._fs_win = None
-        # 视频区 reparent 回主视图（覆盖层/沉浸控制条是其子控件，自动跟随）
-        self._video_frame.setParent(self)
-        self._right_layout.insertWidget(0, self._video_frame)
+        # 播放器容器 reparent 回主视图（画面 + 控制条一起回来）
+        self._player_box.setParent(self)
+        self._right_layout.insertWidget(0, self._player_box)
         try:
             fs.close()
             fs.deleteLater()

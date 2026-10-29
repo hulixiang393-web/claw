@@ -79,6 +79,31 @@ def _detect_system_proxy():
     return result
 
 
+def _is_local_mrl(url: str) -> bool:
+    """是不是本机回环地址的 MRL（我们自己的 media_proxy / VlcStreamProxy）。
+
+    对这类 URL 做「直连失败 → 换本地代理重播」的看门狗毫无意义：它本身就是
+    本地代理，TLS/被墙问题不存在。误触只会白白重播一遍（点播必卡）。
+    """
+    try:
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(url).hostname or "").lower()
+    except (ValueError, AttributeError):
+        return False
+    return host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _should_watch_play(url: str) -> bool:
+    """这次播放要不要装「直连失败 → 换本地代理重播」的看门狗。
+
+    只有**直连外部 CDN**才需要（VLC 的 gnutls 与部分站点 TLS 不兼容 / 被墙）。
+    本机回环（我们自己的 media_proxy / VlcStreamProxy）本身就是代理，装了只会
+    把「本地代理首片慢」误判成直连失败，白白重播一遍 —— 点播必卡一下。
+    """
+    return not _is_local_mrl(url)
+
+
 def _get_instance():
     """模块级单例 vlc.Instance（内嵌去标题、网络缓冲、硬件解码）。
 
@@ -449,13 +474,20 @@ class VlcPlayer(QObject):
     # ------------------------------------------------------------------ #
     # 播放控制
     # ------------------------------------------------------------------ #
-    def play(self, video_url: str, audio_url: str = "", title: str = "") -> None:
+    def play(self, video_url: str, audio_url: str = "", title: str = "",
+             kind: str = "") -> None:
         """播放。单流直接 set_mrl；DASH 双流用 input-slave 挂音频轨。
 
         直连优先，看门狗（_start_play_watchdog）在 VLC 直连卡 Opening/Error
         时救回为本地代理转发（_play_via_proxy，requests 拉流）。不做"主动
         代理"：对 avgood 等直连可达的 CDN 直接播最稳（强制走 Clash 会被代理
         出口 IP 拒绝），YouTube 等直连被墙的靠看门狗救回（按源探测走 Clash）。
+
+        `kind`：媒体类型提示（"hls"/"dash"/"mp4"/"live"）。调用方已经把流包成
+        本地代理 URL（`http://127.0.0.1:PORT/s/<token>`）时**必须**传：这种 URL
+        没有扩展名线索，classify 会落到 unknown 档（缓冲偏小 → HLS 频繁卡）；
+        更糟的是看门狗会把"本地代理首片慢"误判成"直连被墙"，再走一次
+        `_play_via_proxy` 重播 —— 用户体感就是每次点播必然先卡一下。
 
         缓冲调优：按媒体类型（HLS/DASH/MP4/直播）经 MediaTuner.classify
         选择初始 network-caching（media 级覆盖实例级），见 media_tuner.py。
@@ -482,7 +514,9 @@ class VlcPlayer(QObject):
 
         from framework.media_tuner import classify
 
-        profile = classify(video_url)
+        # kind 是裸类型名（"hls"/"mp4"/…）时转成 classify 认的前缀形式，
+        # 其余情况（空串/未给）按 URL 自己判。
+        profile = classify(f"kind:{kind}" if kind else video_url)
         # media 级网络缓存：对分片流（HLS/DASH）抗网络抖动，卡顿自愈时逐级提高
         # media 级硬件解码：--avcodec-hw 是 media 级变量——**实例级参数不生效**
         # （libvlc 老帖/Qt Forum 实测确认），必须在 media_new 后 add_option。
@@ -512,7 +546,13 @@ class VlcPlayer(QObject):
                 self._player.set_media(self._media)
             self._attach_window()
             self._player.play()
-            self._start_play_watchdog(video_url, audio_url)
+            # 已经是本地代理 URL 时不装看门狗：它的职责是"VLC 直连 CDN 的
+            # TLS/被墙失败"救回，本地回环不存在这类问题；而本地代理首片要等
+            # 上游转发（2-3s 常见），4s 两次采样很容易判成"没起来"，于是
+            # 再走 _play_via_proxy 重播一遍 —— 双代理 + 双取流，就是点播时
+            # 那一下明显卡顿。直连 URL 仍保留看门狗。
+            if _should_watch_play(video_url):
+                self._start_play_watchdog(video_url, audio_url)
         except Exception as exc:  # noqa: BLE001
             self._bridge.error.emit(f"VLC 播放失败：{exc}")
 

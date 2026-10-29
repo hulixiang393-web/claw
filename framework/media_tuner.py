@@ -59,8 +59,17 @@ def _hint(url: str, hints) -> bool:
     return any(h in low for h in hints)
 
 
+_KIND_PREFIX = "kind:"  # classify 的类型提示前缀（见 classify 文档）
+
+
 def classify(url: str) -> MediaProfile:
-    """按 URL 推断媒体类型与初始缓冲参数。
+    """按 URL（或显式类型提示）推断媒体类型与初始缓冲参数。
+
+    支持**类型提示**：调用方播的是本地代理 URL（`http://127.0.0.1/s/<token>`）
+    时，URL 里没有任何扩展名线索，直接分类会落到 unknown 档（2500ms），
+    HLS 用这个档位会偏小、更容易频繁缓冲。此时传 `"kind:hls"` /
+    `"kind:dash"` / `"kind:mp4"` / `"kind:live"` 拿到该类型的调优档位。
+    带前缀是为了不和真实 URL 撞车（裸词 "hls" 可能出现在任何路径里）。
 
     - HLS（m3u8）：分片流，网络抖动敏感 → 5000ms
     - DASH（mpd）：分片流，双流合并开销大 → 4000ms
@@ -68,6 +77,18 @@ def classify(url: str) -> MediaProfile:
     - MP4/WebM 直链：渐进式下载，靠 Range 拖动 → 1500ms 即可
     - 未知：保守 2500ms
     """
+    low = (url or "").strip().lower()
+    if low.startswith(_KIND_PREFIX):
+        tag = low[len(_KIND_PREFIX):].strip()
+        if tag == "hls":
+            return MediaProfile("hls", 5000, 30000)
+        if tag == "dash":
+            return MediaProfile("dash", 4000, 8000)
+        if tag == "live":
+            return MediaProfile("live", 2500, 6000)
+        if tag in ("mp4", "file"):
+            return MediaProfile("mp4", 1500, 6000)
+        return MediaProfile("unknown", 2500, 6000)
     if _hint(url, _HLS_HINTS):
         # 5 秒保证普通源不会因过度缓冲而长时间黑屏；慢 CDN 可由源级
         # network_caching_ms 覆盖，不能把所有源都按慢源处理。

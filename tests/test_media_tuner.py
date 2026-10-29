@@ -35,6 +35,19 @@ class TestClassify:
         p = classify("")
         assert p.kind == "unknown"
 
+    def test_kind_hint_overrides_url(self):
+        """本地代理 URL 没有扩展名线索，调用方用 kind: 前缀指定类型。
+
+        不传提示会落到 unknown（2500ms），HLS 用这个档位偏小、更容易频繁缓冲。
+        """
+        assert classify("kind:hls") == classify("https://cdn/x/a.m3u8")
+        assert classify("kind:hls").buffer_ms == 5000
+        assert classify("kind:mp4").buffer_ms == 1500
+        assert classify("kind:file") == classify("kind:mp4")
+        assert classify("kind:dash").buffer_ms == 4000
+        # 没有扩展名的本地代理 URL 自己判不出来（这正是需要提示的原因）
+        assert classify("http://127.0.0.1:8080/s/abc").kind == "unknown"
+
 
 class TestMediaTuner:
     def test_stall_count_window(self):

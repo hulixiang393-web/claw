@@ -158,7 +158,7 @@ class LocalVideoPlayer(QDialog):
             self._player.rehook()
         except Exception:  # noqa: BLE001 —— HWND 未就绪：play 里会再挂
             pass
-        self._player.play(self._path)
+        self._player.play(self._path, kind="file")
         self._apply_volume()
         self._timer.start()
         self.play_btn.setText("⏸")
