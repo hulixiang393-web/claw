@@ -49,6 +49,18 @@ def build(_qapp):
     return _make
 
 
+@pytest.fixture(autouse=True)
+def _embedded_mode(monkeypatch):
+    """本文件验证**内嵌**播放链路：关掉「外部播放器优先」。
+
+    那个开关读本机 app_config.json（用户可能已改成外部播放），不钉住的话
+    这些契约会随本机配置漂移。
+    """
+    from gui.pages.reader.video_view import VideoView
+
+    monkeypatch.setattr(VideoView, "_prefer_external_player", lambda self: False)
+
+
 class _FakePlayer:
     """播放器桩：状态码是唯一真相来源（与 VlcPlayer 的语义一致）。"""
 

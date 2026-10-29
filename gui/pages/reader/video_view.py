@@ -483,6 +483,8 @@ class VideoView(QWidget):
         self._quality_options: list = []
         self._detail_url_for_play = ""  # 无分集时记录详情 URL
         self._player = None
+        self._external_player = None  # 最近一次拉起的外部播放器（launch 结果）
+        self.player_menu = None       # 「外部播放器」子菜单（_build_settings_menu 里建）
         self._fs_win = None  # 全屏顶层窗口
         self._last_pos_save_ts = 0.0  # 上次播放进度存盘时间戳（节流 2s 存一次）
         self._pending_position = None  # 打开书续读播放位置（0~1），播放开始后 seek
@@ -940,13 +942,91 @@ class VideoView(QWidget):
         menu.addAction("📋 复制播放地址").triggered.connect(self._copy)
         menu.addAction("🔄 刷新播放").triggered.connect(self._retry_play)
         menu.addAction("↗ 重新播放当前集").triggered.connect(self._open_external)
+        menu.addAction("▶ 用外部播放器打开").triggered.connect(
+            self._open_in_desktop_player)
+        self.player_menu = menu.addMenu("外部播放器")
         menu.addSeparator()
         menu.addAction("? 快捷键帮助").triggered.connect(self._toggle_help)
 
         self._quality_actions = []  # 防止菜单项被 GC
+        self._player_actions = []
         self._refresh_quality_menu()
         self._refresh_ep_menu()
         self._refresh_source_menu()
+        self._refresh_player_menu()
+
+    def _refresh_player_menu(self) -> None:
+        """外部播放器菜单：本机检测到的播放器 + 「起播即用外部」开关。"""
+        menu = getattr(self, "player_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        self._player_actions = []
+        found, prefs, current = {}, None, None
+        try:
+            from framework import desktop_player
+
+            prefs = desktop_player.load_prefs()
+            found = desktop_player.detect()
+            current = desktop_player.resolve(prefs.player, prefs.player_path)[0]
+        except Exception:  # noqa: BLE001 —— 探测失败只影响菜单内容
+            log.warning("外部播放器探测失败", exc_info=True)
+        if not found:
+            act = menu.addAction("（未检测到播放器，推荐 mpv）")
+            act.setEnabled(False)
+        for key in found:
+            try:
+                from framework.desktop_player import player_display_name
+
+                label = player_display_name(key)
+            except Exception:  # noqa: BLE001
+                label = key
+            act = menu.addAction(f"{label}  ·  {found[key]}")
+            act.setCheckable(True)
+            act.setChecked(key == current)
+            act.triggered.connect(
+                lambda _=False, _k=key: self._set_external_player(_k))
+            self._player_actions.append(act)
+        menu.addSeparator()
+        prefer = menu.addAction("起播时优先外部播放")
+        prefer.setCheckable(True)
+        prefer.setChecked(bool(prefs and prefs.prefer_external))
+        prefer.triggered.connect(
+            lambda checked: self._set_prefer_external(bool(checked)))
+
+    def _set_external_player(self, key: str) -> None:
+        """把某个播放器设为默认（写入 app_config.json 的 video.player）。"""
+        self._save_video_config(player=key, player_path="")
+        self._refresh_player_menu()
+        try:
+            from framework.desktop_player import player_display_name
+
+            name = player_display_name(key)
+        except Exception:  # noqa: BLE001
+            name = key
+        self._show_status(f"外部播放器已设为 {name}")
+
+    def _set_prefer_external(self, enabled: bool) -> None:
+        self._save_video_config(prefer_external=bool(enabled))
+        self._refresh_player_menu()
+        self._show_status("起播将直接用外部播放器" if enabled
+                          else "起播使用内嵌播放器（仍可手动用外部打开）")
+
+    @staticmethod
+    def _save_video_config(**values) -> None:
+        """写 app_config.json 的 video 段（失败只记日志，不影响播放）。"""
+        try:
+            from pathlib import Path
+
+            from framework.settings_manager import SettingsManager
+
+            root = Path(__file__).resolve().parents[3]
+            sm = SettingsManager(root / "app_config.json")
+            for key, value in values.items():
+                sm.set("video", key, value)
+            sm.save()
+        except Exception:  # noqa: BLE001
+            log.warning("保存外部播放器配置失败", exc_info=True)
 
     def _refresh_quality_menu(self) -> None:
         """按源配置重建画质菜单项（无画质选项 → 菜单隐藏）。"""
@@ -2349,6 +2429,129 @@ class VideoView(QWidget):
             log.warning("铸造本地代理 URL 失败，改用直连", exc_info=True)
             return video, audio
 
+    def _prefer_external_player(self) -> bool:
+        """配置里是否要求优先用外部播放器（读失败按内嵌处理）。"""
+        try:
+            from framework import desktop_player
+
+            return bool(desktop_player.load_prefs().prefer_external)
+        except Exception:  # noqa: BLE001 —— 配置坏了走内嵌，不影响播放
+            return False
+
+    def _open_in_desktop_player(self) -> bool:
+        """用**外部播放器**打开当前流（默认 mpv，其次 PotPlayer/MPC-HC）。
+
+        为什么要有这个入口：内嵌 libvlc 播长 TS 会「播一会儿就卡」——VLC 的
+        TS 解复用对时间戳抖动过于敏感，缓冲见底就重同步。mpv 走 ffmpeg
+        解复用，readahead 与音画同步策略更稳。外部播放器拿到的仍是**本地
+        代理地址**，所以广告段剔除、防盗链头、分片缓存全都照旧生效。
+        """
+        if not self._current_play:
+            self._show_status("请先选择要播放的集数" if self._selection_mode
+                              else "当前没有正在播放的集")
+            return False
+        try:
+            from framework import desktop_player
+        except Exception as exc:  # noqa: BLE001 —— 模块导入失败不阻断界面
+            log.warning("外部播放器模块不可用", exc_info=True)
+            self._show_status(f"外部播放器不可用：{_safe_error_text(exc)}")
+            return False
+
+        hdrs = {}
+        try:
+            rh = getattr(self._source, "request_headers", None)
+            if callable(rh):
+                hdrs = rh() or {}
+        except Exception:  # noqa: BLE001
+            hdrs = {}
+        try:
+            ad_block = dict((self._source.raw or {}).get("ad_block") or {})
+        except Exception:  # noqa: BLE001
+            ad_block = {}
+        play_url, audio_url = self._embedded_play_url(
+            self._current_play, self._current_audio, hdrs, ad_block)
+
+        # 起播位置：内嵌已在播就接着播，否则用续播位置
+        start_s = 0
+        try:
+            if self._player is not None and self._has_played:
+                pos = int(self._player.get_time() or 0) // 1000
+                if pos > 3:
+                    start_s = pos
+        except Exception:  # noqa: BLE001 —— 取不到位置从 0 起播
+            start_s = 0
+        if start_s <= 0:
+            try:
+                start_s = int(self._pending_seek_s or 0)
+            except Exception:  # noqa: BLE001
+                start_s = 0
+
+        prefs = desktop_player.load_prefs()
+        lease = None
+        proxy = None
+        try:
+            from framework.media_proxy import MediaProxy
+
+            proxy = MediaProxy.instance()
+            # 租约：播放器暂停/长时间不请求时，代理的看门狗不会回收 token
+            lease = proxy.acquire_lease()
+            launched = desktop_player.launch(
+                play_url,
+                preferred=prefs.player,
+                explicit_path=prefs.player_path,
+                # 代理已补头；这里仍透传，直连兜底时也有 Referer/UA
+                headers={} if play_url != self._current_play else hdrs,
+                title=self._current_title or "",
+                start_s=start_s,
+                fullscreen=prefs.fullscreen,
+                extra_args=prefs.extra_args,
+                audio_url=audio_url,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 拉起失败要说清原因
+            if lease and proxy is not None:
+                try:
+                    proxy.release_lease(lease)
+                except Exception:  # noqa: BLE001
+                    pass
+            log.warning("外部播放器拉起失败：%s", exc, exc_info=True)
+            self._show_status(f"外部播放器打开失败：{_safe_error_text(exc)}")
+            return False
+
+        self._external_player = launched
+        self._hold_proxy_lease(lease, launched.process)
+        try:
+            self._notify_last_episode()
+        except Exception:  # noqa: BLE001 —— 书架记录失败不影响播放
+            pass
+        # 状态提示放最后：_notify_last_episode 自己也会写状态条（如「已是最后
+        # 一集」），先写就被它盖掉了
+        self._show_status(f"已用 {launched.name} 打开")
+        log.info("外部播放器：%s pid=%s url=%s（起播 %.0fs）",
+                 launched.name, launched.pid, play_url, start_s)
+        return True
+
+    def _hold_proxy_lease(self, lease, process) -> None:
+        """播放器进程还活着就占着代理租约；进程退出后自动释放。"""
+        if not lease:
+            return
+        import threading
+
+        def _wait() -> None:
+            try:
+                if process is not None:
+                    process.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from framework.media_proxy import MediaProxy
+
+                MediaProxy.instance().release_lease(lease)
+            except Exception:  # noqa: BLE001 —— 代理已关：无需释放
+                pass
+
+        threading.Thread(target=_wait, name="external-player-lease",
+                         daemon=True).start()
+
     def _play(self, video: str, audio: str, title: str) -> None:
         """播放当前集（内嵌 libvlc）。
 
@@ -2397,6 +2600,13 @@ class VideoView(QWidget):
             self._show_status("没有可播放的地址")
             self._sync_overlay_state(playing=False)
             return
+        # 外部播放器优先（配置 video.prefer_external）：用户实测内嵌 VLC
+        # 播长 TS「播一会儿就卡」，改为默认交给 mpv。拉起失败则回落到内嵌，
+        # 绝不留黑屏。
+        if self._prefer_external_player():
+            if self._open_in_desktop_player():
+                self._has_played = False
+                return
         play_url, audio_url = self._embedded_play_url(video, audio, hdrs, ad_block)
         # 媒体类型提示必须按**上游原始 URL** 判：包成代理 URL 后扩展名线索
         # 就没了（classify 会落到 unknown 档，缓冲偏小 → HLS 频繁卡）。

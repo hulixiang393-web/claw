@@ -16,7 +16,7 @@
     }
   },
   "ui": {
-    "theme": "sakura",
+    "theme": "midnight",
     "font_scale": 1.5,
     "cover_cache_size_mb": 256,
     "default_page_size": 20,
@@ -94,5 +94,12 @@
     "dead_line_ttl_seconds": 600,
     "play_url_probe_timeout_cap": 5,
     "sources_selected": true
+  },
+  "video": {
+    "player": "auto",
+    "player_path": "",
+    "player_extra_args": [],
+    "prefer_external": true,
+    "external_fullscreen": false
   }
 }

@@ -105,8 +105,13 @@ def _install(view, player):
 # 播放入口
 # ---------------------------------------------------------------------- #
 def test_play_uses_embedded_player(_qapp, monkeypatch):
-    """_play 必须交给内嵌播放器，不能再拉起外部进程。"""
+    """_play 必须交给内嵌播放器，不能再拉起外部进程。
+
+    「外部播放器优先」读的是本机 app_config.json 的偏好（用户可开），这里显式
+    关掉，否则这条契约会随本机配置漂移。
+    """
     view = _view()
+    monkeypatch.setattr(view, "_prefer_external_player", lambda: False)
     fake = _FakePlayer()
     monkeypatch.setattr(view, "_ensure_player", lambda hdrs=None: fake)
     monkeypatch.setattr(view, "_embedded_play_url", lambda v, a, h, ad: (v, a))
