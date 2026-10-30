@@ -170,14 +170,13 @@ def test_load_prefs_reads_video_section(tmp_path):
     cfg = tmp_path / "app_config.json"
     cfg.write_text(json.dumps({"video": {
         "player": "potplayer", "player_path": "D:/p/PotPlayerMini64.exe",
-        "player_extra_args": ["--volume=70"], "prefer_external": True,
+        "player_extra_args": ["--volume=70"],
         "external_fullscreen": True,
     }}), encoding="utf-8")
     prefs = dp.load_prefs(tmp_path)
     assert prefs.player == "potplayer"
     assert prefs.player_path.endswith("PotPlayerMini64.exe")
     assert prefs.extra_args == ("--volume=70",)
-    assert prefs.prefer_external is True
     assert prefs.fullscreen is True
 
 
@@ -185,7 +184,7 @@ def test_load_prefs_defaults_when_section_missing(tmp_path):
     (tmp_path / "app_config.json").write_text("{}", encoding="utf-8")
     prefs = dp.load_prefs(tmp_path)
     assert prefs.player == "auto"
-    assert prefs.prefer_external is False
+    assert prefs.extra_args == () and prefs.fullscreen is False
 
 
 def test_load_prefs_survives_broken_json(tmp_path):

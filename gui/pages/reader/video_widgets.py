@@ -10,21 +10,34 @@ from gui.components.hover_title import HoverTitle
 
 
 class _PlayPanel(QWidget):
-    """内嵌 libvlc 的画面区。
+    """播放画面区（画面本身在 mpv 自己的窗口里）。
 
-    libvlc 通过 set_hwnd(winId()) 把视频直接渲染到本控件（外层已设
-    WA_NativeWindow，非原生窗口拿不到稳定 HWND）。本控件自身不画任何
-    内容，只负责：承载视频画面、单击/双击交互、移动鼠标唤出控制条、
-    保持键盘焦点。
+    VLC 的 set_hwnd 内嵌方案已下线：mpv 用独立窗口渲染，本控件只做占位与
+    交互——单击/双击切暂停与全屏、移动鼠标唤出控制条、保持键盘焦点，并提示
+    「画面在播放器窗口中」。
     """
 
     def __init__(self, view, parent=None):
         super().__init__(parent)
         self._view = view
-        # 黑底：libvlc 出首帧前是空洞，浅色底会闪白
+        # 黑底：与播放器窗口的背景一致，避免边界上闪白
         self.setStyleSheet("background: #000;")
         # 无按键移动也触发 mouseMoveEvent → 控制条隐藏后滑动即唤出
         self.setMouseTracking(True)
+        # 占位提示：内嵌画面已下线，用户需要知道去哪里看画面
+        self._hint = QLabel("画面在播放器窗口中播放\n（进度 / 暂停 / 拖动可在下方控制条操作）",
+                            self)
+        self._hint.setAlignment(Qt.AlignCenter)
+        self._hint.setStyleSheet("color: rgba(255,255,255,140); font-size: 13px;")
+        self._hint.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._hint.setGeometry(self.rect())
+
+    def set_hint_visible(self, visible: bool) -> None:
+        """播放中/未播放都可显示：这里没有真实画面可让位。"""
+        self._hint.setVisible(bool(visible))
 
     def showEvent(self, event):  # noqa: N802
         super().showEvent(event)

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """media_proxy 播放转发流畅性测试（真实播放链路）。
 
-真实播放链路：gui/pages/reader/video_view.py `_play` → external_player
-`open_with_player` → media_proxy `proxy_url_for` → 外部 VLC 进程拉
-http://127.0.0.1:PORT/s/<token>。**内嵌 vlc_player.VlcPlayer 从未被实例化**
-（只有 app.py 拿它做 warmup/shutdown），故流畅性只以本链路为准。
+真实播放链路：gui/pages/reader/video_view.py `_play` → framework.player_session
+`PlayerSession.play`（mpv + JSON IPC）→ media_proxy `proxy_url_for` →
+mpv 进程拉 http://127.0.0.1:PORT/s/<token>。内嵌播放器与 VLC 后端已整体
+下线，流畅性只以本链路为准。
 
 已证实的卡顿根因（本次修复对象）：
 - A. `_ProxyHandler.protocol_version` 已是 HTTP/1.1，但**每个**响应都发

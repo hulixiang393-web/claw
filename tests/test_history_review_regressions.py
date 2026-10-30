@@ -1,9 +1,9 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-import framework.external_player as player
 from framework.library_store import LibraryStore
 from framework.reading_progress import ReadingProgress
 from framework.search_history import SearchHistory
@@ -403,79 +403,43 @@ def test_home_rechecks_expired_snapshot(tmp_path, history_clock):
     assert "title" not in json.loads(progress.path.read_text())["book"]
 
 
-@pytest.mark.parametrize("mode", ["failed", "timeout", "too_long"])
-def test_seek_recovery_is_bounded(mode, monkeypatch):
-    state = {"port": 1}
-    proc = SimpleNamespace(poll=lambda: None)
-    monkeypatch.setattr(player, "_control_state", state)
-    monkeypatch.setattr(player, "_last_proc", proc)
-    clock = [100.0]
-    monkeypatch.setattr(player.time, "monotonic", lambda: clock[0])
-    status = {"item_id": 7, "seconds": 0, "duration": 900, "state": "playing"}
-    monkeypatch.setattr(player, "player_status", lambda **kw: dict(status))
-    monkeypatch.setattr(player, "player_playlist_items", lambda **kw: [{"id": 7, "uri": "file:///D:/a.mp4"}])
-    commands, writes = [], []
-    monkeypatch.setattr(player, "player_command", lambda *a, **kw: commands.append(a) or mode != "failed")
-    monitor = player.PlaybackMonitor(state, proc, [(0, "D:/a.mp4")], lambda i, loc: writes.append(loc), {0: {"seconds": 1000 if mode == "too_long" else 120}})
-    monitor.tick()
-    assert writes == []
-    clock[0] += 1
-    status["seconds"] = 1
-    monitor.tick()
-    assert writes == []
-    status["seconds"] = 0
-    clock[0] += 30
-    monitor.tick()
-    assert writes == []
-    status["seconds"] = 31
-    monitor.tick()
-    assert writes and writes[-1]["seconds"] == 31
-    monitor.tick()
-    assert len(commands) == (0 if mode == "too_long" else 1)
-
-
-@pytest.mark.parametrize("resume, expected", [
-    ({"seconds": 120}, "120"),
-    ({"position": 0.5}, "450"),
-])
-def test_seek_target_uses_saved_progress_not_fixed_offset(resume, expected, monkeypatch):
-    """E1 回归：续播寻位用「已保存进度」（秒或播放比例），而非固定 ±10s。
-
-    外置播放器回退路径在播放开始后按历史进度一次寻位——历史里存的是绝对
-    seconds，或 0~1 的 position 比例（比例 × 时长）。此处锁定寻位目标等于
-    保存进度，防止退化成固定偏移。
-    """
-    state = {"port": 1}
-    proc = SimpleNamespace(poll=lambda: None)
-    monkeypatch.setattr(player, "_control_state", state)
-    monkeypatch.setattr(player, "_last_proc", proc)
-    monkeypatch.setattr(player.time, "monotonic", lambda: 100.0)
-    status = {"item_id": 7, "seconds": 0, "duration": 900, "state": "playing"}
-    monkeypatch.setattr(player, "player_status", lambda **kw: dict(status))
-    monkeypatch.setattr(player, "player_playlist_items",
-                        lambda **kw: [{"id": 7, "uri": "file:///D:/a.mp4"}])
-    commands = []
-    monkeypatch.setattr(player, "player_command",
-                        lambda *a, **kw: commands.append(a) or True)
-    monitor = player.PlaybackMonitor(
-        state, proc, [(0, "D:/a.mp4")], lambda i, loc: None, {0: dict(resume)})
-    monitor.tick()
-    assert commands == [("seek", expected)]
 
 
 def test_local_browser_handoff_preserves_privacy_and_precision(_qapp, tmp_path, monkeypatch):
     """本地视频：续播位置精确对齐到同一集；换集不复用上一集的进度。"""
-    import gui.local_video_player as lvp
+    import framework.player_session as _ps
     from gui.app import MainWindow
 
     played = []
 
-    class _FakePlayer:
-        def __init__(self, parent=None, **kw):
-            self.init = kw
+    class _Sig:
+        def __init__(self):
+            self.slots = []
 
-        def play(self, path, start_seconds=None):
-            played.append((path, start_seconds))
+        def connect(self, slot):
+            self.slots.append(slot)
+
+    class _FakePlayer:
+        def __init__(self, *a, **kw):
+            self.init = kw
+            self.time_changed = _Sig()
+            self.length_changed = _Sig()
+            self.state_changed = _Sig()
+
+        def play(self, url, audio_url="", title="", kind="",
+                 network_caching_ms=0, start_s=0):
+            played.append((url, start_s))
+            for slot in self.state_changed.slots:
+                slot(3)          # 起播成功 → 触发 handoff 落盘
+
+        def get_length(self):
+            return 0
+
+        def get_time(self):
+            return 0
+
+        def close(self):
+            pass
             # 真播放器开播即 handoff（落一次「最近阅读」），桩要同语义
             cb = self.init.get("on_handoff")
             if cb is not None:
@@ -493,20 +457,20 @@ def test_local_browser_handoff_preserves_privacy_and_precision(_qapp, tmp_path, 
         def close(self):
             pass
 
-    monkeypatch.setattr(lvp, "LocalVideoPlayer", _FakePlayer)
+    monkeypatch.setattr(_ps, "PlayerSession", _FakePlayer)
     progress = ReadingProgress(tmp_path / "progress.json")
     window = SimpleNamespace(reading_progress=progress)
     record = {"key": "D:/videos", "episode_paths": ["D:/videos/1.mp4"], "title": "本地作品", "url": "book"}
     MainWindow._play_local_video(window, record)
-    assert played[0] == ("D:/videos/1.mp4", None)
+    assert played[0] == (Path("D:/videos/1.mp4").as_uri(), 0)
     assert progress.resume("D:/videos")["location"] is None
     progress.save("", "D:/videos", "video", "D:/videos/1.mp4", "第一集", location={"seconds": 123, "duration": 900})
     MainWindow._play_local_video(window, record)
-    assert played[1] == ("D:/videos/1.mp4", 123)
+    assert played[1] == (Path("D:/videos/1.mp4").as_uri(), 123)
     assert progress.resume("D:/videos")["location"]["seconds"] == 123
     MainWindow._play_local_video(window, {**record, "episode_paths": ["D:/videos/2.mp4"]})
     # 换了文件 → 不得沿用上一集的秒数
-    assert played[2] == ("D:/videos/2.mp4", None)
+    assert played[2] == (Path("D:/videos/2.mp4").as_uri(), 0)
     assert progress.resume("D:/videos")["location"] is None
     store = LibraryStore(tmp_path / "library.json")
     store.create_folder("private", locked=True)
@@ -561,9 +525,9 @@ def test_switched_line_keeps_library_identity(_qapp, tmp_path, monkeypatch):
     task.signals.done.emit(detail, task)
     reader.video_view._current_idx = 0
     options = reader.video_view._progress_options()
-    state = {"port": 1}
-    monkeypatch.setattr(player, "_control_state", state)
-    options["on_progress"](0, {"seconds": 123, "duration": 900, "session_id": id(state)})
+    options["on_progress"](0, {"seconds": 123, "duration": 900,
+                              "engine": "embedded",
+                              "chapter_url": detail.chapters[0].url})
     record = progress.resume(root)
     assert record is not None
     assert record["library_url"] == root
@@ -596,30 +560,29 @@ def test_browser_handoff_retains_only_matching_episode_progress(_qapp, tmp_path,
     from framework.content import Detail, Chapter
     from gui.pages.reader_page import ReaderPage
 
-    monkeypatch.setattr(player, "_locate_vlc", lambda: None)
-    monkeypatch.setattr(player.webbrowser, "open", lambda url: True)
-    monkeypatch.setattr(player, "_progress_monitor", None)
-    monkeypatch.setattr(player, "_last_proc", None)
-    monkeypatch.setattr(player, "_control_state", None)
     progress = ReadingProgress(tmp_path / "progress.json")
     reader = ReaderPage(SimpleNamespace(), SimpleNamespace(), reading_progress=progress)
     detail = Detail(source_id="age", url="book", title="作品", content_type="video", chapters=[Chapter("第一集", "ep1"), Chapter("第二集", "ep2")])
     view = reader.video_view
     view._detail, view._episodes, view._current_idx = detail, detail.chapters, 0
-    player.open_with_player("https://example.test/a.mp4", **view._progress_options())
+
+    def _open(url: str) -> None:
+        """模拟播放后端开播：真正被消费的是 _progress_options() 的回调。"""
+        options = view._progress_options()
+        handoff = options.get("on_handoff")
+        if callable(handoff):
+            handoff()
+
+    _open("https://example.test/a.mp4")
     assert progress.resume("book") is not None
     assert progress.resume("book")["location"] is None
     progress.save("age", "book", "video", "ep1", "第一集", location={"seconds": 123, "duration": 900})
-    player.open_with_player("https://example.test/a.mp4", **view._progress_options())
+    _open("https://example.test/a.mp4")
     assert progress.resume("book")["location"]["seconds"] == 123
     view._current_idx = 1
-    player.open_with_player("https://example.test/b.mp4", **view._progress_options())
+    _open("https://example.test/b.mp4")
     assert progress.resume("book")["chapter_url"] == "ep2"
     assert progress.resume("book")["location"] is None
     assert progress.resume("book")["position"] is None
-    monkeypatch.setattr(player.webbrowser, "open", lambda url: False)
-    view._current_idx = 0
-    player.open_with_player("https://example.test/a.mp4", **view._progress_options())
-    assert progress.resume("book")["chapter_url"] == "ep2"
     reader.deleteLater()
     _qapp.processEvents()

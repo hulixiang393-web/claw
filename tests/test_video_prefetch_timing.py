@@ -319,17 +319,13 @@ def test_prefetch_tick_retries_after_cooldown(_qapp, monkeypatch):
 
 def test_prefetch_tick_silent_outside_window(_qapp, monkeypatch):
     """窗口外巡检不预取，也不发任何请求。"""
-    import framework.external_player as player
-
     view = _view(3)
     view._current_idx = 0
-    monkeypatch.setattr(player, "player_session", lambda: {"ok": True})
-    monkeypatch.setattr(
-        player, "player_status",
-        lambda timeout=1.0: {"seconds": 30.0, "duration": 600.0},
-    )
+    view._player = _fake_embedded_player(30.0, 600.0)
+    view._has_played = True
     calls = []
-    monkeypatch.setattr(view, "_prefetch_next", lambda idx=-1: calls.append(idx))
+    monkeypatch.setattr(view, "_prefetch_next",
+                        lambda idx=-1: calls.append(idx))
     view._prefetch_tick()
     assert calls == []
 

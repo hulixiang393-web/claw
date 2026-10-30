@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-"""播放记录门禁 + 取流预算回归测试。
+"""取流预算回归测试。
 
-覆盖两件事：
-1. `player_launch_ok`：只有真正拉起播放器才允许回写播放进度
-   （视频取流失败/播放器启动失败不得记成「最近阅读」）。
-2. StreamResolver：**最后一个候选给足剩余总预算**，不再被 10s 单项超时
-   丢弃——冷启动首次连接超过 10s 是「第一次打开播放失败、重试就好」的根因。
+StreamResolver：**最后一个候选给足剩余总预算**，不再被 10s 单项超时
+丢弃——冷启动首次连接超过 10s 是「第一次打开播放失败、重试就好」的根因。
+（「只有真正起播才写播放进度」的门禁改由 framework/player_session 的
+状态信号承担，见 tests/test_player_session.py。）
 """
 from __future__ import annotations
 
@@ -14,29 +13,12 @@ import time
 
 import pytest
 
-from framework.external_player import player_launch_ok
 from framework.stream_resolver import StreamBudget, StreamResolver
 
 
 # --------------------------------------------------------------------------- #
 # 播放记录门禁
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(
-    "msg, expected",
-    [
-        ("", False),                       # 取流失败：没有可播地址
-        (None, False),
-        ("   ", False),
-        ("浏览器打开失败", False),           # 兜底也失败
-        ("已用外部播放器打开", True),
-        ("已用外部播放器打开（列表已截断，共 120 集）", True),
-        ("已在浏览器中打开", True),
-    ],
-)
-def test_player_launch_ok(msg, expected):
-    assert player_launch_ok(msg) is expected
-
-
 # --------------------------------------------------------------------------- #
 # 取流预算：最后一个候选不被单项超时丢弃
 # --------------------------------------------------------------------------- #
@@ -133,8 +115,3 @@ def test_direct_media_url_short_circuits_without_candidates():
     video, _audio = resolver.resolve(object(), "https://cdn/a/index.m3u8")
     assert video == "https://cdn/a/index.m3u8"
 
-
-def test_progress_gate_matches_requirement():
-    """需求表述：视频只有拿到可播地址并成功启动播放器才记录；小说漫画点开即记。"""
-    assert player_launch_ok("已用外部播放器打开") is True
-    assert player_launch_ok("") is False

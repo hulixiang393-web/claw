@@ -1386,10 +1386,10 @@ class MediaProxy:
         self._last_use = time.time()
         self._idle_watch: threading.Thread | None = None
         self._active = 0  # 进行中的请求数（含流式长连接）：>0 时 stop 不执行
-        # 外部播放器租约：VLC 进程存活期间持有的 lease id 集合。**非空时
+        # 播放器租约：mpv 进程存活期间持有的 lease id 集合。**非空时
         # 空闲看门狗完全跳过回收** —— 否则用户暂停超 _IDLE_TIMEOUT 后
-        # stop() 会 _tokens.clear()，VLC 恢复播放时全部 404。VLC 退出 /
-        # 重开播放器 / App 退出时由 external_player 释放。
+        # stop() 会 _tokens.clear()，mpv 恢复播放时全部 404。mpv 退出 /
+        # 重开播放器 / App 退出时由 framework.player_session 释放。
         self._leases: set[str] = set()
         # 惰性系列注册表：key → {resolver, on_play, count, memo, sem}
         #   memo: {(endpoint_base, idx): (video, audio, location)} 按端点缓存，
@@ -3777,7 +3777,7 @@ def proxy_url_for(url: str, headers: dict | None = None,
 
 
 
-    """external_player 调用的入口：把目标 URL 打包成本地代理 URL。
+    """播放后端调用的入口（framework/player_session.py）：把目标 URL 打包成本地代理 URL。
 
 
 

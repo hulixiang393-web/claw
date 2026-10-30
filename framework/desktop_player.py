@@ -22,7 +22,6 @@ mpv 用 ffmpeg 解复用，自带 readahead 与音画同步策略，对这类源
       "player": "auto",              # auto | mpv | potplayer | mpchc | vlc | ffplay
       "player_path": "",             # 显式指定 exe（优先于 player）
       "player_extra_args": [],       # 追加给播放器的参数
-      "prefer_external": false,      # true = 起播直接用外部播放器
       "external_fullscreen": false
     }
 """
@@ -320,7 +319,7 @@ _AUDIO_ARG = {
 
 def build_argv(key: str, exe: str, url: str, headers: dict | None = None,
                title: str = "", start_s: int = 0, fullscreen: bool = False,
-               extra_args=(), audio_url: str = "") -> list:
+               extra_args=(), audio_url: str = "", ipc_server: str = "") -> list:
     """按播放器类型拼命令行。未识别的播放器按 mpv 风格兜底（最通用）。"""
     if not url:
         raise ValueError("缺少播放地址")
@@ -335,6 +334,10 @@ def build_argv(key: str, exe: str, url: str, headers: dict | None = None,
         if flag:
             # 各播放器都把媒体地址放在最后一位：音频参数插在它前面
             argv.insert(len(argv) - 1, flag + audio_url)
+    # JSON IPC 只有 mpv 支持（App 靠它读进度/发控制命令）
+    if ipc_server and key == "mpv":
+        argv.insert(len(argv) - 1, "--input-ipc-server=" + ipc_server)
+        argv.insert(len(argv) - 1, "--idle=yes")
     return argv
 
 
@@ -348,6 +351,7 @@ class Launched:
     exe: str
     argv: list = field(default_factory=list)
     process: object = None
+    ipc_server: str = ""        # mpv 的 JSON IPC 端点（其它播放器为空）
 
     @property
     def pid(self):
@@ -370,30 +374,34 @@ def _reap_finished() -> None:
 
 
 def _spawn(argv: list) -> subprocess.Popen:
-    """分离式拉起：不占父进程控制台、不随父进程退出被杀。"""
+    """分离式拉起：不占父进程控制台、不随父进程退出被杀。
+
+    Windows 用 DETACHED_PROCESS（播放器有自己的窗口，不能加 CREATE_NO_WINDOW，
+    否则 mpv 的窗口也会被隐藏）。``creationflags=`` 必须写成字面关键字：
+    tests/test_no_console_windows.py 静态扫描要求每个 subprocess 调用点显式抑制
+    控制台窗口。
+    """
     kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "close_fds": True,
     }
-    if sys.platform == "win32":
-        flags = 0
-        flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
-        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        if flags:
-            kwargs["creationflags"] = flags
-    else:
-        kwargs["start_new_session"] = True
+    win = sys.platform == "win32"
+    # posix 只接受 creationflags=0（非零即 ValueError），Windows 要 DETACHED_PROCESS。
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) if win else 0
     try:
-        return subprocess.Popen(argv, **kwargs)
+        return subprocess.Popen(
+            argv, creationflags=flags, start_new_session=not win, **kwargs)
     except OSError as exc:
         raise PlayerNotFound(f"拉起播放器失败：{exc}") from exc
 
 
 def launch(url: str, preferred: str = "auto", explicit_path: str = "",
            headers: dict | None = None, title: str = "", start_s: int = 0,
-           fullscreen: bool = False, extra_args=(), audio_url: str = "") -> Launched:
+           fullscreen: bool = False, extra_args=(), audio_url: str = "",
+           ipc_server: str = "") -> Launched:
     """用外部播放器打开 ``url``（通常是本地代理地址）。"""
     key, exe = resolve(preferred, explicit_path)
     if not key or not exe:
@@ -401,12 +409,14 @@ def launch(url: str, preferred: str = "auto", explicit_path: str = "",
             "没有找到可用的外部播放器（推荐装 mpv：winget install mpv）")
     argv = build_argv(key, exe, url, headers=headers, title=title,
                       start_s=start_s, fullscreen=fullscreen,
-                      extra_args=extra_args, audio_url=audio_url)
+                      extra_args=extra_args, audio_url=audio_url,
+                      ipc_server=ipc_server)
     _reap_finished()
     proc = _spawn(argv)
     _RUNNING.append(proc)
     return Launched(key=key, name=player_display_name(key), exe=exe,
-                    argv=argv, process=proc)
+                    argv=argv, process=proc,
+                    ipc_server=ipc_server if key == "mpv" else "")
 
 
 # --------------------------------------------------------------------------- #
@@ -417,7 +427,6 @@ class Prefs:
     player: str = "auto"
     player_path: str = ""
     extra_args: tuple = ()
-    prefer_external: bool = False
     fullscreen: bool = False
 
 
@@ -442,6 +451,5 @@ def load_prefs(base_dir=None) -> Prefs:
         player=str(section.get("player") or "auto"),
         player_path=str(section.get("player_path") or ""),
         extra_args=extra,
-        prefer_external=bool(section.get("prefer_external")),
         fullscreen=bool(section.get("external_fullscreen")),
     )

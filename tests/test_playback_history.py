@@ -6,7 +6,6 @@ import pytest
 from framework.library_store import LibraryStore
 from framework.reading_progress import ReadingProgress
 from framework.search_history import SearchHistory
-import framework.external_player as player
 
 
 def test_private_history_dynamic_lock(tmp_path):
@@ -48,57 +47,6 @@ def test_uncollected_video_survives_prune_and_restart(tmp_path):
     assert "title" not in json.loads(path.read_text(encoding="utf-8"))["book"]
 
 
-def test_monitor_seeks_once_only_correct_ready_item(monkeypatch):
-    state = {"port": 1234, "password": "test"}
-    proc = SimpleNamespace(poll=lambda: None)
-    monkeypatch.setattr(player, "_control_state", state)
-    monkeypatch.setattr(player, "_last_proc", proc)
-    writes, seeks = [], []
-    monitor = player.PlaybackMonitor(state, proc, [(0, "file:///video.mp4")], lambda i, p: writes.append((i, p)), {0: {"seconds": 123}})
-    monkeypatch.setattr(player, "player_status", lambda **kw: {"item_id": 7, "seconds": 0, "duration": 900, "state": "opening"})
-    monkeypatch.setattr(player, "player_playlist_items", lambda **kw: [{"id": 7, "uri": "file:///wrong.mp4"}])
-    monkeypatch.setattr(player, "player_command", lambda *a, **kw: seeks.append((a, kw)) or True)
-    monitor.tick()
-    assert writes == seeks == []
-    monkeypatch.setattr(player, "player_status", lambda **kw: {"item_id": 7, "seconds": 30, "duration": 900, "state": "playing"})
-    monitor.tick()
-    assert writes == seeks == []
-    monkeypatch.setattr(player, "player_playlist_items", lambda **kw: [{"id": 7, "uri": "file:///video.mp4"}])
-    monkeypatch.setattr(player, "player_status", lambda **kw: {"item_id": 7, "seconds": 0, "duration": 900, "state": "playing"})
-    monitor.tick()
-    monitor.tick()
-    assert len(seeks) == 1
-    assert writes == []
-    monkeypatch.setattr(player, "player_status", lambda **kw: {"item_id": 7, "seconds": 124, "duration": 900, "state": "playing"})
-    monitor.tick()
-    assert writes[0][1]["seconds"] == 124
-    monkeypatch.setattr(player, "_control_state", dict(state))
-    monitor.tick()
-    assert len(writes) == 1
-
-
-def test_monitor_flushes_last_valid_sample_on_exit(monkeypatch):
-    state = {"port": 1}
-    running = [True]
-    proc = SimpleNamespace(poll=lambda: None if running[0] else 0)
-    monkeypatch.setattr(player, "_control_state", state)
-    monkeypatch.setattr(player, "_last_proc", proc)
-    status = {"item_id": 7, "seconds": 60, "duration": 900, "state": "playing"}
-    monkeypatch.setattr(player, "player_status", lambda **kw: dict(status))
-    monkeypatch.setattr(player, "player_playlist_items", lambda **kw: [{"id": 7, "uri": "https://example.test/ep"}])
-    saved = []
-    monitor = player.PlaybackMonitor(state, proc, [(0, "https://example.test/ep")], lambda idx, location: saved.append(location))
-    monitor.tick()
-    status["seconds"] = 61
-    monitor.tick()
-    assert [x["seconds"] for x in saved] == [60]
-    running[0] = False
-    monitor.stop()
-    assert [x["seconds"] for x in saved] == [60, 61]
-    monitor.stop()
-    assert len(saved) == 2
-
-
 def test_local_privacy_association(tmp_path):
     store = LibraryStore(tmp_path / "library.json")
     store.create_folder("private", locked=True)
@@ -109,80 +57,6 @@ def test_local_privacy_association(tmp_path):
     assert not store.history_hidden("D:/unknown")
 
 
-@pytest.fixture
-def vlc_http(monkeypatch):
-    import base64
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import parse_qs, urlsplit
-
-    data = {"state": "playing", "time": 0, "length": 900, "currentplid": 7}
-    commands = []
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_GET(self):
-            assert self.headers["Authorization"] == "Basic " + base64.b64encode(b":secret").decode()
-            parsed = urlsplit(self.path)
-            if parsed.path.endswith("playlist.json"):
-                payload = {"children": [{"id": "7", "uri": "file:///D:/video.mp4"}]}
-            elif parsed.path.endswith("status.xml"):
-                query = parse_qs(parsed.query)
-                commands.append(query)
-                data["time"] = int(query["val"][0])
-                payload = {}
-            else:
-                payload = data
-            encoded = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(encoded)))
-            self.end_headers()
-            self.wfile.write(encoded)
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    state = {"port": server.server_port, "password": "secret"}
-    proc = SimpleNamespace(poll=lambda: None)
-    monkeypatch.setattr(player, "_control_state", state)
-    monkeypatch.setattr(player, "_last_proc", proc)
-    monkeypatch.setattr(player, "_playlist_items", [])
-    yield state, proc, data, commands
-    server.shutdown()
-    server.server_close()
-    thread.join()
-
-
-def test_http_status_resume_and_persistence(vlc_http, tmp_path):
-    state, proc, data, commands = vlc_http
-    progress = ReadingProgress(tmp_path / "progress.json")
-    progress.save("", "D:/videos", "video", "D:/video.mp4", "第一集", location={"seconds": 120, "duration": 900})
-    restored = ReadingProgress(progress.path)
-
-    def save(idx, location):
-        restored.save("", "D:/videos", "video", "D:/video.mp4", "第一集", location=location)
-
-    monitor = player.PlaybackMonitor(state, proc, [(0, "D:/video.mp4")], save, {0: restored.resume("D:/videos")["location"]})
-    assert player.player_status()["seconds"] == 0
-    monitor.tick()
-    monitor.tick()
-    monitor.tick()
-    assert len(commands) == 1
-    assert ReadingProgress(progress.path).resume("D:/videos")["location"]["seconds"] == 120
-    data["time"] = 130
-    data["state"] = "paused"
-    monitor.tick()
-    assert ReadingProgress(progress.path).resume("D:/videos")["location"]["seconds"] == 130
-    data["length"] = 0
-    assert player.player_status() is None
-    data["length"] = 900
-    data["time"] = float("nan")
-    assert player.player_status() is None
-    data["time"] = 0
-    data["state"] = "stopped"
-    assert player.player_status() is None
 
 
 def test_offscreen_home_filters_counts_and_reopen(_qapp, tmp_path):
@@ -220,49 +94,66 @@ def test_offscreen_home_filters_counts_and_reopen(_qapp, tmp_path):
 
 def test_local_video_app_saves_and_restores(_qapp, tmp_path, monkeypatch):
     """本地视频：进度落盘 → 再次打开续播到该秒数；0 秒不覆盖已存进度。"""
-    import gui.local_video_player as lvp
+    import framework.player_session as _ps
     from gui.app import MainWindow
 
     progress = ReadingProgress(tmp_path / "progress.json")
     calls = []
 
+    class _Sig:
+        def __init__(self):
+            self.slots = []
+
+        def connect(self, slot):
+            self.slots.append(slot)
+
+        def emit(self, *args):
+            for slot in self.slots:
+                slot(*args)
+
     class _FakePlayer:
-        def __init__(self, parent=None, **kw):
-            calls.append({"kw": kw, "path": None, "start": None})
+        """播放后端桩：拉起的 URI / 起播秒数、IPC 时间与状态信号。"""
 
-        def play(self, path, start_seconds=None):
-            calls[-1]["path"] = path
-            calls[-1]["start"] = start_seconds
-            # 真播放器开播即 handoff（落一次「最近阅读」），桩保持同语义
-            cb = calls[-1]["kw"].get("on_handoff")
-            if cb is not None:
-                cb()
+        def __init__(self, *a, **kw):
+            self.time_changed = _Sig()
+            self.length_changed = _Sig()
+            self.state_changed = _Sig()
+            self.time = 0
+            self.length = 0
+            calls.append(self)
 
-        def show(self):
-            pass
+        def play(self, url, audio_url="", title="", kind="",
+                 network_caching_ms=0, start_s=0):
+            self.url = url
+            self.start = start_s
+            self.state_changed.emit(3)      # 起播成功 → handoff 落盘
 
-        def raise_(self):
-            pass
+        def get_length(self):
+            return self.length
 
-        def activateWindow(self):
-            pass
+        def get_time(self):
+            return self.time
 
         def close(self):
             pass
 
-    monkeypatch.setattr(lvp, "LocalVideoPlayer", _FakePlayer)
+    monkeypatch.setattr(_ps, "PlayerSession", _FakePlayer)
     window = SimpleNamespace(reading_progress=progress)
     window._on_local_progress = lambda payload: MainWindow._on_local_progress(window, payload)
     record = {"key": "D:/videos", "episode_paths": ["D:/videos/1.mp4"], "title": "本地视频", "url": "book", "folder": "private"}
     MainWindow._play_local_video(window, record)
     # 还没播到任何位置：不得凭空产生进度
     assert progress.resume("D:/videos")["location"] is None
-    calls[0]["kw"]["on_progress"](321, 900, 321 / 900)
+    calls[0].length = 900_000
+    calls[0].time = 321_000
+    calls[0].time_changed.emit(321_000)
     assert ReadingProgress(progress.path).resume("D:/videos")["library_url"] == "book"
     window.reading_progress = ReadingProgress(progress.path)
     MainWindow._play_local_video(window, record)
-    assert calls[1]["start"] == 321
-    calls[1]["kw"]["on_progress"](0, 900, 0.0)
+    assert calls[1].start == 321
+    calls[1].length = 900_000
+    calls[1].time = 0
+    calls[1].time_changed.emit(0)
     assert window.reading_progress.resume("D:/videos")["location"]["seconds"] == 321
 
 

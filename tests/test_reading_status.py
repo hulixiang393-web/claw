@@ -218,14 +218,13 @@ def test_completed_open_does_not_resume_and_reading_restores(reader_state, monke
 
 @pytest.mark.parametrize("ctype", ["novel", "comic", "video"])
 def test_completed_signal_never_calls_save_then_reading_writes(reader_state, monkeypatch, ctype):
-    import framework.external_player as player
 
     reader, store, progress = reader_state
     detail_url = "https://example.test/switched" if ctype == "video" else BOOK
     detail = Detail(source_id="demo", content_type=ctype, url=detail_url, title="书")
     session = {}
-    monkeypatch.setattr(player, "player_session", lambda: session)
-    location = {"seconds": 50, "duration": 100, "chapter_url": "episode2", "session_id": id(session), "library_url": BOOK}
+    location = {"seconds": 50, "duration": 100, "chapter_url": "episode2",
+                "engine": "embedded", "library_url": BOOK}
     payload = (detail, "第二章", "episode2", 0.5, 2, location)
     save = Mock(wraps=progress.save)
     monkeypatch.setattr(progress, "save", save)
@@ -242,7 +241,6 @@ def test_completed_signal_never_calls_save_then_reading_writes(reader_state, mon
 
 
 def test_completed_video_options_drop_lookup_and_pending_resume(reader_state, monkeypatch):
-    import framework.external_player as player
 
     reader, store, progress = reader_state
     detail = Detail(source_id="demo", content_type="video", url=BOOK, title="书", chapters=[Chapter("第二集", "ep2")])
@@ -255,7 +253,6 @@ def test_completed_video_options_drop_lookup_and_pending_resume(reader_state, mo
     view._restore_episode_url = "ep2"
     view._pending_location = {"seconds": 70, "duration": 100}
     view._pending_position = 0.7
-    monkeypatch.setattr(player, "flush_player_progress", lambda: None)
     store.set_reading_status(BOOK, "completed")
     options = view._progress_options()
     assert options["resume_positions"] == {0: {}}
@@ -271,7 +268,7 @@ def test_completed_video_options_drop_lookup_and_pending_resume(reader_state, mo
 
 def test_local_completed_blocks_resume_progress_and_handoff(_qapp, tmp_path, monkeypatch):
     """读后感为「看完」时：不回传续播位置、进度不落盘，但仍可手动落一次。"""
-    import gui.local_video_player as lvp
+    import framework.player_session as _ps
     from gui.app import MainWindow
 
     store = LibraryStore(tmp_path / "library.json")
@@ -282,27 +279,48 @@ def test_local_completed_blocks_resume_progress_and_handoff(_qapp, tmp_path, mon
     before = progress.resume(key)
     calls = []
 
+    class _Sig:
+        def __init__(self):
+            self.slots = []
+
+        def connect(self, slot):
+            self.slots.append(slot)
+
+        def emit(self, *args):
+            for slot in self.slots:
+                slot(*args)
+
     class _FakePlayer:
-        def __init__(self, parent=None, **kw):
-            calls.append({"kw": kw, "path": None, "start": None})
+        """播放后端桩：记录起播 URI/秒数，并可手动推进 IPC 时间。"""
 
-        def play(self, path, start_seconds=None):
-            calls[-1]["path"] = path
-            calls[-1]["start"] = start_seconds
+        def __init__(self, *a, **kw):
+            self.time_changed = _Sig()
+            self.length_changed = _Sig()
+            self.state_changed = _Sig()
+            self.time = 0
+            self.length = 0
+            calls.append({"path": None, "start": None, "player": self})
 
-        def show(self):
-            pass
+        def play(self, url, audio_url="", title="", kind="",
+                 network_caching_ms=0, start_s=0):
+            calls[-1]["path"] = url
+            calls[-1]["start"] = start_s
 
-        def raise_(self):
-            pass
+        def progress(self, seconds, duration):
+            self.time, self.length = int(seconds * 1000), int(duration * 1000)
+            self.length_changed.emit(self.length)
+            self.time_changed.emit(self.time)
 
-        def activateWindow(self):
-            pass
+        def get_length(self):
+            return self.length
+
+        def get_time(self):
+            return self.time
 
         def close(self):
             pass
 
-    monkeypatch.setattr(lvp, "LocalVideoPlayer", _FakePlayer)
+    monkeypatch.setattr(_ps, "PlayerSession", _FakePlayer)
     window = SimpleNamespace(reading_progress=progress, library_store=store)
     window._on_local_progress = lambda payload: MainWindow._on_local_progress(window, payload)
     record = {"key": key, "url": BOOK, "episode_paths": [episode], "title": "视频"}
@@ -311,19 +329,18 @@ def test_local_completed_blocks_resume_progress_and_handoff(_qapp, tmp_path, mon
     store.set_reading_status(BOOK, "completed")
     MainWindow._play_local_video(window, record)
     # 看完的书不续播
-    assert calls[0]["start"] is None
-    calls[0]["kw"]["on_handoff"]()
-    # 内嵌播放器的进度回调：看完状态不落盘
-    calls[0]["kw"]["on_progress"](80, 100, 0.8)
+    assert calls[0]["start"] == 0
+    # 播放后端回报的进度：看完状态不落盘
+    calls[0]["player"].progress(80, 100)
     assert progress.resume(key) == before
     assert store.has(BOOK)
     store.set_reading_status(BOOK, "reading")
     MainWindow._play_local_video(window, record)
     assert calls[1]["start"] == 60            # 在读 → 续播到 60s
-    calls[0]["kw"]["on_progress"](80, 100, 0.8)
+    calls[1]["player"].progress(80, 100)
     assert progress.resume(key)["location"]["seconds"] == 80
-    calls[1]["kw"]["on_handoff"]()
-    assert save.call_count == 2
+    # 每次打开都会落一次 handoff（最近阅读），进度回写被「看完」状态挡掉
+    assert save.call_count >= 2
     save.assert_called()
 
 
@@ -359,16 +376,14 @@ def test_local_completed_starts_selection_at_first_episode(_qapp, tmp_path, monk
 
 def test_uncollected_local_video_keeps_progress_behavior(_qapp, tmp_path, monkeypatch):
     from gui.app import MainWindow
-    import framework.external_player as player
 
     store = LibraryStore(tmp_path / "library.json")
     progress = ReadingProgress(tmp_path / "progress.json")
     session = {}
-    monkeypatch.setattr(player, "player_session", lambda: session)
     payload = {
         "key": "D:/videos", "chapter_url": "D:/videos/1.mp4", "chapter_title": "1.mp4",
         "title": "视频", "library_url": "", "folder": "",
-        "location": {"seconds": 50, "duration": 100, "session_id": id(session)},
+        "location": {"seconds": 50, "duration": 100, "engine": "embedded"},
     }
     window = SimpleNamespace(reading_progress=progress, library_store=store)
     MainWindow._on_local_progress(window, payload)
@@ -376,14 +391,13 @@ def test_uncollected_local_video_keeps_progress_behavior(_qapp, tmp_path, monkey
 
 
 def test_uncollected_online_video_keeps_progress_and_resume(reader_state, monkeypatch):
-    import framework.external_player as player
 
     reader, store, progress = reader_state
     store.remove(BOOK)
     detail = Detail(source_id="demo", content_type="video", url=BOOK, title="视频")
     session = {}
-    monkeypatch.setattr(player, "player_session", lambda: session)
-    location = {"seconds": 50, "duration": 100, "session_id": id(session), "chapter_url": "episode"}
+    location = {"seconds": 50, "duration": 100, "engine": "embedded",
+                "chapter_url": "episode"}
     reader._on_progress_signal((detail, "第一集", "episode", 0.5, None, location))
     assert reader._resume_progress(BOOK)["position"] == 0.5
     assert not store.has(BOOK)

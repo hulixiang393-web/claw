@@ -1040,25 +1040,13 @@ class MainWindow(QMainWindow):
         )
         # 阅读器「背景」按钮循环 → 写回设置（记忆用户护眼背景色，下次重启沿用）
         self.reader.reading_bg_changed.connect(self._on_reading_bg_changed)
-        # App 退出：先落盘当前阅读进度（续读记忆跨重启保留），再释放 VLC。
+        # App 退出：先落盘当前阅读进度（续读记忆跨重启保留），再释放播放后端。
         from PySide6.QtWidgets import QApplication
 
         QApplication.instance().aboutToQuit.connect(self.reader.flush_progress)
         QApplication.instance().aboutToQuit.connect(self.reader.shutdown_video)
-        # 本地视频内嵌窗口：退出前 close（释放它的 MediaPlayer，避免与
-        # shutdown_vlc 抢同一实例的释放顺序）
+        # 本地视频窗口：退出前 close（结束它拉起的播放器进程）
         QApplication.instance().aboutToQuit.connect(self._shutdown_local_player)
-        from framework.vlc_player import shutdown_vlc
-
-        QApplication.instance().aboutToQuit.connect(shutdown_vlc)
-        # 启动即预热 VLC 实例（import vlc + 建 Instance 约 1-2s，是首播主要耗时）。
-        # 放后台线程不阻塞启动；首播时实例已就绪 → 秒开。
-        from framework.vlc_player import warmup_vlc
-
-        self._vlc_warmup_thread = threading.Thread(
-            target=warmup_vlc, daemon=True, name="vlc-warmup"
-        )
-        self._vlc_warmup_thread.start()
         return self.reader
 
     def _on_reader_fullscreen(self, fs: bool) -> None:
@@ -1649,25 +1637,40 @@ class MainWindow(QMainWindow):
                     folder=metadata["folder"], detail_url=target,
                 )
 
-        # 内嵌播放：不再拉起外部播放器进程，画面在本 App 的子窗口里。
-        # 同一时刻只留一个本地播放窗口（换视频先关旧的，避免两路音频叠加）。
+        # 本地视频：VLC 内嵌窗口已下线，改由播放后端（mpv + JSON IPC）播放。
+        # 同一时刻只留一个本地播放会话（换视频先关旧的，避免两路音频叠加）。
         previous = getattr(self, "_local_player", None)
         if previous is not None:
             try:
                 previous.close()
             except Exception:  # noqa: BLE001 —— 已释放：继续开新的
                 pass
-        from gui.local_video_player import LocalVideoPlayer
+        from framework.player_session import PlayerSession
 
-        player = LocalVideoPlayer(
-            self, on_progress=changed, on_handoff=handed_off,
-            title=metadata["title"],
-        )
+        player = PlayerSession()
+        player.time_changed.connect(
+            lambda ms: MainWindow._emit_local_progress(player, changed))
+        player.length_changed.connect(
+            lambda _ms: MainWindow._emit_local_progress(player, changed))
+        player.state_changed.connect(
+            lambda st: handed_off() if st in (2, 3) else None)
         self._local_player = player
-        player.play(target, start_seconds=location.get("seconds"))
-        player.show()
-        player.raise_()
-        player.activateWindow()
+        start_s = int((location or {}).get("seconds") or 0)
+        player.play(Path(target).as_uri(), title=metadata["title"],
+                    start_s=start_s)
+        handed_off()
+
+    @staticmethod
+    def _emit_local_progress(player, changed) -> None:
+        """把播放后端的 IPC 时间换算成 (秒, 总秒, 比例) 交给历史回写。"""
+        try:
+            length_s = player.get_length() / 1000.0
+            if length_s <= 0:
+                return
+            seconds = player.get_time() / 1000.0
+            changed(seconds, length_s, min(1.0, seconds / length_s))
+        except Exception:  # noqa: BLE001 —— 进度回写失败不影响播放
+            return
 
     def _shutdown_local_player(self) -> None:
         """App 退出：关掉本地视频内嵌窗口（幂等，没有窗口就什么都不做）。"""
@@ -1689,12 +1692,9 @@ class MainWindow(QMainWindow):
             return
         embedded = location.get("engine") == "embedded"
         if not embedded:
-            # 外部播放器时代的入口（含历史调用/其它来源）：仍要求会话匹配
-            from framework.external_player import player_session
-
-            session = player_session()
-            if session is None or location.get("session_id") != id(session):
-                return
+            # 外部播放器时代的入口（含历史调用/其它来源）：无会话可校验，
+            # 直接丢弃——延迟回写不应该再改动进度。
+            return
         seconds, duration = location.get("seconds"), location.get("duration")
         if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (seconds, duration)):
             return

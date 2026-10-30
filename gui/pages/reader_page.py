@@ -359,16 +359,12 @@ class ReaderPage(BasePage):
         if not self._progress_allowed(book_url):
             return
         if getattr(detail, "content_type", "") == "video":
-            # 视频进度的归属校验：内嵌播放器与会话无关（引擎自报 engine），
-            # 外部播放器则要求「进度来自**当前**控制会话」——否则上一次会话
-            # 的迟到回写会把新播放的位置写脏。两条路径都接受，按 engine 分流。
+            # 视频进度的归属校验：播放后端自报 engine=embedded（进度来自 App
+            # 自己的 IPC 会话）；不带该标记的是外部播放器时代的迟到回写，
+            # 无会话可校验，直接丢弃。
             embedded = isinstance(location, dict) and location.get("engine") == "embedded"
             if not embedded:
-                from framework.external_player import player_session
-                session = player_session()
-                if (session is None or not isinstance(location, dict)
-                        or location.get("session_id") != id(session)):
-                    return
+                return
             if not isinstance(location, dict):
                 return
             seconds, duration = location.get("seconds"), location.get("duration")
@@ -477,9 +473,6 @@ class ReaderPage(BasePage):
         作品落盘（幂等），不改变其它行为。
         """
         try:
-            from framework.external_player import flush_player_progress
-
-            flush_player_progress()
             self._flush_current_progress()
         except Exception:  # noqa: BLE001 —— 记忆失败不影响退出
             pass
@@ -877,7 +870,7 @@ class ReaderPage(BasePage):
         super().closeEvent(event)
 
     def shutdown_video(self) -> None:
-        """App 退出释放 VLC 播放器（必须先于 shutdown_vlc 释放实例）。"""
+        """App 退出时先停播放后端（结束 mpv 进程 + 释放代理租约）。"""
         self._invalidate_source_switch()
         if hasattr(self, "video_view"):
             self.video_view.shutdown_video()

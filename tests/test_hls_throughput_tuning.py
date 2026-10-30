@@ -24,13 +24,11 @@ from pathlib import Path
 import pytest
 import requests
 
-import framework.external_player as ep
 import framework.media_cache as mc
 import framework.media_proxy as mp
 from framework.media_cache import MediaCache
 from framework.media_proxy import MediaProxy
 
-_VLC = "C:/fake/vlc.exe"
 
 
 class _DisabledCache:
@@ -38,66 +36,42 @@ class _DisabledCache:
 
 
 # --------------------------------------------------------------------------- #
-# 1. 按源 VLC network-caching
+# 1. 按源缓冲：media.hls.network_caching_ms → mpv demuxer 缓存
 # --------------------------------------------------------------------------- #
-def _install_vlc(monkeypatch):
-    """假装 VLC 存在并捕获启动参数。"""
-    procs = []
+def _mpv_args(kind: str, caching_ms: int = 0) -> list:
+    """按源的缓冲覆盖算出真正下发给 mpv 的参数（VLC --network-caching 的等价物）。"""
+    from framework.player_session import PlayerSession
 
-    class _P:
-        def __init__(self, args):
-            self.args = args
-            self.pid = 1
-            self.returncode = None
-
-        def poll(self):
-            return None
-
-    def _popen(args, *a, **kw):
-        procs.append(_P(list(args)))
-        return procs[-1]
-
-    monkeypatch.setattr(ep, "_locate_vlc", lambda: _VLC)
-    monkeypatch.setattr(ep.subprocess, "Popen", _popen)
-    monkeypatch.setattr(ep.secrets, "token_hex", lambda n: "TESTPWD")
-    monkeypatch.setattr(ep, "_last_proc", None)
-    monkeypatch.setattr(ep, "_control_state", None)
-    monkeypatch.setattr(ep, "_pick_http_port", lambda: 9)
-    # 模拟真实代理路径（ikanpp 源有 transports.headers → 必走 media_proxy）：
-    # play_url != url 才会触发 8000ms 的代理加码。
-    monkeypatch.setattr(
-        ep, "proxy_url_for",
-        lambda u, h=None, ad_block=None, force_proxy=False:
-            "http://127.0.0.1:1/c/k" + u)
-    return procs
+    return list(PlayerSession()._merged_args((), kind, caching_ms))
 
 
-def _caching_of(args):
+def _demuxer_bytes_of(args):
+    """取最终生效的 --demuxer-max-bytes（同名参数后者覆盖前者）。"""
+    value = None
     for a in args:
-        if a.startswith("--network-caching="):
-            return int(a.split("=", 1)[1])
-    return None
+        if a.startswith("--demuxer-max-bytes="):
+            value = a.split("=", 1)[1]
+    return value
 
 
-def test_default_hls_buffer_unchanged(monkeypatch):
-    """不传覆盖时，走代理的 HLS 仍是 8000ms —— 不给其他源添启动延迟。"""
-    procs = _install_vlc(monkeypatch)
-    ep.open_with_player("https://cdn.example.com/hls/a.m3u8")
-    assert _caching_of(procs[0].args) == 8000
+def test_default_hls_buffer_unchanged():
+    """源没配缓冲时不额外加码：基础参数已给 384MiB，起播不被拖慢。"""
+    from framework import desktop_player
+
+    base = desktop_player.build_argv(
+        "mpv", "mpv.exe", "http://127.0.0.1:1/c/k/a.m3u8")
+    assert "--demuxer-max-bytes=384MiB" in base
+    assert _mpv_args("hls", 0) == []
 
 
-def test_source_override_raises_buffer(monkeypatch):
-    """ikanpp 传 45000 → VLC 用 45s 缓冲。"""
-    procs = _install_vlc(monkeypatch)
-    ep.open_with_player("https://cdn.example.com/hls/a.m3u8", caching_ms=45000)
-    assert _caching_of(procs[0].args) == 45000
+def test_source_override_raises_buffer():
+    """ikanpp 配 45000ms → demuxer 缓存放大到 360MiB。"""
+    assert _demuxer_bytes_of(_mpv_args("hls", 45000)) == "360MiB"
 
 
-def test_override_is_floor_not_cap(monkeypatch):
-    """覆盖值当下限用：配小了也不该把分类算出的更大值降级。"""
-    procs = _install_vlc(monkeypatch)
-    ep.open_with_player("https://cdn.example.com/hls/a.m3u8", caching_ms=1000)
-    assert _caching_of(procs[0].args) == 8000
+def test_override_is_floor_not_cap():
+    """覆盖值当下限：配小了也不该缩到 8MiB，最小 32MiB。"""
+    assert _demuxer_bytes_of(_mpv_args("hls", 1000)) == "32MiB"
 
 
 def test_ikanpp_source_declares_30s():
@@ -709,19 +683,14 @@ def test_slow_cdn_sources_declare_playback_tuning(sid, min_depth, min_workers):
     assert int(hls.get("network_caching_ms") or 0) >= 10000, f"{sid} 缓冲太小"
 
 
-def test_hls_cache_floor_skips_mp4_direct(monkeypatch):
+def test_hls_cache_floor_skips_mp4_direct():
     """源级缓冲键叫 media.hls.* → mp4 直链配了也不该加（白等起播）。"""
-    procs = _install_vlc(monkeypatch)
-    ep.open_with_player("https://cdn.example.com/movie.mp4", caching_ms=15000)
-    assert _caching_of(procs[0].args) == 1500
+    assert _mpv_args("mp4", 15000) == []
 
 
-def test_hls_cache_floor_applies_when_format_lies(monkeypatch):
+def test_hls_cache_floor_applies_when_format_lies():
     """format=mp4 但真实地址是 m3u8（agedm）→ 仍按 HLS 加缓冲。"""
-    procs = _install_vlc(monkeypatch)
-    ep.open_with_player("https://cdn.example.com/3000k/hls/mixed.m3u8",
-                        caching_ms=15000)
-    assert _caching_of(procs[0].args) >= 15000
+    assert _demuxer_bytes_of(_mpv_args("hls", 15000)) == "120MiB"
 
 
 # --------------------------------------------------------------------------- #

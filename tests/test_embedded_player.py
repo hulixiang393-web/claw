@@ -86,9 +86,6 @@ class _FakePlayer:
     def set_rate(self, r):
         self.calls.append(("set_rate", r))
 
-    def rehook(self):
-        self.calls.append(("rehook",))
-
     # 供测试手动触发事件
     def _emit_time(self, view, seconds):
         self._time = int(seconds * 1000)
@@ -105,13 +102,11 @@ def _install(view, player):
 # 播放入口
 # ---------------------------------------------------------------------- #
 def test_play_uses_embedded_player(_qapp, monkeypatch):
-    """_play 必须交给内嵌播放器，不能再拉起外部进程。
+    """_play 必须把媒体交给播放后端（PlayerSession → mpv）。
 
-    「外部播放器优先」读的是本机 app_config.json 的偏好（用户可开），这里显式
-    关掉，否则这条契约会随本机配置漂移。
+    播放后端是**唯一**出口：VLC 内嵌/外部两条老路径都已删除。
     """
     view = _view()
-    monkeypatch.setattr(view, "_prefer_external_player", lambda: False)
     fake = _FakePlayer()
     monkeypatch.setattr(view, "_ensure_player", lambda hdrs=None: fake)
     monkeypatch.setattr(view, "_embedded_play_url", lambda v, a, h, ad: (v, a))
@@ -368,18 +363,30 @@ def test_fullscreen_moves_whole_player_box(_qapp, monkeypatch):
 
 
 # ---------------------------------------------------------------------- #
-# 不残留外部播放器依赖
+# VLC 依赖必须彻底消失
 # ---------------------------------------------------------------------- #
+@pytest.mark.parametrize("module", [
+    "framework.vlc_player", "framework.external_player", "gui.local_video_player",
+])
+def test_vlc_modules_are_gone(module):
+    """播放后端统一到 framework.player_session，三个 VLC 模块已删除。"""
+    import importlib.util
+
+    assert importlib.util.find_spec(module) is None, f"{module} 仍然存在"
+
+
 @pytest.mark.parametrize("symbol", [
     "open_with_player", "player_command", "player_session", "PlaybackMonitor",
+    "VlcPlayer", "shutdown_vlc", "warmup_vlc", "_open_in_desktop_player",
+    "_prefer_external_player", "_hold_proxy_lease",
 ])
-def test_video_view_no_longer_calls_external_player(symbol):
+def test_video_view_no_longer_uses_removed_players(symbol):
     import inspect
 
     from gui.pages.reader import video_view as module
 
     src = inspect.getsource(module.VideoView)
-    assert f"{symbol}(" not in src, f"VideoView 仍在调用外部播放器：{symbol}"
+    assert f"{symbol}(" not in src, f"VideoView 仍在调用已删除的播放器 API：{symbol}"
 
 
 if __name__ == "__main__":

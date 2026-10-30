@@ -320,8 +320,6 @@ def test_probe_results_survive_normal_play(_qapp, monkeypatch, finish_before_pla
 
 
 def test_progress_options_falls_back_when_episode_has_no_title(_qapp, monkeypatch):
-    from framework import external_player
-
     view = VideoView(object())
     detail = SimpleNamespace(url="detail", title="详情")
     view._detail = detail
@@ -331,7 +329,6 @@ def test_progress_options_falls_back_when_episode_has_no_title(_qapp, monkeypatc
     progress = []
     view.handoff_writer = lambda *args: handoffs.append(args)
     view.progress_writer = progress.append
-    monkeypatch.setattr(external_player, "flush_player_progress", lambda: None)
     try:
         options = view._progress_options()
         options["on_handoff"]()

@@ -28,7 +28,12 @@ def test_enabled_by_env(monkeypatch):
     ui_perf.set_enabled(False)
 
 
-def test_should_enable_by_settings():
+def test_should_enable_by_settings(tmp_path, monkeypatch):
+    # _marker_files() 里有一条**相对路径** data/ui_perf.on：测试必须脱离仓库 CWD，
+    # 否则本地开着自己的 ui_perf 哨兵文件时，这条断言会假失败（环境耦合）。
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CLAW_UI_PERF", raising=False)
+
     class _Settings:
         def get(self, section, key, default=None):
             return True if (section, key) == ("diagnostics", "ui_perf_logging") else default
@@ -38,6 +43,7 @@ def test_should_enable_by_settings():
 
 
 def test_should_enable_by_marker(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # 同上：先离开仓库根，避免撞上本地的 data/ui_perf.on
     monkeypatch.delenv("CLAW_UI_PERF", raising=False)
     assert ui_perf.should_enable(base_dir=tmp_path) is False
     (tmp_path / "data").mkdir()

@@ -50,19 +50,18 @@ def build(_qapp):
 
 
 @pytest.fixture(autouse=True)
-def _embedded_mode(monkeypatch):
-    """本文件验证**内嵌**播放链路：关掉「外部播放器优先」。
+def _no_real_backend(monkeypatch):
+    """钉住播放后端：这些用例只验状态/图标契约，不得真的拉起 mpv。"""
+    import framework.player_session as _ps
 
-    那个开关读本机 app_config.json（用户可能已改成外部播放），不钉住的话
-    这些契约会随本机配置漂移。
-    """
-    from gui.pages.reader.video_view import VideoView
+    def _boom(*a, **kw):  # pragma: no cover —— 用例里都会替换成桩
+        raise AssertionError("测试不应真的创建播放后端")
 
-    monkeypatch.setattr(VideoView, "_prefer_external_player", lambda self: False)
+    monkeypatch.setattr(_ps, "PlayerSession", _boom)
 
 
 class _FakePlayer:
-    """播放器桩：状态码是唯一真相来源（与 VlcPlayer 的语义一致）。"""
+    """播放器桩：状态码是唯一真相来源（与 player_session 的 ST_* 语义一致）。"""
 
     def __init__(self, state=3):
         self.state = state

@@ -99,7 +99,6 @@
     "player": "auto",
     "player_path": "",
     "player_extra_args": [],
-    "prefer_external": true,
     "external_fullscreen": false
   }
 }

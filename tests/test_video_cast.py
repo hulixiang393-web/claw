@@ -20,7 +20,6 @@ import pytest                                                   # noqa: E402
 from PySide6.QtCore import QCoreApplication, QThreadPool       # noqa: E402
 
 import framework.cast_session as cs                            # noqa: E402
-import framework.external_player as ep                         # noqa: E402
 import framework.media_proxy as mp                             # noqa: E402
 
 _VIEWS = []  # 本轮用例建过的视图：收尾时统一收掉后台轮询任务
@@ -478,12 +477,12 @@ def test_cast_start_failure_keeps_local_player_and_reports_error(_qapp, monkeypa
     view = _view(_video_detail(3), idx=1)
     view._external_active = True
     terminated = []
-    monkeypatch.setattr(ep, "_terminate_previous",
+    monkeypatch.setattr(view, "_stop_player",
                         lambda: terminated.append(threading.get_ident()))
     session = _FakeSession(start_error=RuntimeError("电视拒绝了 URI"))
     _start_cast(view, monkeypatch, session=session)
 
-    assert terminated == []                              # 本地 VLC 没被停
+    assert terminated == []                              # 本地播放没被停
     assert view._cast_active is False
     assert view._cast_state == "error"
     assert "投屏失败" in view.play_label.text()
@@ -826,7 +825,7 @@ def test_playing_timeout_stops_cast_keeps_local_and_allows_retry(_qapp, monkeypa
     view = _view(_video_detail(3), idx=0)
     view._external_active = True
     terminated = []
-    monkeypatch.setattr(ep, "_terminate_previous",
+    monkeypatch.setattr(view, "_stop_player",
                         lambda: terminated.append(threading.get_ident()))
     # 轮询恒报 STOPPED：电视接受 Play 但状态不进 PLAYING（3 次失败判据不触发）
     session = _FakeSession(poll_state_value="STOPPED")
@@ -845,7 +844,7 @@ def test_playing_timeout_stops_cast_keeps_local_and_allows_retry(_qapp, monkeypa
     assert view._cast_poll_task is None
     assert task.running is False
     assert ("stop",) in session.calls                    # 会话/端点已收
-    assert terminated == []                              # 本地 VLC 保留
+    assert terminated == []                              # 本地播放保留
     assert "投屏失败" in view.play_label.text()
     assert "8 秒" in view.cast_btn.toolTip()
     assert view.cast_btn.isEnabled() is True             # 可点重试
@@ -930,7 +929,7 @@ def _casting(monkeypatch, n=3):
     session, _c, _s = _start_cast(view, monkeypatch)
     assert view._cast_active is True
     monkeypatch.setattr(view, "_maybe_load_recommendations", lambda: None)
-    monkeypatch.setattr(ep, "_terminate_previous", lambda: None)
+    monkeypatch.setattr(view, "_stop_player", lambda: None)
     return view, session
 
 
@@ -1467,7 +1466,7 @@ def test_incompatible_cast_start_failure_falls_back_to_transcode(_qapp, monkeypa
     view = _view(_video_detail(1), idx=0)
     view._external_active = True
     stopped = []
-    monkeypatch.setattr(ep, "_terminate_previous", lambda: stopped.append(True))
+    monkeypatch.setattr(view, "_stop_player", lambda: stopped.append(True))
     session = _FakeSession(start_error=RuntimeError("电视不支持 HEVC"))
     _install_session(monkeypatch, session)
     proxy = _install_proxy(monkeypatch)
@@ -1541,7 +1540,7 @@ def test_transcode_failure_is_terminal_and_keeps_local_player(_qapp, monkeypatch
     view = _view(_video_detail(1), idx=0)
     view._external_active = True
     stopped = []
-    monkeypatch.setattr(ep, "_terminate_previous", lambda: stopped.append(True))
+    monkeypatch.setattr(view, "_stop_player", lambda: stopped.append(True))
     session = _FakeSession()
     view._cast_session = session
     view._cast_renderer = _renderer()
