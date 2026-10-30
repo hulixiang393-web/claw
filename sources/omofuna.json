@@ -92,7 +92,7 @@
           "hls_relay": "https://m3u8xx.sgzm.net:2087/{url}",
           "hls_relay_note": "站点播放器自己经 m3u8xx.sgzm.net:2087 中继取清单（playwright 抓包）；裸 CDN 清单 404 而分片 200，故中继版排最前、原地址兜底。",
           "render": "playwright_fallback",
-          "render_skip_from": ["mp4"],
+          "render_skip_from": [],
           "probe": {
             "mode": "skip",
             "note": "直连必 403（vip.dytt-hot.com 校验 Host/时效），同一地址经本地媒体代理 200。探测在这里只会白等约 3s、再把可用线路写进死线缓存，故跳过；地址可用性交给播放器/代理首次请求判定。"
@@ -104,11 +104,11 @@
         },
         "source_switch": {
           "param": "sid",
-          "default_sid": "3",
-          "list_selector": ".channel-tab li a",
-          "list_attr": "href",
-          "sid_regex": "playlist(\\d+)",
-          "name_selector": ".channel-tab li",
+          "default_sid": "1",
+          "list_selector": ".play-channel-item",
+          "list_attr": "data-sid",
+          "sid_regex": "",
+          "name_selector": ".play-channel-item",
           "ep_list_selector": ".play-list-content a[href*='/play/{sid}/']",
           "ep_href_contains": "/play/",
           "detail_url_regex": "(.*/anime/[a-f0-9]+)/play/",

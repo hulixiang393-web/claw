@@ -1963,6 +1963,12 @@ def fetch_rendered_video_sync(
                         low = u.lower()
                         if ".m3u8" in low or (".mp4" in low and "ping" not in low):
                             media_hits.append(u)
+                            return
+                        # 无扩展名的 CDN 直链（TikTok/字节系：路径里只有
+                        # /video/tos/...，靠 query 的 mime_type=video_mp4 标格式）。
+                        # omofuna「精品」线就是这种，只看 .mp4/.m3u8 会漏掉。
+                        if "mime_type=video" in low or "video%2fmp4" in low:
+                            media_hits.append(u)
                     except Exception:
                         pass
 
@@ -2022,6 +2028,12 @@ def fetch_rendered_video_sync(
 
                     优先 .m3u8（HLS 稳定地址）再兜底 .mp4（带签名时效预览变体）；
                     blob src 跳过、由 media_hits 兜底。返回 "" = 尚未就绪。
+
+                    2026-10 补：必须同时读 **property**（currentSrc/src），不能只读
+                    HTML 属性。omofuna「精品」线（sid=1）走 art.v2player.top 的
+                    Artplayer：地址是 JS 直接赋给 video 元素的，`get_attribute("src")`
+                    恒为空、`currentSrc` 才是真地址（实测 readyState=4 可播）；
+                    只读属性会把它判成「没有播放器」，整条精品线取流失败。
                     """
                     for f in page.frames:
                         try:
@@ -2032,9 +2044,26 @@ def fetch_rendered_video_sync(
                                 # 开头，原逻辑直接跳过），真实 m3u8 留在 <video> 的
                                 # <source> 子节点上（5238 播放页）。因此同时读
                                 # video 自身 src 与其全部 <source> 子节点 src。
-                                for src in (v.get_attribute("src") or "",
-                                            *(sv.get_attribute("src") or ""
-                                              for sv in v.query_selector_all("source"))):
+                                candidates = []
+                                try:
+                                    candidates.append(v.get_attribute("src") or "")
+                                except Exception:
+                                    pass
+                                try:
+                                    # JS 赋值的真实源（Artplayer / 手写加载器）
+                                    current = v.evaluate(
+                                        "el => el.currentSrc || el.src || ''"
+                                    )
+                                    if current:
+                                        candidates.append(str(current))
+                                except Exception:
+                                    pass
+                                for sv in v.query_selector_all("source"):
+                                    try:
+                                        candidates.append(sv.get_attribute("src") or "")
+                                    except Exception:
+                                        pass
+                                for src in candidates:
                                     if not src.startswith("http"):
                                         continue
                                     if ".m3u8" in src:
