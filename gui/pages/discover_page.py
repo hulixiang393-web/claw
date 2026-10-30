@@ -913,7 +913,7 @@ class DiscoverPage(BasePage):
 
         runnable = _FetchWorksTask(self._discovery, self._current_source, self._current_cat_url, page)
         runnable.signals.finished.connect(
-            lambda works, err, e=epoch, p=page: self._on_page_loaded(works, err, p, e)
+            lambda works, err, e=epoch, p=page: _deliver_page_loaded(self, works, err, p, e)
         )
         self._page_tasks.append(runnable)  # 持有引用防 GC
         QThreadPool.globalInstance().start(runnable)
@@ -1442,11 +1442,29 @@ class DiscoverPage(BasePage):
         self._reload_sources()
 
 
+def _deliver_page_loaded(page_obj, works, err, page_no: int, epoch: int) -> None:
+    """把后台抓取结果交回页面，并隔离单页回调异常。
+
+    Qt 槽函数里抛异常会被包成 `SystemError: <class 'method'> returned a result
+    with an exception set`，只留一行 traceback、整页状态停在半路（实测其中一次
+    是 `AttributeError: 'function' object has no attribute 'event'`，发现页因此
+    没有继续渲染）。这里兜住：记日志 + 清掉该页在途标记 + 让预加载继续。
+    """
+    try:
+        page_obj._on_page_loaded(works, err, page_no, epoch)
+    except Exception:  # noqa: BLE001 —— 单页失败不得打断整页更新
+        log.exception("[discover] 第 %d 页回调异常", page_no)
+        try:
+            page_obj._active_pages.discard(page_no)
+            page_obj._maybe_preload()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class _FetchWorkerSignals(QObject):
     """后台抓取任务信号。"""
 
     finished = Signal(object, object)  # (works, err)
-
 
 class _FetchWorksTask(QRunnable):
     """后台抓取一页作品（QThreadPool）。"""
