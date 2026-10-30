@@ -342,6 +342,49 @@ class VideoMixin:
             return False
         return str(player.get("from") or "").strip().lower() in wanted
 
+    def _line_has_no_source(self, switch_cfg: dict, html: str) -> bool:
+        """播放页 player_aaaa 存在但 url 为空 → 该线路没有片源。
+
+        omofuna 实测：sid=3/sid=4 两条线路的 `player_aaaa.url` 是空串（站点
+        只给了集数导航，没有挂片源），而配置里 default_sid 恰是 3。空 url 时
+        候选链拿不到任何地址 → 走 playwright_fallback 渲染 → 播放页没有播放器
+        iframe，渲染必然等到超时（实测整次取流 11.5s，其中约 10s 白等），最后
+        才换到 sid=2 拿到真链（0.75s）。
+
+        这种线路不是「解析器失效」，而是「根本没有片源」，渲染再多也变不出来
+        ——直接判失败交给上层换线路。
+
+        只在 switch_cfg 配了 play_regex（即读 player_aaaa 的源）时生效；
+        player_aaaa 缺失 / 解析失败一律返回 False（结构变了不能乱判）。
+        """
+        if not html or not switch_cfg:
+            return False
+        regex = switch_cfg.get("play_regex")
+        if not regex:
+            return False
+        url_field = switch_cfg.get("play_url_path", "url")
+        try:
+            match = _re.search(regex, html, _re.S)
+            if not match:
+                return False
+            raw = (match.group(1) if match.groups() else match.group(0))
+            raw = raw.replace("\\\\/", "/").replace("\\\\\"", '"')
+            player = json.loads(raw)
+        except Exception:  # noqa: BLE001 —— 解析不了就当没命中
+            return False
+        if not isinstance(player, dict):
+            return False
+        return not str(player.get(url_field) or "").strip()
+
+    def _play_page_html_cached(self, source: SourceConfig, abs_ep: str) -> str:
+        """取播放页 HTML 的缓存命中内容（不发请求）；未命中返回空串。"""
+        cache = getattr(self, "_play_page_cache", None) or {}
+        hit = cache.get((source.source_id, abs_ep))
+        if not hit:
+            return ""
+        expire, html = hit
+        return html if expire > time.monotonic() else ""
+
     def _fetch_play_url_once(
         self, source: SourceConfig, episode_url: str, deadline=None, context=None
     ) -> str:
@@ -399,6 +442,15 @@ class VideoMixin:
             if self._render_skipped(source, play_cfg, switch_cfg, abs_ep):
                 raise ContentMissingError(
                     f"该线路解析器不可用，已跳过（{abs_ep}）",
+                    source_id=source.source_id,
+                )
+            # 该线路压根没挂片源（player_aaaa.url 为空）→ 渲染同样变不出地址，
+            # 立刻判失败换线路，别把 10s 花在必然超时的渲染上。
+            if self._line_has_no_source(
+                switch_cfg, self._play_page_html_cached(source, abs_ep)
+            ):
+                raise ContentMissingError(
+                    f"该线路无片源（player_aaaa.url 为空），已跳过（{abs_ep}）",
                     source_id=source.source_id,
                 )
             return self._fetch_play_url_rendered(
@@ -574,6 +626,74 @@ class VideoMixin:
         if "mime_type=video" in low or "video/mp4" in low or "video%2fmp4" in low:
             return True
         return False
+
+    @staticmethod
+    def _with_relay_candidates(play_cfg: dict, candidates: list) -> list:
+        """按源声明的 `play_url.hls_relay` 给清单地址加一条中继候选，排在最前。
+
+        现场（omofuna 实测）：正片分片 `c1.rrcdnbf6.com/.../0000000.ts` 直连
+        200 可取，但**清单** `.../第22集/index.m3u8` 直连 404——站点播放器自己
+        就是经 `https://m3u8xx.sgzm.net:2087/<原始URL>` 中继取的（playwright
+        抓包可见）。拿到裸清单地址却没有中继，播放器就只能一直重试/卡住。
+
+        配置：`"hls_relay": "https://m3u8xx.sgzm.net:2087/{url}"`（`{url}`
+        为原始地址占位）。中继版排在最前，原地址保留作兜底——中继挂了还能直取。
+        """
+        relay = str((play_cfg or {}).get("hls_relay") or "").strip()
+        if not relay or not candidates:
+            return candidates
+        out = []
+        for value in candidates:
+            text = str(value or "").strip()
+            if (text.lower().startswith(("http://", "https://"))
+                    and relay.split("{url}")[0].rstrip("/") not in text
+                    and ".m3u8" in text.lower()):
+                out.append(relay.replace("{url}", text))
+            out.append(value)
+        return out
+
+    @staticmethod
+    def _normalize_js_encoded_url(url: str) -> str:
+        """把「JS escape + percent 混编」的地址还原成合法 URL。
+
+        现场（omofuna 实测）：`player_aaaa.url` 解出来是
+          `https://c1.rrcdnbf6.com/video/.../%u7B2C%32%32%u96C6/%69%6E%64%65%78%2E%6D%33%75%38`
+        其中 `%u7B2C`/`%u96C6` 是 **JS escape**（= 第 / 集），其余是 percent。
+        `%u` 在 URL 里非法，播放器拿去请求必然 404（分片目录其实是 UTF-8 的
+        `%E7%AC%AC22%E9%9B%86`，实测正片分片 200）——用户看到的就是
+        「清单拿到了但一直卡/跳转卡死」。
+
+        顺序必须保持：先解 `%uXXXX`（JS），再 percent 解码，最后按 URL 安全
+        字符集重新编码。反过来做会把 `%u` 的 `%` 当成 percent 头解坏。
+        """
+        import urllib.parse as _up
+
+        text = str(url or "")
+        if "%u" not in text and "\\u" not in text:
+            return text
+
+        def _js_unescape(value: str) -> str:
+            def _sub(match):
+                try:
+                    return chr(int(match.group(1), 16))
+                except (ValueError, OverflowError):
+                    return match.group(0)
+
+            value = _re.sub(r"%u([0-9a-fA-F]{4})", _sub, value)
+            return _re.sub(r"\\u([0-9a-fA-F]{4})", _sub, value)
+
+        decoded = _js_unescape(text)
+        # 只对仍含 percent 转义的段做解码（纯中文/ASCII 部分原样保留）
+        if "%" in decoded:
+            try:
+                decoded = _up.unquote(decoded, errors="strict")
+            except Exception:  # noqa: BLE001 —— 解不动就保留 JS 解完的结果
+                pass
+        # 重新编码成合法 URL：保留 URL 结构字符，中文/空格等转成 UTF-8 percent
+        try:
+            return _up.quote(decoded, safe=":/?#[]@!$&'()*+,;=%~")
+        except Exception:  # noqa: BLE001
+            return decoded
 
     @staticmethod
     def _decode_player_target(value: str) -> str:
@@ -1286,6 +1406,9 @@ class VideoMixin:
             value = _html.unescape(str(value or "")).strip()
             value = value.replace("\\\\/", "/").replace("\\/", "/")
             value = value.replace('\\"', '"')
+            # JS escape（%uXXXX）混编的地址还原成合法 URL（omofuna 实测：
+            # `%u7B2C22%u96C6` 是 UTF-8 的 `%E7%AC%AC22%E9%9B%86`，不解就 404）。
+            value = VideoMixin._normalize_js_encoded_url(value)
             if not value or value.startswith(("javascript:", "data:")):
                 return
             # 外壳页/参数里被编码塞进去的真实媒体直链：先解出来排在前面。
@@ -1474,9 +1597,10 @@ class VideoMixin:
             html = self._get_play_page_html(source, episode_url, abs_ep,
                                            deadline=deadline, context=context)
         self._check_stream_context(context, deadline)
-        return self._extract_play_url_candidates(
+        candidates = self._extract_play_url_candidates(
             html, source, switch_cfg, play_cfg, abs_ep, episode_url
         )
+        return self._with_relay_candidates(play_cfg, candidates)
 
     # 播放页 HTML 短 TTL 缓存：omofuna 实测单页 TTFB 0.4~2.0s（站点本身就慢），
     # 用户来回切同一集/预取与点集撞同一集时没必要再抓一次。只缓存最近几页，
@@ -1623,6 +1747,9 @@ class VideoMixin:
             self._dead_episode_lines.pop(source.source_id, None)
         attempted: set = set()
         candidates: list = []
+        # 需要渲染才能展开的解析器外壳页候选（见下方「挂起」说明）：等所有线路
+        # 都试完、仍然没拿到可直接播放的地址时，再回头渲染它们。
+        deferred: list = []
         current = episode_url
         last_err: Exception | None = None
         for _ in range(max_attempts):
@@ -1652,15 +1779,25 @@ class VideoMixin:
                     )
                     for play, usable in zip(plays, usable_flags):
                         self._check_stream_context(context, deadline)
-                        if usable:
-                            # 探测只证明「能访问」，不证明「能播」：解析器外壳页
-                            # （.../player/?url=<id>）同样 200，播放器打开只会黑屏。
-                            # 此时按源声明转渲染，把解析器展开成真实视频地址。
-                            rendered = self._render_if_parser_shell(
-                                source, play, context, deadline,
-                                episode_url=current,
-                            )
-                            return rendered or play
+                        if not usable:
+                            continue
+                        # 探测只证明「能访问」，不证明「能播」：解析器外壳页
+                        # （.../player/?url=<id>）同样 200，播放器打开只会黑屏。
+                        #
+                        # 外壳页要展开成真地址得靠 playwright 渲染（数秒到数十秒）。
+                        # 实测 omofuna：sid=3 无片源 → 换线 → sid=1 是「精品」线
+                        # （只有不透明 hash，必须渲染）→ sid=2 是干净 m3u8（0.7s）。
+                        # 先渲染 sid=1 会把用户卡十几秒，而 sid=2 本来就在后面。
+                        # 所以外壳页先挂起，继续试后面的线路；全都拿不到真直链时
+                        # 再回头渲染挂起的那条（保留原有兜底能力，只是排到最后）。
+                        if self._looks_like_parser_shell(play):
+                            deferred.append(play)
+                            continue
+                        rendered = self._render_if_parser_shell(
+                            source, play, context, deadline,
+                            episode_url=current,
+                        )
+                        return rendered or play
                     if plays:
                         dead[key] = now
                         self._dead_episode_lines[source.source_id] = dead
@@ -1703,12 +1840,26 @@ class VideoMixin:
             if not candidates:
                 break
             current = candidates.pop(0)
+        # 所有线路都没给出可直接播放的地址：回头把挂起的解析器外壳页渲染展开
+        # （最慢的一条路，但总比直接报错强）。
+        for shell in deferred:
+            self._check_stream_context(context, deadline)
+            rendered = self._render_if_parser_shell(
+                source, shell, context, deadline, episode_url=episode_url,
+            )
+            if rendered:
+                return rendered
+        if deferred:
+            last_err = ContentMissingError(
+                f"播放器外壳页展开失败（已尝试 {len(deferred)} 个）",
+                source_id=source.source_id,
+            )
         if last_err is None:
             last_err = ContentMissingError("未取到播放地址", source_id=source.source_id)
         raise ContentMissingError(
             f"全部线路取流失败（{source.source_id}）",
             source_id=source.source_id,
-        )
+        ) from last_err
 
     def _probe_candidates_parallel(
         self, source: SourceConfig, plays: list, episode_url: str,
@@ -1907,11 +2058,13 @@ class VideoMixin:
             source, detail_url, idx, cur_sid,
             [str(line.get("sid") or "") for line in (base_detail.source_list or [])],
             deadline=deadline, context=context, max_parallel=max_parallel,
+            episode_url=episode_url,
         )
 
     def _switch_candidate_episode_urls_parallel(
         self, source: SourceConfig, detail_url: str, idx, cur_sid: str,
         sids: list, deadline=None, context=None, max_parallel: int = 3,
+        episode_url: str = "",
     ) -> list:
         """并行取各其它线路分集，按 sid 顺序返回「同集」URL 列表。
 
@@ -1941,7 +2094,23 @@ class VideoMixin:
                 return
             if not chs:
                 return
-            u = chs[idx].url if idx is not None and idx < len(chs) else chs[0].url
+            # 优先按「集数序号」在新线路里找同一集：不同线路的分集列表长度/顺序
+            # 可能不一致（omofuna sid=3 只有 22 项、sid=2 有 24 项），用位置 idx
+            # 会错位甚至越界。序号匹配不上才退回 idx。
+            target_ordinal = self._episode_ordinal(episode_url)
+            u = ""
+            if target_ordinal is not None:
+                for ch in chs:
+                    if self._episode_ordinal(ch.url) == target_ordinal:
+                        u = ch.url
+                        break
+            if not u and idx is not None and idx < len(chs):
+                u = chs[idx].url
+            # 都定位不到就不要乱猜：早先兜底 `chs[0]` 会让「点第 22 集」
+            # 播成「第 1 集」（omofuna 换线实测）。宁可在本线路失败、让上层
+            # 继续试别的线路，也不给用户放错集。
+            if not u:
+                return
             if u:
                 with lock:
                     results[sid] = u
@@ -2007,9 +2176,14 @@ class VideoMixin:
 
     @staticmethod
     def _episode_ordinal(url: str):
-        """URL 路径末段数字（分集号/集索引），用于跨线路定位同一集。"""
-        path = url.split("?", 1)[0].rstrip("/")
-        m = _re.search(r"(\d+)$", path)
+        """URL 路径末段数字（分集号/集索引），用于跨线路定位同一集。
+
+        兼容 `.html` 后缀（omofuna 这类 `/play/3/22.html?sid=3`）：早先只认
+        结尾纯数字，`.html` 一律返回 None → 换线时定位不到集号 → 兜底
+        `chs[0]`（第 1 集），点第 22 集却播成第 1 集。
+        """
+        path = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        m = _re.search(r"(\d+)(?:\.(?:html?|shtml|php|htm))?$", path)
         return int(m.group(1)) if m else None
 
     def _fetch_streams_ytdlp(self, source: SourceConfig, episode_url: str, cfg: dict,
@@ -2324,6 +2498,9 @@ class VideoMixin:
                 source_id=(source.source_id if source else ""),
             )
         raw_url = raw_url.replace("\\/", "/")
+        # JS escape（%uXXXX）混编的地址必须还原成合法 URL，否则播放器 404：
+        # omofuna 的 `%u7B2C22%u96C6` 实际是 UTF-8 的 `%E7%AC%AC22%E9%9B%86`。
+        raw_url = self._normalize_js_encoded_url(raw_url)
         # ps=1 → 走 parse 接口转码（iframe 外链源 → m3u8；parse 端自解加密）
         ps = str(obj.get("ps", "0") or "0")
         parse_url = (obj.get("parse") or switch_cfg.get("default_parse") or "")

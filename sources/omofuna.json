@@ -89,6 +89,8 @@
       },
       "episode": {
         "play_url": {
+          "hls_relay": "https://m3u8xx.sgzm.net:2087/{url}",
+          "hls_relay_note": "站点播放器自己经 m3u8xx.sgzm.net:2087 中继取清单（playwright 抓包）；裸 CDN 清单 404 而分片 200，故中继版排最前、原地址兜底。",
           "render": "playwright_fallback",
           "render_skip_from": ["mp4"],
           "probe": {
