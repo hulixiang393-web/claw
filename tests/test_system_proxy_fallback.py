@@ -19,6 +19,7 @@ from __future__ import annotations
 import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -32,12 +33,14 @@ from framework.http import HttpClient, NetworkDefaults  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _reset_proxy_cache(monkeypatch):
-    """每个用例前清空系统代理 TTL 缓存，避免用例间相互污染。"""
+    """每个用例前清空系统代理 TTL 缓存与僵尸代理记忆，避免用例间相互污染。"""
     http_mod._SYSTEM_PROXY_CACHE["t"] = 0.0
     http_mod._SYSTEM_PROXY_CACHE["url"] = None
+    http_mod._reset_proxy_failures()
     yield
     http_mod._SYSTEM_PROXY_CACHE["t"] = 0.0
     http_mod._SYSTEM_PROXY_CACHE["url"] = None
+    http_mod._reset_proxy_failures()
 
 
 def _live_local_listener():
@@ -205,6 +208,177 @@ def test_no_implicit_registry_proxy_in_session(server):
     assert http._session is not None and http._session.trust_env is False
     url = f"http://127.0.0.1:{server.server_port}/ok"
     assert http.get_text(url, retries=2, interval_ms=0) == "OK-DIRECT"
+
+
+# ---------------------------------------------------------------------- #
+# 僵尸代理：端口活着但转发不出去（加速器开着但上游断了）
+# 现象：探活通过 → 全部请求交给它 → 每个都读超时（实测 44s）→ 界面空白、
+# 播放器拿不到流。对策：走它失败立刻改直连，并记住这台主机。
+# ---------------------------------------------------------------------- #
+_SYSTEM_PROXY = "http://127.0.0.1:65532"
+
+
+def _zombie_client(monkeypatch):
+    """构造"系统代理=僵尸代理"的客户端（探测恒返回该系统代理）。"""
+    monkeypatch.setattr(http_mod, "_live_system_proxy", lambda: _SYSTEM_PROXY)
+    return HttpClient(sleeper=lambda s: None)
+
+
+def test_system_proxy_failure_falls_back_to_direct(monkeypatch):
+    """僵尸代理：一次短超时探测后立刻改直连，并记得这台主机。"""
+    attempts = []
+    http = _zombie_client(monkeypatch)
+
+    def fake_get_once(url, headers, proxy, timeout, encoding=None):
+        attempts.append((proxy, timeout))
+        if proxy:
+            raise OSError("read timed out")
+        return "DIRECT-OK"
+
+    monkeypatch.setattr(http, "_get_once", fake_get_once)
+    assert http.get_text("http://site.test/a", retries=3, interval_ms=0) == "DIRECT-OK"
+
+    assert attempts[0][0] == _SYSTEM_PROXY
+    assert attempts[0][1] <= http_mod._PROXY_PROBE_TIMEOUT, "僵尸代理只能用短超时探一次"
+    assert attempts[-1][0] is None, "失败后必须直连"
+    assert http_mod._proxy_failed_for("site.test") is True
+
+
+def test_proxy_failed_host_skips_proxy_entirely(monkeypatch):
+    """已知走代理不通的主机：第二次请求连探测都不再做，直接直连。"""
+    attempts = []
+    http = _zombie_client(monkeypatch)
+
+    def fake_get_once(url, headers, proxy, timeout, encoding=None):
+        attempts.append(proxy)
+        if proxy:
+            raise OSError("read timed out")
+        return "DIRECT-OK"
+
+    monkeypatch.setattr(http, "_get_once", fake_get_once)
+    assert http.get_text("http://site.test/a", retries=0, interval_ms=0) == "DIRECT-OK"
+    attempts.clear()
+    assert http.get_text("http://site.test/b", retries=0, interval_ms=0) == "DIRECT-OK"
+    assert attempts == [None], "同主机第二次请求不该再碰系统代理"
+
+
+def test_two_host_failures_suspend_system_proxy(monkeypatch):
+    """不同主机连续失败到阈值 → 系统代理整体停用（到期自动恢复）。"""
+    monkeypatch.setattr(
+        http_mod, "_system_proxy_candidates", lambda: [_SYSTEM_PROXY]
+    )
+    assert http_mod._live_system_proxy() == _SYSTEM_PROXY
+    http_mod._note_system_proxy_failure("a.test")
+    assert http_mod._live_system_proxy() == _SYSTEM_PROXY, "单主机失败还不该整体停用"
+    http_mod._note_system_proxy_failure("b.test")
+    assert http_mod._system_proxy_suspended() is True
+    assert http_mod._live_system_proxy() is None, "停用期内必须直连"
+
+
+def test_suspension_expires(monkeypatch):
+    """停用窗口到期 → 清空记忆，系统代理重新可用（VPN 修好后自动回来）。"""
+    monkeypatch.setattr(
+        http_mod, "_system_proxy_candidates", lambda: [_SYSTEM_PROXY]
+    )
+    http_mod._note_system_proxy_failure("a.test")
+    http_mod._note_system_proxy_failure("b.test")
+    assert http_mod._system_proxy_suspended() is True
+    http_mod._PROXY_FAIL["until"] = time.monotonic() - 1
+    assert http_mod._system_proxy_suspended() is False
+    assert http_mod._PROXY_FAIL["hosts"] == set()
+    assert http_mod._live_system_proxy() == _SYSTEM_PROXY
+
+
+def test_explicit_proxy_is_never_bypassed(monkeypatch):
+    """显式代理是调用方意图：失败就失败，不偷偷改直连。"""
+    attempts = []
+    http = _zombie_client(monkeypatch)
+
+    def fake_get_once(url, headers, proxy, timeout, encoding=None):
+        attempts.append(proxy)
+        raise OSError("dead")
+
+    monkeypatch.setattr(http, "_get_once", fake_get_once)
+    with pytest.raises(http_mod.RequestError):
+        http.get_text("http://site.test/a", proxy="http://p1:1111", retries=0,
+                      interval_ms=0)
+    assert attempts == ["http://p1:1111"]
+
+
+def test_global_default_proxy_is_never_bypassed(monkeypatch):
+    """全局 network.proxy 同理：配置了就按配置走，不自动直连。"""
+    attempts = []
+    monkeypatch.setattr(http_mod, "_live_system_proxy", lambda: _SYSTEM_PROXY)
+    http = HttpClient(
+        sleeper=lambda s: None, defaults=NetworkDefaults(proxy="http://global:3128")
+    )
+
+    def fake_get_once(url, headers, proxy, timeout, encoding=None):
+        attempts.append(proxy)
+        raise OSError("dead")
+
+    monkeypatch.setattr(http, "_get_once", fake_get_once)
+    with pytest.raises(http_mod.RequestError):
+        http.get_text("http://site.test/a", retries=0, interval_ms=0)
+    assert attempts == ["http://global:3128"]
+
+
+def test_direct_fallback_retries_proxy_when_direct_also_fails(monkeypatch):
+    """直连也不通：可能确实需要代理（只是慢），用完整预算再走一次代理。"""
+    attempts = []
+    http = _zombie_client(monkeypatch)
+
+    def fake_get_once(url, headers, proxy, timeout, encoding=None):
+        attempts.append((proxy, timeout))
+        if proxy is None:
+            raise OSError("direct blocked")
+        if len([a for a in attempts if a[0] == _SYSTEM_PROXY]) == 1:  # 首次短超时探测
+            raise OSError("slow proxy")
+        return "VIA-PROXY"
+
+    monkeypatch.setattr(http, "_get_once", fake_get_once)
+    assert http.get_text("http://vpn-only.test/a", retries=0, interval_ms=0) == "VIA-PROXY"
+    assert [flag for flag, _t in attempts] == [_SYSTEM_PROXY, None, _SYSTEM_PROXY]
+    assert attempts[0][1] == http_mod._PROXY_PROBE_TIMEOUT
+    assert attempts[2][1] == http.defaults.timeout, "兜底那次要用完整超时"
+    # 直连也不通 → 不是僵尸代理的证据，不能记仇（否则真需要 VPN 的站会被长期判死）
+    assert http_mod._proxy_failed_for("vpn-only.test") is False
+
+
+def test_antiscrape_still_propagates_from_proxy_attempt(monkeypatch):
+    """反爬语义不能被"改直连"抹掉：代理那次的 AntiScrapeError 原样上抛。"""
+    http = _zombie_client(monkeypatch)
+
+    def fake_get_once(url, headers, proxy, timeout, encoding=None):
+        raise http_mod.AntiScrapeError("反爬响应 HTTP 403")
+
+    monkeypatch.setattr(http, "_get_once", fake_get_once)
+    with pytest.raises(http_mod.AntiScrapeError):
+        http.get_text("http://site.test/a", retries=0, interval_ms=0)
+
+
+def test_post_text_also_falls_back_to_direct(monkeypatch):
+    """POST 走同一套兜底（搜索/解密请求也常在僵尸代理下卡死）。"""
+    calls = []
+    http = _zombie_client(monkeypatch)
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+        headers = {"Content-Type": "application/json"}
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, **kwargs):
+        calls.append(kwargs.get("proxies"))
+        if kwargs.get("proxies"):
+            raise OSError("read timed out")
+        return _Resp()
+
+    monkeypatch.setattr(http._session, "post", fake_post)
+    assert http.post_text("http://site.test/api", json_body={}, retries=0) == "{}"
+    assert calls[0] is not None and calls[-1] is None
 
 
 if __name__ == "__main__":

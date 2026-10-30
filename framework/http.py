@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -233,13 +235,83 @@ def _system_proxy_candidates() -> list:
 _SYSTEM_PROXY_CACHE: dict = {"t": 0.0, "url": None}
 _SYSTEM_PROXY_LOCK = threading.Lock()
 
+# 「端口活着但转发不出去」的僵尸代理记忆。
+# 端口探活只能证明"有人在听"，证明不了"能把请求送出去"：加速器开着但上游
+# 断了、或 65532 被别的程序占用时，探活通过 → 所有请求都交给它 → 每个请求
+# 读超时（实测 44s）→ 界面整片空白、播放器也拿不到流。所以这里记下"走系统
+# 代理失败过"的主机：同一主机后续直接绕过代理；不同主机连续失败到阈值，就把
+# 系统代理整体停用一段时间（到期自动重试，VPN 恢复后自己会回来）。
+_PROXY_FAIL_TTL = 300.0
+_PROXY_FAIL_HOSTS = 2
+_PROXY_FAIL: dict = {"hosts": set(), "until": 0.0}
+# 系统代理首次尝试的最长等待：僵尸代理要尽快暴露，别把整页请求耗满 retries×timeout
+_PROXY_PROBE_TIMEOUT = 5.0
+
+
+def _host_of_url(url: str) -> str:
+    """取 URL 主机名（小写）；解析失败返回空串。"""
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001 —— 畸形 URL 不参与僵尸代理记忆
+        return ""
+
+
+def _proxy_failed_for(host: str) -> bool:
+    """该主机是否已被判定"走系统代理不通"。"""
+    if not host:
+        return False
+    with _SYSTEM_PROXY_LOCK:
+        return host in _PROXY_FAIL["hosts"]
+
+
+def _note_system_proxy_failure(host: str) -> None:
+    """记录一次系统代理失败；不同主机累计到阈值 → 整体停用一段时间。"""
+    now = time.monotonic()
+    with _SYSTEM_PROXY_LOCK:
+        if host:
+            _PROXY_FAIL["hosts"].add(host)
+        if len(_PROXY_FAIL["hosts"]) >= _PROXY_FAIL_HOSTS:
+            _PROXY_FAIL["until"] = now + _PROXY_FAIL_TTL
+        # 立刻让下一次探活重新决策（可能已整体停用）
+        _SYSTEM_PROXY_CACHE["t"] = 0.0
+        _SYSTEM_PROXY_CACHE["url"] = None
+
+
+def _reset_proxy_failures() -> None:
+    """清空僵尸代理记忆（测试 / 用户手动切换网络后调用）。"""
+    with _SYSTEM_PROXY_LOCK:
+        _PROXY_FAIL["hosts"].clear()
+        _PROXY_FAIL["until"] = 0.0
+        _SYSTEM_PROXY_CACHE["t"] = 0.0
+        _SYSTEM_PROXY_CACHE["url"] = None
+
+
+def _system_proxy_suspended() -> bool:
+    """系统代理是否处于"整体停用"窗口内（到期自动解除）。"""
+    now = time.monotonic()
+    with _SYSTEM_PROXY_LOCK:
+        until = _PROXY_FAIL["until"]
+        if until and until <= now:
+            _PROXY_FAIL["hosts"].clear()
+            _PROXY_FAIL["until"] = 0.0
+            return False
+        return bool(until)
+
 
 def _live_system_proxy() -> Optional[str]:
     """返回当前**存活可用**的系统代理 URL；未配置/端口已死 → None（上层直连）。
 
     带 TTL 缓存：常规请求不反复探测端口；VPN/加速器开/关后最迟 ~10s 自动生效。
     解析不出 host:port 的非标准写（如 socks 名）按历史行为直接采用，不误伤。
+
+    另外两层保护（见 _PROXY_FAIL）：
+    - 端口探活**不代表能用**，走它失败过的主机会被记录，后续直接绕过；
+    - 多主机连续失败 → 系统代理整体停用 _PROXY_FAIL_TTL 秒，到点自动重试。
     """
+    if _system_proxy_suspended():
+        return None
     now = time.monotonic()
     with _SYSTEM_PROXY_LOCK:
         if now - _SYSTEM_PROXY_CACHE["t"] < _SYSTEM_PROXY_TTL:
@@ -420,6 +492,8 @@ class HttpClient:
         self._ua_lock = threading.Lock()
         self._ua_index = 0
         self._last_url = ""
+        # >0 时临时强制直连（系统代理不通的回退路径用，见 _run_with_proxy_switch）
+        self._direct_depth = 0
         if _REQUESTS_AVAILABLE:
             self._session = requests.Session()
             # `_system_proxy_enabled`：是否自动采用「存活」的系统代理（见 _effective_proxy）。
@@ -453,9 +527,30 @@ class HttpClient:
             return explicit
         if self.defaults.proxy:
             return self.defaults.proxy
-        if not self._system_proxy_enabled:
+        if self._direct_depth or not self._system_proxy_enabled:
             return None
         return _live_system_proxy()
+
+    def _using_system_proxy(self, proxy: Optional[str]) -> bool:
+        """本次请求的出口是否正是"自动探测到的系统代理"（僵尸代理回退只管这种）。
+
+        显式 proxy、全局 network.proxy、测试禁用、强制直连 —— 都是调用方的
+        明确意图，不做自动回退，免得把用户配置的代理悄悄绕过。
+        """
+        if proxy or self.defaults.proxy:
+            return False
+        if self._direct_depth or not self._system_proxy_enabled:
+            return False
+        return _live_system_proxy() is not None
+
+    @contextmanager
+    def _direct_only(self):
+        """临时强制直连（屏蔽系统代理；显式/全局代理仍优先）。"""
+        self._direct_depth += 1
+        try:
+            yield
+        finally:
+            self._direct_depth -= 1
 
     def _bump_connection_pool(self) -> None:
         """放大 requests HTTPAdapter 连接池（每 host 并发连接数）。
@@ -563,9 +658,15 @@ class HttpClient:
 
         未配置代理池（或池为空）时行为与原逻辑完全一致：直连/单代理跑一次。
         once(current_proxy)：单次（含原 retries 重试）请求，抛异常表示该 IP 失败。
+
+        唯一的例外是**系统代理**：它只是"探测到的"，不代表可用。走它失败后
+        立刻改直连重试，并把该主机记进 _PROXY_FAIL（同主机后续直接绕过）。
+        显式 proxy / 全局 network.proxy 不参与这套回退。
         """
         if proxy_pool is None or len(proxy_pool) == 0:
-            return once(proxy)
+            if not self._using_system_proxy(proxy):
+                return once(proxy)
+            return self._run_direct_fallback(once, proxy, url_desc)
         last_error: Exception | None = None
         total = proxy_pool.max_switches + 1  # 初始 IP + 最多换 N 次
         for attempt in range(total):
@@ -597,6 +698,63 @@ class HttpClient:
         if isinstance(last_error, RequestError):
             raise last_error
         raise RequestError(f"请求失败 {url_desc}：{last_error}")
+
+    def _run_direct_fallback(self, once, proxy, url_desc):
+        """系统代理出口专用的兜底：先快速探一次，不通立刻改直连。
+
+        "端口活着"不等于"能转发"：僵尸加速器会让每个请求读超时，
+        retries×timeout 实测能拖 44s，界面/播放器全拿不到内容。这里把代价
+        压到一次 _PROXY_PROBE_TIMEOUT，并把"代理不通但直连能通"的主机记进
+        _PROXY_FAIL（同主机后续直接绕过）。
+
+        直连也不通时用完整预算再试一次代理 —— 需要 VPN 的站可能只是慢或者
+        本来就得走代理，不能因为一次快速探测被判死，也不计入僵尸代理记忆。
+        """
+        url = url_desc.rsplit(" ", 1)[-1]
+        host = _host_of_url(url)
+
+        # 已知"走代理不通、直连能通"的主机：连探测都省掉
+        if _proxy_failed_for(host):
+            direct_exc = None
+            with self._direct_only():
+                try:
+                    return once(proxy)
+                except AntiScrapeError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 —— 直连又不行了
+                    direct_exc = exc
+            try:
+                return once(proxy)
+            except Exception:  # noqa: BLE001 —— 代理也救不回来，抛直连错误
+                raise direct_exc
+
+        proxy_exc = None
+        try:
+            return once(proxy, 0, min(self.defaults.timeout, _PROXY_PROBE_TIMEOUT))
+        except AntiScrapeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 探测失败，改直连
+            proxy_exc = exc
+        logging.getLogger(__name__).warning(
+            "系统代理不通（%s），改直连重试：%s", host or url, str(proxy_exc)[:160],
+        )
+        direct_exc = None
+        with self._direct_only():
+            try:
+                result = once(proxy)
+            except AntiScrapeError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                direct_exc = exc
+            else:
+                # 只有"代理不通、直连通"才算僵尸代理证据
+                _note_system_proxy_failure(host)
+                return result
+        # 直连也不通：可能确实需要代理（只是慢），完整预算再走一次代理
+        try:
+            return once(proxy)
+        except Exception:  # noqa: BLE001 —— 代理也救不回来，抛直连错误
+            raise direct_exc from proxy_exc
 
     # ------------------------------------------------------------------ #
     def get_text(
@@ -630,23 +788,26 @@ class HttpClient:
         if proxy is None:
             proxy = None if direct else self.defaults.proxy
 
-        def _once(current_proxy: Optional[str]) -> str:
+        def _once(current_proxy: Optional[str], retries_override: int | None = None,
+                  timeout_override: float | None = None) -> str:
             proxy_eff = self._effective_proxy(current_proxy, direct)
+            budget = retries if retries_override is None else retries_override
+            wait_s = timeout if timeout_override is None else timeout_override
             last_error: Exception | None = None
-            for attempt in range(retries + 1):
+            for attempt in range(budget + 1):
                 try:
-                    return self._get_once(url, headers, proxy_eff, timeout, encoding)
+                    return self._get_once(url, headers, proxy_eff, wait_s, encoding)
                 except AntiScrapeError as exc:
                     if proxy_pool is not None:
                         raise  # 反爬：不重复请求同一IP，立即换IP重试
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
                 except Exception as exc:  # noqa: BLE001
                     if _is_nonretryable_status(exc):
                         raise RequestError(f"请求失败 GET {url}：{exc}")
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
             # 反爬/网络异常已是 RequestError（含 AntiScrapeError）→ 原样透传，
             # 保留类型供调用方区分反爬（否则包成纯 RequestError 会抹掉类型）。
@@ -679,16 +840,19 @@ class HttpClient:
         headers = self._headers_with_ua(headers)
         self._sleeper(0.0)
 
-        def _once(current_proxy: Optional[str]) -> bytes:
+        def _once(current_proxy: Optional[str], retries_override: int | None = None,
+                  timeout_override: float | None = None) -> bytes:
             proxy_eff = self._effective_proxy(current_proxy, direct)
+            budget = retries if retries_override is None else retries_override
+            wait_s = timeout if timeout_override is None else timeout_override
             last_error: Exception | None = None
-            for attempt in range(retries + 1):
+            for attempt in range(budget + 1):
                 try:
                     session = self._active_session()
                     if session is not None:
                         proxies = {"http": proxy_eff, "https": proxy_eff} if proxy_eff else None
                         resp = session.get(
-                            url, headers=headers, proxies=proxies, timeout=timeout
+                            url, headers=headers, proxies=proxies, timeout=wait_s
                         )
                         if _is_anti_scrape_status(resp.status_code):
                             raise AntiScrapeError(f"反爬响应 HTTP {resp.status_code} {url}")
@@ -697,7 +861,7 @@ class HttpClient:
                     import urllib.request
 
                     req = urllib.request.Request(url, headers=headers or {})
-                    with _urllib_opener(proxy_eff).open(req, timeout=timeout) as resp:
+                    with _urllib_opener(proxy_eff).open(req, timeout=wait_s) as resp:
                         if resp.status >= 400:
                             raise RequestError(f"HTTP {resp.status} {url}")
                         return resp.read()
@@ -705,13 +869,13 @@ class HttpClient:
                     if proxy_pool is not None:
                         raise
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
                 except Exception as exc:  # noqa: BLE001
                     if _is_nonretryable_status(exc):
                         raise RequestError(f"请求失败 GET {url}：{exc}")
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
             if isinstance(last_error, RequestError):
                 raise last_error
@@ -764,10 +928,13 @@ class HttpClient:
         headers = self._headers_with_ua(headers)
         self._sleeper(0.0)
 
-        def _once(current_proxy: Optional[str]) -> dict:
+        def _once(current_proxy: Optional[str], retries_override: int | None = None,
+                  timeout_override: float | None = None) -> dict:
             proxy_eff = self._effective_proxy(current_proxy, direct)
+            budget = retries if retries_override is None else retries_override
+            wait_s = timeout if timeout_override is None else timeout_override
             last_error: Exception | None = None
-            for attempt in range(retries + 1):
+            for attempt in range(budget + 1):
                 try:
                     post_headers = dict(headers or {})
                     post_headers.setdefault("Content-Type", "application/json")
@@ -776,7 +943,7 @@ class HttpClient:
                             url,
                             json=json_body or {},
                             headers=post_headers,
-                            timeout=timeout,
+                            timeout=wait_s,
                             proxies={"http": proxy_eff, "https": proxy_eff} if proxy_eff else None,
                         )
                         if _is_anti_scrape_status(resp.status_code):
@@ -790,7 +957,7 @@ class HttpClient:
                         req = urllib.request.Request(
                             url, data=body, headers=post_headers
                         )
-                        with _urllib_opener(proxy_eff).open(req, timeout=timeout) as resp:
+                        with _urllib_opener(proxy_eff).open(req, timeout=wait_s) as resp:
                             text = resp.read().decode("utf-8", errors="replace")
                     if _is_anti_scrape_text(text):
                         raise AntiScrapeError(f"反爬特征响应 POST {url}")
@@ -803,11 +970,11 @@ class HttpClient:
                     if proxy_pool is not None:
                         raise
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
             if isinstance(last_error, RequestError):
                 raise last_error
@@ -844,10 +1011,13 @@ class HttpClient:
         headers = self._headers_with_ua(headers)
         self._sleeper(0.0)
 
-        def _once(current_proxy: Optional[str]) -> str:
+        def _once(current_proxy: Optional[str], retries_override: int | None = None,
+                  timeout_override: float | None = None) -> str:
             proxy_eff = self._effective_proxy(current_proxy, direct)
+            budget = retries if retries_override is None else retries_override
+            wait_s = timeout if timeout_override is None else timeout_override
             last_error: Exception | None = None
-            for attempt in range(retries + 1):
+            for attempt in range(budget + 1):
                 try:
                     post_headers = dict(headers or {})
                     post_headers.setdefault("Content-Type", "application/json")
@@ -856,7 +1026,7 @@ class HttpClient:
                             url,
                             json=json_body or {},
                             headers=post_headers,
-                            timeout=timeout,
+                            timeout=wait_s,
                             proxies={"http": proxy_eff, "https": proxy_eff} if proxy_eff else None,
                         )
                         if _is_anti_scrape_status(resp.status_code):
@@ -870,7 +1040,7 @@ class HttpClient:
                         req = urllib.request.Request(
                             url, data=body, headers=post_headers
                         )
-                        with _urllib_opener(proxy_eff).open(req, timeout=timeout) as resp:
+                        with _urllib_opener(proxy_eff).open(req, timeout=wait_s) as resp:
                             text = resp.read().decode(encoding or "utf-8", errors="replace")
                     if _is_anti_scrape_text(text):
                         raise AntiScrapeError(f"反爬特征响应 POST {url}")
@@ -879,11 +1049,11 @@ class HttpClient:
                     if proxy_pool is not None:
                         raise
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
             if isinstance(last_error, RequestError):
                 raise last_error
@@ -920,10 +1090,13 @@ class HttpClient:
         headers = self._headers_with_ua(headers)
         self._sleeper(interval_ms / 1000.0)
 
-        def _once(current_proxy: Optional[str]) -> str:
+        def _once(current_proxy: Optional[str], retries_override: int | None = None,
+                  timeout_override: float | None = None) -> str:
             proxy_eff = self._effective_proxy(current_proxy, direct)
+            budget = retries if retries_override is None else retries_override
+            wait_s = timeout if timeout_override is None else timeout_override
             last_error: Exception | None = None
-            for attempt in range(retries + 1):
+            for attempt in range(budget + 1):
                 try:
                     post_headers = dict(headers or {})
                     post_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
@@ -932,7 +1105,7 @@ class HttpClient:
                             url,
                             data=urlencode(form_data or {}),
                             headers=post_headers,
-                            timeout=timeout,
+                            timeout=wait_s,
                             proxies={"http": proxy_eff, "https": proxy_eff} if proxy_eff else None,
                         )
                         if _is_anti_scrape_status(resp.status_code):
@@ -946,7 +1119,7 @@ class HttpClient:
 
                         body = urlencode(form_data or {}).encode("utf-8")
                         req = urllib.request.Request(url, data=body, headers=post_headers)
-                        with _urllib_opener(proxy_eff).open(req, timeout=timeout) as resp:
+                        with _urllib_opener(proxy_eff).open(req, timeout=wait_s) as resp:
                             if encoding:
                                 text = resp.read().decode(encoding, errors="replace")
                             else:
@@ -958,11 +1131,11 @@ class HttpClient:
                     if proxy_pool is not None:
                         raise
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
-                    if attempt < retries:
+                    if attempt < budget:
                         self._sleeper(min(0.5 * (2 ** attempt), 2.0))
             if isinstance(last_error, RequestError):
                 raise last_error
