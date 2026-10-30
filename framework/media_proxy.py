@@ -809,6 +809,170 @@ def _prefetch_budget(total: int | None) -> float:
     return min(_PREFETCH_MAX_TIMEOUT, max(_PREFETCH_TIMEOUT, want))
 
 
+# 「证书链不完整 / 证书与主机名不匹配」的媒体主机记忆。
+#
+# 现场（omofuna 实测）：正片分片 `c1.rrcdnbf6.com/.../0000000.ts` 直连 404，
+# 只有经过站点自己的中继 `m3u8xx.sgzm.net:2087/<原始URL>` 才能取；而中继会
+# 302 到 `s3.uvdag.top`，那台的证书与主机名不匹配 → requests 直接抛 SSLError。
+# 结果：清单能拿到、分片全失败 → 播放器反复重试 → 用户看到「源站很快但 mpv
+# 卡成幻灯片 / 一拖进度条就卡死」。
+#
+# 这类 CDN 的内容本身是公开可取的（浏览器用的是 `curl -k` 等价行为），所以按
+# 主机记一笔、之后该主机用 verify=False 重试一次；只影响已证明确实证书有病的
+# 主机，其余仍严格校验。
+_INSECURE_MEDIA_HOSTS: dict = {}
+_INSECURE_MEDIA_LOCK = threading.Lock()
+_INSECURE_MEDIA_TTL = 6 * 3600.0
+
+
+def _media_host_insecure(host: str) -> bool:
+    if not host:
+        return False
+    now = time.monotonic()
+    with _INSECURE_MEDIA_LOCK:
+        until = _INSECURE_MEDIA_HOSTS.get(host)
+        if until is None:
+            return False
+        if until <= now:
+            _INSECURE_MEDIA_HOSTS.pop(host, None)
+            return False
+        return True
+
+
+def _note_media_host_insecure(host: str) -> None:
+    if not host:
+        return
+    with _INSECURE_MEDIA_LOCK:
+        if len(_INSECURE_MEDIA_HOSTS) >= 256:
+            _INSECURE_MEDIA_HOSTS.pop(next(iter(_INSECURE_MEDIA_HOSTS)))
+        _INSECURE_MEDIA_HOSTS[host] = time.monotonic() + _INSECURE_MEDIA_TTL
+    # 降级是有意为之（内容本身公开可取），别让 urllib3 每片刷一条警告。
+    try:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reset_media_insecure_hosts() -> None:
+    """清空证书降级记忆（测试 / 用户切换网络后调用）。"""
+    global _INSECURE_SESSION
+    with _INSECURE_MEDIA_LOCK:
+        _INSECURE_MEDIA_HOSTS.clear()
+    with _INSECURE_SESSION_LOCK:
+        if _INSECURE_SESSION is not None:
+            try:
+                _INSECURE_SESSION.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _INSECURE_SESSION = None
+
+
+_INSECURE_SESSION = None
+_INSECURE_SESSION_LOCK = threading.Lock()
+
+
+def _insecure_session():
+    """专用降级会话：不复用正常连接池（那里可能残留失败的 TLS 连接）。
+
+    302 链上的证书问题发生在重定向**内部**（omofuna：入口 `m3u8xx.sgzm.net`
+    → 302 → `s3.uvdag.top` 证书与主机名不匹配），必须整条链都不校验才走得通。
+    """
+    global _INSECURE_SESSION
+    with _INSECURE_SESSION_LOCK:
+        if _INSECURE_SESSION is None:
+            session = requests.Session()
+            session.trust_env = True
+            session.verify = False
+            _INSECURE_SESSION = session
+        return _INSECURE_SESSION
+
+
+def _hosts_in_ssl_error(exc: BaseException) -> list:
+    """从 SSLError 文本里抠出真实失败的主机（重定向目标常与入口不同）。"""
+    import re as _re
+
+    text = str(exc)
+    hosts = _re.findall(r"host='([^']+)'", text)
+    return [h.lower() for h in hosts if h]
+
+
+def _media_get(session, target: str, headers: dict, timeout, *,
+               attempts: int = 1, backoff: float = 0.0,
+               downgrade_on_error: bool = True):
+    """带「证书有病的主机自动 verify=False」的取流。
+
+    正常主机保持严格校验。`downgrade_on_error=True`（走代理/中继时）遇到
+    SSLError 就地降级重试一次；`False`（直连）只把主机记下来并抛错，交给
+    上层回退代理——直连证书失败本来就该换一条路走，不该在同一条路上纠缠。
+    """
+    host = (urlparse(target).hostname or "").lower()
+    insecure = _media_host_insecure(host)
+    last_exc = None
+    deadline = None
+    if isinstance(timeout, tuple):
+        deadline = time.monotonic() + max(timeout)
+    for attempt in range(attempts):
+        request_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.Timeout("media fetch timeout")
+            request_timeout = (min(timeout[0], remaining), remaining)
+        try:
+            if insecure:
+                # 已记账的主机：本次不校验。仍优先用调用方给的 session，
+                # 这样连接池/信任设置保持一致；只有它不接受 verify 参数时
+                # 才退回专用降级会话。
+                try:
+                    return session.get(target, headers=headers,
+                                       timeout=request_timeout, stream=True,
+                                       verify=False)
+                except TypeError:
+                    return _insecure_session().get(
+                        target, headers=headers, timeout=request_timeout, stream=True,
+                    )
+            return session.get(target, headers=headers, timeout=request_timeout,
+                               stream=True)
+        except requests.exceptions.SSLError as exc:
+            # 证书问题与代理/网络抖动无关：先记账，再决定就地降级还是换路。
+            last_exc = exc
+            for failed_host in [host, *_hosts_in_ssl_error(exc)]:
+                _note_media_host_insecure(failed_host)
+            if not insecure and downgrade_on_error:
+                insecure = True
+                try:
+                    # 优先复用调用方传入的 session（只是本次请求不校验），
+                    # 这样注入的假 session（测试）也能被走到；真场景里若它
+                    # 不接受 verify 参数或连接池已脏，退回专用降级会话。
+                    try:
+                        return session.get(
+                            target, headers=headers, timeout=request_timeout,
+                            stream=True, verify=False,
+                        )
+                    except TypeError:
+                        return _insecure_session().get(
+                            target, headers=headers, timeout=request_timeout,
+                            stream=True,
+                        )
+                except requests.RequestException as retry_exc:  # noqa: BLE001
+                    last_exc = retry_exc
+            if attempt + 1 >= attempts:
+                break
+        except requests.RequestException as exc:  # noqa: BLE001
+            last_exc = exc
+            if deadline is None:
+                if backoff:
+                    time.sleep(backoff)
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(backoff or 0.3, remaining))
+    raise last_exc  # noqa: BLE001 —— 全部尝试失败，让上层 502/重试
+
+
 def _proxy_get(target: str, headers: dict, timeout=30, attempts=2):
     """经系统代理会话取流。重试一次短退避：代理偶发连接重置/切节点时，
     否则上层把异常当 502 抛给播放器 → VLC demux 失败 → 播放中断。
@@ -825,8 +989,8 @@ def _proxy_get(target: str, headers: dict, timeout=30, attempts=2):
                 raise requests.Timeout("proxy fetch timeout")
             request_timeout = (min(timeout[0], remaining), remaining)
         try:
-            return _get_session().get(
-                target, headers=headers, timeout=request_timeout, stream=True
+            return _media_get(
+                _get_session(), target, headers, request_timeout, attempts=1,
             )
         except requests.RequestException as exc:  # noqa: BLE001
             last_exc = exc
@@ -883,10 +1047,11 @@ def _fetch_upstream(target: str, headers: dict, force_proxy: bool = False,
     if not blocked:
         started = time.perf_counter()
         try:
-            resp = _get_direct_session().get(
-                target, headers=headers,
-                timeout=(_request_timeout() if timeout is not None else
-                         (_DIRECT_CONNECT_TIMEOUT, 60)), stream=True,
+            resp = _media_get(
+                _get_direct_session(), target, headers,
+                (_request_timeout() if timeout is not None else
+                 (_DIRECT_CONNECT_TIMEOUT, 60)),
+                attempts=1, downgrade_on_error=False,
             )
             if resp is not None:
                 if resp.status_code < 400 or (segment and resp.status_code in (403, 429)):
@@ -3346,9 +3511,16 @@ class MediaProxy:
                     req_headers["Range"] = f"bytes={resume_offset}-"
             fetch_status = None
             fetch_error = None
+            is_segment = not seg_name.endswith(".m3u8")
+            # 分片用短超时：默认的 (连接超时, 60s 读) 是给整片 mp4 的。
+            # 实测 omofuna 有大量死分片——直连先 5.5s 连接超时，再走代理 1.3s
+            # 拿 404，一次拖动要白等十几秒（用户感受就是「跳转卡死」）。
+            # 分片本来就只有几秒内容，3s 连不上基本就可以判死：快速失败让
+            # 播放器立刻请求下一片，比死等一个永远不来的分片流畅得多。
+            seg_timeout = (3.0, 10.0) if is_segment else None
             try:
                 resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy,
-                                       segment=not seg_name.endswith(".m3u8"))
+                                       segment=is_segment, timeout=seg_timeout)
                 if resume_offset and resp.status_code == 416:
                     # 偏移越界（.part 已完整但尚未提交）→ 弃 part，从头重取。
                     try:
@@ -3359,7 +3531,7 @@ class MediaProxy:
                     resume_offset = 0
                     req_headers.pop("Range", None)
                     resp = _fetch_upstream(target, req_headers, force_proxy=force_proxy,
-                                           segment=True)
+                                           segment=True, timeout=seg_timeout)
             except Exception as exc:
                 if fetch_owner:
                     cache.finish_fetch(fetch_key, fetch_state, 502, exc)
@@ -3691,8 +3863,14 @@ class MediaProxy:
         headers["Accept-Encoding"] = "identity"
         force_proxy = _tuple_force_proxy(ctx)
         head = segs[: max(1, self._pf_cfg["depth"])]
-        # 起播阶段限制预取排队数量：head 全排队会在播放开始前先打一串请求
-        budget = max(1, min(int(self._pf_cfg["workers"]), 2))
+        # 起播并发：早先硬编码 min(workers, 2)，理由是"连拉 8+ 并发会被上游
+        # 当抓取返回 429"（18mh 实测）。但实测 omofuna 的单连接吞吐只有
+        # 0.6~0.9MB/s：一片 5 秒、0.7~1.4MB，2 路并发≈1.3~1.8MB/s，
+        # 只够勉强跟上播放，**缓冲永远没有余量**，一拖动就要等下一片下载
+        # 6~13 秒（用户感受到的"跳转卡死 / 预加载很慢"）。
+        # 折中：给到 min(workers, 4)——比 2 路有明显余量，又不至于像 8 路
+        # 那样触发反爬。真正的保护仍是上面的 _PREFETCH_MAX_PENDING 上限。
+        budget = max(1, min(int(self._pf_cfg["workers"]), 4))
         queued = 0
         for u in head:
             if queued >= budget:
