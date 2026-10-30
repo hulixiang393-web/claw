@@ -300,6 +300,46 @@ def _system_proxy_suspended() -> bool:
         return bool(until)
 
 
+# --------------------------------------------------------------------------- #
+# 证书链不完整的站点（少发中间证书的 CDN / 被中间设备改写的站点）
+# --------------------------------------------------------------------------- #
+# requests+certifi 不会像浏览器那样去 AIA 补拉中间证书，于是
+# `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` 直接失败，
+# 站点在界面里等同于"打不开"（agedm.io 实测就是这种）。这类站点用其他客户端
+# （浏览器/curl -k）都能正常取到内容，所以这里做一次**针对性放宽**：
+# 只在证书链验证失败时对该主机改用 verify=False，并在本进程内记住，避免每次
+# 都先失败一遍；其他主机的校验强度不受影响。
+_INSECURE_HOSTS: set = set()
+_INSECURE_LOCK = threading.Lock()
+
+
+def _insecure_host(host: str) -> bool:
+    if not host:
+        return False
+    with _INSECURE_LOCK:
+        return host in _INSECURE_HOSTS
+
+
+def _note_insecure_host(host: str) -> None:
+    if not host:
+        return
+    with _INSECURE_LOCK:
+        _INSECURE_HOSTS.add(host)
+
+
+def _reset_insecure_hosts() -> None:
+    with _INSECURE_LOCK:
+        _INSECURE_HOSTS.clear()
+
+
+def _is_cert_error(exc) -> bool:
+    """是否为 TLS 证书链校验失败（区别于超时/连接被拒）。"""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return ("certificate_verify_failed" in text or "certificate verify failed" in text
+            or "self-signed certificate" in text
+            or "unable to get local issuer certificate" in text)
+
+
 def _live_system_proxy() -> Optional[str]:
     """返回当前**存活可用**的系统代理 URL；未配置/端口已死 → None（上层直连）。
 
@@ -699,6 +739,33 @@ class HttpClient:
             raise last_error
         raise RequestError(f"请求失败 {url_desc}：{last_error}")
 
+    def _retry_insecure(self, url, call):
+        """执行 call(verify=...)；证书链不完整时本进程内改用 verify=False 重试。
+
+        只放宽"证书链验证失败"这一种错误：超时、连接被拒、反爬状态码照旧。
+        已知主机（_INSECURE_HOSTS）后续直接不验证，不再白跑一次失败请求。
+        """
+        host = _host_of_url(url)
+        verify = not _insecure_host(host)
+        try:
+            return call(verify)
+        except Exception as exc:  # noqa: BLE001
+            if not verify or not _is_cert_error(exc):
+                raise
+            logging.getLogger(__name__).warning(
+                "证书链不完整（%s），本进程内改用 verify=False：%s",
+                host or url, str(exc)[:120],
+            )
+            _note_insecure_host(host)
+            # 已明确知道这是"刻意放宽"，就别再让 urllib3 反复刷 InsecureRequestWarning
+            try:
+                import urllib3
+
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:  # noqa: BLE001 —— 告警压制失败不影响请求
+                pass
+            return call(False)
+
     def _run_direct_fallback(self, once, proxy, url_desc):
         """系统代理出口专用的兜底：先快速探一次，不通立刻改直连。
 
@@ -851,9 +918,10 @@ class HttpClient:
                     session = self._active_session()
                     if session is not None:
                         proxies = {"http": proxy_eff, "https": proxy_eff} if proxy_eff else None
-                        resp = session.get(
-                            url, headers=headers, proxies=proxies, timeout=wait_s
-                        )
+                        resp = self._retry_insecure(url, lambda verify: session.get(
+                            url, headers=headers, proxies=proxies,
+                            timeout=wait_s, verify=verify,
+                        ))
                         if _is_anti_scrape_status(resp.status_code):
                             raise AntiScrapeError(f"反爬响应 HTTP {resp.status_code} {url}")
                         resp.raise_for_status()
@@ -939,13 +1007,14 @@ class HttpClient:
                     post_headers = dict(headers or {})
                     post_headers.setdefault("Content-Type", "application/json")
                     if self._session is not None:
-                        resp = self._session.post(
+                        resp = self._retry_insecure(url, lambda verify: self._session.post(
                             url,
                             json=json_body or {},
                             headers=post_headers,
                             timeout=wait_s,
+                            verify=verify,
                             proxies={"http": proxy_eff, "https": proxy_eff} if proxy_eff else None,
-                        )
+                        ))
                         if _is_anti_scrape_status(resp.status_code):
                             raise AntiScrapeError(f"反爬响应 HTTP {resp.status_code} {url}")
                         resp.raise_for_status()
@@ -1022,13 +1091,14 @@ class HttpClient:
                     post_headers = dict(headers or {})
                     post_headers.setdefault("Content-Type", "application/json")
                     if self._session is not None:
-                        resp = self._session.post(
+                        resp = self._retry_insecure(url, lambda verify: self._session.post(
                             url,
                             json=json_body or {},
                             headers=post_headers,
                             timeout=wait_s,
+                            verify=verify,
                             proxies={"http": proxy_eff, "https": proxy_eff} if proxy_eff else None,
-                        )
+                        ))
                         if _is_anti_scrape_status(resp.status_code):
                             raise AntiScrapeError(f"反爬响应 HTTP {resp.status_code} {url}")
                         resp.raise_for_status()
@@ -1101,13 +1171,14 @@ class HttpClient:
                     post_headers = dict(headers or {})
                     post_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
                     if self._session is not None:
-                        resp = self._session.post(
+                        resp = self._retry_insecure(url, lambda verify: self._session.post(
                             url,
                             data=urlencode(form_data or {}),
                             headers=post_headers,
                             timeout=wait_s,
+                            verify=verify,
                             proxies={"http": proxy_eff, "https": proxy_eff} if proxy_eff else None,
-                        )
+                        ))
                         if _is_anti_scrape_status(resp.status_code):
                             raise AntiScrapeError(f"反爬响应 HTTP {resp.status_code} {url}")
                         resp.raise_for_status()
@@ -1169,7 +1240,9 @@ class HttpClient:
         session = self._active_session()
         if session is not None:
             proxies = {"http": proxy, "https": proxy} if proxy else None
-            resp = session.get(url, headers=headers, proxies=proxies, timeout=timeout)
+            resp = self._retry_insecure(url, lambda verify: session.get(
+                url, headers=headers, proxies=proxies, timeout=timeout, verify=verify
+            ))
             if _is_anti_scrape_status(resp.status_code):
                 raise AntiScrapeError(f"反爬响应 HTTP {resp.status_code} {url}")
             resp.raise_for_status()
