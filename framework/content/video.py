@@ -71,11 +71,22 @@ class VideoMixin:
         # 源级预算（sources/<id>.json 的 stream_resolver.candidate_timeout /
         # total_budget）：慢站单次取流可能远超默认 10s，不放大就会在候选阶段
         # 被判超时、异常被吞成空地址，表现为播放黑屏（omofuna 实测取流 22s）。
-        return resolver.resolve(
+        result = resolver.resolve(
                 source, episode_url, quality, merged, deadline=deadline, context=context,
                 source_lock=source_lock, **stream_resolver_options(source)
 
         )
+        video = (result[0] if result else "") or ""
+        # 只拿到「解析器外壳页」时不要把 URL 丢给播放器：mpv 会把网页当媒体打开，
+        # 结果是空窗口＋无进度（实测 omofuna/agedm）。宁可给出明确错误让用户换
+        # 线路/查网络，也不给一个看起来在播、其实什么都没有的窗口。
+        if video and self._looks_like_parser_shell(video):
+            raise ContentMissingError(
+                f"只解析到播放器外壳页（{urlsplit(video).hostname or video}），"
+                "未取到真实视频流；可换线路重试或检查网络/代理",
+                source_id=source.source_id,
+            )
+        return result
 
     def invalidate_video_stream_cache(
         self, source: SourceConfig, episode_url: str | None = None,
@@ -563,6 +574,67 @@ class VideoMixin:
         if "mime_type=video" in low or "video/mp4" in low or "video%2fmp4" in low:
             return True
         return False
+
+    @staticmethod
+    def _decode_player_target(value: str) -> str:
+        """把被编码塞进外壳页/参数里的媒体直链解出来。
+
+        MacCMS 派生站常见两种形态：
+          - `player_aaaa.url` 就是逐字符 percent 编码的地址
+            （`%68%74%74%70%73%3A%2F%2Fvip.example.com%2F...m3u8`）；
+          - 地址再套一层解析站外壳 `https://解析站/player/?url=<编码值>`。
+        外壳页是网页，播放器打不开（黑屏/空白窗口），所以先尝试解码：
+        percent 解码（一次/两层）、纯 hex 解码；解出来的必须是 http(s) 地址。
+
+        返回 "" 表示解不出可用地址（调用方保持原行为）。
+        """
+        import urllib.parse as _up
+
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        raw_items = []
+        match = _re.search(r"[?&](?:url|urls|v|vid|src)=([^&]+)", text)
+        if match:
+            raw_items.append(match.group(1))
+        raw_items.append(text)
+
+        seen = set()
+        for raw in raw_items:
+            if not raw or raw in seen:
+                continue
+            seen.add(raw)
+            variants = []
+            try:
+                once = _up.unquote(raw)
+                variants.extend((once, _up.unquote(once)))
+            except Exception:  # noqa: BLE001 —— 解码失败就试下一种形态
+                pass
+            stripped = raw.strip()
+            if len(stripped) >= 16 and len(stripped) % 2 == 0 and _re.fullmatch(
+                    r"[0-9a-fA-F]+", stripped):
+                try:
+                    variants.append(bytes.fromhex(stripped).decode("utf-8", "ignore"))
+                except Exception:  # noqa: BLE001
+                    pass
+            for candidate in variants:
+                candidate = candidate.strip()
+                if candidate.lower().startswith(("http://", "https://")):
+                    return candidate
+        return ""
+
+    @staticmethod
+    def _wrapper_is_signed(value: str) -> bool:
+        """包裹地址是否带站点签名参数（带签名的必须整串用，不能拆成内层裸链）。
+
+        18mh 实测：`/media/m3u8?url=<裸 m3u8>&exp=…&token=…` 一旦丢掉签名参数
+        直接请求内层 CDN 一律 403，所以这种包装地址要原样保留、优先级不能动。
+        """
+        low = str(value or "").lower()
+        return any(hint in low for hint in (
+            "exp=", "expire=", "token=", "auth_key=", "sign=", "signature=",
+            "sig=", "md5=", "deadline=", "wssecret=", "wsse=",
+        ))
 
     @staticmethod
     def _looks_like_parser_shell(url: str) -> bool:
@@ -1216,6 +1288,17 @@ class VideoMixin:
             value = value.replace('\\"', '"')
             if not value or value.startswith(("javascript:", "data:")):
                 return
+            # 外壳页/参数里被编码塞进去的真实媒体直链：先解出来排在前面。
+            # mpv/VLC 打不开 `解析站/player/?url=<编码值>` 这种网页（只会得到空白
+            # 窗口），而同一串里往往就有真正的 m3u8（omofuna 实测：player_aaaa.url
+            # 是逐字符 percent 编码的 vip.dytt-hot.com/.../index.m3u8）。
+            # 但带签名的包装（/media/m3u8?url=…&exp=…&token=…）必须整串用：拆出
+            # 内层裸链会 403（18mh 实测），所以那种情况保持原顺序。
+            inner = VideoMixin._decode_player_target(value)
+            if (inner and inner not in seen and VideoMixin._is_playable_direct(inner)
+                    and not VideoMixin._wrapper_is_signed(value)):
+                seen.add(inner)
+                values.append(inner)
             if not value.startswith(("http://", "https://", "//")):
                 # 不透明 id（如 MacCMS 外部解析器的 32 位 hex）不能 urljoin：那会
                 # 拼出 `play/1/<hash>` 这种不存在的地址，播放器直接黑屏
