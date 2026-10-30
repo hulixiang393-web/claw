@@ -97,8 +97,14 @@ def test_play_launches_backend_and_attaches_ipc(session, monkeypatch):
     session.play("http://127.0.0.1:9/s/t/index.m3u8", title="第1集")
     assert _FakeIPC.instances, "mpv 必须带 IPC 才谈得上进度同步"
     ipc = _FakeIPC.instances[-1]
-    observed = [c[1] for c in ipc.sent if c[0] == "observe_property"]
-    assert "time-pos" in observed and "duration" in observed
+    observes = [c for c in ipc.sent if c[0] == "observe_property"]
+    # mpv 的签名是 observe_property <id:int> <name>；传属性名当 id 会被
+    # 回 invalid parameter，事件一条都不来（进度条/时长全死）。
+    assert all(isinstance(c[1], int) for c in observes), observes
+    ids = [c[1] for c in observes]
+    assert len(ids) == len(set(ids)), f"observe id 必须唯一：{ids}"
+    names = [c[2] for c in observes]
+    assert {"time-pos", "duration", "pause", "demuxer-cache-state"} <= set(names)
     assert session.get_state() == ps.ST_OPENING
 
 
@@ -187,6 +193,30 @@ def test_duplicate_state_is_not_re_emitted(session):
     assert len(states) == before + 1
 
 
+def test_idle_before_file_loaded_is_ignored(session):
+    """mpv 带 --idle=yes 启动时先发一条 idle：此时还没加载文件，
+    不能据此判成"已停止"，否则一开播界面就显示已播完。"""
+    session.play("http://x/y.m3u8")
+    _events(session, {"event": "idle"})
+    assert session.get_state() == ps.ST_OPENING
+
+    _events(session, {"event": "start-file"})
+    _events(session, {"event": "file-loaded"})
+    assert session.get_state() == ps.ST_PLAYING
+    # 文件加载之后的 idle 才代表播放结束/被卸载
+    _events(session, {"event": "idle"})
+    assert session.get_state() == ps.ST_STOPPED
+
+
+def test_idle_never_overrides_ended_state(session):
+    session.play("http://x/y.m3u8")
+    _events(session, {"event": "file-loaded"})
+    _events(session, {"event": "end-file", "reason": "eof"})
+    assert session.get_state() == ps.ST_ENDED
+    _events(session, {"event": "idle"})
+    assert session.get_state() == ps.ST_ENDED
+
+
 # --------------------------------------------------------------------------- #
 # 控制命令
 # --------------------------------------------------------------------------- #
@@ -228,6 +258,15 @@ def test_close_quits_and_resets(session):
     assert ["quit"] in ipc.sent
     assert ipc.ok is False
     assert session.get_length() == 0 and session.get_time() == 0
+
+
+def test_closing_fresh_session_keeps_nothing_state(session):
+    """没播过就 close() 不该冒出一个"已停止"，否则界面会闪一下。"""
+    states = []
+    session.state_changed.connect(states.append)
+    session.close()
+    assert states == []
+    assert session.get_state() == ps.ST_NOTHING
 
 
 # --------------------------------------------------------------------------- #
@@ -312,3 +351,107 @@ def test_ipc_send_is_noop_when_closed():
     ipc = ps._MpvIPC("x", lambda m: None)
     assert ipc.send(["quit"]) == -1
     ipc.close()
+
+
+class _Recorder:
+    """记录写入内容的假句柄。"""
+
+    def __init__(self):
+        self.written = []
+        self.closed = False
+
+    def write(self, data):
+        self.written.append(data)
+        return len(data)
+
+    def read(self, n):  # pragma: no cover —— 读句柄不该被写
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+def test_ipc_send_writes_through_the_shared_connection():
+    """观察和控制必须走**同一条**连接：mpv 的 property-change 事件与命令
+    回执只发给发命令的那个客户端，拆成两条连接就再也收不到进度事件。"""
+    handle = _Recorder()
+    ipc = ps._MpvIPC("x", lambda m: None)
+    ipc._conn = handle
+    ipc._alive.set()
+
+    first = ipc.send(["set_property", "pause", "yes"])
+    second = ipc.send(["seek", "4.0", "absolute"])
+    assert first > 0 and second > first
+    assert len(handle.written) == 2
+    payload = json.loads(handle.written[0].decode("utf-8"))
+    assert payload["command"] == ["set_property", "pause", "yes"]
+    assert payload["request_id"] == first
+
+
+def test_ipc_read_loop_polls_available_bytes_when_handle_is_known():
+    """Windows 上必须先 Peek 再按"可用字节数"读：
+    句柄上挂起一次阻塞 read 会让同线程之外的 write 卡死（暂停后拖进度条
+    就死在这上面），所以 read 的 size 只能是当前可读量，不能是 65536。"""
+    received = []
+    sizes = []
+
+    class _Conn:
+        def __init__(self):
+            self.pending = [b'{"event":"a"}\n', b'{"event":"b"}\n']
+
+        def read(self, n):
+            sizes.append(n)
+            return self.pending.pop(0) if self.pending else b""
+
+        def close(self):
+            return None
+
+        def write(self, data):
+            return len(data)
+
+    ipc = ps._MpvIPC("x", received.append)
+    ipc._conn = _Conn()
+    ipc._handle = 1234          # 假装是 Windows 管道句柄
+    ipc._alive.set()
+
+    peeked = {"left": [8, 8, -1]}
+
+    def fake_peek():
+        return peeked["left"].pop(0) if peeked["left"] else 0
+
+    ipc._peek_available = fake_peek
+    ipc._read_loop()
+
+    assert [m.get("event") for m in received] == ["a", "b"]
+    assert sizes == [8, 8], f"必须按可用字节数读，实际 {sizes}"
+    assert ipc.ok is False
+
+
+def test_ipc_peek_returning_negative_stops_reader():
+    ipc = ps._MpvIPC("x", lambda m: None)
+    ipc._conn = _Recorder()
+    ipc._handle = 4321
+    ipc._alive.set()
+    ipc._peek_available = lambda: -1
+    ipc._read_loop()
+    assert ipc.ok is False
+
+
+def test_ipc_connect_opens_single_readwrite_connection(monkeypatch):
+    opened = []
+
+    class _FakePipe(_Recorder):
+        def fileno(self):
+            raise OSError
+
+    def fake_open(path, mode="rb", buffering=-1):
+        opened.append((path, mode))
+        return _FakePipe()
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    ipc = ps._MpvIPC(r"\\.\pipe\test", lambda m: None)
+    assert ipc.connect(timeout=0.5) is True
+    assert [mode for _path, mode in opened] == ["r+b"]
+    assert ipc._handle is None, "拿不到 fileno 时退化为阻塞读，不能崩"
+    ipc.close()
+    assert ipc._conn is None

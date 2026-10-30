@@ -56,7 +56,21 @@ ST_ERROR = 7
 
 _IPC_CONNECT_TIMEOUT = 8.0
 _IPC_CONNECT_INTERVAL = 0.1
+_IPC_POLL_INTERVAL = 0.02
 _START_WATCHDOG_S = 20.0
+
+# 需要观察的 mpv 属性（顺序即 observe_property 的整数 id，从 1 开始）
+_OBSERVED_PROPERTIES = (
+    "time-pos",
+    "duration",
+    "pause",
+    "core-idle",
+    "demuxer-cache-state",
+    "volume",
+    "mute",
+    "speed",
+    "media-title",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -67,12 +81,23 @@ class _MpvIPC:
 
     读线程把事件交给 ``on_event`` 回调；回调里只做信号 emit（Qt 会自动
     跨线程排队），不做阻塞操作。
+
+    **为什么读循环要轮询而不是阻塞读**：mpv 的 ``observe_property`` 事件和
+    命令回执只发给**发命令的那条连接**，所以观察与控制必须共用一条连接。
+    可 Windows 命名管道是同步句柄 —— 句柄上挂着一次阻塞 ``ReadFile`` 时，
+    另一个线程的 ``WriteFile`` 要等它完成。播放暂停后 mpv 不再推送任何
+    属性变化，读永远不返回，于是"暂停后拖进度条/调音量"就死在这条 write
+    上（实测 seek 卡住 6s 以上）。这里改用 ``PeekNamedPipe`` 先问"有多少
+    字节可读"，有数据才 ``read(可用字节数)``，句柄上永远没有挂起的读，
+    写立刻返回；POLL 间隔 20ms，对进度条刷新足够。POSIX socket 读写互不
+    阻塞，直接阻塞 ``read`` 即可。
     """
 
     def __init__(self, server: str, on_event) -> None:
         self.server = server
         self._on_event = on_event
         self._conn = None
+        self._handle = None      # Windows 下的 OS 句柄（PeekNamedPipe 用）
         self._reader = None
         self._alive = threading.Event()
         self._ids = itertools.count(1)
@@ -89,6 +114,7 @@ class _MpvIPC:
                 time.sleep(_IPC_CONNECT_INTERVAL)
         else:
             return False
+        self._handle = _os_pipe_handle(self._conn)
         self._alive.set()
         self._reader = threading.Thread(target=self._read_loop,
                                         name="mpv-ipc", daemon=True)
@@ -114,14 +140,34 @@ class _MpvIPC:
             return -1
         return request_id
 
+    def _peek_available(self) -> int:
+        """可读字节数；-1 表示管道已断（Windows 专用，其他平台返回 -1）。"""
+        if self._handle is None:
+            return -1
+        return _peek_pipe(self._handle)
+
     def _read_loop(self) -> None:
         buf = b""
+        polling = self._handle is not None
         while self.ok:
+            if polling:
+                available = self._peek_available()
+                if available < 0:
+                    break
+                if available == 0:
+                    time.sleep(_IPC_POLL_INTERVAL)
+                    continue
+                want = min(available, 65536)
+            else:
+                want = 65536
             try:
-                chunk = self._conn.read(65536)
+                chunk = self._conn.read(want)
             except (OSError, ValueError, AttributeError):
                 break
             if not chunk:
+                if polling:
+                    time.sleep(_IPC_POLL_INTERVAL)
+                    continue
                 break
             buf += chunk
             while b"\n" in buf:
@@ -141,12 +187,46 @@ class _MpvIPC:
 
     def close(self) -> None:
         self._alive.clear()
+        self._handle = None
         conn, self._conn = self._conn, None
         if conn is not None:
             try:
                 conn.close()
             except OSError:
                 pass
+
+
+def _os_pipe_handle(conn):
+    """取文件对象背后的 Windows OS 句柄；拿不到就返回 None（走阻塞读）。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import msvcrt
+
+        return int(msvcrt.get_osfhandle(conn.fileno()))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _peek_pipe(handle: int) -> int:
+    """PeekNamedPipe 的薄封装：返回可读字节数，失败返回 -1。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        peek = kernel32.PeekNamedPipe
+        peek.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                         wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD]
+        peek.restype = wintypes.BOOL
+        available = wintypes.DWORD(0)
+        ok = peek(wintypes.HANDLE(handle), None, 0, None,
+                  ctypes.byref(available), None)
+        if not ok:
+            return -1
+        return int(available.value)
+    except (OSError, AttributeError, TypeError, ValueError):
+        return -1
 
 
 # --------------------------------------------------------------------------- #
@@ -180,6 +260,7 @@ class PlayerSession(QObject):
         self._rate = 1.0
         self._pending_audio = ""
         self._started_at = 0.0
+        self._file_loaded = False
         self._watchdog = None
         self._player_key = ""
         self._player_name = ""
@@ -212,6 +293,7 @@ class PlayerSession(QObject):
         self._player_key = launched.key
         self._player_name = launched.name
         self._pending_audio = audio_url or ""
+        self._file_loaded = False
         self._set_state(ST_OPENING)
         # 代理租约：播放器暂停/长时间不请求时 token 不被空闲看门狗回收
         self._hold_proxy_lease(launched.process)
@@ -289,10 +371,13 @@ class PlayerSession(QObject):
             self._set_state(ST_PLAYING)
             return
         self._ipc = ipc
-        for prop in ("time-pos", "duration", "pause", "core-idle",
-                     "demuxer-cache-state", "volume", "mute", "speed",
-                     "media-title"):
-            ipc.send(["observe_property", prop, prop])
+        # observe_property 的签名是 ``observe_property <id> <name>``：
+        # 第一个参数必须是**整数 id**（客户端自选，用来在 property-change
+        # 里认出是哪条观察）。早先这里传的是属性名，mpv 一律回
+        # ``{"error": "invalid parameter"}`` —— 结果一个 time-pos/duration
+        # 事件都不来，进度条、时长、"载入中"全部死掉。
+        for index, prop in enumerate(_OBSERVED_PROPERTIES, start=1):
+            ipc.send(["observe_property", index, prop])
         self._ipc.send(["set_property", "pause", "no"])
         if self._pending_audio:
             self._ipc.send(["audio-add", self._pending_audio, "select"])
@@ -344,10 +429,16 @@ class PlayerSession(QObject):
             elif name == "speed":
                 self._rate = float(value)
         elif event == "start-file":
+            self._file_loaded = False
             self._set_state(ST_OPENING)
         elif event == "file-loaded":
+            # 只有 file-loaded 之后收到的 idle 才代表「文件播完/被卸载」；
+            # mpv 带 --idle=yes 启动时会在加载文件**之前**先发一条 idle，
+            # 那条必须忽略，否则一开播就被判成已结束（界面显示"已播完"）。
+            self._file_loaded = True
             self._set_state(ST_PLAYING)
         elif event == "end-file":
+            self._file_loaded = False
             if message.get("reason") == "eof":
                 self._time_ms = self._length_ms or self._time_ms
                 self._set_state(ST_ENDED)
@@ -355,7 +446,9 @@ class PlayerSession(QObject):
             else:
                 self._set_state(ST_STOPPED)
         elif event == "idle":
-            self._set_state(ST_STOPPED)
+            if self._file_loaded and self._state not in (ST_ENDED, ST_ERROR):
+                self._file_loaded = False
+                self._set_state(ST_STOPPED)
 
     def _on_cache_state(self, value) -> None:
         """缓存状态 → 缓冲百分比（喂给「载入中/缓冲中」进度条）。"""
@@ -464,7 +557,9 @@ class PlayerSession(QObject):
             releases, self._leases = self._leases, []
         for release in releases:
             release()
-        if self._state not in (ST_ENDED, ST_ERROR):
+        # 只有真正播过（或失败过）才补一个"已停止"；刚建会话就 close()
+        # 不该把状态从 NOTHING 推到 STOPPED —— 否则界面会闪一下"已停止"。
+        if self._state not in (ST_NOTHING, ST_ENDED, ST_ERROR):
             self._set_state(ST_STOPPED)
         self._time_ms = 0
         self._length_ms = 0
