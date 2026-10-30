@@ -343,6 +343,48 @@ def test_direct_fallback_retries_proxy_when_direct_also_fails(monkeypatch):
     assert attempts[2][1] == http.defaults.timeout, "兜底那次要用完整超时"
     # 直连也不通 → 不是僵尸代理的证据，不能记仇（否则真需要 VPN 的站会被长期判死）
     assert http_mod._proxy_failed_for("vpn-only.test") is False
+    # 反而要记住「这个站只有代理能通」，下次别再白试直连
+    assert http_mod._proxy_preferred("vpn-only.test") is True
+
+
+def test_proxy_preferred_host_skips_probe_and_direct(monkeypatch):
+    """已知只有代理能通的站：一次（完整预算的）代理请求就拿到结果。
+
+    实测背景：favcomic / xvideos 直连 18s 连接被重置，走代理 1.6~2.3s 正常。
+    没有偏好记忆时每次都要先 5s 探测 + 一次必然失败的直连。
+    """
+    attempts = []
+    http = _zombie_client(monkeypatch)
+
+    def fake_get_once(url, headers, proxy, timeout, encoding=None):
+        attempts.append((proxy, timeout))
+        return "VIA-PROXY"
+
+    monkeypatch.setattr(http, "_get_once", fake_get_once)
+    http_mod._note_proxy_success("only-proxy.test")
+    assert http.get_text("http://only-proxy.test/a", retries=0, interval_ms=0) == "VIA-PROXY"
+    assert len(attempts) == 1, attempts
+    assert attempts[0][0] == _SYSTEM_PROXY
+    assert attempts[0][1] == http.defaults.timeout, "偏好路径要用完整预算，不再短超时"
+
+
+def test_proxy_preference_expires(monkeypatch):
+    """偏好会过期：到期后回到「短探测 → 直连」的常规流程。"""
+    attempts = []
+    http = _zombie_client(monkeypatch)
+
+    def fake_get_once(url, headers, proxy, timeout, encoding=None):
+        attempts.append((proxy, timeout))
+        if proxy and timeout == http_mod._PROXY_PROBE_TIMEOUT:
+            raise OSError("read timed out")
+        return "OK"
+
+    monkeypatch.setattr(http, "_get_once", fake_get_once)
+    http_mod._note_proxy_success("only-proxy.test")
+    with http_mod._SYSTEM_PROXY_LOCK:
+        http_mod._PROXY_OK["only-proxy.test"] = time.monotonic() - 1.0
+    assert http.get_text("http://only-proxy.test/a", retries=0, interval_ms=0) == "OK"
+    assert attempts[0][1] == http_mod._PROXY_PROBE_TIMEOUT, "过期后先短探测"
 
 
 def test_antiscrape_still_propagates_from_proxy_attempt(monkeypatch):

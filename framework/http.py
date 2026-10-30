@@ -244,6 +244,11 @@ _SYSTEM_PROXY_LOCK = threading.Lock()
 _PROXY_FAIL_TTL = 300.0
 _PROXY_FAIL_HOSTS = 2
 _PROXY_FAIL: dict = {"hosts": set(), "until": 0.0}
+# 「只有代理能通」的主机记忆（与 _PROXY_FAIL 互为反面）：
+# _PROXY_FAIL 记"代理不行、直连行"，_PROXY_OK 记"直连不行、代理行"。
+# 两个方向的出口偏好都带 TTL，网络变化后自动重新决策。
+_PROXY_OK_TTL = 600.0
+_PROXY_OK: dict = {}
 # 系统代理首次尝试的最长等待：僵尸代理要尽快暴露，别把整页请求耗满 retries×timeout
 _PROXY_PROBE_TIMEOUT = 5.0
 
@@ -284,8 +289,38 @@ def _reset_proxy_failures() -> None:
     with _SYSTEM_PROXY_LOCK:
         _PROXY_FAIL["hosts"].clear()
         _PROXY_FAIL["until"] = 0.0
+        _PROXY_OK.clear()
         _SYSTEM_PROXY_CACHE["t"] = 0.0
         _SYSTEM_PROXY_CACHE["url"] = None
+
+
+def _note_proxy_success(host: str) -> None:
+    """该主机只有在系统代理下才通（直连不通）→ 短期内优先走代理。
+
+    实测（同一台机器、同一时刻、各 3 轮）：favcomic / xvideos 直连
+    18s 连接被重置，走代理 1.6~2.3s 正常；反之 dm5 / omofuna 直连 0.2~0.9s。
+    没有一个出口对所有站都对，所以按主机记「哪个出口成功过」：代理偏好成立时
+    直接给足预算走代理，不再先白等一次 5s 探测 + 一次直连失败。
+    """
+    if not host:
+        return
+    with _SYSTEM_PROXY_LOCK:
+        _PROXY_OK[host] = time.monotonic() + _PROXY_OK_TTL
+
+
+def _proxy_preferred(host: str) -> bool:
+    """该主机是否处于「已知只有代理能通」的有效期内。"""
+    if not host:
+        return False
+    now = time.monotonic()
+    with _SYSTEM_PROXY_LOCK:
+        until = _PROXY_OK.get(host)
+        if until is None:
+            return False
+        if until <= now:
+            _PROXY_OK.pop(host, None)
+            return False
+        return True
 
 
 def _system_proxy_suspended() -> bool:
@@ -780,6 +815,18 @@ class HttpClient:
         url = url_desc.rsplit(" ", 1)[-1]
         host = _host_of_url(url)
 
+        # 已知「只有代理能通」（直连被重置/封锁）→ 直接给足预算走代理，
+        # 省掉一次 5s 探测 + 一次必然失败的直连（favcomic/xvideos 实测）。
+        if _proxy_preferred(host) and not _proxy_failed_for(host):
+            try:
+                return once(proxy)
+            except AntiScrapeError:
+                raise
+            except Exception as exc:  # noqa: BLE001 —— 代理这条路也不行了，走常规流程
+                logging.getLogger(__name__).info(
+                    "代理偏好失效（%s），改按直连重试：%s", host or url, str(exc)[:120],
+                )
+
         # 已知"走代理不通、直连能通"的主机：连探测都省掉
         if _proxy_failed_for(host):
             direct_exc = None
@@ -819,9 +866,12 @@ class HttpClient:
                 return result
         # 直连也不通：可能确实需要代理（只是慢），完整预算再走一次代理
         try:
-            return once(proxy)
+            result = once(proxy)
         except Exception:  # noqa: BLE001 —— 代理也救不回来，抛直连错误
             raise direct_exc from proxy_exc
+        # 直连不通、代理能通 → 记住该主机的出口偏好，下次不再白试直连
+        _note_proxy_success(host)
+        return result
 
     # ------------------------------------------------------------------ #
     def get_text(
