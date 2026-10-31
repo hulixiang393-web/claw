@@ -16,7 +16,7 @@
     }
   },
   "ui": {
-    "theme": "midnight",
+    "theme": "sakura",
     "font_scale": 1.5,
     "cover_cache_size_mb": 256,
     "default_page_size": 20,
@@ -72,12 +72,16 @@
     "prefetch_ahead": 3,
     "prefetch_behind": 1,
     "show_images": true,
-    "font_size": 0,
+    "font_size": 16,
     "font_family": "system",
-    "line_spacing": 1.8,
+    "line_spacing": 1.5,
     "content_width": 960,
     "paragraph_indent": true,
-    "language": "zh-cn"
+    "language": "zh-cn",
+    "paragraph_spacing": 0.9,
+    "paragraph_indent_width": 2,
+    "text_align": "justify",
+    "letter_spacing": 0.05
   },
   "discover": {
     "preload_pages": 5,
