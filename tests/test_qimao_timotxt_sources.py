@@ -79,7 +79,10 @@ def test_timotxt_prefers_http_and_falls_back_to_rendered_pages():
     assert detail["title"]["fallback"][0]["css"] == "h1.title"
     assert detail["cover"]["fallback"][0]["css"] == ".col.cover img"
     body = source.raw["endpoints"]["content"]["chapter"]["body"]
-    assert body["render"] == "playwright"
+    # 正文页服务端直出（实测原始 HTML 已含 72 段）：先走 HTTP，命中就免掉
+    # 一次浏览器渲染（之前 render=playwright 每章约 12.8s）。
+    assert body["render"] == "playwright_fallback"
+    assert body["render_config"]["http_probe"] == "#chapterWarp .chapter-content .content > p"
     assert body["selector"]["css"] == "#chapterWarp .chapter-content .content > p"
     assert body["image_selector"]["css"].endswith("> figure")
     assert body["render_config"]["api_content"] == {

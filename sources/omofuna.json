@@ -20,9 +20,9 @@
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
       "Referer": "https://www.omofuna.com/"
     },
-    "timeout": 12,
+    "timeout": 8,
     "retries": 1,
-    "interval_ms": 500,
+    "interval_ms": 300,
     "follow_redirects": true,
     "prefer_proxy": true
   },
@@ -95,6 +95,7 @@
           "render_skip_from": ["mp4"],
           "external_player": {
             "from": ["mp4"],
+            "budget_s": 8,
             "note": "精品线路（sid=1/3）：player_aaaa 只给 32 位不透明 id，真实直链在 art.v2player.top 播放器页面里由 playData(密文, key) 解密（crypto-js + 混淆 common.js）。浏览器渲染实测 47s 仍拿不到，改为 Node 跑站点自己的解密函数：约 1s 得到 TikTok CDN 的 mp4 直链。解析失败时 render_skip_from 命中 mp4 → 立即换线，不再空等渲染。",
             "player_url": "https://art.v2player.top:8989/player/?url={enc_url}&dmid=&next=&name={name}&sid={sid}&nid={nid}&ph={ph}&h={h}&pic={pic}",
             "cipher_regex": "playData\\(\\s*'([^']+)'\\s*,\\s*'([^']+)'\\s*\\)",

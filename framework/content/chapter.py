@@ -696,6 +696,14 @@ class ChapterMixin:
                 else:
                     fragments.append({"type": "text", "text": value})
 
+        def add_break():
+            """根节点之间补一个换行。"""
+            if fragments and fragments[-1].get("type") == "text":
+                if not fragments[-1]["text"].endswith("\n"):
+                    fragments[-1]["text"] += "\n"
+            else:
+                add_text("\n")
+
         def walk(node, is_root=False):
             if node.tag == "img":
                 raw_url = self._image_url_from_node(node)
@@ -714,6 +722,10 @@ class ChapterMixin:
 
         for root in self._image_selector_nodes(self._parser, doc, selector):
             walk(root, is_root=True)
+            # 正文选择器常直接指向段落节点（`#content p` / `p:not(.copy)`），
+            # 每个 root 就是一段：is_root 不补换行时整章会被并成一行，
+            # 阅读器按图片片段渲染时就成了「整章只有一段」。
+            add_break()
         if fragments and fragments[-1].get("type") == "text":
             fragments[-1]["text"] = fragments[-1]["text"].rstrip("\n")
         return fragments

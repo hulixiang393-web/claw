@@ -1538,6 +1538,10 @@ class Search:
             from framework.http import note_proxy_preferred
 
             note_proxy_preferred(url)
+        elif source.transports().get("prefer_direct"):
+            from framework.http import note_direct_preferred
+
+            note_direct_preferred(url)
         return http.get_text(
             url,
             headers=source.request_headers(),

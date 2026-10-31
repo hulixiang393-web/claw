@@ -253,6 +253,11 @@ class Discovery:
             from framework.http import note_proxy_preferred
 
             note_proxy_preferred(abs_url)
+        elif source.transports().get("prefer_direct"):
+            # 反向：该站经代理硬失败（全本代理 TLS 报错、直连可用）→ 直接直连。
+            from framework.http import note_direct_preferred
+
+            note_direct_preferred(abs_url)
         return self._http.get_text(
             abs_url,
             headers=self._headers(source),

@@ -86,6 +86,11 @@ class NovelView(AutoScrollMixin, QWidget):
         self._line_spacing = 1.8
         self._content_width = 960
         self._paragraph_indent = True
+        # 段落/文字排版（常见小说阅读器的可调项）
+        self._paragraph_spacing = 0.9   # 段间距（em）
+        self._indent_width = 2          # 首行缩进（字）
+        self._text_align = "justify"    # 对齐：justify | left
+        self._letter_spacing = 0.0      # 字间距（em）
         self._displayed_plain_text = ""
         self._reading_bg = ""  # 阅读区独立背景色（ui-reader #12，空=透明跟随主题）
         self._reading_fg = ""  # 夜间黑等深色背景下的正文前景色（空=跟随主题）
@@ -384,6 +389,23 @@ class NovelView(AutoScrollMixin, QWidget):
             width = 960
         self._content_width = max(640, min(1200, width))
         self._paragraph_indent = bool(get("reader", "paragraph_indent", True))
+        try:
+            paragraph_spacing = float(get("reader", "paragraph_spacing", 0.9))
+        except (TypeError, ValueError):
+            paragraph_spacing = 0.9
+        self._paragraph_spacing = max(0.0, min(2.4, paragraph_spacing))
+        try:
+            indent_width = int(get("reader", "paragraph_indent_width", 2) or 2)
+        except (TypeError, ValueError):
+            indent_width = 2
+        self._indent_width = max(0, min(4, indent_width))
+        align = str(get("reader", "text_align", "justify") or "justify").lower()
+        self._text_align = align if align in {"justify", "left"} else "justify"
+        try:
+            letter_spacing = float(get("reader", "letter_spacing", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            letter_spacing = 0.0
+        self._letter_spacing = max(0.0, min(0.3, letter_spacing))
         self._show_images = bool(get("reader", "show_images", True))
 
     def _persist_reader_options(self) -> None:
@@ -395,6 +417,10 @@ class NovelView(AutoScrollMixin, QWidget):
         self._settings.set("reader", "line_spacing", self._line_spacing)
         self._settings.set("reader", "content_width", self._content_width)
         self._settings.set("reader", "paragraph_indent", self._paragraph_indent)
+        self._settings.set("reader", "paragraph_spacing", self._paragraph_spacing)
+        self._settings.set("reader", "paragraph_indent_width", self._indent_width)
+        self._settings.set("reader", "text_align", self._text_align)
+        self._settings.set("reader", "letter_spacing", self._letter_spacing)
         self._settings.save()
 
     def _build_settings_menu(self) -> None:
@@ -436,7 +462,7 @@ class NovelView(AutoScrollMixin, QWidget):
         self._spacing_group = QActionGroup(spacing_menu)
         self._spacing_group.setExclusive(True)
         self._spacing_actions = {}
-        for spacing, label in ((1.5, "紧凑"), (1.8, "标准"), (2.1, "宽松")):
+        for spacing, label in ((1.5, "紧凑"), (1.8, "标准"), (2.1, "宽松"), (2.4, "超宽")):
             action = QAction(label, spacing_menu, checkable=True)
             action.setData(spacing)
             action.triggered.connect(
@@ -445,6 +471,65 @@ class NovelView(AutoScrollMixin, QWidget):
             self._spacing_group.addAction(action)
             spacing_menu.addAction(action)
             self._spacing_actions[spacing] = action
+
+        para_menu = menu.addMenu("段间距")
+        self._para_group = QActionGroup(para_menu)
+        self._para_group.setExclusive(True)
+        self._para_actions = {}
+        for value, label in ((0.2, "无"), (0.6, "紧凑"), (0.9, "标准"),
+                             (1.4, "宽松"), (2.0, "开阔")):
+            action = QAction(label, para_menu, checkable=True)
+            action.setData(value)
+            action.triggered.connect(
+                lambda _checked, spacing=value: self._set_paragraph_spacing(spacing)
+            )
+            self._para_group.addAction(action)
+            para_menu.addAction(action)
+            self._para_actions[value] = action
+
+        indent_menu = menu.addMenu("首行缩进")
+        self._indent_group = QActionGroup(indent_menu)
+        self._indent_group.setExclusive(True)
+        self._indent_actions = {}
+        for value, label in ((0, "不缩进"), (1, "缩进一字"), (2, "缩进两字"),
+                             (3, "缩进三字")):
+            action = QAction(label, indent_menu, checkable=True)
+            action.setData(value)
+            action.triggered.connect(
+                lambda _checked, width=value: self._set_indent_width(width)
+            )
+            self._indent_group.addAction(action)
+            indent_menu.addAction(action)
+            self._indent_actions[value] = action
+
+        align_menu = menu.addMenu("对齐方式")
+        self._align_group = QActionGroup(align_menu)
+        self._align_group.setExclusive(True)
+        self._align_actions = {}
+        for value, label in (("justify", "两端对齐"), ("left", "左对齐")):
+            action = QAction(label, align_menu, checkable=True)
+            action.setData(value)
+            action.triggered.connect(
+                lambda _checked, align=value: self._set_text_align(align)
+            )
+            self._align_group.addAction(action)
+            align_menu.addAction(action)
+            self._align_actions[value] = action
+
+        letter_menu = menu.addMenu("字间距")
+        self._letter_group = QActionGroup(letter_menu)
+        self._letter_group.setExclusive(True)
+        self._letter_actions = {}
+        for value, label in ((0.0, "标准"), (0.05, "稍宽"), (0.1, "宽松"),
+                             (0.15, "很宽")):
+            action = QAction(label, letter_menu, checkable=True)
+            action.setData(value)
+            action.triggered.connect(
+                lambda _checked, spacing=value: self._set_letter_spacing(spacing)
+            )
+            self._letter_group.addAction(action)
+            letter_menu.addAction(action)
+            self._letter_actions[value] = action
 
         width_menu = menu.addMenu("版心宽度")
         self._width_group = QActionGroup(width_menu)
@@ -487,6 +572,15 @@ class NovelView(AutoScrollMixin, QWidget):
         self._sync_settings_actions()
 
     def _sync_settings_actions(self) -> None:
+        # setChecked 会触发 toggled → 又回到 _set_* → 再 sync；这里用标志位
+        # 挡住构建/同步期间的级联回调（否则构造时就会反复重排正文/写配置）。
+        self._syncing_settings = True
+        try:
+            self._sync_settings_actions_impl()
+        finally:
+            self._syncing_settings = False
+
+    def _sync_settings_actions_impl(self) -> None:
         current_size = self._reader_font_size
         for size, action in self._font_actions.items():
             action.setChecked(size == current_size)
@@ -500,10 +594,23 @@ class NovelView(AutoScrollMixin, QWidget):
             action.setChecked(value == width)
         for mode, action in self._mode_actions.items():
             action.setChecked(mode == self._mode)
+        para = min(self._para_actions, key=lambda value: abs(value - self._paragraph_spacing))
+        for value, action in self._para_actions.items():
+            action.setChecked(value == para)
+        indent = max(self._indent_actions, key=lambda value: value if value <= self._indent_width else -1)
+        for value, action in self._indent_actions.items():
+            action.setChecked(value == indent)
+        for align, action in self._align_actions.items():
+            action.setChecked(align == self._text_align)
+        letter = min(self._letter_actions, key=lambda value: abs(value - self._letter_spacing))
+        for value, action in self._letter_actions.items():
+            action.setChecked(value == letter)
         self.indent_action.setChecked(self._paragraph_indent)
         self.images_action.setChecked(self._show_images)
 
     def _set_reader_font_size(self, size: int) -> None:
+        if getattr(self, "_syncing_settings", False):
+            return
         self._reader_font_size = max(0, min(48, int(size)))
         self._font_delta = 0
         self._base_font = (
@@ -516,6 +623,8 @@ class NovelView(AutoScrollMixin, QWidget):
         self._sync_settings_actions()
 
     def _set_reader_font_family(self, family: str) -> None:
+        if getattr(self, "_syncing_settings", False):
+            return
         if family not in self.READER_FONT_FAMILIES:
             return
         self._reader_font_family = family
@@ -524,19 +633,66 @@ class NovelView(AutoScrollMixin, QWidget):
         self._sync_settings_actions()
 
     def _set_line_spacing(self, spacing: float) -> None:
+        if getattr(self, "_syncing_settings", False):
+            return
         self._line_spacing = max(1.4, min(2.4, float(spacing)))
         self._apply_font()
         self._persist_reader_options()
         self._sync_settings_actions()
 
+    def _set_paragraph_spacing(self, spacing: float) -> None:
+        """段间距（em）：常见阅读器的「段落留白」档位。"""
+        if getattr(self, "_syncing_settings", False):
+            return
+        self._paragraph_spacing = max(0.0, min(2.4, float(spacing)))
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    def _set_indent_width(self, width: int) -> None:
+        """首行缩进宽度（字）；0 = 不缩进（等价于关掉段首缩进）。"""
+        if getattr(self, "_syncing_settings", False):
+            return
+        self._indent_width = max(0, min(4, int(width)))
+        self._paragraph_indent = self._indent_width > 0
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    def _set_text_align(self, align: str) -> None:
+        if getattr(self, "_syncing_settings", False):
+            return
+        align = str(align or "").lower()
+        if align not in {"justify", "left"}:
+            return
+        self._text_align = align
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
+    def _set_letter_spacing(self, spacing: float) -> None:
+        """字间距（em）；0 = 标准。"""
+        if getattr(self, "_syncing_settings", False):
+            return
+        self._letter_spacing = max(0.0, min(0.3, float(spacing)))
+        self._apply_font()
+        self._persist_reader_options()
+        self._sync_settings_actions()
+
     def _set_content_width(self, width: int) -> None:
+        if getattr(self, "_syncing_settings", False):
+            return
         self._content_width = max(640, min(1200, int(width)))
         self._apply_font()
         self._persist_reader_options()
         self._sync_settings_actions()
 
     def _set_paragraph_indent(self, enabled: bool) -> None:
+        if getattr(self, "_syncing_settings", False):
+            return
         self._paragraph_indent = bool(enabled)
+        if self._paragraph_indent and self._indent_width <= 0:
+            self._indent_width = 2
         self._apply_font()
         self._persist_reader_options()
         self._sync_settings_actions()
@@ -550,6 +706,10 @@ class NovelView(AutoScrollMixin, QWidget):
         self._line_spacing = 1.8
         self._content_width = 960
         self._paragraph_indent = True
+        self._paragraph_spacing = 0.9
+        self._indent_width = 2
+        self._text_align = "justify"
+        self._letter_spacing = 0.0
         self.set_show_images(True)
         self._apply_font()
         self._persist_reader_options()
@@ -803,7 +963,10 @@ class NovelView(AutoScrollMixin, QWidget):
         if self._mode == "scroll" and self._show_images and fragments:
             self.text.setVisible(False)
             generation = self._image_generation
-            title_widget = QLabel(f"【{label}】")
+            title_widget = QLabel(
+                self._reader_body_html(f"【{escape(str(label))}】", has_title=True)
+            )
+            title_widget.setTextFormat(Qt.RichText)
             title_widget.setObjectName("readerBody")
             title_widget.setWordWrap(True)
             title_widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -814,12 +977,16 @@ class NovelView(AutoScrollMixin, QWidget):
             )
             for fragment in fragments:
                 if fragment.get("type") == "text":
-                    segment = QLabel(
-                        self._format_reader_text(
-                            self._reader_convert_text(str(fragment.get("text") or "")),
-                            has_title=False,
-                        )
+                    # 片段正文与主正文用同一套段落排版：早先这里直接 setText(纯文本)，
+                    # 图片夹在正文里时整章就退化成一个没有段距/缩进的 QLabel，
+                    # 表现就是「所有段落挤成一段」。
+                    fragment_text = self._split_merged_paragraphs(
+                        self._reader_convert_text(str(fragment.get("text") or ""))
                     )
+                    segment = QLabel(
+                        self._reader_body_html(fragment_text, has_title=False)
+                    )
+                    segment.setTextFormat(Qt.RichText)
                     segment.setObjectName("readerBody")
                     segment.setWordWrap(True)
                     segment.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1368,10 +1535,11 @@ class NovelView(AutoScrollMixin, QWidget):
         family_css = self.READER_FONT_FAMILIES[self._reader_font_family][1]
         return (
             f"font-family: {family_css}; "
-            f"font-size: {size}px; line-height: {self._line_spacing}; padding: 12px 20px;"
-            # Indentation is materialized as exactly two ideographic spaces
-            # below; CSS text-indent would double-indent fetched text.
-            f" text-indent: 0; margin-bottom: 0.9em;"
+            f"font-size: {size}px; line-height: {self._line_spacing};"
+            f" padding: 12px 20px;"
+            # Indentation is materialized as ideographic spaces below;
+            # CSS text-indent would double-indent fetched text.
+            f" text-indent: 0; margin-bottom: {round(self._paragraph_spacing, 2)}em;"
             f"{bg_css}{fg_css}"
         )
 
@@ -1409,6 +1577,12 @@ class NovelView(AutoScrollMixin, QWidget):
             return self.READER_BODY_LINE_HEIGHT
         return round(spacing, 2)
 
+    def _indent_prefix(self) -> str:
+        """首行缩进前缀（用全角空格 materialize，Qt 不认 CSS text-indent）。"""
+        if not self._paragraph_indent:
+            return ""
+        return "　" * max(0, int(self._indent_width))
+
     def _reader_body_html(
         self, text: str, has_title: bool = True, noise_re=None,
         center_tokens=(),
@@ -1417,8 +1591,9 @@ class NovelView(AutoScrollMixin, QWidget):
 
         这些源的正文都是「一段一行」的纯文本：整块丢进 QTextEdit 会挤成一片
         文字墙——段间没有留白、行距偏紧、章节标题混在正文里。这里统一按段落
-        生成 <p> 块：段间距 0.9em、行距跟随阅读设置（默认 2.0）、首行缩进两字、
-        两端对齐；章节标题单独居中并拉开字距。字号/字体/颜色仍跟随阅读设置。
+        生成 <p> 块：段间距/行距/缩进/对齐/字间距全部跟随阅读设置
+        （默认 段距 0.9em、行距 2.0、缩进两字、两端对齐、标准字距）；
+        章节标题单独居中并拉开字距。字号/字体/颜色同样跟随阅读设置。
 
         noise_re：可选行过滤正则（站点广告/求票/域名提示行）。
         center_tokens：可选「居中短行」集合（如插图占位），命中则居中显示。
@@ -1428,6 +1603,10 @@ class NovelView(AutoScrollMixin, QWidget):
         family = escape(self.READER_FONT_FAMILIES[self._reader_font_family][1], quote=True)
         line_height = self._reader_line_height()
         color = escape(self._reading_fg or "palette(text)", quote=True)
+        para_spacing = round(float(self._paragraph_spacing), 2)
+        align = "left" if self._text_align == "left" else "justify"
+        letter = round(float(self._letter_spacing), 3)
+        letter_css = f" letter-spacing:{letter}em;" if letter > 0 else ""
         blocks = []
         title_pending = bool(has_title)
         for raw in lines:
@@ -1451,19 +1630,21 @@ class NovelView(AutoScrollMixin, QWidget):
                     f'color:palette(mid); margin:0.5em 0 1em 0;">{content}</div>'
                 )
                 continue
-            # 缩进用「两个全角空格」materialize：Qt 的富文本导入不认 CSS
+            # 缩进用「全角空格」materialize：Qt 的富文本导入不认 CSS
             # text-indent（实测 QTextBlockFormat.textIndent() 恒为 0），
             # 而 U+3000 在 white-space:pre-wrap 下稳定保留。
             indented = str(raw).rstrip()
-            if self._paragraph_indent:
-                indented = "　　" + indented.lstrip(" \t　")
+            prefix = self._indent_prefix()
+            if prefix:
+                indented = prefix + indented.lstrip(" \t　")
             blocks.append(
-                '<p style="margin:0 0 0.9em 0; line-height:'
-                f'{line_height}; text-align:justify;">{escape(indented)}</p>'
+                f'<p style="margin:0 0 {para_spacing}em 0; line-height:'
+                f'{line_height}; text-align:{align};">{escape(indented)}</p>'
             )
         return (
             f'<div style="font-family:{family}; font-size:{size}px; '
-            f'line-height:{line_height}; color:{color}; white-space:pre-wrap;">'
+            f'line-height:{line_height}; color:{color};'
+            f'{letter_css} white-space:pre-wrap;">'
             + "".join(blocks)
             + "</div>"
         )
@@ -1486,18 +1667,19 @@ class NovelView(AutoScrollMixin, QWidget):
             widget.setText(html)
 
     def _format_reader_text(self, text: str, has_title: bool = True) -> str:
-        """Normalize fetched leading whitespace and apply one two-character indent."""
+        """Normalize fetched leading whitespace and apply the configured indent."""
         lines = str(text or "").split("\n")
         if getattr(self._source, "source_id", "") == "timotxt":
             lines = [
                 line for line in lines
                 if not re.fullmatch(r"[_=\-]{4,}", line.strip())
             ]
+        prefix = self._indent_prefix()
         out = []
         for index, line in enumerate(lines):
             stripped = line.lstrip(" \t　")
-            if stripped and self._paragraph_indent and (not has_title or index > 0):
-                stripped = "　　" + stripped
+            if stripped and prefix and (not has_title or index > 0):
+                stripped = prefix + stripped
             out.append(stripped)
         return "\n".join(out)
 

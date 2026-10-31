@@ -286,6 +286,22 @@ def note_proxy_preferred(url: str) -> None:
         _note_proxy_success(host)
 
 
+def note_direct_preferred(url: str) -> None:
+    """把 URL 所属主机标记为「走系统代理不通、直接连」（transports.prefer_direct）。
+
+    与 note_proxy_preferred 相反：有些站经代理是硬失败（全本实测代理 TLS
+    6.19s 报错、直连 4s 正常），而框架默认先探代理再回落，每次都要多付一次
+    探测/失败预算。源声明后直接按主机绕过代理。
+    """
+    host = _host_of_url(url)
+    if not host:
+        return
+    with _SYSTEM_PROXY_LOCK:
+        _PROXY_FAIL["hosts"].add(host)
+        _SYSTEM_PROXY_CACHE["t"] = 0.0
+        _SYSTEM_PROXY_CACHE["url"] = None
+
+
 def _proxy_failed_for(host: str) -> bool:
     """该主机是否已被判定"走系统代理不通"。"""
     if not host:

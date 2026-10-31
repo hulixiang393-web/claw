@@ -117,10 +117,11 @@ class ExternalPlayer:
         self._http = http
         self._log = log_ or log
         self._started = time.monotonic()
+        self._budget = _RESOLVE_BUDGET
 
     def _left(self) -> float:
         """本次解析剩余时间预算（秒）。"""
-        return _RESOLVE_BUDGET - (time.monotonic() - self._started)
+        return self._budget - (time.monotonic() - self._started)
 
     # ------------------------------------------------------------------ #
     def _download(self, url: str, headers: dict, name: str) -> str:
@@ -175,6 +176,11 @@ class ExternalPlayer:
         if not cfg:
             return ""
         started = time.monotonic()
+        # 源可用 budget_s 收紧本次解析预算（第三方播放器挂掉时尽快换线）
+        try:
+            self._budget = float(cfg.get("budget_s") or _RESOLVE_BUDGET)
+        except (TypeError, ValueError):
+            self._budget = _RESOLVE_BUDGET
         self._started = started
 
         sources = [str(item).lower() for item in (cfg.get("from") or [])]

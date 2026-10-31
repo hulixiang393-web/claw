@@ -347,6 +347,15 @@ class ContentBase:
                 note_proxy_preferred(abs_url)
             except Exception:  # noqa: BLE001 —— 只是优化，失败照常请求
                 pass
+        elif source.transports().get("prefer_direct"):
+            # 反之：该站经代理是硬失败（全本实测代理 TLS 6s 报错、直连可用）→
+            # 把主机标成「别走代理」，省掉每次的代理探测/失败重试。
+            try:
+                from framework.http import note_direct_preferred
+
+                note_direct_preferred(abs_url)
+            except Exception:  # noqa: BLE001 —— 只是优化，失败照常请求
+                pass
         value = client.get_text(
             abs_url,
             headers=self._headers(source),

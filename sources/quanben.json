@@ -25,9 +25,10 @@
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
       "Referer": "https://quanben-xiaoshuo.com/"
     },
-    "timeout": 10,
-    "retries": 2,
-    "interval_ms": 1000
+    "timeout": 12,
+    "retries": 1,
+    "interval_ms": 300,
+    "prefer_direct": true
   },
   "endpoints": {
     "discovery": {
