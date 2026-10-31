@@ -241,7 +241,7 @@ _SYSTEM_PROXY_LOCK = threading.Lock()
 # 读超时（实测 44s）→ 界面整片空白、播放器也拿不到流。所以这里记下"走系统
 # 代理失败过"的主机：同一主机后续直接绕过代理；不同主机连续失败到阈值，就把
 # 系统代理整体停用一段时间（到期自动重试，VPN 恢复后自己会回来）。
-_PROXY_FAIL_TTL = 180.0
+_PROXY_FAIL_TTL = 900.0
 _PROXY_FAIL_HOSTS = 3
 _PROXY_FAIL: dict = {"hosts": set(), "until": 0.0}
 # 「只有代理能通」的主机记忆（与 _PROXY_FAIL 互为反面）：
@@ -258,6 +258,9 @@ _PROXY_LIVE_WINDOW = 120.0
 # 取 8s：本机加速器实测正常转发常在 4~6s（pornhub/xvideos 首包 6.3s），
 # 5s 会把"慢但可用"的代理误判成僵尸，进而错误地把主机记为"必须直连"。
 _PROXY_PROBE_TIMEOUT = 8.0
+# 「探测失败、直连也不通」时给代理的最后一次机会的超时上限（单次、不重试）：
+# 按满超时×重试重跑会把一次请求拖到几十秒，而出口明显已经不健康的概率更高。
+_PROXY_RETRY_TIMEOUT = 12.0
 
 
 def _host_of_url(url: str) -> str:
@@ -268,6 +271,19 @@ def _host_of_url(url: str) -> str:
         return (urlsplit(url).hostname or "").lower()
     except Exception:  # noqa: BLE001 —— 畸形 URL 不参与僵尸代理记忆
         return ""
+
+
+def note_proxy_preferred(url: str) -> None:
+    """把 URL 所属主机标记为「必须走代理」（源配置 transports.prefer_proxy）。
+
+    有些站的直连是**硬失败**：TLS 握手被拒/重置，每次都要等十几秒才报错，
+    而经系统代理 200（omofuna 详情页实测：直连 3/3 次 SSLError 15~21s，
+    代理可用）。源声明后直接走 `_proxy_preferred` 分支，省掉「一次 8s 探测 +
+    一次注定失败的直连预算」。
+    """
+    host = _host_of_url(url)
+    if host:
+        _note_proxy_success(host)
 
 
 def _proxy_failed_for(host: str) -> bool:
@@ -950,9 +966,15 @@ class HttpClient:
                 # 只有"代理不通、直连通"才算僵尸代理证据
                 _note_system_proxy_failure(host)
                 return result
-        # 直连也不通：可能确实需要代理（只是慢），完整预算再走一次代理
+        # 直连也不通：可能确实需要代理（只是慢），再给代理一次机会——
+        # 但只试一次、超时封顶 12s：刚才的探测已经证明出口黑了几秒，
+        # 再按「完整预算（retries+1 次 × 满超时）」重试，实测能把一次详情
+        # 请求拖到 30s（omofuna 代理黑洞 + 直连 RST）。真需要代理的慢站，
+        # 单次 12s 仍能拿到，拿不到就是真不通。
         try:
-            result = once(proxy)
+            result = once(
+                proxy, 0, min(self.defaults.timeout, _PROXY_RETRY_TIMEOUT)
+            )
         except Exception:  # noqa: BLE001 —— 代理也救不回来，抛直连错误
             raise direct_exc from proxy_exc
         # 直连不通、代理能通 → 记住该主机的出口偏好，下次不再白试直连

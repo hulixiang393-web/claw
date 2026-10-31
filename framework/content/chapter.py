@@ -651,11 +651,18 @@ class ChapterMixin:
             if text and use_cache:
                 self._cache_set(key, text, ttl=7 * 86400)
 
+    # 正文抽取版本：改变文本提取语义时自增，旧缓存（7 天）自动失效。
+    # 2 = keep_breaks（容器正文按 <br>/块边界还原换行，修「整章粘成一段」）。
+    _CHAPTER_TEXT_VERSION = 2
+
     def _chapter_cache_key(self, source: SourceConfig, url: str) -> str:
         """Build a versioned chapter cache key when a source changes decoding."""
         version = (source.raw.get("chapter_cache_version") if source else None) or ""
         marker = f":v{version}" if version else ""
-        return f"body:{source.source_id}{marker}:{self._abs_url(source, url)}"
+        return (
+            f"body:{source.source_id}{marker}"
+            f":t{self._CHAPTER_TEXT_VERSION}:{self._abs_url(source, url)}"
+        )
 
     @staticmethod
     def _image_selector_nodes(parser, doc, selector):
@@ -815,7 +822,9 @@ class ChapterMixin:
         if not selector:
             raise ContentMissingError("源未配置正文选择器", source_id=source.source_id)
 
-        paragraphs = self._parser.extract(doc, selector)
+        paragraphs = self._parser.extract(
+            doc, self._with_keep_breaks(selector)
+        )
         if not paragraphs:
             # 正文选择器未命中：可能是混淆/加密正文，尝试解密
             text = self._decrypt_chapter(source, html, url)
@@ -932,6 +941,26 @@ class ChapterMixin:
                 f"渲染页面为空（{url}）", source_id=source.source_id
             )
         return rendered
+
+    @staticmethod
+    def _with_keep_breaks(selector) -> dict | None:
+        """正文选择器加 keep_breaks：把容器里的 <br>/块边界还原成换行。
+
+        正文选择器多半直接指向容器（`#content`、`.entry-content`），站点用
+        `<br>` 分段；用 `text_content()` 提取会把整章粘成一行，前端就成了
+        「整章只有一段」。显式关闭（keep_breaks: false）时保持原行为。
+        """
+        if not isinstance(selector, dict):
+            return selector
+        if "fallback" in selector:
+            merged = dict(selector)
+            merged["fallback"] = [
+                ChapterMixin._with_keep_breaks(s) for s in selector["fallback"]
+            ]
+            return merged
+        merged = dict(selector)
+        merged.setdefault("keep_breaks", True)
+        return merged
 
     @staticmethod
     def _normalize_para_indent(text: str) -> str:

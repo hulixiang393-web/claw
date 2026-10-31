@@ -338,6 +338,15 @@ class ContentBase:
             timeout = min(timeout, remaining)
             retries = 0
             interval_ms = 0
+        if source.transports().get("prefer_proxy"):
+            # 源声明「该站直连硬失败、必须走代理」→ 先把主机标记成代理优先，
+            # 省掉一次 8s 探测 + 一次注定失败的直连（omofuna 详情页实测 21s）。
+            try:
+                from framework.http import note_proxy_preferred
+
+                note_proxy_preferred(abs_url)
+            except Exception:  # noqa: BLE001 —— 只是优化，失败照常请求
+                pass
         value = client.get_text(
             abs_url,
             headers=self._headers(source),

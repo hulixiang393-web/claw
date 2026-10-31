@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from html import escape
 import hashlib
+import logging
 import re
 import time
 import webbrowser
@@ -43,6 +44,8 @@ from gui.pages.reader.auto_scroll import AutoScrollMixin
 
 
 from gui.pages.reader.novel_tasks import _LoadChapterSignals, _LoadChapterTask
+
+log = logging.getLogger(__name__)
 
 
 class NovelView(AutoScrollMixin, QWidget):
@@ -1393,44 +1396,94 @@ class NovelView(AutoScrollMixin, QWidget):
     def _rich_text_enabled(self) -> bool:
         return self._line_spacing != 1.8 or not self._paragraph_indent
 
-    def _qk17_reader_html(self, text: str, has_title: bool = True) -> str:
-        """Render 17K's single-newline paragraphs as real block elements."""
-        lines = self._format_reader_text(text, has_title=has_title).split("\n")
-        blocks = []
-        for index, line in enumerate(lines):
-            if not line.strip():
-                continue
-            content = escape(line)
-            if has_title and index == 0:
-                blocks.append(f'<div class="chapter-marker">{content}</div>')
-            else:
-                blocks.append(f'<p style="margin:0 0 0.8em 0;">{content}</p>')
-        return '<div class="qk17-reader-body">' + "".join(blocks) + '</div>'
+    # 正文行距兜底：用户没调行距（默认 1.8）时正文块用 2.0，中文长段落最省眼。
+    READER_BODY_LINE_HEIGHT = 2.0
 
-    def _set_reader_text(self, widget, text: str, has_title: bool = True) -> None:
-        """Render plain text directly unless a layout option needs rich text."""
-        if getattr(self._source, "source_id", "") == "qk17":
-            widget.setText(self._qk17_reader_html(text, has_title=has_title))
-            return
-        if getattr(self._source, "source_id", "") == "timotxt":
-            widget.setText(self._timotxt_reader_html(text, has_title=has_title))
-            return
-        if getattr(self._source, "source_id", "") == "linovelib":
-            widget.setText(self._linovelib_reader_html(text, has_title=has_title))
-            return
-        text = self._format_reader_text(text, has_title=has_title)
-        if not self._rich_text_enabled():
-            # 调字号/背景只改样式时，避免再次复制整章正文。
-            if widget.text() != text:
-                widget.setText(text)
-            return
-        body = escape(text).replace("\n", "<br/>")
+    def _reader_line_height(self) -> float:
+        """当前正文行距（默认档位映射到更舒展的 2.0）。"""
+        try:
+            spacing = float(self._line_spacing)
+        except (TypeError, ValueError):
+            spacing = 0.0
+        if not spacing or abs(spacing - 1.8) < 1e-6:
+            return self.READER_BODY_LINE_HEIGHT
+        return round(spacing, 2)
+
+    def _reader_body_html(
+        self, text: str, has_title: bool = True, noise_re=None,
+        center_tokens=(),
+    ) -> str:
+        """通用正文排版（所有纯文本小说源共用）。
+
+        这些源的正文都是「一段一行」的纯文本：整块丢进 QTextEdit 会挤成一片
+        文字墙——段间没有留白、行距偏紧、章节标题混在正文里。这里统一按段落
+        生成 <p> 块：段间距 0.9em、行距跟随阅读设置（默认 2.0）、首行缩进两字、
+        两端对齐；章节标题单独居中并拉开字距。字号/字体/颜色仍跟随阅读设置。
+
+        noise_re：可选行过滤正则（站点广告/求票/域名提示行）。
+        center_tokens：可选「居中短行」集合（如插图占位），命中则居中显示。
+        """
+        lines = self._format_reader_text(text, has_title=has_title).splitlines()
         size = self._clamp_font(self._base_font + self._font_delta)
         family = escape(self.READER_FONT_FAMILIES[self._reader_font_family][1], quote=True)
-        widget.setText(
-            f'<div style="font-family:{family}; font-size:{size}px; line-height:{self._line_spacing}; '
-            f'white-space:pre-wrap;">{body}</div>'
+        line_height = self._reader_line_height()
+        color = escape(self._reading_fg or "palette(text)", quote=True)
+        blocks = []
+        title_pending = bool(has_title)
+        for raw in lines:
+            line = str(raw).strip()
+            if not line:
+                continue
+            content = escape(line)
+            if title_pending:
+                title_pending = False
+                blocks.append(
+                    '<div class="chapter-marker" style="text-align:center; '
+                    'font-size:0.86em; letter-spacing:0.18em; color:palette(mid);'
+                    f' margin:0 0 1.2em 0;">{content}</div>'
+                )
+                continue
+            if noise_re is not None and noise_re.search(line):
+                continue
+            if center_tokens and line.strip("（）()【】[] ") in center_tokens:
+                blocks.append(
+                    '<div style="text-align:center; font-size:0.86em; '
+                    f'color:palette(mid); margin:0.5em 0 1em 0;">{content}</div>'
+                )
+                continue
+            # 缩进用「两个全角空格」materialize：Qt 的富文本导入不认 CSS
+            # text-indent（实测 QTextBlockFormat.textIndent() 恒为 0），
+            # 而 U+3000 在 white-space:pre-wrap 下稳定保留。
+            indented = str(raw).rstrip()
+            if self._paragraph_indent:
+                indented = "　　" + indented.lstrip(" \t　")
+            blocks.append(
+                '<p style="margin:0 0 0.9em 0; line-height:'
+                f'{line_height}; text-align:justify;">{escape(indented)}</p>'
+            )
+        return (
+            f'<div style="font-family:{family}; font-size:{size}px; '
+            f'line-height:{line_height}; color:{color}; white-space:pre-wrap;">'
+            + "".join(blocks)
+            + "</div>"
         )
+
+    def _qk17_reader_html(self, text: str, has_title: bool = True) -> str:
+        """17K：一段一行 → 段落块（沿用通用排版）。"""
+        return self._reader_body_html(text, has_title=has_title)
+
+    def _set_reader_text(self, widget, text: str, has_title: bool = True) -> None:
+        """正文一律按段落渲染（通用排版），源内差异只体现在过滤/居中规则上。"""
+        source_id = getattr(self._source, "source_id", "")
+        if source_id == "timotxt":
+            html = self._timotxt_reader_html(text, has_title=has_title)
+        elif source_id == "linovelib":
+            html = self._linovelib_reader_html(text, has_title=has_title)
+        else:
+            html = self._reader_body_html(text, has_title=has_title)
+        # 同内容重复渲染（调字号/切模式）时不必再写一遍文档
+        if widget.text() != html:
+            widget.setText(html)
 
     def _format_reader_text(self, text: str, has_title: bool = True) -> str:
         """Normalize fetched leading whitespace and apply one two-character indent."""
@@ -1448,9 +1501,67 @@ class NovelView(AutoScrollMixin, QWidget):
             out.append(stripped)
         return "\n".join(out)
 
+    # 段首标记：两个全角空格（站点/上游规范化后的段落缩进）
+    _MERGED_PARA_SPLIT_RE = re.compile(r"(?<=[。！？!?…”」』）)】])\s*(?=　　)")
+    _BR_TAG_RE = re.compile(r"(?i)<\s*br\s*/?\s*>|</\s*p\s*>|</\s*div\s*>")
+    # 句末标点：没有任何段标记时按句子聚合分段
+    _SENTENCE_RE = re.compile(r"[^。！？!?…]*[。！？!?…”」』]+|[^。！？!?…]+$")
+    # 无标记长文兜底分段：单段目标字数
+    _PACK_MIN_CHARS = 110
+    _PACK_MAX_CHARS = 190
+
+    @classmethod
+    def _pack_sentences(cls, line: str) -> str:
+        """把整段「文字墙」按句子重新聚成段落（兜底，仅无段标记时使用）。"""
+        sentences = [s for s in cls._SENTENCE_RE.findall(line) if s.strip()]
+        if not sentences:
+            return line
+        out, buf = [], ""
+        for sentence in sentences:
+            if buf and len(buf) + len(sentence) > cls._PACK_MAX_CHARS:
+                out.append(buf.strip())
+                buf = sentence
+                continue
+            buf += sentence
+            if len(buf) >= cls._PACK_MIN_CHARS:
+                out.append(buf.strip())
+                buf = ""
+        if buf.strip():
+            out.append(buf.strip())
+        return "\n".join(out) if len(out) > 1 else line
+
+    @classmethod
+    def _split_merged_paragraphs(cls, text: str) -> str:
+        """把「整章挤成一行」的正文重新切回段落（兜底）。
+
+        正文选择器指向容器时，上游可能只给出一行（站点用 `<br>` 分段、
+        `text_content()` 又把 `<br>` 吃掉），前端就会表现为「整章只有一段」。
+        这里按 `<br>`/`</p>` 残留、段首「　　两个全角空格」找回段边界；两者
+        都没有时按句末标点聚合成长度适中的段落。多行文本原样返回。
+        """
+        value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not value.strip():
+            return value
+        if sum(1 for line in value.split("\n") if line.strip()) > 1:
+            return value
+        # 先按显式标记（<br>/</p>、段首两个全角空格）找段边界：有标记就按标记切，
+        # 与文本长短无关（短章节、对话体正文同样会被粘成一行）。
+        with_breaks = cls._BR_TAG_RE.sub("\n", value)
+        if sum(1 for line in with_breaks.split("\n") if line.strip()) > 1:
+            return with_breaks
+        parts = cls._MERGED_PARA_SPLIT_RE.split(with_breaks)
+        if len(parts) > 1:
+            merged = "\n".join(part.strip() for part in parts if part.strip())
+            log.info("[reader] 正文为单行，按段首全角缩进拆成 %d 段", len(parts))
+            return merged
+        # 完全没有段标记：只有长文才值得按句子聚合（短文保持原样）
+        if len(with_breaks) < 120:
+            return with_breaks
+        return cls._pack_sentences(with_breaks)
+
     def _prepare_reader_body(self, chapter, text: str) -> str:
         """Normalize TimoTXT's one-line-per-paragraph response for display."""
-        converted = self._reader_convert_text(text)
+        converted = self._split_merged_paragraphs(self._reader_convert_text(text))
         if getattr(self._source, "source_id", "") == "linovelib":
             # 目录页/正文页首段常重复一次章节名（重排后会出现「【第1章】第1章 ...」
             # 的双标题），这里把与章节名相同的首行去掉。
@@ -1483,29 +1594,8 @@ class NovelView(AutoScrollMixin, QWidget):
         return "\n".join(lines)
 
     def _timotxt_reader_html(self, text: str, has_title: bool = True) -> str:
-        """Render TimoTXT paragraphs with deliberate spacing and line height."""
-        lines = self._format_reader_text(text, has_title=has_title).splitlines()
-        blocks = []
-        size = self._clamp_font(self._base_font + self._font_delta)
-        family = escape(self.READER_FONT_FAMILIES[self._reader_font_family][1], quote=True)
-        line_height = self._line_spacing if self._line_spacing != 1.8 else 2.0
-        for index, line in enumerate(lines):
-            if not line.strip():
-                continue
-            content = escape(line)
-            if has_title and index == 0:
-                blocks.append(f'<div class="chapter-marker">{content}</div>')
-            else:
-                blocks.append(
-                    f'<p style="margin:0 0 0.95em 0; line-height:{line_height};">'
-                    f"{content}</p>"
-                )
-        return (
-            f'<div style="font-family:{family}; font-size:{size}px; '
-            f'line-height:{line_height}; white-space:pre-wrap;">'
-            + "".join(blocks)
-            + "</div>"
-        )
+        """TimoTXT：段落块 + 稍大的段间距（沿用通用排版）。"""
+        return self._reader_body_html(text, has_title=has_title)
 
     # 站点广告/求票/域名提示行（哔哩轻小说正文里混排的噪声）
     _LINOVELIB_NOISE_RE = re.compile(
@@ -1514,48 +1604,16 @@ class NovelView(AutoScrollMixin, QWidget):
     )
 
     def _linovelib_reader_html(self, text: str, has_title: bool = True) -> str:
-        """哔哩轻小说正文重排：段落化 + 衬线字体 + 居中章节标记。
+        """哔哩轻小说正文重排：通用段落排版 + 站点噪声过滤 + 插图居中。
 
-        该站正文是「一段一行」的纯文本，原样丢进 QTextEdit 会挤成一大块、
-        段间没有呼吸感，首行缩进也跟其它源不一致，读起来很难看。这里按段落
-        生成 <p>（固定段间距、行距略放大），章节标记单独居中、字距拉开，
-        并过滤站点混排的广告/求票/域名行。字号与行距仍跟随用户设置。
+        该站正文除段落外还混排广告/求票/域名行，插图位置只有「插图」占位文字，
+        这两类交给通用排版的可选参数处理，段落/行距/缩进与其它源保持一致。
         """
-        lines = self._format_reader_text(text, has_title=has_title).splitlines()
-        size = self._clamp_font(self._base_font + self._font_delta)
-        family = escape(self.READER_FONT_FAMILIES[self._reader_font_family][1], quote=True)
-        line_height = self._line_spacing if self._line_spacing != 1.8 else 2.05
-        color = escape(self._reading_fg or "palette(text)", quote=True)
-        blocks = []
-        for index, line in enumerate(lines):
-            raw = line.strip()
-            if not raw:
-                continue
-            content = escape(raw)
-            if has_title and index == 0:
-                blocks.append(
-                    '<div style="text-align:center; font-size:0.82em; '
-                    'letter-spacing:0.22em; color:palette(mid); '
-                    f'margin:0 0 1.15em 0;">{content}</div>'
-                )
-            elif raw.strip("（）()【】[] ") in ("插图", "插圖", "illustration"):
-                blocks.append(
-                    '<div style="text-align:center; font-size:0.85em; '
-                    f'color:palette(mid); margin:0.6em 0 1em 0;">{content}</div>'
-                )
-            elif self._LINOVELIB_NOISE_RE.search(raw):
-                continue
-            else:
-                blocks.append(
-                    '<p style="margin:0 0 0.88em 0; text-indent:0; '
-                    f'line-height:{line_height}; text-align:justify;">{content}</p>'
-                )
-        return (
-            f'<div style="font-family:{family}; font-size:{size}px; '
-            f'line-height:{line_height}; color:{color}; '
-            f'padding:0 0.4em; white-space:pre-wrap;">'
-            + "".join(blocks)
-            + "</div>"
+        return self._reader_body_html(
+            text,
+            has_title=has_title,
+            noise_re=self._LINOVELIB_NOISE_RE,
+            center_tokens=("插图", "插圖", "illustration"),
         )
 
     def _apply_font(self) -> None:
@@ -1570,10 +1628,8 @@ class NovelView(AutoScrollMixin, QWidget):
         if self._mode == "pager":
             self._pager_show_page(self._current_page)
         if self._displayed_plain_text and self.text.isVisible():
-            if self._rich_text_enabled() or getattr(
-                self._source, "source_id", ""
-            ) == "linovelib":
-                self._set_reader_text(self.text, self._displayed_plain_text)
+            # 字号/行距/配色都写在正文 HTML 里，改设置时按新样式重排一遍
+            self._set_reader_text(self.text, self._displayed_plain_text)
 
     def set_reading_style(self, bg: str = "", font_size: int = 0, fg: str = "") -> None:
         """设置阅读区独立背景色/字号/前景色（ui-reader #12）。

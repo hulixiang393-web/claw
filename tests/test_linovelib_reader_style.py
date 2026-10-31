@@ -47,9 +47,13 @@ def test_linovelib_strips_duplicate_chapter_title(_qapp):
     view.deleteLater()
 
 
-def test_other_sources_keep_default_plain_render(_qapp):
+def test_other_sources_use_generic_layout_without_site_filters(_qapp):
+    """通用排版对所有源生效；站点专属规则（噪声过滤）不外溢。"""
     view = _view(_Other())
     view.text.setText("")
-    view._set_reader_text(view.text, "第一段\n第二段", has_title=False)
-    assert "<p " not in view.text.text(), "其它源不应被哔哩轻小说的重排波及"
+    view._set_reader_text(view.text, "第一段\n请记住本站域名 example\n第二段", has_title=False)
+    html = view.text.text()
+    assert html.count("<p ") == 3, "通用源也按段落排版"
+    # 哔哩轻小说的噪声过滤不应波及其它源
+    assert "请记住本站域名 example" in html
     view.deleteLater()

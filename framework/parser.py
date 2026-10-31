@@ -95,6 +95,49 @@ class Parser:
             return []
         return nodes
 
+    # 文本提取需要补换行的块级标签（keep_breaks）
+    _BLOCK_TAGS = frozenset({
+        "p", "div", "br", "li", "ul", "ol", "dl", "dt", "dd", "tr", "td",
+        "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "blockquote",
+        "pre", "table", "hr",
+    })
+
+    @classmethod
+    def _text_with_breaks(cls, node) -> str:
+        """取节点文本，但把 <br>/块级边界还原为换行，并压缩多余空行。
+
+        `text_content()` 会丢掉 `<br>` 与块边界：正文选择器指向容器时（站点
+        用 `<br>` 分段），整章会被粘成一行——前端表现为"整章只有一段"。
+        """
+        if not _LXML or not hasattr(node, "iter"):
+            return node.text_content() if hasattr(node, "text_content") else str(node)
+        parts: List[str] = []
+
+        def walk(el) -> None:
+            if el.text:
+                parts.append(el.text)
+            for child in el:
+                tag = child.tag.lower() if isinstance(child.tag, str) else ""
+                if tag == "br":
+                    parts.append("\n")
+                elif tag in cls._BLOCK_TAGS:
+                    parts.append("\n")
+                    walk(child)
+                    parts.append("\n")
+                else:
+                    walk(child)
+                if child.tail:
+                    parts.append(child.tail)
+
+        walk(node)
+        lines = [line.strip(" \t\u00a0\u3000") for line in "".join(parts).split("\n")]
+        out: List[str] = []
+        for line in lines:
+            if not line and out and not out[-1]:
+                continue  # 连续空行压成一行
+            out.append(line)
+        return "\n".join(out).strip("\n")
+
     # ------------------------------------------------------------------ #
     def extract(
         self, doc: Any, sel: dict | None, base_url: str = ""
@@ -116,6 +159,10 @@ class Parser:
         attr = sel.get("attr")
         regex = sel.get("regex")
         b64 = sel.get("b64decode")
+        # keep_breaks：文本提取时把 <br>/块级元素边界还原成换行。
+        # 正文选择器常直接指向容器（如 #content），容器里的段落全靠 <br> 分隔；
+        # 用 text_content() 会把整章粘成一行（读起来"整章只有一段"）。
+        keep_breaks = bool(sel.get("keep_breaks"))
         nodes = self._query(doc, css, xpath)
         results: List[str] = []
         for node in nodes:
@@ -140,7 +187,11 @@ class Parser:
                 if v:
                     results.append(v)
             else:
-                txt = node.text_content().strip()
+                txt = (
+                    self._text_with_breaks(node)
+                    if keep_breaks
+                    else node.text_content()
+                ).strip()
                 if txt:
                     results.append(txt)
         if regex or b64:

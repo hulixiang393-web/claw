@@ -1393,6 +1393,28 @@ class VideoMixin:
             )
         return final
 
+    def _resolve_external_stream(self, source: SourceConfig, play_cfg: dict,
+                                 player: dict, abs_ep: str) -> str:
+        """第三方播放器线路 → 真实直链（play_url.external_player 配置）。
+
+        未配置、from 不匹配、缺 Node、解密失败都返回空串：调用方按原逻辑
+        继续（保留不透明 id，让换线/渲染兜底），不影响其它线路。
+        """
+        external = play_cfg.get("external_player") or {}
+        if not external:
+            return ""
+        try:
+            from framework.external_player import resolve_external_player
+
+            return resolve_external_player(self._http, external, player, abs_ep) or ""
+        except StreamCancelledError:
+            raise
+        except TimeoutError:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 解析失败只降级，不打断取流
+            log.info("[%s] 第三方播放器解析失败：%s", source.source_id, str(exc)[:140])
+            return ""
+
     def _extract_play_url_candidates(
         self, html: str, source: SourceConfig, switch_cfg: dict,
         play_cfg: dict, abs_ep: str, episode_url: str
@@ -1466,6 +1488,14 @@ class VideoMixin:
                 raw_url = url_match.group(1) if url_match else ""
             if raw_url:
                 raw_url = str(raw_url).replace("\\\\/", "/").replace("\\/", "/")
+                # 第三方播放器线路（omofuna 精品：player_aaaa 只给 32 位不透明 id，
+                # 真实直链在播放器页面里由 playData() 解密）→ 直接解出直链，
+                # 免得把 id 当成播放地址交给播放器（那样只会黑屏/被换线）。
+                resolved = self._resolve_external_stream(
+                    source, play_cfg, player, abs_ep
+                )
+                if resolved:
+                    add(resolved)
                 ps = str(player.get("ps", "0") or "0") if player else "0"
                 parse_url = str(
                     (player.get("parse") if player else "")
@@ -1820,6 +1850,22 @@ class VideoMixin:
                         self._safe_exception_summary(exc),
                     )
             if not candidates:
+                # 先走零请求的坐标替换（omofuna 这类 URL 自带线路坐标的站），
+                # 拿不到再退回「逐线路抓详情页」的老路（实测 11.7s）。
+                try:
+                    candidates = self._call_with_context(
+                        self._switch_candidate_episode_urls_fast,
+                        (source, current), context, deadline
+                    )
+                except StreamCancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 —— 快路径只是优化
+                    candidates = []
+            if candidates:
+                log.info(
+                    "[%s] 阶段=换线，快路径候选=%d", source.source_id, len(candidates)
+                )
+            if not candidates:
                 try:
                     if deadline is not None and time.monotonic() >= deadline:
                         break
@@ -2007,6 +2053,65 @@ class VideoMixin:
         except Exception:  # noqa: BLE001
             self._check_stream_context(context, deadline)
             return False
+
+    def _switch_candidate_episode_urls_fast(
+        self, source: SourceConfig, episode_url: str
+    ) -> list:
+        """零请求算出同集其它线路 URL：线路 tab 来自已缓存的播放页。
+
+        omofuna 的分集 URL 自带线路坐标（`/play/<sid>/<集>.html?sid=<sid>`），
+        换线路只是把这两处 sid 换掉。线路集合直接读**当前播放页**的线路 tab
+        （页面早已抓过、在短 TTL 缓存里），不必为每条线路各抓一次详情页——
+        那正是「换线要先等十几秒」的来源（实测 11.7s，且站点一抽风就超时）。
+        """
+        switch = self._get_source_switch_cfg(source)
+        if not switch:
+            return []
+        abs_ep = self._abs_url(source, episode_url)
+        html = ""
+        page_cache = getattr(self, "_play_page_cache", None) or {}
+        hit = page_cache.get((source.source_id, abs_ep))
+        if hit:
+            html = hit[1] or ""
+        if not html:
+            html = (getattr(self, "_video_html_cache", None) or {}).get(
+                (source.source_id, abs_ep), ""
+            ) or ""
+        if not html:
+            return []
+        try:
+            sids = [
+                str(item.get("sid") or "")
+                for item in self._parse_source_list(source, html)
+            ]
+        except Exception:  # noqa: BLE001 —— 解析失败就走老路
+            return []
+        if not sids:
+            return []
+        m_cur = _re.search(r"[?&]sid=(\d+)", abs_ep)
+        cur_sid = m_cur.group(1) if m_cur else str(switch.get("default_sid") or "1")
+        out: list = []
+        for sid in sids:
+            if not sid or sid == cur_sid:
+                continue
+            cand = self._swap_line_sid(abs_ep, cur_sid, sid)
+            if cand and cand not in out:
+                out.append(cand)
+        return out
+
+    @staticmethod
+    def _swap_line_sid(url: str, cur_sid: str, sid: str) -> str:
+        """把分集 URL 的线路坐标从 cur_sid 换成 sid（路径段 + sid 参数）。"""
+        if not url or not cur_sid or not sid:
+            return ""
+        text = _re.sub(
+            r"(/play/)" + _re.escape(cur_sid) + r"(/)", r"\g<1>" + sid + r"\g<2>",
+            url, count=1,
+        )
+        text = _re.sub(
+            r"([?&]sid=)" + _re.escape(cur_sid) + r"(?=&|\b|$)", r"\g<1>" + sid, text
+        )
+        return text if text != url else ""
 
     def _switch_candidate_episode_urls(
         self, source: SourceConfig, episode_url: str, deadline=None, context=None
@@ -2465,9 +2570,9 @@ class VideoMixin:
         try:
             headers = dict(self._headers(source))
             headers.setdefault("Referer", getattr(detail, "url", "") or ep_url)
-            # 线路菜单是「顺手补」，不值得拖慢详情：单次尝试 + 最长 10s，
-            # 站点抽风时立刻放弃，交给播放期间的自动轮换。
-            timeout = min(self._timeout(source), 10.0)
+            # 线路菜单是「顺手补」，不值得拖慢详情：单次尝试 + 最长 6s（播放页
+            # 正常 TTFB 1~1.3s），站点抽风时立刻放弃，交给播放期间的自动轮换。
+            timeout = min(self._timeout(source), 6.0)
             if context is not None:
                 timeout = min(timeout, context.remaining())
             html = self._http.get_text(

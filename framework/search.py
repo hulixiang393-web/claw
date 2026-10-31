@@ -1533,6 +1533,11 @@ class Search:
         self, source: SourceConfig, url: str, http: Optional[HttpClient] = None
     ) -> str:
         http = http or self._http
+        if source.transports().get("prefer_proxy"):
+            # 与详情/发现一致：直连硬失败的源直接走代理，别先白试一次直连
+            from framework.http import note_proxy_preferred
+
+            note_proxy_preferred(url)
         return http.get_text(
             url,
             headers=source.request_headers(),

@@ -247,6 +247,12 @@ class Discovery:
         abs_url = self._abs_url(source, url)
         # 中文参数等需 URL 编码（保留结构字符）
         abs_url = quote(abs_url, safe=":/?=&%#")
+        if source.transports().get("prefer_proxy"):
+            # 源声明直连硬失败（TLS 被拒）→ 直接走代理，省掉一次探测 +
+            # 一次注定失败的直连；发现页首屏不再白等十几秒。
+            from framework.http import note_proxy_preferred
+
+            note_proxy_preferred(abs_url)
         return self._http.get_text(
             abs_url,
             headers=self._headers(source),
