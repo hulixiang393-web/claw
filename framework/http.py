@@ -241,16 +241,23 @@ _SYSTEM_PROXY_LOCK = threading.Lock()
 # 读超时（实测 44s）→ 界面整片空白、播放器也拿不到流。所以这里记下"走系统
 # 代理失败过"的主机：同一主机后续直接绕过代理；不同主机连续失败到阈值，就把
 # 系统代理整体停用一段时间（到期自动重试，VPN 恢复后自己会回来）。
-_PROXY_FAIL_TTL = 300.0
-_PROXY_FAIL_HOSTS = 2
+_PROXY_FAIL_TTL = 180.0
+_PROXY_FAIL_HOSTS = 3
 _PROXY_FAIL: dict = {"hosts": set(), "until": 0.0}
 # 「只有代理能通」的主机记忆（与 _PROXY_FAIL 互为反面）：
 # _PROXY_FAIL 记"代理不行、直连行"，_PROXY_OK 记"直连不行、代理行"。
 # 两个方向的出口偏好都带 TTL，网络变化后自动重新决策。
 _PROXY_OK_TTL = 600.0
 _PROXY_OK: dict = {}
-# 系统代理首次尝试的最长等待：僵尸代理要尽快暴露，别把整页请求耗满 retries×timeout
-_PROXY_PROBE_TIMEOUT = 5.0
+# 代理最近一次成功转发的时刻。整体停用只在"代理确实一个都送不出去"时成立：
+# 只要近期有任一请求经代理成功，就不许因为几台主机"直连更快"把整个代理关掉
+# （否则浏览一批国内站就会把需要代理的站一起停用 3 分钟）。
+_PROXY_LAST_OK = {"t": 0.0}
+_PROXY_LIVE_WINDOW = 120.0
+# 系统代理首次尝试的最长等待：僵尸代理要尽快暴露，别把整页请求耗满 retries×timeout。
+# 取 8s：本机加速器实测正常转发常在 4~6s（pornhub/xvideos 首包 6.3s），
+# 5s 会把"慢但可用"的代理误判成僵尸，进而错误地把主机记为"必须直连"。
+_PROXY_PROBE_TIMEOUT = 8.0
 
 
 def _host_of_url(url: str) -> str:
@@ -271,13 +278,54 @@ def _proxy_failed_for(host: str) -> bool:
         return host in _PROXY_FAIL["hosts"]
 
 
+def _is_http_status_error(exc) -> bool:
+    """异常是否为"服务端已明确答复"的 HTTP 状态错误（4xx/5xx）。
+
+    这类失败与出口（代理/直连）无关：代理转发回来的 404 换个出口仍是 404。
+    用它把"代理正常但页面不存在"从僵尸代理证据里剔除，否则单页 404 就会把
+    整个主机的请求强制改直连（需要代理的站随即打不开）。
+    """
+    seen = 0
+    cur = exc
+    while cur is not None and seen < 5:
+        resp = getattr(cur, "response", None)
+        code = getattr(resp, "status_code", None)
+        if code is None:
+            code = getattr(cur, "code", None)
+        if isinstance(code, int) and code >= 400:
+            return True
+        if re.search(r"\b(?:4\d{2}|5\d{2})\b[^\n]{0,24}Error", f"{type(cur).__name__}: {cur}"):
+            return True
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    return False
+
+
+def _proxy_recently_ok() -> bool:
+    """近期是否有请求经系统代理成功转发（有则不允许整体停用代理）。"""
+    with _SYSTEM_PROXY_LOCK:
+        return (time.monotonic() - _PROXY_LAST_OK["t"]) < _PROXY_LIVE_WINDOW
+
+
+def _mark_proxy_live() -> None:
+    """记一次代理成功转发（用于阻止"浏览国内站就把代理整体关掉"的级联停用）。"""
+    with _SYSTEM_PROXY_LOCK:
+        _PROXY_LAST_OK["t"] = time.monotonic()
+
+
 def _note_system_proxy_failure(host: str) -> None:
-    """记录一次系统代理失败；不同主机累计到阈值 → 整体停用一段时间。"""
+    """记录一次系统代理失败；不同主机累计到阈值 → 整体停用一段时间。
+
+    前提：近期没有任何请求经代理成功过。若代理确实在转发（只是个别主机直连更
+    快/个别请求超时），整体停用会把大量"只有代理能通"的站一起打死——这正是
+    「所有需要代理的网站都加载不出来」的级联成因，故只做按主机绕过。
+    """
     now = time.monotonic()
     with _SYSTEM_PROXY_LOCK:
         if host:
             _PROXY_FAIL["hosts"].add(host)
-        if len(_PROXY_FAIL["hosts"]) >= _PROXY_FAIL_HOSTS:
+        live = (now - _PROXY_LAST_OK["t"]) < _PROXY_LIVE_WINDOW
+        if not live and len(_PROXY_FAIL["hosts"]) >= _PROXY_FAIL_HOSTS:
             _PROXY_FAIL["until"] = now + _PROXY_FAIL_TTL
         # 立刻让下一次探活重新决策（可能已整体停用）
         _SYSTEM_PROXY_CACHE["t"] = 0.0
@@ -290,6 +338,7 @@ def _reset_proxy_failures() -> None:
         _PROXY_FAIL["hosts"].clear()
         _PROXY_FAIL["until"] = 0.0
         _PROXY_OK.clear()
+        _PROXY_LAST_OK["t"] = 0.0
         _SYSTEM_PROXY_CACHE["t"] = 0.0
         _SYSTEM_PROXY_CACHE["url"] = None
 
@@ -300,12 +349,13 @@ def _note_proxy_success(host: str) -> None:
     实测（同一台机器、同一时刻、各 3 轮）：favcomic / xvideos 直连
     18s 连接被重置，走代理 1.6~2.3s 正常；反之 dm5 / omofuna 直连 0.2~0.9s。
     没有一个出口对所有站都对，所以按主机记「哪个出口成功过」：代理偏好成立时
-    直接给足预算走代理，不再先白等一次 5s 探测 + 一次直连失败。
+    直接给足预算走代理，不再先白等一次探测 + 一次必然失败的直连。
     """
     if not host:
         return
     with _SYSTEM_PROXY_LOCK:
         _PROXY_OK[host] = time.monotonic() + _PROXY_OK_TTL
+        _PROXY_LAST_OK["t"] = time.monotonic()
 
 
 def _proxy_preferred(host: str) -> bool:
@@ -469,7 +519,15 @@ ANTI_SCRAPE_KEYWORDS = (
     "you have been blocked", "access denied", "access is denied",
     "anti-bot", "riskcontrol", "waf",
     "acw_sc__v2", "aliyunwaf", "var arg1=",
+    # Cloudflare 挑战/拦截页（HTTP 200 也会出现）：不识别就会被当正文解析，
+    # 最终报成「未解析到正文内容」，真实原因（被 CF 拦）完全看不出。
+    "just a moment", "attention required", "checking your browser",
+    "cf-browser-verification", "cf_chl_opt", "cf-chl-",
+    "enable javascript and cookies to continue",
     "验证码", "人机验证", "滑动验证", "拖动验证",
+    # 站点限流/权限页（哔哩轻小说连发几次后返回 200 + 这段文案）：
+    # 不识别就会被解析成「空正文」，用户只看到「未解析到正文内容」。
+    "沒有可閱讀的章節", "没有可阅读的章节",
     "访问过于频繁", "访问频率过高", "请求过于频繁",
     "频繁操作", "搜索时间间隔",
     "被封", "封禁", "已封", "被禁止访问", "ip被限制", "ip 被限制", "访问被拒绝",
@@ -521,14 +579,34 @@ def _solve_acw(challenge_html: str) -> str:
         return ""
 
 
+def _anti_scrape_hit(text: str) -> str:
+    """返回命中的反爬特征词（未命中为空串）。
+
+    命中词直接带进异常信息：用户/日志能看到是「验证码」「沒有可閱讀的章節」
+    还是「访问过于频繁」，不用再去猜为什么正文是空的。
+    """
+    snippet = (text or "")[:6000]
+    snippet = re.sub(r"<!--.*?-->", " ", snippet, flags=re.S)
+    snippet = re.sub(r"<[^>]*>", " ", snippet)
+    snippet = snippet.lower()
+    for keyword in ANTI_SCRAPE_KEYWORDS:
+        if keyword in snippet:
+            return keyword
+    return ""
+
+
 def _is_anti_scrape_text(text: str) -> bool:
-    """按特征词判定反爬：验证码/封禁提示等。只扫前 2000 字符降低误报与开销。
+    """按特征词判定反爬：验证码/封禁提示等。只扫前 6000 字符降低误报与开销。
 
     先剔除 HTML 注释与标签：关键词在标签属性里会误报（如
     comment-captcha-dialog.css 的 'captcha' 是正常资源文件名，非反爬）。
     真实反爬页关键词在可见文本/脚本正文，剥标签后仍命中。
+
+    扫描窗口不能太小：小说站的「沒有可閱讀的章節」提示藏在很长的
+    meta description 与导航之后（实测 >2000 字符），窗口 2000 会漏判，
+    最终报成「未解析到正文内容」，用户看不出真实原因。
     """
-    snippet = (text or "")[:2000]
+    snippet = (text or "")[:6000]
     snippet = re.sub(r"<!--.*?-->", " ", snippet, flags=re.S)
     snippet = re.sub(r"<[^>]*>", " ", snippet)
     snippet = snippet.lower()
@@ -844,11 +922,19 @@ class HttpClient:
 
         proxy_exc = None
         try:
-            return once(proxy, 0, min(self.defaults.timeout, _PROXY_PROBE_TIMEOUT))
+            result = once(proxy, 0, min(self.defaults.timeout, _PROXY_PROBE_TIMEOUT))
         except AntiScrapeError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 探测失败，改直连
             proxy_exc = exc
+        else:
+            # 代理成功转发 → 记一笔"代理是活的"，阻止后续级联整体停用
+            _mark_proxy_live()
+            return result
+        if _is_http_status_error(proxy_exc):
+            # 服务端明确答复了状态码（404/400/…）：与出口无关，别把主机记成
+            # "必须直连"（换直连只会再失败一次，还白白关掉该主机的代理）。
+            raise proxy_exc
         logging.getLogger(__name__).warning(
             "系统代理不通（%s），改直连重试：%s", host or url, str(proxy_exc)[:160],
         )
@@ -1079,7 +1165,7 @@ class HttpClient:
                         with _urllib_opener(proxy_eff).open(req, timeout=wait_s) as resp:
                             text = resp.read().decode("utf-8", errors="replace")
                     if _is_anti_scrape_text(text):
-                        raise AntiScrapeError(f"反爬特征响应 POST {url}")
+                        raise AntiScrapeError(f"反爬特征响应 POST（命中：{_anti_scrape_hit(text)}）{url}")
                     try:
                         return _json.loads(text)
                     except _json.JSONDecodeError:
@@ -1163,7 +1249,7 @@ class HttpClient:
                         with _urllib_opener(proxy_eff).open(req, timeout=wait_s) as resp:
                             text = resp.read().decode(encoding or "utf-8", errors="replace")
                     if _is_anti_scrape_text(text):
-                        raise AntiScrapeError(f"反爬特征响应 POST {url}")
+                        raise AntiScrapeError(f"反爬特征响应 POST（命中：{_anti_scrape_hit(text)}）{url}")
                     return text
                 except AntiScrapeError as exc:
                     if proxy_pool is not None:
@@ -1246,7 +1332,7 @@ class HttpClient:
                             else:
                                 text = resp.read().decode("utf-8", errors="replace")
                     if _is_anti_scrape_text(text):
-                        raise AntiScrapeError(f"反爬特征响应 POST {url}")
+                        raise AntiScrapeError(f"反爬特征响应 POST（命中：{_anti_scrape_hit(text)}）{url}")
                     return text
                 except AntiScrapeError as exc:
                     if proxy_pool is not None:
@@ -1278,7 +1364,7 @@ class HttpClient:
                 if not _is_acw_challenge(text):
                     return text
         if _is_anti_scrape_text(text):
-            raise AntiScrapeError(f"反爬特征响应 {url}")
+            raise AntiScrapeError(f"反爬特征响应（命中：{_anti_scrape_hit(text)}）{url}")
         # Cloudflare 等边缘节点对瞬时流量偶发返回 200 空 body（首个连接常发，
         # 无 Set-Cookie/无内容，第 2 次请求即正常）。空文本对 HTML 解析无意义，
         # 视为瞬时失败走 retries 重试（间隔 0.5s/1s/2s 避峰），避免把活源误判为空页。

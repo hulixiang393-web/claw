@@ -2444,6 +2444,53 @@ class VideoMixin:
                 pass  # playerconfig 加载失败 → 所有源 ps=0 直接用 url
         return out
 
+    def _source_list_from_first_episode(self, source: SourceConfig, detail, context=None) -> List[dict]:
+        """详情页没有线路 tab 时，改从首集播放页解析可用线路（omofuna 形态）。
+
+        有些换源站的线路 tab 只渲染在**播放页**（omofuna 详情页 0 个
+        .play-channel-item，播放页 3 条：1/2/4），详情解析永远拿不到线路 →
+        播放界面「换源」菜单为空、点不动。此处在详情解析为空时补一次首集页
+        请求拿线路。仅当 source_switch.probe_from_chapter 显式开启才做，
+        避免给所有换源站多加一次请求。
+        """
+        switch = self._get_source_switch_cfg(source)
+        if not (switch.get("probe_from_chapter") or switch.get("probe_from_episode")):
+            return []
+        chapters = list(getattr(detail, "chapters", None) or [])
+        if not chapters:
+            return []
+        ep_url = self._abs_url(source, chapters[0].url)
+        if not ep_url:
+            return []
+        try:
+            headers = dict(self._headers(source))
+            headers.setdefault("Referer", getattr(detail, "url", "") or ep_url)
+            # 线路菜单是「顺手补」，不值得拖慢详情：单次尝试 + 最长 10s，
+            # 站点抽风时立刻放弃，交给播放期间的自动轮换。
+            timeout = min(self._timeout(source), 10.0)
+            if context is not None:
+                timeout = min(timeout, context.remaining())
+            html = self._http.get_text(
+                ep_url,
+                headers=headers,
+                timeout=timeout,
+                retries=0,
+                interval_ms=0,
+                encoding=source.transports().get("charset"),
+                proxy_pool=source.proxy_pool(),
+            )
+            self._check_stream_context(context)
+        except StreamCancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 线路探测失败不影响观看
+            log.info(
+                "[%s] 阶段=换源，首集页解析线路失败：%s",
+                source.source_id,
+                type(exc).__name__,
+            )
+            return []
+        return self._parse_source_list(source, html, context=context)
+
     @staticmethod
     def _merge_parse_config(source_list: List[dict], pc_html: str) -> None:
         """解析 playerconfig.js 的 player_list，把各 from 的 ps/parse 合入源列表。"""

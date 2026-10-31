@@ -1415,6 +1415,9 @@ class NovelView(AutoScrollMixin, QWidget):
         if getattr(self._source, "source_id", "") == "timotxt":
             widget.setText(self._timotxt_reader_html(text, has_title=has_title))
             return
+        if getattr(self._source, "source_id", "") == "linovelib":
+            widget.setText(self._linovelib_reader_html(text, has_title=has_title))
+            return
         text = self._format_reader_text(text, has_title=has_title)
         if not self._rich_text_enabled():
             # 调字号/背景只改样式时，避免再次复制整章正文。
@@ -1448,6 +1451,20 @@ class NovelView(AutoScrollMixin, QWidget):
     def _prepare_reader_body(self, chapter, text: str) -> str:
         """Normalize TimoTXT's one-line-per-paragraph response for display."""
         converted = self._reader_convert_text(text)
+        if getattr(self._source, "source_id", "") == "linovelib":
+            # 目录页/正文页首段常重复一次章节名（重排后会出现「【第1章】第1章 ...」
+            # 的双标题），这里把与章节名相同的首行去掉。
+            lines = str(converted or "").splitlines()
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            chapter_title = self._reader_convert_text(
+                getattr(chapter, "title", "") or ""
+            ).strip()
+            if chapter_title and lines and lines[0].strip() == chapter_title:
+                lines.pop(0)
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            return "\n".join(lines)
         if getattr(self._source, "source_id", "") != "timotxt":
             return converted
         lines = str(converted or "").splitlines()
@@ -1490,6 +1507,57 @@ class NovelView(AutoScrollMixin, QWidget):
             + "</div>"
         )
 
+    # 站点广告/求票/域名提示行（哔哩轻小说正文里混排的噪声）
+    _LINOVELIB_NOISE_RE = re.compile(
+        r"(哔哩轻小说|linovelib|请记住本站|最新网址|手机阅读|章节报错|加入书签"
+        r"|投推荐票|本章未完|点击下一页|全文阅读)"
+    )
+
+    def _linovelib_reader_html(self, text: str, has_title: bool = True) -> str:
+        """哔哩轻小说正文重排：段落化 + 衬线字体 + 居中章节标记。
+
+        该站正文是「一段一行」的纯文本，原样丢进 QTextEdit 会挤成一大块、
+        段间没有呼吸感，首行缩进也跟其它源不一致，读起来很难看。这里按段落
+        生成 <p>（固定段间距、行距略放大），章节标记单独居中、字距拉开，
+        并过滤站点混排的广告/求票/域名行。字号与行距仍跟随用户设置。
+        """
+        lines = self._format_reader_text(text, has_title=has_title).splitlines()
+        size = self._clamp_font(self._base_font + self._font_delta)
+        family = escape(self.READER_FONT_FAMILIES[self._reader_font_family][1], quote=True)
+        line_height = self._line_spacing if self._line_spacing != 1.8 else 2.05
+        color = escape(self._reading_fg or "palette(text)", quote=True)
+        blocks = []
+        for index, line in enumerate(lines):
+            raw = line.strip()
+            if not raw:
+                continue
+            content = escape(raw)
+            if has_title and index == 0:
+                blocks.append(
+                    '<div style="text-align:center; font-size:0.82em; '
+                    'letter-spacing:0.22em; color:palette(mid); '
+                    f'margin:0 0 1.15em 0;">{content}</div>'
+                )
+            elif raw.strip("（）()【】[] ") in ("插图", "插圖", "illustration"):
+                blocks.append(
+                    '<div style="text-align:center; font-size:0.85em; '
+                    f'color:palette(mid); margin:0.6em 0 1em 0;">{content}</div>'
+                )
+            elif self._LINOVELIB_NOISE_RE.search(raw):
+                continue
+            else:
+                blocks.append(
+                    '<p style="margin:0 0 0.88em 0; text-indent:0; '
+                    f'line-height:{line_height}; text-align:justify;">{content}</p>'
+                )
+        return (
+            f'<div style="font-family:{family}; font-size:{size}px; '
+            f'line-height:{line_height}; color:{color}; '
+            f'padding:0 0.4em; white-space:pre-wrap;">'
+            + "".join(blocks)
+            + "</div>"
+        )
+
     def _apply_font(self) -> None:
         if not hasattr(self, "text") or not hasattr(self, "paged_label"):
             return
@@ -1502,7 +1570,9 @@ class NovelView(AutoScrollMixin, QWidget):
         if self._mode == "pager":
             self._pager_show_page(self._current_page)
         if self._displayed_plain_text and self.text.isVisible():
-            if self._rich_text_enabled():
+            if self._rich_text_enabled() or getattr(
+                self._source, "source_id", ""
+            ) == "linovelib":
                 self._set_reader_text(self.text, self._displayed_plain_text)
 
     def set_reading_style(self, bg: str = "", font_size: int = 0, fg: str = "") -> None:

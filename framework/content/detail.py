@@ -288,6 +288,11 @@ class DetailMixin:
         if tags:
             detail.tags = tags
 
+        # 元数据以页面 head 为准（api_endpoints.detail.meta_html）：接口只给分集/
+        # 线路，标题/封面/简介只存在于详情页 og:* 标签（ikanpp 这类「接口拆家」站）。
+        if cfg.get("meta_html"):
+            self._fill_meta_from_html(source, detail, url)
+
         # 章节列表
         chapters_cfg = cfg.get("chapters") or {}
         items = self._jsonpath(data, chapters_cfg.get("items"))
@@ -321,6 +326,70 @@ class DetailMixin:
                     ]
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] API 目录抓取失败：%s", source.source_id, exc)
+        # 「线路 → 分集」嵌套结构的接口（ikanpp /api/lines：lines[].episodes[]）：
+        # chapters.lines_path 指向线路数组，逐条线路把分集摊平成章节，线路名写
+        # 进 provider 供播放界面按线路切换。已配置 items 的源不受影响。
+        lines_path = chapters_cfg.get("lines_path")
+        if lines_path:
+            lines = self._jsonpath(data, lines_path)
+            if isinstance(lines, list):
+                line_name_key = chapters_cfg.get("line_name") or "sourceName"
+                line_id_key = chapters_cfg.get("line_id") or "sourceId"
+                items_key = chapters_cfg.get("line_items") or "episodes"
+                title_key = chapters_cfg.get("title") or "title"
+                url_key = chapters_cfg.get("url_key") or "url"
+                line_chapters: list = []
+                for line in lines:
+                    if not isinstance(line, dict):
+                        continue
+                    line_name = str(line.get(line_name_key) or "")
+                    line_id = str(line.get(line_id_key) or "")
+                    # 换线路 = 用同一作品 ID 换 source 参数重新打开详情；把目标
+                    # 详情的 URL 挂在分集上，播放界面的线路菜单据此直接切换。
+                    switch_url = self._line_switch_url(url, line_id)
+                    episodes = line.get(items_key)
+                    if not isinstance(episodes, list):
+                        continue
+                    for it in episodes:
+                        if not isinstance(it, dict):
+                            continue
+                        c_url = str(it.get(url_key) or "")
+                        if not c_url:
+                            continue
+                        c_title = str(
+                            it.get(title_key) or f"第{len(line_chapters)+1}集"
+                        )
+                        chapter = Chapter(
+                            title=c_title, url=c_url, provider=line_name
+                        )
+                        if switch_url and line_id:
+                            chapter.line_switch_url = switch_url
+                            chapter.line_switch_source = line_id
+                            chapter.line_name = line_name or line_id
+                        line_chapters.append(chapter)
+                if line_chapters:
+                    # 多线路接口（一行一集）不能把所有线路的集都当分集：21 条线
+                    # 各 1 集会显示成「21 集」。按 URL 上的线路坐标只留当前线路
+                    # 的分集，其它线路全部进线路菜单（source_list）供切换。
+                    build_menu = getattr(self, "line_menu_from_chapters", None)
+                    menu = build_menu(line_chapters) if build_menu else []
+                    param = chapters_cfg.get("current_line_param") or "source"
+                    current = self._query_param(url, param)
+                    keep = [
+                        ch for ch in line_chapters
+                        if getattr(ch, "line_switch_source", "") == current
+                    ] if current else []
+                    if not keep and menu:
+                        # URL 里的 source 是发现/搜索的来源坐标，不一定是线路
+                        # id（ikanpp 的 lines 用 youxuan/jisu/…）→ 默认取首条线路
+                        default_sid = menu[0].get("sid") or ""
+                        keep = [
+                            ch for ch in line_chapters
+                            if getattr(ch, "line_switch_source", "") == default_sid
+                        ]
+                    detail.chapters = keep or line_chapters
+                    if menu:
+                        detail.source_list = menu
         # 单章即全片（单集视频 API 源）：详情页自身就是唯一分集，接口若不返回
         # 章节列表则按 content.<type>.single_chapter 补一条，避免播放页「无分集」。
         if not detail.chapters:
@@ -339,6 +408,84 @@ class DetailMixin:
                 )
         self._mark_line_menu(source, detail, cfg, url, data)
         return detail
+
+    def _fill_meta_from_html(self, source: SourceConfig, detail, url: str) -> None:
+        """API 详情补页面元数据：接口只给分集/线路时，从详情页 head 取标题/封面/简介。
+
+        只填空字段（接口有值不覆盖），任何失败静默——元数据缺失不该让详情失败。
+        """
+        fields = (source.get_detail_config() or {}).get("fields") or {}
+        if not fields:
+            return
+        try:
+            abs_url = self._abs_url(source, url)
+            html = self._get_detail_html(source, url, abs_url)
+            doc = self._parser.parse(html)
+        except Exception as exc:  # noqa: BLE001 —— 补全失败保持接口原值
+            log.info("[%s] 阶段=详情，页面元数据补全失败：%s", source.source_id, exc)
+            return
+
+        def _pick(key: str, absolute: bool = False) -> str:
+            spec = fields.get(key)
+            if not spec:
+                return ""
+            try:
+                # 只有 URL 类字段（封面）才做 base_url 绝对化：标题/简介按字面取，
+                # 否则 Parser 会把纯文本当相对路径拼成 https://站点/书名。
+                return str(
+                    self._parser.extract_first(
+                        doc, spec, source.base_url if absolute else ""
+                    ) or ""
+                )
+            except Exception:  # noqa: BLE001
+                return ""
+
+        if not detail.title:
+            detail.title = _pick("title")
+        if not detail.cover:
+            detail.cover = _pick("cover", absolute=True)
+        if not detail.summary:
+            detail.summary = _pick("summary")
+        if not detail.author:
+            detail.author = _pick("author")
+        if not detail.status:
+            detail.status = _pick("status")
+        if not detail.tags:
+            try:
+                detail.tags = list(self._parser.extract(doc, fields.get("tags")) or [])
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _query_param(url: str, key: str) -> str:
+        """取 URL query 里某个参数（缺失返回空串）。"""
+        if not url or not key:
+            return ""
+        from urllib.parse import parse_qs, urlsplit
+
+        try:
+            return (parse_qs(urlsplit(url).query).get(key) or [""])[0]
+        except Exception:  # noqa: BLE001 —— 畸形 URL 当无参数
+            return ""
+
+    @staticmethod
+    def _line_switch_url(url: str, line_id: str) -> str:
+        """把详情 URL 的线路坐标换成 line_id（query 的 source/line/sid）。
+
+        没有线路坐标的 URL 返回空串——此时线路菜单拿不到可切换目标，
+        交给播放界面的其它换源路径（source_switch / related_episodes）。
+        """
+        if not url or not line_id:
+            return ""
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        parts = urlsplit(url)
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        keys = ("source", "line", "sid")
+        if not any(k in keys for k, _ in query):
+            return ""
+        new_query = [(k, line_id if k in keys else v) for k, v in query]
+        return urlunsplit(parts._replace(query=urlencode(new_query)))
 
     # ------------------------------------------------------------------ #
     # API 详情：同作品其它线路（related_episodes）

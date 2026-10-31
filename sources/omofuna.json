@@ -116,7 +116,8 @@
           "play_regex": "var player_aaaa=(\\{.*?\\})\\s*</script>",
           "play_url_path": "url",
           "default_parse": "https://art.v2player.top:8989/player/",
-          "max_switch_attempts": 4
+          "max_switch_attempts": 4,
+          "probe_from_chapter": true
         }
       }
     }

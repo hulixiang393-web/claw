@@ -44,6 +44,31 @@
           { "title": "全部", "url": "/api/library/browse?type=total" }
         ]
       }
+    },
+    "detail": {
+      "url_pattern": "/title/",
+      "fields": {
+        "title": {
+          "fallback": [
+            {
+              "css": "meta[property='og:title']",
+              "attr": "content",
+              "regex": "^(.+?)\\s*(?:\\(\\d{4}\\))?\\s*在线观看"
+            },
+            { "css": "meta[property='og:title']", "attr": "content" }
+          ]
+        },
+        "cover": { "css": "meta[property='og:image']", "attr": "content" },
+        "summary": { "css": "meta[name='description']", "attr": "content" }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": false,
+        "play_url": {
+          "regex": "\"url\"\\s*:\\s*\"([^\"]+)\""
+        }
+      }
     }
   },
   "api_endpoints": {
@@ -115,48 +140,19 @@
       }
     },
     "detail": {
-      "url": "/api/detail",
-      "method": "POST",
-      "body": {
-        "id": "{id}",
-        "source": "{source}",
-        "title": "{title}"
+      "url": "/api/lines",
+      "method": "GET",
+      "params": {
+        "title": "{id}",
+        "source": "{source}"
       },
-      "field_extractors": {
-        "title": "vod_name",
-        "cover": "vod_pic",
-        "status": "vod_remarks",
-        "summary": "vod_content",
-        "actor": "vod_actor",
-        "author": "vod_director",
-        "tags": "type_name"
-      },
+      "meta_html": true,
       "chapters": {
-        "items": "episodes",
+        "lines_path": "lines",
+        "line_name": "sourceName",
+        "line_items": "episodes",
         "title": "name",
-        "number": "index",
-        "url_template": "{url}",
-        "related_episodes": {
-          "enabled": true,
-          "url": "/api/detail",
-          "id_path": "vod_id",
-          "source_path": "source",
-          "line_sources": ["guangsu", "jisu", "baofeng"],
-          "max_lines": 2,
-          "items": "episodes",
-          "title": "name",
-          "url_key": "url",
-          "item_fields": { "play_id": "vod_id" },
-          "resolve_url": "/title/{play_id}",
-          "provider_catalog": {
-            "juliang": "巨量资源",
-            "guangsu": "光速资源",
-            "baofeng": "暴风资源",
-            "jisu": "极速资源",
-            "wujin": "无尽资源",
-            "zuida": "最大资源"
-          }
-        }
+        "url_key": "url"
       }
     }
   },

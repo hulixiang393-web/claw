@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""ikanpp 播放界面换源（同作品多线路）与中插广告过滤回归测试（全部离线）。
+"""ikanpp 详情（/api/lines 多线路）+ 换源播放 + 中插广告过滤回归（全部离线）。
+
+站点把原来的 `/api/detail`（已 404）拆成了两个接口：
+- `GET /api/lines?title=<id>&source=<src>` → `{"lines":[{sourceId,sourceName,episodes:[{name,url}]}]}`
+- `GET /api/play?id=<vodId>&ep=<n>&film=1` → `{"url":"https://…mp4|l…m3u8"}`
+标题/封面/简介只剩详情页 `og:*`，由 `api_endpoints.detail.meta_html` 补。
 
 覆盖：
-- 详情接口只给一条线路时，按 `chapters.related_episodes` 把同作品其它线路的集
-  并进来，`detail.source_list` 给出线路菜单（与 omofuna 的 source_switch 同一份
-  播放界面契约：source_id/name/detail_url）。
-- 换线路后 `switch_source_url` 把 `Detail.url` 更新到目标线路：否则下次取流
-  又从旧 URL 推导线路坐标，切回原线路。
-- 换过去再切回（命中详情缓存）时线路菜单仍完整，不丢当前线路。
-- 任一线路请求失败只跳过该线路，详情主体不受影响；未配置的源零影响。
-- `ad_block.hls_rules.drop_short_blocks`：真实清单（json1080 源）里与正片同主机
-  同目录、URL 无广告词的极短 DISCONTINUITY 块（16.5~17.7s）被删；片尾块需与中插
+- 详情按线路摊平，但**播放界面只显示当前线路的分集**（否则 21 条线各 1 集会
+  显示成「21 集」）；其它线路进 `detail.source_list` 线路菜单。
+- 菜单项带目标线路自己的详情 URL（source 坐标随 URL 一起变），
+  `switch_source_url` 换线后 `Detail.url` 跟着走。
+- 播放地址从 `/api/play` 的 JSON `url` 字段提取。
+- `ad_block.hls_rules.drop_short_blocks`：真实清单里与正片同主机、同目录、
+  URL 无广告词、时长 16.5~17.7s 的极短 DISCONTINUITY 块被删；片尾块需与中插
   广告的时长签名一致才删。超长块、大占比、纯短清单、未配置该规则的源均不受影响。
 """
 import json
@@ -31,14 +34,31 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SOURCE_PATH = os.path.join(ROOT, "sources", "ikanpp.json")
 _BASE = "https://www.ikanpp.com"
 
-# 各线路自己的作品坐标与分集（暴风为当前线路）
-_LINE_IDS = {"baofeng": 20717, "guangsu": 41107, "jisu": 4664, "zuida": 9}
-_LINE_HOSTS = {
-    "baofeng": "c1.rrcdnbf6.com",
-    "guangsu": "v.gsuus.com",
-    "jisu": "vv.jisuzyv.com",
-    "zuida": "api.zuidapi.example",
-}
+# 真实接口形状（略去 season/remarks 等无关字段）
+_LINES = [
+    {
+        "sourceId": "youxuan",
+        "sourceName": "优选",
+        "episodes": [{"name": "正片", "url": "/api/play?id=youxuan-main&ep=1&film=1"}],
+    },
+    {
+        "sourceId": "juliang",
+        "sourceName": "巨量",
+        "episodes": [{"name": "播放", "url": "https://jimao.example/movie/index.m3u8"}],
+    },
+    {
+        "sourceId": "jisu",
+        "sourceName": "极速",
+        "episodes": [{"name": "正片", "url": "https://vv.jisu.example/play/abc/index.m3u8"}],
+    },
+]
+
+_DETAIL_HTML = """<!DOCTYPE html><html><head>
+<title>流浪地球 (2019) 在线观看 - 电影 | iKanPP 爱看片片</title>
+<meta property="og:title" content="流浪地球 (2019) 在线观看 - 电影 | iKanPP 爱看片片">
+<meta property="og:image" content="https://img.example/wandering.jpg">
+<meta name="description" content="太阳即将毁灭，人类启动流浪地球计划。">
+</head><body></body></html>"""
 
 
 def _source() -> SourceConfig:
@@ -46,383 +66,132 @@ def _source() -> SourceConfig:
         return SourceConfig.from_dict(json.load(handle), _SOURCE_PATH)
 
 
-class _LineHttp:
-    """离线假 HttpClient，**复刻真实 API 的危险行为**：
-
-    - 搜索（post_text，SSE）：只带目标线路一个源，返回该线路自己的 vod_id。
-    - 详情（post_json）：若 id 不是该线路自己的 vod_id，**静默返回另一部作品**
-      （真实实测：json1080 的 id + source=jisu → 「窒息的阳光」，success=True）。
-      这样才能保证「换线路必须用目标线路自己的 id」有测试兜底。
-    """
+class _LinesHttp:
+    """离线 HttpClient：只认 /api/lines、/api/play 与详情页 HTML。"""
 
     defaults = type("D", (), {"timeout": 10, "retries": 0, "interval_ms": 0})()
 
-    def __init__(self, failing=(), episodes_per_line=2, line_titles=None):
-        self.bodies = []
-        self.search_bodies = []
-        self.failing = set(failing)
-        self.episodes_per_line = episodes_per_line
-        # 各线路的显示标题（默认与当前作品同名；可注入「国语版」这类差异）
-        self.line_titles = dict(line_titles or {})
+    def __init__(self, lines=None, play_url="https://cdn.example/a.m3u8", html=_DETAIL_HTML):
+        self.lines = list(lines if lines is not None else _LINES)
+        self.play_url = play_url
+        self.html = html
+        self.json_calls = []
+        self.text_calls = []
 
-    # ---- 搜索：拿到目标线路自己的 vod_id ----
-    def post_text(self, url, json_body=None, **kwargs):
-        body = dict(json_body or {})
-        self.search_bodies.append(body)
-        entries = body.get("sources") or []
-        videos = []
-        for entry in entries:
-            source = str(entry.get("id") or "")
-            if source in self.failing:
-                continue
-            videos.append({
-                "source": source,
-                "vod_id": _LINE_IDS[source],
-                "vod_name": self.line_titles.get(source, "流浪地球"),
-            })
-        return "data: " + json.dumps(
-            {"type": "videos", "videos": videos}, ensure_ascii=False
-        ) + "\n\n"
-
-    # ---- 详情 ----
-    def post_json(self, url, json_body=None, **kwargs):
-        body = dict(json_body or {})
-        self.bodies.append(body)
-        source = body.get("source") or "baofeng"
-        if source in self.failing:
-            raise RuntimeError("line down")
-        own_id = str(_LINE_IDS[source])
-        if str(body.get("id") or "") != own_id:
-            # 真实 API 的行为：id 属于别的线路时，返回一部**无关作品**
-            return {
-                "success": True,
-                "data": {
-                    "vod_id": body.get("id"),
-                    "vod_name": "窒息的阳光",
-                    "source": source,
-                    "episodes": [{
-                        "name": "正片",
-                        "url": "https://wrong.example/movie.m3u8",
-                        "index": 0,
-                    }],
-                },
-            }
-        host = _LINE_HOSTS.get(source, "cdn.example")
-        episodes = [
-            {
-                "name": f"第{i + 1}集",
-                "url": f"https://{host}/play/{own_id}/{i + 1}/index.m3u8",
-                "index": i,
-            }
-            for i in range(self.episodes_per_line)
-        ]
-        return {
-            "success": True,
-            "data": {
-                "vod_id": _LINE_IDS[source],
-                "vod_name": self.line_titles.get(source, "流浪地球"),
-                "source": source,
-                "episodes": episodes,
-            },
-        }
-
-    def get_text(self, url, **kwargs):
-        return "{}"
-
-    def get_json(self, url, **kwargs):
+    def get_json(self, url, headers=None, proxy=None, timeout=None, retries=None, **kw):
+        self.json_calls.append(url)
+        if "/api/lines" in url:
+            return {"lines": self.lines}
         return {}
+
+    def get_text(self, url, **kw):
+        self.text_calls.append(url)
+        if "/api/play" in url:
+            return json.dumps({"url": self.play_url, "kind": "mp4", "line": "official:z"})
+        return self.html
+
+    def get_bytes(self, url, **kw):  # pragma: no cover - 详情链路不取字节
+        raise AssertionError("详情/播放链路不应请求字节流")
+
+    def post_json(self, url, json_body=None, **kw):  # pragma: no cover
+        raise AssertionError(f"ikanpp 已没有 POST 接口，却被请求：{url}")
+
+    def post_text(self, url, json_body=None, **kw):  # pragma: no cover
+        raise AssertionError(f"ikanpp 已没有 POST 接口，却被请求：{url}")
 
     def close(self):
         pass
 
 
 def _content(http=None):
-    return Content(http or _LineHttp(), Parser(), None)
+    return Content(http or _LinesHttp(), Parser(), None)
 
 
-def _detail_url(source="baofeng", vid=20717, title="流浪地球"):
+def _detail_url(source="bfzy", vid="ik130467", title="流浪地球"):
     return f"{_BASE}/title/{vid}?title={title}&source={source}"
 
 
-def _with_lines(content=None, http=None, source=None, url=None):
-    """模拟播放界面的新流程：详情只打标记，线路菜单单独按需取。
-
-    对应实现：`fetch_detail` 不发线路请求（`line_menu_available=True`），
-    `fetch_line_menu` 在后台补；补到之后把线路分集并进详情、构建 source_list。
-    """
-    content = content or _content(http)
-    source = source or _source()
-    url = url or _detail_url()
-    detail = content.fetch_detail(source, url)
-    # 当前线路的分集标记来源（与旧合并逻辑一致；菜单靠 URL 的 source 定位）
-    from urllib.parse import parse_qs, urlsplit
-
-    cur = (parse_qs(urlsplit(detail.url).query).get("source") or [""])[0]
-    for chapter in detail.chapters:
-        if not getattr(chapter, "provider", ""):
-            chapter.provider = cur
-    chapters = content.fetch_line_menu(source, detail.url, detail.title)
-    if chapters:
-        detail.chapters = list(detail.chapters) + list(chapters)
-    if not detail.source_list:
-        content._attach_line_sources(source, detail)
-    return content, detail
-
-
 # --------------------------------------------------------------------------- #
-# 播放界面换线路（related_episodes）
+# 详情：/api/lines 摊平 + 页面 og 元数据
 # --------------------------------------------------------------------------- #
-def test_detail_defers_line_menu_and_makes_no_extra_requests():
-    """详情加载不得为换线路多花网络往返（实测 4.5s → 1.2s 的关键）。"""
-    http = _LineHttp()
+def test_detail_reads_lines_api_and_page_meta():
+    http = _LinesHttp()
     detail = _content(http).fetch_detail(_source(), _detail_url())
 
-    assert detail.line_menu_available is True
-    assert detail.source_list == []
-    assert len(http.bodies) == 1        # 只有详情本身
-    assert http.search_bodies == []     # 没有为线路发检索
+    # 标题/封面/简介来自详情页 og:*（接口里没有）
+    assert detail.title == "流浪地球"
+    assert detail.cover == "https://img.example/wandering.jpg"
+    assert "流浪地球计划" in detail.summary
+    # 只显示首条线路的分集：21 条线各 1 集不能显示成 21 集
+    assert len(detail.chapters) == 1
+    assert detail.chapters[0].title == "正片"
+    assert detail.chapters[0].provider == "优选"
+    # 线路菜单覆盖全部线路
+    assert [item["sid"] for item in detail.source_list] == ["youxuan", "juliang", "jisu"]
+    assert [item["name"] for item in detail.source_list] == ["优选", "巨量", "极速"]
+    # 详情只调一次 lines 接口 + 一次详情页（取 og），没有 POST
+    assert len([u for u in http.json_calls if "/api/lines" in u]) == 1
+    assert all("/api/play" not in u for u in http.json_calls)
 
 
-def test_line_menu_fetched_on_demand():
-    http = _LineHttp()
-    content, detail = _with_lines(http=http)
+def test_line_menu_items_carry_target_line_detail_url():
+    detail = _content().fetch_detail(_source(), _detail_url())
 
-    assert [item["source_id"] for item in detail.source_list] == ["guangsu", "jisu"]
-    assert [item["name"] for item in detail.source_list] == ["光速资源", "极速资源"]
-    # 菜单项带上目标线路自己的详情 URL（线路坐标随 URL 一起变）
-    assert [item["detail_url"] for item in detail.source_list] == [
-        _detail_url("guangsu", 41107),
-        _detail_url("jisu", 4664),
+    from urllib.parse import parse_qs, urlsplit
+
+    # 换线目标 URL：同作品坐标，只把 source 换成目标线路
+    coordinates = []
+    for item in detail.source_list:
+        parts = urlsplit(item["detail_url"])
+        query = parse_qs(parts.query)
+        coordinates.append((parts.path, query.get("source"), query.get("title")))
+    assert coordinates == [
+        ("/title/ik130467", ["youxuan"], ["流浪地球"]),
+        ("/title/ik130467", ["juliang"], ["流浪地球"]),
+        ("/title/ik130467", ["jisu"], ["流浪地球"]),
     ]
-    # 每个菜单项都带该线路的集，播放界面据此定位当前集
-    assert [len(item["episodes"]) for item in detail.source_list] == [2, 2]
+    # 每条线路都带自己的集，播放界面据此定位当前集
+    assert [len(item["episodes"]) for item in detail.source_list] == [1, 1, 1]
 
 
-def test_related_lines_resolve_their_own_vod_id_by_title():
-    """换线路必须先在该线路内按标题查到它自己的 vod_id。"""
-    http = _LineHttp()
-    _with_lines(http=http)
+def test_current_line_param_selects_that_line():
+    """详情 URL 的 source 命中线路 id 时，分集取该线路（而不是首条）。"""
+    detail = _content().fetch_detail(_source(), _detail_url("jisu"))
 
-    # 首次详情
-    assert http.bodies[0] == {"id": "20717", "source": "baofeng", "title": "流浪地球"}
-    # 每条相关线路：先按标题搜索（只带该源），再用**它自己的 id** 请求详情
-    assert len(http.search_bodies) == 2
-    for body in http.search_bodies:
-        assert body["query"] == "流浪地球"
-        assert len(body["sources"]) == 1  # 只查目标线路，不重复拉 25 个源
-    line_bodies = [b for b in http.bodies[1:] if b.get("source") != "baofeng"]
-    by_source = {b["source"]: b for b in line_bodies}
-    assert by_source["guangsu"]["id"] == str(_LINE_IDS["guangsu"])
-    assert by_source["jisu"]["id"] == str(_LINE_IDS["jisu"])
-    assert all(b["title"] == "流浪地球" for b in line_bodies)
+    assert detail.chapters[0].provider == "极速"
+    assert detail.chapters[0].url == "https://vv.jisu.example/play/abc/index.m3u8"
 
 
-def test_wrong_line_id_would_return_unrelated_work():
-    """守住故障现场：用别的线路 id 请求会拿到无关作品，绝不能并进分集列表。"""
-    _content_, detail = _with_lines()
+def test_switch_source_url_moves_detail_url_and_chapters():
+    http = _LinesHttp()
+    content = _content(http)
+    detail = content.fetch_detail(_source(), _detail_url())
 
-    # 假 HTTP 在 id 不匹配时会返回「窒息的阳光」单集片；验证它没混进来
-    urls = [ch.url for ch in detail.chapters]
-    assert not any("wrong.example" in u for u in urls)
-    assert all(ch.line_switch_url for ch in detail.chapters if ch.provider != "baofeng")
-
-
-def test_line_with_mismatched_title_is_skipped():
-    """目标线路返回的作品标题不匹配 → 宁可不并该线路，也不混入无关作品。"""
-    http = _LineHttp(line_titles={"jisu": "完全无关的另一部剧"})
-    _content_, detail = _with_lines(http=http)
-
-    assert [item["source_id"] for item in detail.source_list] == ["guangsu"]
-    assert not any(ch.provider == "jisu" for ch in detail.chapters)
-
-
-def test_line_title_with_language_suffix_still_matches():
-    """「国語版」这类后缀差异不应导致线路被丢弃（真实数据即如此）。"""
-    http = _LineHttp(line_titles={"jisu": "流浪地球国语版"})
-    _content_, detail = _with_lines(http=http)
-
-    assert [item["source_id"] for item in detail.source_list] == ["guangsu", "jisu"]
-
-
-def test_line_vod_id_is_resolved_once_per_title():
-    """同一 (线路, 标题) 只搜索一次：反复取线路菜单不得重复请求。"""
-    http = _LineHttp()
-    content, detail = _with_lines(http=http)
-    searches = len(http.search_bodies)
-    assert searches == 2  # guangsu + jisu 各搜一次
-
-    again = content.fetch_line_menu(_source(), detail.url, detail.title)
-    assert again  # 仍然能拿到线路集
-    assert len(http.search_bodies) == searches  # 但没有任何新检索
-
-
-def test_merged_chapters_are_tagged_with_line_switch_info():
-    _content_, detail = _with_lines()
-
-    current = [ch for ch in detail.chapters if ch.provider == "baofeng"]
-    assert len(current) == 2
-    assert all(ch.line_switch_url == "" for ch in current)
-
-    guangsu = [ch for ch in detail.chapters if ch.provider == "guangsu"]
-    assert [ch.title for ch in guangsu] == ["第1集", "第2集"]
-    assert all(ch.line_name == "光速资源" for ch in guangsu)
-    assert all(
-        ch.line_switch_url == _detail_url("guangsu", 41107) for ch in guangsu
-    )
-
-
-def test_switch_source_url_moves_detail_url_to_target_line():
-    http = _LineHttp()
-    content, detail = _with_lines(http=http)
-    before = len(http.bodies)
-
-    target = detail.source_list[0]
+    target = detail.source_list[2]  # 极速
     switched, chapters = content.switch_source_url(_source(), target["detail_url"])
 
-    # URL 跟着目标线路走：否则下次取流仍按旧 URL 的 source 再切回原线路
-    assert switched.url == _detail_url("guangsu", 41107)
-    switch_bodies = http.bodies[before:]
-    assert switch_bodies[0]["source"] == "guangsu"
-    assert switch_bodies[0]["title"] == "流浪地球"
-    # 切换后的详情只含目标线路自己的集（其它线路是菜单项，不混进集列表）
-    assert {ch.url.split("/")[2] for ch in chapters} == {"v.gsuus.com"}
+    # URL 跟着目标线路走：否则下次取流仍按旧 source 切回原线路
+    assert "source=jisu" in switched.url
+    assert [ch.title for ch in chapters] == ["正片"]
+    assert {ch.url for ch in chapters} == {"https://vv.jisu.example/play/abc/index.m3u8"}
 
 
-def test_switch_back_keeps_full_line_menu_from_cache():
-    """无论当前在哪条线路，按需取线路菜单都应拿到「其它线路」完整列表。"""
-    content, detail = _with_lines()
-    source = _source()
-
-    switched, _ = content.switch_source_url(source, detail.source_list[0]["detail_url"])
-    # 切到光速后，菜单应变成「光速之外的两条线」（当前线路不再列出）
-    lines = content.fetch_line_menu(source, switched.url, switched.title)
-    menu = content.line_menu_from_chapters(lines)
-    assert [item["source_id"] for item in menu] == ["jisu", "baofeng"]
-
-    back, _ = content.switch_source_url(source, _detail_url())
-    lines = content.fetch_line_menu(source, back.url, back.title)
-    menu = content.line_menu_from_chapters(lines)
-    assert [item["source_id"] for item in menu] == ["guangsu", "jisu"]
-
-
-def test_single_failing_line_is_skipped_without_breaking_detail():
-    http = _LineHttp(failing={"jisu"})
-    _content_, detail = _with_lines(http=http)
-
-    assert [item["source_id"] for item in detail.source_list] == ["guangsu"]
-    # 当前线路的分集照常可用
-    assert any(ch.provider == "baofeng" for ch in detail.chapters)
-
-
-def test_line_requests_are_bounded_by_max_lines():
-    http = _LineHttp()
-    source = _source()
-    source.raw["api_endpoints"]["detail"]["chapters"]["related_episodes"][
-        "max_lines"
-    ] = 1
-    _with_lines(http=http, source=source)
-    # 首次详情 + 1 条相关线路（该线路一次搜索 + 一次详情）
-    assert len(http.bodies) == 1 + 1
-    assert len(http.search_bodies) == 1
-
-
-def test_related_episodes_disabled_has_no_effect():
-    http = _LineHttp()
-    source = _source()
-    source.raw["api_endpoints"]["detail"]["chapters"]["related_episodes"][
-        "enabled"
-    ] = False
-    detail = _content(http).fetch_detail(source, _detail_url())
-
-    assert len(http.bodies) == 1
-    assert detail.line_menu_available is False
-    assert detail.source_list == []
-    # 关掉之后按需取也应当拿不到线路
-    assert _content(http).fetch_line_menu(source, _detail_url(), "流浪地球") == []
-
-
-def test_search_provider_group_takes_precedence_over_related_episodes(monkeypatch):
-    from framework import search_groups
-
-    http = _LineHttp()
+def test_play_url_extracted_from_api_play_json():
+    http = _LinesHttp(play_url="https://p6.example/video.mp4")
     content = _content(http)
-    content.fetch_detail(_source(), _detail_url())
-    search_groups.remember_group(
-        "ikanpp",
-        "流浪地球",
-        [
-            {"provider": "baofeng", "name": "暴风资源", "url": _detail_url(), "order": 1},
-            {
-                "provider": "zuida",
-                "name": "最大资源",
-                "url": _detail_url("zuida", 9),
-                "order": 2,
-            },
-        ],
-    )
-    before = len(http.bodies)
-    try:
-        # 搜索分组记得这一组作品：详情走分组给出的采集源菜单（当前源排首位）
-        grouped = content.fetch_detail(_source(), _detail_url("zuida", 9))
-    finally:
-        search_groups.clear_groups()
+    detail = content.fetch_detail(_source(), _detail_url())
 
-    assert [item["source_id"] for item in grouped.source_list] == ["zuida", "baofeng"]
-    # 分组菜单来自搜索缓存，不含 related_episodes 的线路集字段
-    assert all("episodes" not in item for item in grouped.source_list)
-    assert http.bodies[before]["source"] == "zuida"
+    play = content.fetch_video_episode(_source(), detail.chapters[0].url)
+    assert play == "https://p6.example/video.mp4"
+    assert any("/api/play" in u for u in http.text_calls)
 
 
-def test_group_menu_skips_related_line_requests(monkeypatch):
-    """已有分组线路列表时不再请求同作品线路（省掉两条线路的详情往返）。"""
-    from framework import search_groups
+def test_detail_without_lines_falls_back_to_single_chapter():
+    """接口没给线路时不能凭空造集：保持空分集，交给 single_chapter 兜底。"""
+    detail = _content(_LinesHttp(lines=[])).fetch_detail(_source(), _detail_url())
 
-    http = _LineHttp()
-    content = _content(http)
-    search_groups.remember_group(
-        "ikanpp",
-        "流浪地球",
-        [
-            {"provider": "baofeng", "name": "暴风资源", "url": _detail_url(), "order": 1},
-            {
-                "provider": "zuida",
-                "name": "最大资源",
-                "url": _detail_url("zuida", 9),
-                "order": 2,
-            },
-        ],
-    )
-    try:
-        grouped = content.fetch_detail(_source(), _detail_url())
-    finally:
-        search_groups.clear_groups()
-
-    assert [item["source_id"] for item in grouped.source_list] == ["baofeng", "zuida"]
-    # 只有本次详情请求，没有 guangsu/jisu 两条线路请求
-    assert [body["source"] for body in http.bodies] == ["baofeng"]
-
-
-def test_source_without_related_config_is_unaffected():
-    with open(_SOURCE_PATH, encoding="utf-8") as handle:
-        raw = json.load(handle)
-    config = dict(raw)
-    detail_api = json.loads(json.dumps(raw["api_endpoints"]["detail"]))
-    detail_api["chapters"].pop("related_episodes")
-    config["api_endpoints"] = dict(raw["api_endpoints"], detail=detail_api)
-    config["$id"] = "ikanpp-no-lines"
-    source = SourceConfig.from_dict(config, _SOURCE_PATH)
-
-    http = _LineHttp()
-    detail = _content(http).fetch_detail(source, _detail_url())
-    assert len(http.bodies) == 1
+    assert detail.chapters == []
     assert detail.source_list == []
-
-
-# --------------------------------------------------------------------------- #
-# 中插广告：drop_short_blocks（依据真实清单定标）
-# --------------------------------------------------------------------------- #
-_MAIN = "https://s2.bfllvip.com/video/x/%d.ts"
-_AD = "https://fengbao13.com/video/pp/%d.ts"
 
 
 def _manifest(pre=30, ad=6, post=30, ad_host="fengbao13.com",
@@ -458,7 +227,6 @@ def _engine():
 
 
 _BASE_URL = "https://s2.bfllvip.com/video/x/index.m3u8"
-
 
 def test_ikanpp_config_declares_short_block_rule():
     with open(_SOURCE_PATH, encoding="utf-8") as handle:

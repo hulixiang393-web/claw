@@ -103,6 +103,12 @@ class ComicMixin:
             #   extract_mode      提取方式：canvas(默认) / img / text
             #   proxy             是否走代理（默认自动探测系统代理）
             rc = block.get("render_config") or body_cfg.get("render_config") or {}
+            # 渲染出口：源显式 proxy > 源标记 direct（强制直连）> 自动探测系统代理。
+            # 走本机代理会被站点 reset 的源（manben）在浏览器侧也必须直连，否则
+            # 渲染直接 ERR_CONNECTION_RESET → 整话取不到图。
+            render_proxy = source.transports().get("proxy")
+            if not render_proxy and source.transports().get("direct"):
+                render_proxy = "direct"
             try:
                 from framework.playwright_helper import fetch_rendered_images_sync
 
@@ -117,7 +123,7 @@ class ComicMixin:
                     click_selector=rc.get("click_selector"),
                     scroll_to_bottom=rc.get("scroll_to_bottom", False),
                     extract_mode=rc.get("extract_mode", "canvas"),
-                    proxy=source.transports().get("proxy"),
+                    proxy=render_proxy,
                     page_container_selector=rc.get("page_container_selector"),
                     scroll_step_px=int(rc.get("scroll_step_px", 600)),
                     scroll_stale_rounds=int(rc.get("scroll_stale_rounds", 6)),

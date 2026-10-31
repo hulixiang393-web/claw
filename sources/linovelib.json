@@ -28,8 +28,8 @@
       "Referer": "https://www.linovelib.com/"
     },
     "timeout": 10,
-    "retries": 2,
-    "interval_ms": 800
+    "retries": 1,
+    "interval_ms": 1500
   },
   "endpoints": {
     "discovery": {
@@ -76,7 +76,11 @@
           },
           "url": {
             "css": ".rank_d_b_name a",
-            "attr": "href"
+            "attr": "href",
+            "url_replace": [
+              "/novel/(\\d+)\\.html$",
+              "/novel/{1}/1.html"
+            ]
           },
           "cover": {
             "css": ".rank_d_book_img img",
@@ -102,25 +106,33 @@
           "attr": "content"
         },
         "author": {
-          "css": "meta[property='og:novel:author']",
-          "attr": "content"
+          "css": "div.book-meta",
+          "regex": "作者：([^\\s<]+)"
         },
         "cover": {
-          "css": "meta[property='og:image']",
-          "attr": "content"
+          "fallback": [
+            {
+              "css": "meta[property='og:image']",
+              "attr": "content"
+            },
+            {
+              "css": "img.book-cover",
+              "attr": "src"
+            }
+          ]
         },
         "status": {
           "css": "meta[property='og:novel:status']",
           "attr": "content"
         }
-      }
+      },
+      "url_pattern": "/novel/\\d+/\\d+\\.html"
     },
     "content": {
       "chapter": {
         "list": {
-          "chapters_url": "/novel/{id}/catalog",
           "root_selector": {
-            "css": "ul.chapter-list li a"
+            "css": "ul.chapter-list li"
           },
           "chapter_order": "asc",
           "fields": {

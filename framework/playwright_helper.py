@@ -418,7 +418,14 @@ def _port_open(port: int, timeout: float = 0.15) -> bool:
 
 
 def _pick_proxy(source_proxy: Optional[str] = None) -> Optional[str]:
-    """选取代理：源配置指定 > 系统环境代理 > Clash 默认端口探测 > None。"""
+    """选取代理：源配置指定 > 系统环境代理 > Clash 默认端口探测 > None。
+
+    source_proxy 取特殊值 "direct"/"none" 表示"该源强制直连"：不再自动采用系统
+    代理（部分站点走本机代理会被重置，如 manben 直连 4s 通、代理连接被 reset，
+    浏览器渲染若沿用系统代理会 ERR_CONNECTION_RESET，整源取不到图）。
+    """
+    if isinstance(source_proxy, str) and source_proxy.strip().lower() in ("direct", "none", "-"):
+        return None
     if source_proxy:
         return source_proxy
     return _system_proxy()
@@ -847,6 +854,25 @@ async def _wait_all_canvases_ready(
     return False
 
 
+async def _launch_chromium_async(p):
+    """异步启动 Chromium：托管浏览器优先，缺失时回退本机 Chrome/Edge。
+
+    Playwright 升级/重装后 ms-playwright 里的 headless shell 可能已不存在，
+    `p.chromium.launch()` 会直接抛 "Executable doesn't exist"。渲染型源（漫画
+    canvas 分片、SPA 正文、反爬验证页）全靠渲染取内容，缺浏览器等于整源不可用
+    （manben/dm5/comicbox 实测）。同步路径早已按 `_system_chromium_executable`
+    回退本机浏览器，这里补齐同一行为。
+    """
+    try:
+        return await p.chromium.launch(headless=True)
+    except Exception:
+        executable = _system_chromium_executable(p.chromium)
+        if not executable:
+            raise
+        log.warning("Playwright 托管浏览器缺失，回退本机浏览器：%s", executable)
+        return await p.chromium.launch(headless=True, executable_path=executable)
+
+
 async def fetch_rendered_images(
     url: str,
     wait_for: str = "canvas",
@@ -908,7 +934,7 @@ async def fetch_rendered_images(
         log.info("[playwright] 阶段=代理，状态=直连")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await _launch_chromium_async(p)
         try:
             context = await _new_browser_context_async(
                 browser,
@@ -1393,7 +1419,7 @@ async def _fetch_pages_batch(
 
     results = {}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await _launch_chromium_async(p)
         try:
             used_proxy = _pick_proxy(render_cfg.get("proxy"))
             context = await _new_browser_context_async(

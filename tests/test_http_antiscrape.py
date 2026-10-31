@@ -198,3 +198,19 @@ def test_default_no_charset_falls_back_utf8():
     client._session = fake
     client._get_once_raw("http://x/", None, None, 5)
     assert resp.encoding == "utf-8"
+
+def test_anti_scrape_marker_far_into_page_is_detected():
+    """特征词在 2000 字符之后也要命中（哔哩轻小说限流页）。"""
+    filler = '<p>' + ('正文占位。' * 400) + '</p>'
+    html = '<html><head><title>第1章</title></head><body>' + filler + (
+        '<center>沒有可閱讀的章節 內容可能審核未通過或需要足夠的權限</center>'
+    ) + '</body></html>'
+    assert len(html) > 2000
+    assert http_mod._is_anti_scrape_text(html) is True
+    assert http_mod._anti_scrape_hit(html) == '沒有可閱讀的章節'
+
+
+def test_anti_scrape_hit_reports_matched_keyword():
+    html = '<html><body>请完成滑动验证后重试</body></html>'
+    assert http_mod._anti_scrape_hit(html) in ('滑动验证', '验证码')
+    assert http_mod._anti_scrape_hit('<html><body>正常正文</body></html>') == ''

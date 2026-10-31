@@ -47,15 +47,18 @@
       "works_list_item": {
         "cover_backfill": true,
         "root_selector": {
-          "css": "ul.list2 li"
+          "css": "dl.box dd ul.text_list li"
         },
         "fields": {
           "title": {
-            "css": "span[itemprop='name']"
+            "css": "b[itemprop='name']"
           },
           "url": {
             "css": "a[itemprop='url']",
             "attr": "href"
+          },
+          "author": {
+            "css": "span[itemprop='author']"
           }
         }
       }

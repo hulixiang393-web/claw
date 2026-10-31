@@ -262,17 +262,54 @@ def test_proxy_failed_host_skips_proxy_entirely(monkeypatch):
     assert attempts == [None], "同主机第二次请求不该再碰系统代理"
 
 
-def test_two_host_failures_suspend_system_proxy(monkeypatch):
-    """不同主机连续失败到阈值 → 系统代理整体停用（到期自动恢复）。"""
+def test_host_failures_suspend_system_proxy_when_proxy_never_worked(monkeypatch):
+    """不同主机连续失败到阈值 → 系统代理整体停用（到期自动恢复）。
+
+    只在这种前提下成立：近期没有任何请求经系统代理成功过（真僵尸代理）。
+    """
     monkeypatch.setattr(
         http_mod, "_system_proxy_candidates", lambda: [_SYSTEM_PROXY]
     )
     assert http_mod._live_system_proxy() == _SYSTEM_PROXY
-    http_mod._note_system_proxy_failure("a.test")
-    assert http_mod._live_system_proxy() == _SYSTEM_PROXY, "单主机失败还不该整体停用"
-    http_mod._note_system_proxy_failure("b.test")
+    for host in ("a.test", "b.test"):
+        http_mod._note_system_proxy_failure(host)
+    assert http_mod._live_system_proxy() == _SYSTEM_PROXY, "未到阈值不该整体停用"
+    http_mod._note_system_proxy_failure("c.test")
     assert http_mod._system_proxy_suspended() is True
     assert http_mod._live_system_proxy() is None, "停用期内必须直连"
+
+
+def test_proxy_success_blocks_global_suspension(monkeypatch):
+    """代理刚转发成功过 → 不许因为几台主机"直连更快"把整个代理关掉。
+
+    回归「所有需要代理的站一起打不开」：浏览一批国内站会把代理标记成僵尸，
+    整体停用 3 分钟后 xvideos/quanben 这类只能走代理的站全挂。
+    """
+    monkeypatch.setattr(
+        http_mod, "_system_proxy_candidates", lambda: [_SYSTEM_PROXY]
+    )
+    http_mod._mark_proxy_live()
+    for host in ("a.test", "b.test", "c.test", "d.test", "e.test"):
+        http_mod._note_system_proxy_failure(host)
+    assert http_mod._system_proxy_suspended() is False
+    assert http_mod._live_system_proxy() == _SYSTEM_PROXY
+    # 按主机绕过仍然生效：这几台后续直接走直连
+    assert http_mod._proxy_failed_for("a.test") is True
+
+
+def test_http_status_error_not_blamed_on_proxy(monkeypatch):
+    """代理转发回来的 404/400 属服务端答复，不能算僵尸代理证据。"""
+    assert http_mod._is_http_status_error(
+        http_mod.RequestError("请求失败 GET http://x/a：404 Client Error: Not Found")
+    ) is True
+
+    class _Resp:
+        status_code = 404
+
+    exc = RuntimeError("boom")
+    exc.response = _Resp()
+    assert http_mod._is_http_status_error(exc) is True
+    assert http_mod._is_http_status_error(OSError("read timed out")) is False
 
 
 def test_suspension_expires(monkeypatch):
@@ -280,8 +317,8 @@ def test_suspension_expires(monkeypatch):
     monkeypatch.setattr(
         http_mod, "_system_proxy_candidates", lambda: [_SYSTEM_PROXY]
     )
-    http_mod._note_system_proxy_failure("a.test")
-    http_mod._note_system_proxy_failure("b.test")
+    for host in ("a.test", "b.test", "c.test"):
+        http_mod._note_system_proxy_failure(host)
     assert http_mod._system_proxy_suspended() is True
     http_mod._PROXY_FAIL["until"] = time.monotonic() - 1
     assert http_mod._system_proxy_suspended() is False

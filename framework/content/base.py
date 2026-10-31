@@ -701,6 +701,20 @@ class ContentBase:
 
         # 播放源列表（换源站）：解析 source_switch 配置的可用源
         detail.source_list = self._parse_source_list(source, html, context=context)
+        if not detail.source_list and hasattr(self, "_source_list_from_first_episode"):
+            # 线路 tab 只出现在播放页的站（omofuna）→ 用首集页补一次
+            detail.source_list = self._source_list_from_first_episode(
+                source, detail, context=context
+            )
+        if not detail.source_list and source.content_type == "video":
+            # 分集自带线路坐标（api_endpoints.detail.chapters.lines_path，如 ikanpp
+            # 的 /api/lines）→ 直接由分集整理线路菜单，零额外请求。
+            build_menu = getattr(self, "line_menu_from_chapters", None)
+            if build_menu is not None:
+                try:
+                    detail.source_list = build_menu(detail.chapters) or []
+                except Exception:  # noqa: BLE001 —— 线路菜单只是优化
+                    detail.source_list = []
         if not detail.source_list:
             self._prepare_video_source_list(source, detail)
 
