@@ -67,6 +67,14 @@ _READ_CHUNK = 64 * 1024
 # （慢 CDN 上就是肉眼可见的起播延迟）。
 _SNIFF_BYTES = 16
 
+# 单个媒体响应超过这个字节数就算「大文件长流」，响应头声明 Connection: close。
+#
+# 与 HLS 分片相反：分片小、请求短，keep-alive 省掉重复握手才是收益；
+# 而 272MB 的 mp4 是**一条连接写很久**，播放器在这条连接上发起的 seek 请求
+# 要等它写完才可能被读到（实测 ffmpeg 直接报 `Seek failed` + `0 seeks`，
+# 用户看到「拖动就卡死」）。关连接让每次 seek 走独立连接、独立线程。
+_LARGE_STREAM_CLOSE_BYTES = 8 * 1024 * 1024
+
 
 def _read_available(raw, size: int) -> bytes:
     """有多少读多少地读上游：只调一次 read1，绝不并读。
@@ -1384,15 +1392,24 @@ def _send_upstream_error(handler, resp) -> None:
     _send_range_error(handler, 416, resp.headers)
 
 
-def _send_stream_headers(handler, resp, override_len: int | None = None) -> tuple:
+def _send_stream_headers(handler, resp, override_len: int | None = None,
+                         close_if_larger: int = 0) -> tuple:
     """透传上游媒体响应头并保证 HTTP/1.1 响应有正确定界。
 
-    **不能声明 Connection: close**（handler 已是 HTTP/1.1）：HLS 播放器逐段
-    拉分片、mp4 拖动逐个发 Range，每次新建连接都要重新握手 + 代理新建服务
-    线程，是播放卡顿/拖动迟滞的主要来源。代价是每个响应都必须有定界：
-    上游给了 Content-Length 就原样透传；上游是 chunked 则由我们重新按
-    chunked 分帧（保持流式）；两者都没有（连接关闭定界）才退回
-    close_connection，让客户端读到 EOF 为止。
+    **默认不声明 Connection: close**（handler 已是 HTTP/1.1）：HLS 播放器逐段
+    拉分片，每次新建连接都要重新握手 + 代理新建服务线程，是播放卡顿/拖动迟滞
+    的主要来源。代价是每个响应都必须有定界：上游给了 Content-Length 就原样
+    透传；上游是 chunked 则由我们重新按 chunked 分帧（保持流式）；两者都没有
+    （连接关闭定界）才退回 close_connection，让客户端读到 EOF 为止。
+
+    `close_if_larger`：**单个大文件长流必须关连接**，与分片相反。
+    现场（omofuna「精品」线 272MB mp4）：ffmpeg 在 keep-alive 连接上发 seek 请求，
+    而我们的 handler 还在这条连接上流式写整片 body，回不到 `handle_one_request`
+    去读下一个请求 → ffmpeg 的 http_seek 迟迟拿不到响应：
+        `stream level seek from 19087100 to 95353670`
+        `Seek failed (to 95353670, size 285167868)` + `0 seeks`
+    表现就是「一拖进度条就卡死」。声明 Connection: close 后，播放器每次 seek
+    都新建连接，各自一个服务线程，Range 立刻能处理。
 
     override_len：body 已被整读（如 gzip 分支 resp.content 已解压）时传入
     实际长度——此时上游的 Content-Length 是压缩态长度，与将写出的字节数不
@@ -1413,6 +1430,9 @@ def _send_stream_headers(handler, resp, override_len: int | None = None) -> tupl
     else:
         raw_len = resp.headers.get("Content-Length")
     declared = int(raw_len) if (raw_len or "").isdigit() else None
+    if close_if_larger and declared is not None and declared >= close_if_larger:
+        handler.send_header("Connection", "close")
+        handler.close_connection = True
     chunked = False
     if declared is None:
         if (resp.headers.get("Transfer-Encoding") or "").lower() == "chunked":
@@ -2971,15 +2991,23 @@ class MediaProxy:
                         _record_cache_diagnostic(target, req_headers, "hit")
                         self._serve_local_file(handler, p)
                         return
-                if self._wait_for_cached_fetch(handler, cache, key, target, req_headers):
-                    return
-                if not handler.headers.get("Range"):
+                # 拖动（Range）请求绝不排队等别人的整片抓取。
+                #
+                # 现场（omofuna「精品」线 272MB mp4 实测）：起播请求不带 Range，
+                # 成为 fetch owner 后一边流式转发一边 tee 落盘，这个连接要等
+                # mpv 读完整个文件才结束。用户一拖动，mpv 发来新的数据请求，
+                # 旧逻辑在这里 `_wait_for_cached_fetch` 死等前一个抓取结束 →
+                # 上游请求数恒为 0、pos 卡在目标位置不动（"跳转后直接卡住"）。
+                #
+                # 结论：**任何请求都不为缓存排队**。文件已 complete 时上面已经
+                # 直接 serve 本地；没下完就各自去上游取自己需要的字节段，
+                # tee 仍只由第一个整片请求负责，不会重复落盘。
+                is_range = bool(handler.headers.get("Range"))
+                if not is_range:
                     fetch_owner, fetch_state = cache.start_fetch(key)
                     if not fetch_owner:
-                        if self._wait_for_cached_fetch(handler, cache, key, target,
-                                                       req_headers):
-                            return
-                        fetch_owner, fetch_state = cache.start_fetch(key)
+                        fetch_owner = False
+                        fetch_state = None
             except Exception:  # noqa: BLE001 —— 缓存不可用退化为直传
                 cache_on = False
                 fetch_owner = False
@@ -3038,8 +3066,13 @@ class MediaProxy:
                 return
 
             # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
+            # 普通媒体：透传响应头 + 流式转发（已拦截 >=400，这里透传上游状态码）
+            # 单个大文件（mp4 等）声明 Connection: close：播放器 seek 时才能
+            # 立刻新建连接拿到 Range 响应，而不是排在整片长流后面干等（见
+            # _send_stream_headers 的 close_if_larger 说明）。
             chunked, declared = _send_stream_headers(
-                handler, resp, override_len=len(first) if whole else None)
+                handler, resp, override_len=len(first) if whole else None,
+                close_if_larger=_LARGE_STREAM_CLOSE_BYTES)
 
             # 磁盘缓存 tee：首播流（从头开始）才起写；已知总长且从头接收，
             # 写满 commit。拖动进度的非 0 起始请求走 _abort_tee_on_gap 放弃。
