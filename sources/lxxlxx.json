@@ -1,0 +1,172 @@
+{
+  "$schema_version": 2,
+  "$id": "lxxlxx",
+  "$type": "video",
+  "$name": "Lxxlx（LXXLXX 标签站）",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "adult": true,
+    "homepage": "https://www.lxxlxx.com/",
+    "description": "LXXLXX 标签站（多语言镜像 -en/-cn/-zhs）。列表与分类都是标签页：/tags/{Tag}/ 为第 1 页，/tags/{Tag}/{page}/ 为第 N 页，站点第 1 页无页码、缺尾斜杠的 /tags/{Tag}/{page} 会被 301 到 http 后阻断，故分类 URL 统一写 /tags/{Tag}// 并由 page_placeholder 在末尾两个斜杠之间插入页码。搜索 /search/?key=。详情页单章（一个页面即一个视频），取流走三段链：详情页 /vjs/{vid}.js → m4-player-*.gotojs.xyz 播放器脚本 → <source src=...mp4>，全程纯 HTTP。播放器与 CDN 主机按语言域/地域不同，逐跳从响应内容提取，不写死主机名。",
+    "lang": "en",
+    "region": "us",
+    "tags": [
+      "视频",
+      "成人",
+      "标签站",
+      "mp4"
+    ],
+    "last_verified": "2026-10-29"
+  },
+  "transports": {
+    "base_url": "https://www.lxxlxx.com",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.lxxlxx.com/"
+    },
+    "timeout": 15,
+    "retries": 2,
+    "interval_ms": 500,
+    "charset": "utf-8"
+  },
+  "endpoints": {
+    "discovery": {
+      "list_url": "/tags/Lesbians//",
+      "list_paginator": {
+        "type": "increment",
+        "param": "page",
+        "page_placeholder": "(?<=/)(?=/$)"
+      },
+      "list_item": {
+        "categories": [
+          { "title": "Lesbians", "url": "/tags/Lesbians//" },
+          { "title": "European", "url": "/tags/European//" },
+          { "title": "Asian", "url": "/tags/Asian//" },
+          { "title": "Arab", "url": "/tags/Arab//" },
+          { "title": "Latin", "url": "/tags/Latin//" },
+          { "title": "Solo", "url": "/tags/Solo//" },
+          { "title": "Threesomes", "url": "/tags/Threesomes//" },
+          { "title": "Group Sex", "url": "/tags/Group-Sex//" },
+          { "title": "Hentai", "url": "/tags/Hentai//" },
+          { "title": "African", "url": "/tags/African//" },
+          { "title": "Blondes", "url": "/tags/Blondes//" },
+          { "title": "Brunettes", "url": "/tags/Brunettes//" },
+          { "title": "Redheads", "url": "/tags/Redheads//" },
+          { "title": "Amateur", "url": "/tags/Amateur//" },
+          { "title": "POV", "url": "/tags/POV//" },
+          { "title": "Babes", "url": "/tags/Babes//" },
+          { "title": "Big Boobs", "url": "/tags/Big-Boobs//" },
+          { "title": "Bikini", "url": "/tags/Bikini//" },
+          { "title": "Blowjobs", "url": "/tags/Blowjobs//" },
+          { "title": "Cosplay", "url": "/tags/Cosplay//" },
+          { "title": "Couple", "url": "/tags/Couple//" },
+          { "title": "Dance", "url": "/tags/Dance//" },
+          { "title": "Enjoys", "url": "/tags/Enjoys//" },
+          { "title": "Lingerie", "url": "/tags/Lingerie//" },
+          { "title": "Masturbation", "url": "/tags/Masturbation//" },
+          { "title": "Matures", "url": "/tags/Matures//" },
+          { "title": "Orgasms", "url": "/tags/Orgasms//" },
+          { "title": "Outdoor", "url": "/tags/Outdoor//" },
+          { "title": "Pussy", "url": "/tags/Pussy//" },
+          { "title": "Stockings", "url": "/tags/Stockings//" },
+          { "title": "Lovely", "url": "/tags/Lovely//" },
+          { "title": "Uncensored", "url": "/tags/Uncensored//" }
+        ]
+      },
+      "works_list_item": {
+        "root_selector": { "css": "div.thumb" },
+        "fields": {
+          "title": { "css": "u" },
+          "url": { "css": "a[href*='/video/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "src" },
+          "update": { "css": "t" }
+        }
+      }
+    },
+    "search": {
+      "base_url": "/search/",
+      "method": "GET",
+      "keyword_param": "key",
+      "item": {
+        "root_selector": { "css": "div.thumb" },
+        "fields": {
+          "title": { "css": "u" },
+          "url": { "css": "a[href*='/video/']", "attr": "href" },
+          "cover": { "css": "img", "attr": "src" },
+          "update": { "css": "t" }
+        }
+      }
+    },
+    "detail": {
+      "url_pattern": "/video/[^/]+\\.html",
+      "fields": {
+        "title": { "css": "h1" },
+        "cover": { "css": "meta[property='og:image']", "attr": "content" },
+        "summary": { "css": "meta[name='description']", "attr": "content" },
+        "status": { "css": "div.video-info b" },
+        "tags": { "css": "div.pagination a[href*='/tags/']" }
+      }
+    },
+    "content": {
+      "episode": {
+        "single_chapter": true,
+        "note": "每个 /video/*.html 就是单个视频（无分集）。播放地址走 http_chain：详情页脚本 /vjs/{vid}.js（vid 从详情页 src 提取）→ 该脚本 document.write 的 m4-player-*.gotojs.xyz 二级播放器脚本 → 脚本内 <source src=...mp4>；语言域/地域不同主机不同，逐跳提取不写死；链尾 mp4 直链声明 fetch:false 不再回源。",
+        "play_url": {
+          "http_chain": [
+            {
+              "name": "vid",
+              "regex": "src=[\"']?(/vjs/\\d+\\.js)",
+              "referer": "detail",
+              "fetch": true
+            },
+            {
+              "name": "stage2",
+              "regex": "src=[\"']?(//[\\w.-]+[\\w./-]*?/vjs/\\d+\\.js)",
+              "referer": "detail",
+              "fetch": true
+            },
+            {
+              "name": "stream",
+              "regex": "(//[\\w.-]+[\\w./-]*?\\.mp4)",
+              "fetch": false
+            }
+          ]
+        }
+      }
+    }
+  },
+  "media": {
+    "format": "mp4",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    }
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 100
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 1
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "soft",
+      "selector": { "css": "div.thumb" }
+    }
+  }
+}
