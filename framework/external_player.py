@@ -32,8 +32,13 @@ _DEPS_TTL = 7 * 86400.0
 # 第三方播放器整条解析的时间预算：超预算就判失败交给换线，
 # 不让一个挂掉的解析站把整次取流拖成几十秒。
 _RESOLVE_BUDGET = 16.0
-# 单次 HTTP 上限（页面/脚本共用）
-_HTTP_TIMEOUT = 6.0
+# 单次 HTTP 上限（页面/脚本共用）。art.v2player.top 实测同一个页面
+# 6.1~10.9s 才吐完（12KB HTML），6s 上限会稳定超时 → 解析必失败。
+_HTTP_TIMEOUT = 12.0
+# 解析结果短期缓存：同一个播放页 hash 反复进入时不必再走一遍
+# 「取页面 + Node 解密」（实测一次 7~12s）。
+_STREAM_CACHE: dict = {}
+_STREAM_CACHE_TTL = 900.0
 
 _NODE_RUNNER = r"""
 const fs = require('fs');
@@ -118,6 +123,7 @@ class ExternalPlayer:
         self._log = log_ or log
         self._started = time.monotonic()
         self._budget = _RESOLVE_BUDGET
+        self._http_timeout = _HTTP_TIMEOUT
 
     def _left(self) -> float:
         """本次解析剩余时间预算（秒）。"""
@@ -181,6 +187,10 @@ class ExternalPlayer:
             self._budget = float(cfg.get("budget_s") or _RESOLVE_BUDGET)
         except (TypeError, ValueError):
             self._budget = _RESOLVE_BUDGET
+        try:
+            self._http_timeout = float(cfg.get("http_timeout_s") or _HTTP_TIMEOUT)
+        except (TypeError, ValueError):
+            self._http_timeout = _HTTP_TIMEOUT
         self._started = started
 
         sources = [str(item).lower() for item in (cfg.get("from") or [])]
@@ -232,10 +242,58 @@ class ExternalPlayer:
         )
         headers = dict(cfg.get("headers") or {})
         headers.setdefault("Referer", origin or "https://www.omofuna.com/")
-        page = self._http.get_text(
-            player_url, headers=headers, retries=1,
-            timeout=max(3.0, min(_HTTP_TIMEOUT, self._left())),
-        )
+        # 同一播放页 hash 短期命中缓存：解析站一次要 7~12s，重进/拖动进度条
+        # 再走一遍太慢（config: cache_ttl_s，默认 900s，0 = 不缓存）。
+        try:
+            ttl = float(cfg.get("cache_ttl_s", _STREAM_CACHE_TTL))
+        except (TypeError, ValueError):
+            ttl = _STREAM_CACHE_TTL
+        if ttl > 0:
+            hit = _STREAM_CACHE.get(player_url)
+            if hit and time.monotonic() - hit[0] < ttl:
+                self._log.info("external_player 缓存命中：%s", hit[1][:90])
+                return hit[1]
+        if cfg.get("prefer_direct"):
+            # 解析站主机常与站点主域不同出口：art.v2player.top 实测直连 200、
+            # 经系统代理 ReadTimeout。源声明后按主机绕过代理，否则每次取流
+            # 都要先白等一次代理超时。
+            try:
+                from framework.http import note_direct_preferred
+
+                for dep in [player_url] + [str(item) for item in (cfg.get("scripts") or [])]:
+                    note_direct_preferred(dep)
+            except Exception:  # noqa: BLE001 —— 只是优化，失败照常请求
+                pass
+        page = ""
+        last_error: Exception | None = None
+        try:
+            attempts = max(1, int(cfg.get("attempts") or 1))
+        except (TypeError, ValueError):
+            attempts = 1
+        for attempt in range(attempts):
+            if self._left() <= 1.5:
+                break
+            try:
+                page = self._http.get_text(
+                    player_url, headers=headers, retries=0,
+                    timeout=max(3.0, min(self._http_timeout, self._left())),
+                )
+            except Exception as exc:  # noqa: BLE001 —— TLS 抖动/超时：短退避再试
+                from framework.stream_resolver import StreamCancelledError
+
+                if isinstance(exc, (StreamCancelledError, TimeoutError)):
+                    raise
+                last_error = exc
+                page = ""
+                if attempt + 1 < attempts:
+                    time.sleep(min(1.2, 0.4 * (attempt + 1)))
+                continue
+            if page:
+                break
+        if not page and last_error is not None:
+            raise ContentMissingError(
+                f"第三方播放器页面获取失败（{attempts} 次）：{str(last_error)[:90]}"
+            )
         if not page:
             raise ContentMissingError("第三方播放器页面为空")
 
@@ -258,6 +316,11 @@ class ExternalPlayer:
         if not url.startswith(("http://", "https://")):
             raise ContentMissingError(f"第三方播放器返回的不是直链：{url[:80]}")
         self._log.info("external_player 解析成功：%s", url[:90])
+        if ttl > 0:
+            now = time.monotonic()
+            for stale in [k for k, (t, _) in _STREAM_CACHE.items() if now - t >= ttl]:
+                _STREAM_CACHE.pop(stale, None)
+            _STREAM_CACHE[player_url] = (now, url)
         return url
 
 

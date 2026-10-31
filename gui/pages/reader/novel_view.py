@@ -103,6 +103,11 @@ class NovelView(AutoScrollMixin, QWidget):
         self._image_generation = 0
         self._show_images = True
         self._cached_image_urls = []
+        # 片段渲染（正文夹图片）：文本片段是独立 QLabel，改排版设置时
+        # 必须重写它们的 HTML，否则段距/行距/字间距在这些源上毫无反应。
+        self._fragment_text_labels = []  # [(QLabel, 原始片段文本), ...]
+        self._fragment_title_label = None
+        self._fragment_title_text = ""
         self._bookstack_image_pixmaps = {}
         self._current_chapter_url = ""
         self._toc_generation = 0
@@ -963,15 +968,16 @@ class NovelView(AutoScrollMixin, QWidget):
         if self._mode == "scroll" and self._show_images and fragments:
             self.text.setVisible(False)
             generation = self._image_generation
-            title_widget = QLabel(
-                self._reader_body_html(f"【{escape(str(label))}】", has_title=True)
-            )
+            title_widget = QLabel()
             title_widget.setTextFormat(Qt.RichText)
             title_widget.setObjectName("readerBody")
             title_widget.setWordWrap(True)
             title_widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
             title_widget.setStyleSheet(self._plain_body_css())
             title_widget.setMaximumWidth(self._content_width)
+            self._set_reader_text(title_widget, f"【{label}】", has_title=True)
+            self._fragment_title_label = title_widget
+            self._fragment_title_text = f"【{label}】"
             self.scroll_layout.insertWidget(
                 self.scroll_layout.count() - 1, title_widget, alignment=Qt.AlignHCenter
             )
@@ -980,18 +986,20 @@ class NovelView(AutoScrollMixin, QWidget):
                     # 片段正文与主正文用同一套段落排版：早先这里直接 setText(纯文本)，
                     # 图片夹在正文里时整章就退化成一个没有段距/缩进的 QLabel，
                     # 表现就是「所有段落挤成一段」。
-                    fragment_text = self._split_merged_paragraphs(
-                        self._reader_convert_text(str(fragment.get("text") or ""))
-                    )
-                    segment = QLabel(
-                        self._reader_body_html(fragment_text, has_title=False)
-                    )
+                    raw = str(fragment.get("text") or "")
+                    segment = QLabel()
                     segment.setTextFormat(Qt.RichText)
                     segment.setObjectName("readerBody")
                     segment.setWordWrap(True)
                     segment.setTextInteractionFlags(Qt.TextSelectableByMouse)
                     segment.setStyleSheet(self._plain_body_css())
                     segment.setMaximumWidth(self._content_width)
+                    self._set_reader_text(
+                        segment,
+                        self._split_merged_paragraphs(self._reader_convert_text(raw)),
+                        has_title=False,
+                    )
+                    self._fragment_text_labels.append((segment, raw))
                     self.scroll_layout.insertWidget(
                         self.scroll_layout.count() - 1, segment, alignment=Qt.AlignHCenter
                     )
@@ -1001,6 +1009,9 @@ class NovelView(AutoScrollMixin, QWidget):
                         self._load_image(image_url, generation, self._load_generation)
         else:
             self.text.setVisible(True)
+            self._fragment_text_labels = []
+            self._fragment_title_label = None
+            self._fragment_title_text = ""
         # 翻页视图同步（分页结果按章缓存，避免反复全量切分长文）
         self._paged_full_text = full
         self.scroll_body.adjustSize()
@@ -1281,6 +1292,10 @@ class NovelView(AutoScrollMixin, QWidget):
             self.scroll_layout.insertWidget(1, self._rich_body)
         self.text.setVisible(True)
         self._rich_body.setVisible(False)
+        # 片段标签已被清掉（上面的循环），引用一并作废，避免重排时访问死指针
+        self._fragment_text_labels = []
+        self._fragment_title_label = None
+        self._fragment_title_text = ""
 
     def set_show_images(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -1809,9 +1824,34 @@ class NovelView(AutoScrollMixin, QWidget):
         self._repaginate()
         if self._mode == "pager":
             self._pager_show_page(self._current_page)
-        if self._displayed_plain_text and self.text.isVisible():
-            # 字号/行距/配色都写在正文 HTML 里，改设置时按新样式重排一遍
+        if self._displayed_plain_text:
+            # 字号/行距/段距/缩进/字距都写在正文 HTML 里，改设置时按新样式重排一遍
             self._set_reader_text(self.text, self._displayed_plain_text)
+        self._refresh_fragment_body()
+
+    def _refresh_fragment_body(self) -> None:
+        """按当前排版重写「片段渲染」里的正文标签。
+
+        带图片的章节（哔哩轻小说/全本/timo/纵横等）走的是片段渲染：正文在
+        若干独立 QLabel 里，`self.text` 是隐藏的。之前 `_apply_font` 只重排
+        `self.text`，于是这些源的段间距/行距/首行缩进/字间距设置点了没反应。
+        """
+        labels = list(getattr(self, "_fragment_text_labels", []) or [])
+        if not labels:
+            return
+        for widget, raw in labels:
+            text = self._split_merged_paragraphs(self._reader_convert_text(raw))
+            self._set_reader_text(widget, text, has_title=False)
+            widget.setStyleSheet(self._plain_body_css())
+            widget.setMaximumWidth(self._content_width)
+        title_widget = getattr(self, "_fragment_title_label", None)
+        if title_widget is not None:
+            self._set_reader_text(
+                title_widget, self._fragment_title_text or "", has_title=True
+            )
+            title_widget.setStyleSheet(self._plain_body_css())
+            title_widget.setMaximumWidth(self._content_width)
+        self.scroll_body.adjustSize()
 
     def set_reading_style(self, bg: str = "", font_size: int = 0, fg: str = "") -> None:
         """设置阅读区独立背景色/字号/前景色（ui-reader #12）。

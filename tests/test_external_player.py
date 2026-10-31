@@ -56,6 +56,10 @@ EPISODE = "https://www.omofuna.com/anime/x/play/1/1.html?sid=1"
 @pytest.fixture(autouse=True)
 def _tmp_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(ep, "_cache_dir", lambda: str(tmp_path))
+    # 解析结果缓存是进程级状态：不清会跨用例命中，失败用例就测不到异常路径。
+    ep._STREAM_CACHE.clear()
+    yield
+    ep._STREAM_CACHE.clear()
 
 
 @pytest.mark.skipif(not ep.node_available(), reason="需要 Node.js")
