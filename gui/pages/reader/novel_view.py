@@ -721,6 +721,31 @@ class NovelView(AutoScrollMixin, QWidget):
         self._sync_language_button()
         self._sync_settings_actions()
 
+    def _ensure_decoded(self, ch, text: str) -> str:
+        """渲染前兜底：正文若还带反爬字体假字，就地解一次。
+
+        章节文本可能来自新抓取、正文缓存、书架缓存仓库或离线预缓存——后三者
+        存的是**解密后**文本（TTL 7 天），解码上线前写入的条目会原样带假字
+        （「张起灵녈头」）。这里统一过一遍 Content 的自愈逻辑，正常文本零开销。
+        """
+        body = str(text or "")
+        if not body:
+            return body
+        content = getattr(self, "_content", None)
+        redo = getattr(content, "_redecode_if_obfuscated", None)
+        if not callable(redo):
+            return body
+        try:
+            fixed = redo(self._source, str(getattr(ch, "url", "") or ""), body)
+        except Exception:  # noqa: BLE001 —— 兜底失败就用原文
+            return body
+        if fixed and fixed != body:
+            try:
+                ch._cached_text = fixed
+            except Exception:  # noqa: BLE001
+                pass
+        return fixed or body
+
     def _reader_convert_text(self, text: str) -> str:
         """Convert display text without changing the cached source text."""
         from framework.zh_convert import convert
@@ -925,6 +950,7 @@ class NovelView(AutoScrollMixin, QWidget):
     def _display_chapter(self, ch, text: str, scroll_to_end: bool = False) -> None:
         """正文前加章节编号行（如「第12章」），不含标题文字。"""
         from framework.content import chapter_label
+        text = self._ensure_decoded(ch, text)
         label = chapter_label(ch.title) or f"第{self._current_idx + 1}章"
         self._update_reader_header(ch, label)
         display_text = self._prepare_reader_body(ch, text)
@@ -1392,6 +1418,9 @@ class NovelView(AutoScrollMixin, QWidget):
         if not hasattr(ch, "_cached_image_urls"):
             ch._cached_image_urls = []
         ch._images_attempted = True
+        # 预取/离线路径可能直接带旧文本进来，先兜底解码再渲染
+        text = self._ensure_decoded(ch, text)
+        ch._cached_text = text
         self._auto_loading = False  # 翻页边界跳章完成，解除锁定
         self._auto_prev_loading = False
         if self._current_idx >= 0 and ch.url == self._chapters[self._current_idx].url:
