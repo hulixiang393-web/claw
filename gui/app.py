@@ -483,6 +483,31 @@ def _app_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _log_build_stamp(base_dir: Path) -> None:
+    """启动时把代码版本写进日志：排查「改完还是老行为」时先看这一行。"""
+    stamp = "unknown"
+    try:
+        import subprocess
+
+        stamp = subprocess.run(
+            ["git", "-C", str(base_dir), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001 —— 打包环境没有 git
+        pass
+    try:
+        import framework.obfuscated_font as of
+
+        font_ok = bool(of._sys_font())
+    except Exception:  # noqa: BLE001
+        font_ok = False
+    log.info(
+        "claw 启动：commit %s，根目录 %s，字体混淆解码 %s，解释器 %s",
+        stamp, base_dir, "可用" if font_ok else "不可用（缺系统字体）",
+        sys.version.split()[0],
+    )
+
+
 def _pick_favorite_folder(parent, store) -> str:
     """弹「收藏到分类」对话框，返回所选收藏夹名。
 
@@ -2425,6 +2450,7 @@ def main() -> int:
     # 日志初始化（诊断区 verbose_logging / log_dir）
     base_dir = _app_base_dir()
     setup_logging(SettingsManager(base_dir / "app_config.json"))
+    _log_build_stamp(base_dir)
 
     def _log_uncaught(exc_type, exc, tb) -> None:
         if issubclass(exc_type, KeyboardInterrupt):

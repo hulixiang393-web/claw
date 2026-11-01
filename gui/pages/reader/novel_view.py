@@ -747,7 +747,18 @@ class NovelView(AutoScrollMixin, QWidget):
             fake = sum(1 for ch_ in body if 0xAC00 <= ord(ch_) <= 0xD7A3)
             log.info("阅读器兜底解码：%d 个假字 → 0（%s）", fake,
                      str(getattr(ch, "url", "") or "")[-40:])
-        return fixed or body
+        out = fixed or body
+        leftover = sum(1 for ch_ in out if 0xAC00 <= ord(ch_) <= 0xD7A3)
+        if leftover:
+            # 兜底之后还有假字：把源和样本打进日志，方便按源定位（不要猜）
+            log.warning(
+                "阅读器仍见假字：源 %s 章节 %s 剩余 %d 个，样本 %s",
+                getattr(getattr(self, "_source", None), "source_id", "?"),
+                str(getattr(ch, "url", "") or "")[-40:],
+                leftover,
+                "".join(ch_ for ch_ in out if 0xAC00 <= ord(ch_) <= 0xD7A3)[:12],
+            )
+        return out
 
     def _reader_convert_text(self, text: str) -> str:
         """Convert display text without changing the cached source text."""
