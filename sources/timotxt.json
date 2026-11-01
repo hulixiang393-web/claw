@@ -6,7 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "detail_cache_version": 2,
-  "chapter_cache_version": 3,
+  "chapter_cache_version": "4",
   "$metadata": {
     "homepage": "https://www.timotxt.com/",
     "description": "TimoTXT 免费小说站。优先 HTTP/代理，必要时回退 Playwright；正文繁体自动转换为简体。",

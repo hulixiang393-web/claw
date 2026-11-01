@@ -132,3 +132,6 @@ def test_timotxt_source_declares_font_decoding():
         assert steps[0]["codepoint_ranges"] == [[44032, 55203]]
         assert steps[0]["font_css"], "必须声明到字体所在 CSS"
         assert steps[-1]["strategy"] == "zh_convert"
+    # 正文缓存存的是**解密后**的文本：旧缓存（解出前抓的）会把假字冻 7 天，
+    # 所以字体解码上线时必须递增 chapter_cache_version 让旧键失效。
+    assert raw["chapter_cache_version"] >= "4"
