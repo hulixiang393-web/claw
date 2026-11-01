@@ -90,7 +90,17 @@ def test_timotxt_prefers_http_and_falls_back_to_rendered_pages():
         "response_field": "content",
         "selector": "#chapterWarp .chapter-content .content",
     }
-    assert source.raw["decryption"]["targets"]["content"]["to"] == "zh-cn"
+    # 站内转码接口是服务端明文（无子集字体假字）：正文优先走它，字形匹配只做回退
+    assert body["api"] == {
+        "url": "/chapter/transcode.html?bid={book_id}&cid={chapter_id}&sid=0",
+        "book_id_regex": "/?(\\d{6,})/(\\d+)\\.html",
+        "response_path": "content",
+        "decrypt_target": "chapter",
+        "fallback": True,
+    }
+    steps = source.raw["decryption"]["targets"]["content"]["steps"]
+    assert steps[0]["strategy"] == "obfuscated_font"
+    assert steps[1] == {"strategy": "zh_convert", "to": "zh-cn"}
 
 
 def test_timotxt_search_uses_site_search_path():
@@ -103,8 +113,10 @@ def test_timotxt_search_uses_site_search_path():
 def test_timotxt_conversion_is_configured_for_cached_content_invalidation():
     source = _source("timotxt")
     assert source.raw["detail_cache_version"] == 2
-    assert source.raw["chapter_cache_version"] == 3
-    assert source.raw["decryption"]["targets"]["content"]["strategy"] == "zh_convert"
+    # 5 = 正文接口明文上线；旧缓存（字形匹配留下的形近字）必须重新取
+    assert source.raw["chapter_cache_version"] == "5"
+    steps = source.raw["decryption"]["targets"]["content"]["steps"]
+    assert [step["strategy"] for step in steps] == ["obfuscated_font", "zh_convert"]
 
 
 def test_timotxt_supports_both_conversion_directions():

@@ -837,7 +837,17 @@ class ChapterMixin:
         api_cfg = body.get("api") or {}
         api_text = ""
         if api_cfg:
-            api_text = self._fetch_chapter_api_text(source, url, api_cfg)
+            # 站内正文接口（服务端已解好码的明文）优先：比「抓页面 + 字形匹配」
+            # 更准也更快。接口挂了按 fallback 回退页面解析，正文不能因此变空。
+            try:
+                api_text = self._fetch_chapter_api_text(source, url, api_cfg)
+            except Exception as exc:  # noqa: BLE001
+                if not api_cfg.get("fallback", True):
+                    raise
+                log.info("[%s] 正文接口失败，回退页面解析：%s（%s）",
+                         source.source_id, str(exc)[:80], url[-40:])
+                api_text = ""
+        if api_text:
             html = api_text
         elif body.get("render") == "playwright_fallback":
             render_cfg = body.get("render_config") or {}
@@ -859,6 +869,9 @@ class ChapterMixin:
         # feed the Base64/decoded text through an HTML selector a second time.
         if api_text:
             text = self._normalize_para_indent(api_text)
+            if source.content_type == "novel":
+                # 接口偶发返回仍未转码的正文（msg=轉碼失敗）：字体混淆兜底照跑
+                text = self._auto_decode_font(source, url, text, "")
             return (text, "", []) if include_images else (text, "")
 
         nxt = ""
@@ -891,28 +904,23 @@ class ChapterMixin:
             text = self._decrypt_chapter(source, html, url)
         else:
             text = "\n".join(paragraphs)
+        # 站点二次转义（`&amp;#19981;`）时 lxml 只解一层，正文里会留 `&#19981;`
+        # 字面量上屏；命中实体形态才再解一次，正常文本零改动。
+        text = self._unescape_residual_entities(text)
         # 小说正文段落开头空格规范化（18mh 等站原文多个空格缩进）
         if source.content_type == "novel":
             text = self._normalize_para_indent(text)
-            # 字符映射解密（番茄小说字体混淆等）：decryption.targets.chapter.strategy=translit
-            if self._decrypter is not None:
-                # Font-face URLs are commonly relative to the chapter page;
-                # resolve them before the font matcher downloads the glyph map.
-                from framework.fanqie_font import extract_font_urls
-
-                font_urls = [
-                    urljoin(self._abs_url(source, url), font_url)
-                    for font_url in extract_font_urls(html)
-                ]
-                targets = (source.raw.get("decryption") or {}).get("targets") or {}
-                text_target = "content" if targets.get("content") else "chapter"
-                text = self._decrypter.decrypt(
-                    source, text, text_target, html=html, font_urls=font_urls
-                )
-            # 源未声明解码、但正文里仍是「谚文/私用区」假码点时，自动按页面字体还原：
-            # 这套字体混淆（U+AC00–U+D7A3 或 U+E000–U+F8FF 承载真字，靠 @font-face
-            # 子集字体画出来）在多个笔趣阁系站点通用，不逐个源写配置也能解。
-            text = self._auto_decode_font(source, url, text, html)
+            text = self._decode_body_text(source, url, text, html)
+            # 图文混排的**文本片段**也必须走同一条解码链：GUI 在「显示图片」开启时
+            # 直接渲染这些片段（self.text 被隐藏），片段原文来自 DOM、绕过正文链路，
+            # 字体混淆源就会露出「雍正十三뎃的冬天」这种假字。
+            for entry in image_entries or []:
+                if isinstance(entry, dict) and entry.get("type") == "text":
+                    entry["text"] = self._decode_body_text(
+                        source, url,
+                        self._unescape_residual_entities(str(entry.get("text") or "")),
+                        html,
+                    )
         image_entries = image_entries if include_images else []
         # 正文广告行过滤（ad_block 引擎：剔除「广告/推广/点击领取」等特征行）
         try:
@@ -926,6 +934,44 @@ class ChapterMixin:
         return (text, nxt, image_entries) if include_images else (text, nxt)
 
     _AUTO_FONT_RANGES = ((0xAC00, 0xD7A3), (0xE000, 0xF8FF))
+    _ENTITY_RESIDUE_RE = _re.compile(r"&(?:#\d{2,7}|#x[0-9a-fA-F]{2,6}|[a-zA-Z]{2,8});")
+
+    def _unescape_residual_entities(self, text: str) -> str:
+        """解掉「二次转义」留下的实体字面量（`&#19981;` → `不`）。"""
+        body = str(text or "")
+        if not body or "&" not in body or not self._ENTITY_RESIDUE_RE.search(body):
+            return body
+        import html as _html
+
+        return _html.unescape(body)
+
+    def _decode_body_text(self, source, url: str, text: str, html: str) -> str:
+        """正文解码链：源声明的 decryption 链（字体混淆/繁简等）+ 字体混淆自动兜底。
+
+        正文与图文片段共用这一条链，保证「主正文」和「图片之间的文字」解码结果一致。
+        """
+        body = str(text or "")
+        if not body:
+            return body
+        if self._decrypter is not None:
+            # 字符映射解密（番茄小说字体混淆等）：decryption.targets.chapter.strategy=translit
+            # Font-face URLs are commonly relative to the chapter page;
+            # resolve them before the font matcher downloads the glyph map.
+            from framework.fanqie_font import extract_font_urls
+
+            font_urls = [
+                urljoin(self._abs_url(source, url), font_url)
+                for font_url in extract_font_urls(html)
+            ]
+            targets = (source.raw.get("decryption") or {}).get("targets") or {}
+            text_target = "content" if targets.get("content") else "chapter"
+            body = self._decrypter.decrypt(
+                source, body, text_target, html=html, font_urls=font_urls
+            )
+        # 源未声明解码、但正文里仍是「谚文/私用区」假码点时，自动按页面字体还原：
+        # 这套字体混淆（U+AC00–U+D7A3 或 U+E000–U+F8FF 承载真字，靠 @font-face
+        # 子集字体画出来）在多个笔趣阁系站点通用，不逐个源写配置也能解。
+        return self._auto_decode_font(source, url, body, html)
 
     def _auto_decode_font(self, source, url: str, text: str, html: str) -> str:
         """正文出现字体混淆假码点时自动解码（与源配置无关）。
@@ -976,22 +1022,36 @@ class ChapterMixin:
         return body
 
     def _fetch_chapter_api_text(self, source, url: str, cfg: dict) -> str:
-        """Fetch and decrypt a JSON chapter payload configured by the source."""
+        """Fetch and decrypt a JSON chapter payload configured by the source.
+
+        cfg：
+          url            接口地址，支持 {id} / {book_id} / {chapter_id} 占位
+          book_id_regex  从章节页 URL 取书号的规则（默认按 /novel/<id>/ 等路径段）
+          response_path  JSONPath（默认 data.content.0.text）
+          decrypt_target 解密链目标（默认 chapter）
+        """
         from urllib.parse import parse_qs, urlencode, urlsplit
 
         match = _re.search(
-            r"/(?:novel|book|comic|detail|bookinfo|program|shuku|chapter)/(\w+)",
+            cfg.get("book_id_regex")
+            or r"/(?:novel|book|comic|detail|bookinfo|program|shuku|chapter)/(\w+)",
             url,
         )
         parts = urlsplit(url)
         book_id = match.group(1) if match else ""
         chapter_id = parts.path.rstrip("/").split("/")[-1].split(".")[0]
-        api_url = str(cfg.get("url") or "").replace("{id}", book_id).replace("{chapter_id}", chapter_id)
+
+        def _fill(value: str) -> str:
+            return (value.replace("{id}", book_id)
+                    .replace("{book_id}", book_id)
+                    .replace("{chapter_id}", chapter_id))
+
+        api_url = _fill(str(cfg.get("url") or ""))
         params = dict(cfg.get("params") or {})
         for key, value in parse_qs(parts.query).items():
             if value:
                 params.setdefault(key, value[0])
-        query = urlencode({k: str(v).replace("{id}", book_id).replace("{chapter_id}", chapter_id) for k, v in params.items()})
+        query = urlencode({k: _fill(str(v)) for k, v in params.items()})
         abs_url = self._abs_url(source, api_url)
         if query:
             abs_url += ("&" if "?" in abs_url else "?") + query
@@ -999,9 +1059,12 @@ class ChapterMixin:
             abs_url, headers=self._headers(source), timeout=self._timeout(source),
             retries=self._retries(source), proxy_pool=source.proxy_pool(),
         )
-        value = self._jsonpath(payload, cfg.get("response_path") or "data.content.0.text")
+        rpath = cfg.get("response_path") or "data.content.0.text"
+        value = self._jsonpath(payload, rpath)
         if not value:
-            raise ContentMissingError("17K 正文接口未返回内容", source_id=source.source_id)
+            raise ContentMissingError(
+                "正文接口未返回内容（%s）" % rpath, source_id=source.source_id
+            )
         text = str(value)
         if self._decrypter is not None:
             text = self._decrypter.decrypt(source, text, cfg.get("decrypt_target") or "chapter")

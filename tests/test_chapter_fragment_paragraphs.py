@@ -126,3 +126,59 @@ def test_merged_fragment_text_is_split_before_render(_qapp):
     bodies = [label.text() for label in labels if "<p " in label.text()]
     assert bodies and bodies[0].count("<p ") >= 6
     view.deleteLater()
+
+
+# --------------------------------------------------------------------------- #
+# 字体混淆（反爬子集字体）：图文片段必须与主正文走同一条解码链
+# timotxt 实测：正文链路已解码，但片段原文来自 DOM，阅读器渲染片段时露出
+# 「雍正十三뎃的冬天」这类假字。
+# --------------------------------------------------------------------------- #
+FAKE_PAGE = """<html><body>
+<div class="jm-rd-read">
+  <p>第1章 开端</p>
+  <p>雍正十三뎃的冬天，比往뎃冷得早。</p>
+  <p><img src="/img/1.jpg" /></p>
+  <p>臘梅剛冒눕花苞，就被北風裹上白霜。</p>
+</div></body></html>"""
+
+
+class _FontDecrypter:
+    """最小解密器：记录调用，并把假字换回真字。"""
+
+    TABLE = {"뎃": "年", "눕": "出"}
+
+    def __init__(self):
+        self.calls = []
+
+    def decrypt(self, source, text, target="content", html="", font_urls=None):
+        self.calls.append(str(text))
+        out = str(text)
+        for fake, real in self.TABLE.items():
+            out = out.replace(fake, real)
+        return out
+
+
+class _HttpFake(_Http):
+    def get_text(self, url, **kwargs):
+        return FAKE_PAGE
+
+
+def _fake_count(text):
+    return sum(1 for ch in str(text) if 0xAC00 <= ord(ch) <= 0xD7A3)
+
+
+def test_text_fragments_are_decoded_like_body():
+    decrypter = _FontDecrypter()
+    content = Content(_HttpFake(), Parser(), None, decrypter=decrypter)
+    text, fragments = content.fetch_chapter_with_images(
+        _source(), "https://example.com/novel/1/1.html"
+    )
+    assert _fake_count(text) == 0, text
+    texts = [str(e.get("text") or "") for e in fragments if e.get("type") == "text"]
+    assert texts, fragments
+    assert all(_fake_count(item) == 0 for item in texts), texts
+    # 片段里的假字确实被还原成真字，而不是被删掉
+    joined = "".join(texts)
+    assert "雍正十三年的冬天" in joined and "冒出花苞" in joined
+    # 主正文与片段都经过解密链（不是只解了其中一条）
+    assert any("雍正十三" in call for call in decrypter.calls)

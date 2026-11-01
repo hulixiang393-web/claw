@@ -6,7 +6,7 @@
   "$enabled": true,
   "$weight": 1.0,
   "detail_cache_version": 2,
-  "chapter_cache_version": "4",
+  "chapter_cache_version": "5",
   "$metadata": {
     "homepage": "https://www.timotxt.com/",
     "description": "TimoTXT 免费小说站。优先 HTTP/代理，必要时回退 Playwright；正文繁体自动转换为简体。",
@@ -246,6 +246,13 @@
           },
           "image_selector": {
             "css": "#chapterWarp .chapter-content .content > p, #chapterWarp .chapter-content .content > figure"
+          },
+          "api": {
+            "url": "/chapter/transcode.html?bid={book_id}&cid={chapter_id}&sid=0",
+            "book_id_regex": "/?(\\d{6,})/(\\d+)\\.html",
+            "response_path": "content",
+            "decrypt_target": "chapter",
+            "fallback": true
           },
           "render": "playwright_fallback",
           "render_config": {
