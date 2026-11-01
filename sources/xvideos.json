@@ -105,10 +105,28 @@
     "content": {
       "episode": {
         "single_chapter": true,
-        "note": "详情页即播放页（单集视频，无分集列表）：播放地址在 html5player.setVideoHLS('...m3u8')，regex 优先取 HLS 自适应主清单；主清单缺失时框架通用候选会退到 html5player.setVideoUrlHigh 的 mp4 直链。.",
+        "note": "详情页即播放页（单集视频，无分集列表）：新版页面只在播放器脚本里给编码 id（setEncodedIdVideo），真实地址由站内接口 /html5player/getvideo/<encoded_id> 返回，故 http_chain 先取 id 再取 JSON 的 hls（m3u8 自适应主清单）；旧版内联 setVideoHLS 与通用 .m3u8 候选只作兜底。",
         "play_url": {
-          "regex": "html5player\\.setVideoHLS\\('([^']+)'\\)",
-          "note": "只取播放器脚本里的 m3u8；不要改成 '.m3u8' 宽匹配——相关视频卡片 JSON（video_related）里没有 m3u8，但缩略图预览是 preview.mp4，宽匹配容易把预览/相关条目当正片。"
+          "http_chain": [
+            {
+              "name": "encoded",
+              "regex": "html5player\\.setEncodedIdVideo\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)",
+              "note": "2026-11 起详情页不再内联 setVideoHLS / setVideoUrlHigh，只在播放器脚本里给编码 id：html5player.setEncodedIdVideo('kpibcfobe53')。"
+            },
+            {
+              "name": "api",
+              "url": "https://www.xvideos.com/html5player/getvideo/{encoded}",
+              "referer": "detail",
+              "note": "站点播放器 JS（player.html5hls.static.js 的 updateUrlRPC / 无 HLS 分支）就是用 /html5player/getvideo/<encoded_id>[/<cdn_id>] 取真实地址；实测不带 cdn_id、只带详情页 Referer 即 200，故不额外探测 cdn 编号。"
+            },
+            {
+              "name": "play",
+              "regex": "\"hls\"\\s*:\\s*\"([^\"]+)\"",
+              "note": "响应 JSON：{exist,id,mp4_low,mp4_high,mp4_idcdn,hls,hls_idcdn,OK}；hls 是 \\/ 转义的 m3u8 主清单（480p/720p/360p 变体），http_chain 会把 \\/ 还原成 /。"
+            }
+          ],
+          "regex": "html5player\\.setVideoHLS\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)",
+          "note": "兜底：老版详情页仍内联 setVideoHLS('…m3u8')，http_chain 第 1 步匹配不到时走这里。只取播放器脚本里的 m3u8，不要改成 '.m3u8' 宽匹配——相关视频卡片 JSON（video_related）里的缩略图预览是 preview.mp4，宽匹配容易把预览当正片。"
         }
       }
     }

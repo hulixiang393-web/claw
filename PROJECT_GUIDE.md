@@ -708,7 +708,7 @@ _switch_candidate_episode_urls_parallel，默认线路失败时才触发，串�
 | `18j` | `ad_block.hls_rules.drop_leading_block`；片头仅在短时长、首个分界、媒体主机切换、未加密到 AES-128 切换等独立信号同时满足时删除，并受 `max_duration`/`max_ratio` 限制 | 仅按第一段短时长会误删正片；规则变化还可能使音视频时间戳异常 |
 | `ikanpp` | `ad_block.block_url_regex` 过滤暴风源 `/video/adjump/` 中插广告；`hls_rules.drop_short_blocks` 兜底识别「被 DISCONTINUITY 夹住、时长极短、占比极小」的广告块（广告与正片**同主机同目录**、URL 无广告词，只有「短」这一个结构特征） | 暴风广告不是稳定的固定时长，且广告 CDN 会轮换域名，单靠 URL 特征会漏；反过来，要求「主机切换」也识别不到真实广告（2026-10 实测：json1080 源广告块与正片同主机，旧 `drop_inserted_blocks` 一条都没命中，广告原样播放）。短块规则必须同时保留时长上限、占比上限和「清单内至少两个正片块」三重约束，放宽任一条都可能误删正片 |
 | `xuandm`、`avgood`、`bilibili`、`kanav`、`omofuna` | 继续使用各自已声明的通用 URL/HTML/HLS 规则 | 删除 `ad_block` 会让播放、下载和投屏行为不一致 |
-| `xvideos` | 列表/搜索的 `root_selector.exclude` 同时剔除频道卡（`.thumb-block-profile`）与付费卡（卡内含 `.is-premium`）；标签页分页按站点 0 索引，统一用 `?page=N`；取流只匹配 `html5player.setVideoHLS('…')` | 频道卡点进去是用户主页、付费卡（`?premium=1` tab）打开也只有预告，用户明确要求「只保留免费」；分页若用路径式 `/{N}` 会与站点 0 索引错位、第二页起全部重复第一页（实测 `/tags/xvedio/1` 与基底同页）；相关视频的缩略图预览是 `preview.mp4`，宽匹配 `.m3u8`/`.mp4` 会把预览当正片 |
+| `xvideos` | 列表/搜索的 `root_selector.exclude` 同时剔除频道卡（`.thumb-block-profile`）与付费卡（卡内含 `.is-premium`）；标签页分页按站点 0 索引，统一用 `?page=N`；取流走 `play_url.http_chain`：详情页取 `html5player.setEncodedIdVideo('…')` → `GET /html5player/getvideo/{encoded}`（Referer=详情页）→ JSON 字段 `hls`，旧版内联 `html5player.setVideoHLS('…')` 只作 regex 兜底 | 频道卡点进去是用户主页、付费卡（`?premium=1` tab）打开也只有预告，用户明确要求「只保留免费」；分页若用路径式 `/{N}` 会与站点 0 索引错位、第二页起全部重复第一页（实测 `/tags/xvedio/1` 与基底同页）；2026-11 起详情页不再内联 `setVideoHLS`/`setVideoUrlHigh`，也没有明文 m3u8（播放器 JS 改用 getvideo 接口取地址），只靠旧 regex 会「匹配不到播放地址」；相关视频的缩略图预览是 `preview.mp4`，宽匹配 `.m3u8`/`.mp4` 会把预览当正片 |
 
 #### 7.12.2 HLS 代理、密钥和预取
 
