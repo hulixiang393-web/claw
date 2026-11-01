@@ -472,6 +472,34 @@ def _store_cached(key: str, mapping: dict):
         log.info("obfuscated_font: 映射缓存写入失败 %s", exc)
 
 
+# 按字体 URL 再存一份：字体下载被反爬挡住（403/超时）时，只要本地暖过一次
+# 映射表就仍能解码——用户侧「时不时又乱码」多半是字体请求被限流，而不是算法错。
+def _url_key(url: str) -> str:
+    return hashlib.sha1(str(url).encode()).hexdigest()[:16]
+
+
+def _load_cached_url(url: str):
+    path = os.path.join(_cache_dir(), "mapurl_%s.json" % _url_key(url))
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < _MAP_TTL * 4:
+            with open(path, "r", encoding="utf-8") as handle:
+                mapping = json.load(handle)
+            if isinstance(mapping, dict) and mapping:
+                return mapping
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _store_cached_url(url: str, mapping: dict):
+    try:
+        path = os.path.join(_cache_dir(), "mapurl_%s.json" % _url_key(url))
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(mapping, handle, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def decode(text: str, cfg: dict, headers: dict = None) -> tuple:
     """按配置解码文本，返回 (新文本, 映射表)。cfg 见模块头注释。"""
     ranges = cfg.get("codepoint_ranges") or [[0xAC00, 0xD7A3], [0xE000, 0xF8FF]]
@@ -524,10 +552,19 @@ def decode(text: str, cfg: dict, headers: dict = None) -> tuple:
         have = {ord(k) for k in mapping}
         if needed.issubset(have):
             break
+        # 先看这个字体 URL 有没有暖过的映射（字体被反爬挡住也能解）
+        warm = _load_cached_url(url)
+        if warm and needed.issubset({ord(k) for k in warm}):
+            for fake, real in warm.items():
+                mapping.setdefault(fake, real)
+            continue
         try:
             raw = font_bytes(url, headers=headers)
         except Exception as exc:  # noqa: BLE001
             log.info("obfuscated_font: 字体下载失败 %s (%s)", url, exc)
+            if warm:
+                for fake, real in warm.items():
+                    mapping.setdefault(fake, real)
             continue
         key = hashlib.sha1(raw).hexdigest()[:16]
         cached = dict(_load_cached(key) or {})
@@ -544,6 +581,8 @@ def decode(text: str, cfg: dict, headers: dict = None) -> tuple:
             if fresh:
                 cached.update(fresh)
                 _store_cached(key, cached)
+        if cached:
+            _store_cached_url(url, cached)
         for fake, real in cached.items():
             mapping.setdefault(fake, real)
     if not mapping:

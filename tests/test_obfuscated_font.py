@@ -135,3 +135,32 @@ def test_timotxt_source_declares_font_decoding():
     # 正文缓存存的是**解密后**的文本：旧缓存（解出前抓的）会把假字冻 7 天，
     # 所以字体解码上线时必须递增 chapter_cache_version 让旧键失效。
     assert raw["chapter_cache_version"] >= "4"
+
+
+@pytest.mark.skipif(not of._sys_font(), reason="需要系统字体做字形匹配")
+def test_decode_works_from_url_cache_when_font_is_blocked(font_raw, tmp_path):
+    """字体请求被反爬挡住（403/超时）时，暖过的映射表仍要能解码。
+
+    真实场景：站点限流后字体下载失败，decode 会静默返回原文，用户看到的就是
+    「时不时又冒出谚文」。按字体 URL 存一份映射即可离线解码。
+    """
+    text = "周围全놆殘垣斷壁，他놅心裡很뀪往一樣平靜。"
+    cfg = {"codepoint_ranges": [[0xAC00, 0xD7A3]], "confidence": 0.55,
+           "font_urls": ["https://example.test/f24092.ttf"]}
+    original = of.font_bytes
+    of.font_bytes = lambda url, headers=None: font_raw
+    try:
+        warm, mapping = of.decode(text, cfg)
+        assert len(mapping) == 150
+        assert list(tmp_path.glob("mapurl_*.json")), "要按字体 URL 落盘一份映射"
+
+        def blocked(url, headers=None):
+            raise RuntimeError("HTTP 403")
+
+        of.font_bytes = blocked
+        offline, mapping2 = of.decode(text, cfg)
+    finally:
+        of.font_bytes = original
+    assert not [c for c in offline if 0xAC00 <= ord(c) <= 0xD7A3], offline
+    assert offline == warm, "离线解出的结果必须与在线一致"
+    assert len(mapping2) == 150
