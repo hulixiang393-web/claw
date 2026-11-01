@@ -469,7 +469,7 @@ class ChapterMixin:
         cache_key = self._chapter_cache_key(source, url)
         cached = self._cache_get(cache_key) if use_cache else None
         if cached is not None:
-            return cached
+            return self._redecode_if_obfuscated(source, url, cached)
         return self._inflight_call(
             ("body", source.source_id, self._abs_url(source, url), bool(use_cache)),
             lambda: self._fetch_chapter_body(
@@ -654,6 +654,51 @@ class ChapterMixin:
     # 正文抽取版本：改变文本提取语义时自增，旧缓存（7 天）自动失效。
     # 2 = keep_breaks（容器正文按 <br>/块边界还原换行，修「整章粘成一段」）。
     _CHAPTER_TEXT_VERSION = 2
+
+    @staticmethod
+    def _obfuscated_font_steps(source):
+        """源声明的「字体混淆解码」步骤（strategy=obfuscated_font）。"""
+        targets = (source.raw.get("decryption") or {}).get("targets") or {}
+        found = []
+        for name in ("content", "chapter"):
+            cfg = targets.get(name) or {}
+            steps = cfg.get("steps") if isinstance(cfg.get("steps"), list) else [cfg]
+            for step in steps:
+                if isinstance(step, dict) and step.get("strategy") == "obfuscated_font":
+                    found.append((name, step))
+        return found
+
+    def _redecode_if_obfuscated(self, source, url: str, text: str) -> str:
+        """缓存正文若还带假字（解码上线前存的），就地重解并回写缓存。
+
+        正文缓存存的是**解密后**文本、TTL 7 天，所以字体混淆解码上线前抓过的
+        章节会一直显示「张起灵녈头」。这里按 source 声明的码点区间自检，命中就
+        跑同一套 decryption.targets 链（字形映射已落盘缓存，毫秒级）后回写。
+        """
+        if not text or self._decrypter is None:
+            return text
+        for name, step in self._obfuscated_font_steps(source):
+            ranges = step.get("codepoint_ranges") or [[0xAC00, 0xD7A3], [0xE000, 0xF8FF]]
+            spans = []
+            for item in ranges:
+                try:
+                    spans.append((int(item[0]), int(item[1])))
+                except (TypeError, IndexError, ValueError):
+                    continue
+            if not any(any(lo <= ord(ch) <= hi for lo, hi in spans) for ch in text):
+                continue
+            try:
+                fixed = self._decrypter.decrypt(source, text, target=name)
+            except Exception:  # noqa: BLE001 —— 解不了就保留原文
+                return text
+            if fixed and fixed != text:
+                try:
+                    self._cache_set(self._chapter_cache_key(source, url), fixed,
+                                    ttl=7 * 86400)
+                except Exception:  # noqa: BLE001
+                    pass
+                return fixed
+        return text
 
     def _chapter_cache_key(self, source: SourceConfig, url: str) -> str:
         """Build a versioned chapter cache key when a source changes decoding."""
