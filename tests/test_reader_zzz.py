@@ -77,16 +77,21 @@ def test_novel_toc_old_generation_cannot_append(_qapp):
     assert view.toc_list.count() == 2
 
 
-def test_novel_prefetch_config_is_safe_and_defaults_are_small(_qapp):
+def test_novel_prefetch_config_follows_settings_page_range(_qapp):
+    """预加载深度跟设置页一致（向后 0–20、向前 0–10），串行模型不变。"""
     view = NovelView(object())
-    assert (view._prefetch_ahead, view._prefetch_behind) == (1, 0)
+    assert (view._prefetch_ahead, view._prefetch_behind) == (3, 1)
     view.set_prefetch_config(True, 999, 999)
-    assert (view._prefetch_ahead, view._prefetch_behind) == (1, 0)
+    assert (view._prefetch_ahead, view._prefetch_behind) == (20, 10)
     view.set_prefetch_config(True, "bad", None)
-    assert (view._prefetch_ahead, view._prefetch_behind) == (1, 0)
+    assert (view._prefetch_ahead, view._prefetch_behind) == (3, 1)
+    view.set_prefetch_config(True, 5, 2)
+    assert (view._prefetch_ahead, view._prefetch_behind) == (5, 2)
+    view.set_prefetch_config(False, 5, 2)
+    assert (view._prefetch_ahead, view._prefetch_behind) == (0, 0)
 
 
-def test_reader_prefetch_settings_has_small_defaults_and_caps():
+def test_reader_prefetch_settings_honors_configured_depth():
     class _Settings:
         def __init__(self, values):
             self.values = values
@@ -95,9 +100,13 @@ def test_reader_prefetch_settings_has_small_defaults_and_caps():
             return self.values.get(key, default)
 
     defaults = reader_prefetch_settings(_Settings({}))
-    assert defaults == {"enabled": True, "ahead": 1, "behind": 0}
+    assert defaults == {"enabled": True, "ahead": 3, "behind": 1}
+    configured = reader_prefetch_settings(
+        _Settings({"prefetch_ahead": 6, "prefetch_behind": 2})
+    )
+    assert configured == {"enabled": True, "ahead": 6, "behind": 2}
     capped = reader_prefetch_settings(_Settings({"prefetch_ahead": 99, "prefetch_behind": 99}))
-    assert capped == {"enabled": True, "ahead": 1, "behind": 0}
+    assert capped == {"enabled": True, "ahead": 20, "behind": 10}
 
 
 def test_novel_current_load_and_prefetch_do_not_duplicate(_qapp, monkeypatch):

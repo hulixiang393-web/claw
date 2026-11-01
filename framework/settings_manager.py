@@ -103,8 +103,8 @@ DEFAULTS: dict = {
     },
     "reader": {
         "prefetch_enabled": True,
-        "prefetch_ahead": 1,
-        "prefetch_behind": 0,
+        "prefetch_ahead": 3,
+        "prefetch_behind": 1,
         "show_images": True,
         "font_size": 0,
         "font_family": "system",
@@ -217,11 +217,17 @@ def media_source_probe_settings(settings_manager) -> dict:
 
 
 def reader_prefetch_settings(settings_manager) -> dict:
+    """阅读器章节预加载配置（设置页同款范围：向后 0–20、向前 0–10）。
+
+    串行模型不变（同一时间只跑 1 个预取任务），这里只决定**预取多少章**。
+    之前把 ahead 硬钳到 1、behind 硬钳到 0，设置页选 3/1 实际只预取下一章，
+    向前缓存则完全没生效。
+    """
     g = settings_manager.get
     return {
         "enabled": bool(g("reader", "prefetch_enabled", True)),
-        "ahead": _clamp_int(g("reader", "prefetch_ahead", 1), 0, 1, 1),
-        "behind": 0,
+        "ahead": _clamp_int(g("reader", "prefetch_ahead", 3), 0, 20, 3),
+        "behind": _clamp_int(g("reader", "prefetch_behind", 1), 0, 10, 1),
     }
 
 

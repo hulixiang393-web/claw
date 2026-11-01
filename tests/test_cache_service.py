@@ -228,7 +228,8 @@ def test_content_fetch_chapter_caches_body():
     src = _fake_source()
     url = "https://x.com/b/1.html"
     text = c.fetch_chapter(src, url)
-    key = f"body:{src.source_id}:{url}"
+    # 正文键带文本抽取版本（body:<源>:t2:<url>），用同一条构造器取键
+    key = c._chapter_cache_key(src, url)
     assert store.get(key) == text
     # 二次调用（清内存缓存后）不重新抓取
     c._detail_html_cache.clear()
@@ -315,15 +316,17 @@ def test_content_precache_chapters():
         for i in range(5)
     ]
     c.precache_chapters(src, chapters, 1, ahead=3)
-    # 当前章(1) + 后续章[2,3) → 预加载 1,2,3（后 ahead-1 章）
-    for i in (1, 2, 3):
-        assert store.get(f"body:{src.source_id}:https://x.com/b/{i}.html") is not None
-    # 第4章（index 4）不在范围内
-    assert store.get(f"body:{src.source_id}:https://x.com/b/4.html") is None
+    # 契约（见 precache_chapters docstring）：当前章 + 后 ahead 章
+    # → idx1 起算 ahead=3 覆盖 1,2,3,4 四章
+    for i in (1, 2, 3, 4):
+        assert store.get(c._chapter_cache_key(src, f"https://x.com/b/{i}.html")) is not None
+    # 第1章（index 0）在当前章之前，不在向后预加载范围
+    assert store.get(c._chapter_cache_key(src, "https://x.com/b/0.html")) is None
     assert set(http.calls) == {
         "https://x.com/b/1.html",
         "https://x.com/b/2.html",
         "https://x.com/b/3.html",
+        "https://x.com/b/4.html",
     }
 
 
@@ -392,3 +395,37 @@ def _src_with_discovery(sid, base):
         },
     }
     return SourceConfig.from_dict(raw, "<mem>")
+
+
+def test_shelf_precache_repository_key_matches_reader_reads():
+    """书架预加载写的正文，阅读器必须按 URL 读得到（版本前缀不进仓库键）。
+
+    正文缓存键是 `body:<源>:t2:<url>`；仓库（shelf 离线缓存）键必须是干净 URL，
+    否则预加载写完的章节读不到、并且会在 evict_book_content(kept=URL) 时被当成
+    多余条目淘汰。
+    """
+
+    class Repo:
+        def __init__(self):
+            self.values = {}
+
+        def get_content(self, book_key, chapter_key):
+            return self.values.get((book_key, chapter_key))
+
+        def upsert_book(self, *args):
+            pass
+
+        def put_content(self, book_key, chapter_key, content_type, payload, metadata):
+            self.values[(book_key, chapter_key)] = payload
+
+    repo = Repo()
+    c = _make_content(None)
+    c._cache = None
+    c._repository = repo
+    src = _fake_source()
+    url = "https://x.com/b/7.html"
+    key = c._chapter_cache_key(src, url)
+    assert key.startswith("body:srcA:t"), key  # 版本前缀确实存在于缓存键
+    c._cache_set(key, "离线正文", ttl=60, book_key="https://x.com/book")
+    assert repo.values[("https://x.com/book", url)] == "离线正文"
+    assert c._cache_get(key, book_key="https://x.com/book") == "离线正文"

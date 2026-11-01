@@ -97,8 +97,8 @@ class NovelView(AutoScrollMixin, QWidget):
         self._auto_loading = False  # 翻页边界跳章锁，防重复触发
         self._auto_prev_loading = False  # 向上翻页边界跳章锁，防重复触发
         self._prefetch_idx = -2  # 正在后台预加载的章节 idx（<0 表示空闲）
-        self._prefetch_ahead = 1
-        self._prefetch_behind = 0
+        self._prefetch_ahead = 3  # 与设置页默认值一致（加载时按设置覆盖）
+        self._prefetch_behind = 1
         self._load_generation = 0
         self._image_generation = 0
         self._show_images = True
@@ -2102,7 +2102,11 @@ class NovelView(AutoScrollMixin, QWidget):
         return super().eventFilter(obj, event)
 
     def set_prefetch_config(self, enabled: bool, ahead: int, behind: int) -> None:
-        """设置预加载数量；无效值回退默认值，不改变串行模型。"""
+        """设置预加载数量；无效值回退默认值，不改变串行模型。
+
+        范围与设置页一致（向后 0–20、向前 0–10）。串行模型保留：同时只跑
+        1 个预取任务，队列按「近→远」顺序推进。
+        """
         if not enabled:
             self._prefetch_ahead = 0
             self._prefetch_behind = 0
@@ -2110,13 +2114,13 @@ class NovelView(AutoScrollMixin, QWidget):
         try:
             ahead = int(ahead)
         except (TypeError, ValueError):
-            ahead = 1
+            ahead = 3
         try:
             behind = int(behind)
         except (TypeError, ValueError):
-            behind = 0
-        self._prefetch_ahead = max(0, min(1, ahead))
-        self._prefetch_behind = 0
+            behind = 1
+        self._prefetch_ahead = max(0, min(20, ahead))
+        self._prefetch_behind = max(0, min(10, behind))
 
     @staticmethod
     def _prefetch_back_queue(total: int, idx: int, behind: int) -> list[int]:

@@ -211,8 +211,17 @@ class ContentBase:
             abs_url = f"{abs_url}{separator}__cache_version={version}"
         return f"page:{source.source_id}:{abs_url}"
 
+    _REPO_VERSION_PREFIX_RE = _re.compile(r"^t\d+:")
+
     @staticmethod
     def _repository_cache_parts(key: str, book_key: str | None = None) -> tuple[str, str]:
+        """缓存键 → 仓库 (chapter_key, book_key)。
+
+        正文键带文本版本前缀（`body:<source>:t2:<url>`），它是 Redis 键的一部分，
+        用来让旧的正文抽取语义自动失效。仓库（shelf 离线缓存）的键必须是**干净的
+        URL**：shelf_precache 写/淘汰、GUI 书架读取都按 URL 找，带前缀会让「预加载
+        写进去的正文读不到、写完立刻被当作多余条目淘汰」。
+        """
         parts = key.split(":", 3)
         if len(parts) == 4 and parts[0] == "pages" and parts[1] == "v3":
             url = parts[3]
@@ -220,6 +229,7 @@ class ContentBase:
                 return "pages", url
             return url, book_key
         kind, _source_id, url = key.split(":", 2)
+        url = ContentBase._REPO_VERSION_PREFIX_RE.sub("", url)
         if book_key is None:
             return kind, url
         return url, book_key

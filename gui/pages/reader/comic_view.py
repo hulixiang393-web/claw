@@ -756,12 +756,16 @@ class ComicView(AutoScrollMixin, QWidget):
 
 
     def set_prefetch_config(self, enabled: bool, ahead: int, behind: int) -> None:
+        """设置预渲染话数；范围与设置页一致（向后 0–20、向前 0–10）。
+
+        串行模型不变：同一时间只预渲染 1 话（并发 Chromium 会抢内存）。
+        """
         try:
-            ahead_value = max(0, int(ahead))
+            ahead_value = max(0, min(20, int(ahead)))
         except (TypeError, ValueError):
             ahead_value = PREFETCH_COUNT
         try:
-            behind_value = max(0, int(behind))
+            behind_value = max(0, min(10, int(behind)))
         except (TypeError, ValueError):
             behind_value = PREFETCH_BACK
         self._prefetch_count = ahead_value if enabled else 0
