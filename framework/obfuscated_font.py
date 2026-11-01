@@ -360,6 +360,20 @@ def build_map(raw: bytes, codes, confidence: float = _CONFIDENCE,
             continue
         mapping[ch] = candidate
         claimed[candidate] = ch
+    # 二轮补齐：一一映射里抢输的码点不能留空，否则正文里那几个字仍是谚文。
+    # 放宽到「未占用的候选、分数 ≥ 0.40」；实在没有就用它自己的最优候选（允许
+    # 与别的码点同字——重复一次真字，总比留一个看不懂的假字强）。
+    for ch, scored in scored_by_code.items():
+        if ch in mapping or not scored:
+            continue
+        pick = next(((score, cand) for score, cand in scored
+                     if cand not in claimed and score >= 0.40), None)
+        if pick is None:
+            pick = next(((score, cand) for score, cand in scored
+                         if score >= 0.40), None)
+        if pick is not None:
+            mapping[ch] = pick[1]
+            claimed.setdefault(pick[1], ch)
     return mapping
 
 
@@ -519,6 +533,8 @@ def decode(text: str, cfg: dict, headers: dict = None) -> tuple:
         log.info("obfuscated_font: 未解析出映射（%d 个待解码点）", len(needed))
         return text, {}
     out = "".join(mapping.get(ch, ch) for ch in text)
-    log.info("obfuscated_font: 解出 %d 个字（剩余 %d 个码点未命中）",
-             len(mapping), len(needed.difference({ord(k) for k in mapping})))
+    left = sorted(needed.difference({ord(k) for k in mapping}))
+    log.info("obfuscated_font: 解出 %d 个字（剩余 %d 个码点未命中%s）",
+             len(mapping), len(left),
+             ("：" + ",".join("U+%04X" % code for code in left[:8])) if left else "")
     return out, mapping
