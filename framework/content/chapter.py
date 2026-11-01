@@ -674,10 +674,14 @@ class ChapterMixin:
         正文缓存存的是**解密后**文本、TTL 7 天，所以字体混淆解码上线前抓过的
         章节会一直显示「张起灵녈头」。这里按 source 声明的码点区间自检，命中就
         跑同一套 decryption.targets 链（字形映射已落盘缓存，毫秒级）后回写。
+        源没声明策略时退回自动模式：真出现谚文/私用区字符就用上次记住的字体解。
         """
         if not text or self._decrypter is None:
             return text
-        for name, step in self._obfuscated_font_steps(source):
+        steps = self._obfuscated_font_steps(source)
+        if not steps:
+            return self._auto_decode_font(source, url, text, "")
+        for name, step in steps:
             ranges = step.get("codepoint_ranges") or [[0xAC00, 0xD7A3], [0xE000, 0xF8FF]]
             spans = []
             for item in ranges:
@@ -905,6 +909,10 @@ class ChapterMixin:
                 text = self._decrypter.decrypt(
                     source, text, text_target, html=html, font_urls=font_urls
                 )
+            # 源未声明解码、但正文里仍是「谚文/私用区」假码点时，自动按页面字体还原：
+            # 这套字体混淆（U+AC00–U+D7A3 或 U+E000–U+F8FF 承载真字，靠 @font-face
+            # 子集字体画出来）在多个笔趣阁系站点通用，不逐个源写配置也能解。
+            text = self._auto_decode_font(source, url, text, html)
         image_entries = image_entries if include_images else []
         # 正文广告行过滤（ad_block 引擎：剔除「广告/推广/点击领取」等特征行）
         try:
@@ -916,6 +924,56 @@ class ChapterMixin:
         except Exception:
             pass  # 广告过滤是增强能力，失败不影响正文
         return (text, nxt, image_entries) if include_images else (text, nxt)
+
+    _AUTO_FONT_RANGES = ((0xAC00, 0xD7A3), (0xE000, 0xF8FF))
+
+    def _auto_decode_font(self, source, url: str, text: str, html: str) -> str:
+        """正文出现字体混淆假码点时自动解码（与源配置无关）。
+
+        汉字小说正文里出现谚文/私用区字符，基本只可能是反爬子集字体：
+        页面用 @font-face 把真字画出来，抓到的文本却是假码点。这里就地按
+        页面字体还原，解不出就原样返回（不影响正文）。
+        """
+        body = str(text or "")
+        if not body:
+            return body
+        if not any(any(lo <= ord(ch) <= hi for lo, hi in self._AUTO_FONT_RANGES)
+                   for ch in body):
+            return body
+        try:
+            from framework import obfuscated_font
+        except Exception:  # noqa: BLE001
+            return body
+        cfg = {
+            "codepoint_ranges": [list(span) for span in self._AUTO_FONT_RANGES],
+            "confidence": 0.55,
+        }
+        headers = {}
+        try:
+            headers = source.request_headers()
+        except Exception:  # noqa: BLE001
+            pass
+        # 命中缓存/离线文本时没有 html：用该源上次成功解码时记住的字体地址
+        known = obfuscated_font.hint_fonts(source.source_id)
+        if not html and not known:
+            return body
+        if known:
+            cfg["font_urls"] = known
+        try:
+            resolved, mapping = obfuscated_font.decode(
+                body, dict(cfg, html=html, hint_key=source.source_id), headers=headers
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("[%s] 字体混淆自动解码失败：%s（%s）",
+                     source.source_id, str(exc)[:80], url[-40:])
+            return body
+        if resolved and resolved != body:
+            left = sum(1 for ch in resolved
+                       if any(lo <= ord(ch) <= hi for lo, hi in self._AUTO_FONT_RANGES))
+            log.info("[%s] 字体混淆自动解码：映射 %d 个字，剩余假码点 %d（%s）",
+                     source.source_id, len(mapping), left, url[-40:])
+            return resolved
+        return body
 
     def _fetch_chapter_api_text(self, source, url: str, cfg: dict) -> str:
         """Fetch and decrypt a JSON chapter payload configured by the source."""

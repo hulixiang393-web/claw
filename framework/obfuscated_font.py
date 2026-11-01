@@ -367,10 +367,17 @@ def build_map(raw: bytes, codes, confidence: float = _CONFIDENCE,
         if ch in mapping or not scored:
             continue
         pick = next(((score, cand) for score, cand in scored
-                     if cand not in claimed and score >= 0.40), None)
+                     if cand not in claimed and cand in common and score >= 0.40), None)
+        if pick is None:
+            # 宁可和别的码点撞同一个常用字（重复一个真字只影响个别字），
+            # 也不要让生僻字（扡/昰/孒）混进正文，「滴在扡上」这种就是它。
+            pick = next(((score, cand) for score, cand in scored
+                         if cand in common and score >= 0.40), None)
         if pick is None:
             pick = next(((score, cand) for score, cand in scored
-                         if score >= 0.40), None)
+                         if cand not in claimed and score >= 0.40), None)
+        if pick is None:
+            pick = next(((score, cand) for score, cand in scored if score >= 0.40), None)
         if pick is not None:
             mapping[ch] = pick[1]
             claimed.setdefault(pick[1], ch)
@@ -380,6 +387,12 @@ def build_map(raw: bytes, codes, confidence: float = _CONFIDENCE,
 _FONT_REF = {}
 _REF_MASKS: dict = {}
 _COMMON: dict = {}
+_FONT_HINTS: dict = {}
+
+
+def hint_fonts(key: str) -> list:
+    """某源上次成功解码时用到的字体地址（缓存/离线正文没 html 时复用）。"""
+    return list(_FONT_HINTS.get(str(key or "")) or [])
 
 
 def _common_chars() -> set:
@@ -501,6 +514,10 @@ def decode(text: str, cfg: dict, headers: dict = None) -> tuple:
     for url in urls:
         if url not in seen:
             seen.append(url)
+    hint = cfg.get("hint_key")
+    if hint and seen:
+        # 记住「这个源用哪些字体」：之后命中缓存/离线文本时没有 html 也能解
+        _FONT_HINTS[str(hint)] = list(seen)
 
     mapping = {}
     for url in seen:
