@@ -744,6 +744,9 @@ class NovelView(AutoScrollMixin, QWidget):
                 ch._cached_text = fixed
             except Exception:  # noqa: BLE001
                 pass
+            fake = sum(1 for ch_ in body if 0xAC00 <= ord(ch_) <= 0xD7A3)
+            log.info("阅读器兜底解码：%d 个假字 → 0（%s）", fake,
+                     str(getattr(ch, "url", "") or "")[-40:])
         return fixed or body
 
     def _reader_convert_text(self, text: str) -> str:
