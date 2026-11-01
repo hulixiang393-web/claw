@@ -53,6 +53,26 @@ class Decrypter:
             # 搜索页可使用与正文不同的字体码表；没有专用配置时
             # 兼容旧源，回退到 title/author 的同名策略。
             cfg = targets.get(target[7:]) or {}
+        # steps：按顺序串多个策略（如「先按字形解出被替换的字，再繁转简」），
+        # 单策略源不受影响。
+        steps = cfg.get("steps")
+        if isinstance(steps, list) and steps:
+            out = content
+            for step in steps:
+                if isinstance(step, dict):
+                    out = self._run_strategy(
+                        source, step, out, target=target, html=html, font_urls=font_urls
+                    )
+            return out
+        return self._run_strategy(
+            source, cfg, content, target=target, html=html, font_urls=font_urls
+        )
+
+    def _run_strategy(
+        self, source: SourceConfig, cfg: dict, content: str, target: str = "content",
+        html: str = "", font_urls=None,
+    ) -> str:
+        cfg = dict(cfg or {})
         strategy = cfg.get("strategy") or ""
         # 未配置解密策略 → 原样返回（与 decrypt_bytes 一致，避免误 base64 解码）
         if not strategy:
@@ -65,8 +85,31 @@ class Decrypter:
             return self._maccms_url(content)
         if strategy == "custom_endpoint":
             return self._call_endpoint(cfg, content)
+        if strategy == "obfuscated_font":
+            # 反爬子集字体：正文里的假码点按字体字形还原成真字（源特有混淆）
+            if html:
+                cfg.setdefault("html", html)
+            if font_urls:
+                cfg.setdefault("font_urls", list(font_urls))
+            headers = {}
+            try:
+                headers = source.request_headers()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from . import obfuscated_font
+
+                resolved, _ = obfuscated_font.decode(content, cfg, headers=headers)
+                if resolved:
+                    content = resolved
+            except Exception as exc:  # noqa: BLE001 —— 解不出就保留原文，不阻塞正文
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "obfuscated_font 解码失败：%s", str(exc)[:120]
+                )
+            return content
         if strategy == "translit":
-            cfg = dict(cfg or {})
             if html:
                 cfg["html"] = html
             if font_urls:

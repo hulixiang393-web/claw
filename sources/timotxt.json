@@ -13,7 +13,12 @@
     "icon": "https://www.timotxt.com/favicon.ico",
     "lang": "zh-CN",
     "region": "tw",
-    "tags": ["小说", "免费", "简体转换", "HTTP优先"],
+    "tags": [
+      "小说",
+      "免费",
+      "简体转换",
+      "HTTP优先"
+    ],
     "last_verified": "2026-10-12",
     "adult": false
   },
@@ -99,14 +104,32 @@
           "css": "ul.list.flex > li.row"
         },
         "fields": {
-          "title": {"css": "h3 a"},
-          "url": {"css": "h3 a", "attr": "href"},
-          "cover": {"fallback": [
-            {"css": "img", "attr": "data-src"},
-            {"css": "img", "attr": "data-original"},
-            {"css": "img", "attr": "src"}
-          ]},
-          "author": {"css": "span.author"}
+          "title": {
+            "css": "h3 a"
+          },
+          "url": {
+            "css": "h3 a",
+            "attr": "href"
+          },
+          "cover": {
+            "fallback": [
+              {
+                "css": "img",
+                "attr": "data-src"
+              },
+              {
+                "css": "img",
+                "attr": "data-original"
+              },
+              {
+                "css": "img",
+                "attr": "src"
+              }
+            ]
+          },
+          "author": {
+            "css": "span.author"
+          }
         },
         "render_config": {
           "wait_for": "ul.list.flex > li.row",
@@ -116,7 +139,9 @@
           "filter_keyword": true
         }
       },
-      "paginator": {"url_template": "/search/{keyword}"}
+      "paginator": {
+        "url_template": "/search/{keyword}"
+      }
     },
     "detail": {
       "render": "playwright_fallback",
@@ -275,12 +300,46 @@
         "to": "zh-cn"
       },
       "content": {
-        "strategy": "zh_convert",
-        "to": "zh-cn"
+        "steps": [
+          {
+            "strategy": "obfuscated_font",
+            "codepoint_ranges": [
+              [
+                44032,
+                55203
+              ]
+            ],
+            "font_css": [
+              "https://i1.timotxt.com/min/read.38.css"
+            ],
+            "confidence": 0.55
+          },
+          {
+            "strategy": "zh_convert",
+            "to": "zh-cn"
+          }
+        ]
       },
       "chapter": {
-        "strategy": "zh_convert",
-        "to": "zh-cn"
+        "steps": [
+          {
+            "strategy": "obfuscated_font",
+            "codepoint_ranges": [
+              [
+                44032,
+                55203
+              ]
+            ],
+            "font_css": [
+              "https://i1.timotxt.com/min/read.38.css"
+            ],
+            "confidence": 0.55
+          },
+          {
+            "strategy": "zh_convert",
+            "to": "zh-cn"
+          }
+        ]
       }
     }
   },
