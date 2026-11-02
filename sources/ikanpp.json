@@ -142,6 +142,7 @@
     "detail": {
       "url": "/api/lines",
       "method": "GET",
+      "id_regex": "^(ik\\d+)",
       "params": {
         "title": "{id}",
         "source": "{source}"
@@ -153,6 +154,25 @@
         "line_items": "episodes",
         "title": "name",
         "url_key": "url"
+      },
+      "fallback": {
+        "strategy": "search_play_url",
+        "title_param": "title",
+        "source_param": "source",
+        "line_param": "line",
+        "from_field": "vod_play_from",
+        "url_field": "vod_play_url",
+        "max_sources": 5,
+        "line_names": {
+          "jlm3u8": "巨量",
+          "jlplayer": "巨量解析",
+          "bfzym3u8": "暴风",
+          "lzm3u8": "量子",
+          "ffm3u8": "非凡",
+          "1080zyk": "优质",
+          "rym3u8": "如意",
+          "dyttm3u8": "天堂"
+        }
       }
     }
   },

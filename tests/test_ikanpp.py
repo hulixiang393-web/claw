@@ -73,6 +73,29 @@ _DETAIL = {
     "healed": True,
 }
 
+# 2026-11 现场：详情接口改成 GET /api/lines?title=<自家库 id>&source=<线路>
+# 返回 lines[]，每条的 episodes[].url 是 /api/play?id=...&ep=N 的相对地址。
+_LINES = {
+    "lines": [
+        {
+            "sourceId": "youxuan",
+            "sourceName": "优选",
+            "episodes": [
+                {"name": "第1集", "url": "/api/play?id=bytevod%3Aav_demo&ep=1"},
+                {"name": "第2集", "url": "/api/play?id=bytevod%3Aav_demo&ep=2"},
+            ],
+        }
+    ]
+}
+
+_TITLE_HTML = (
+    '<html><head>'
+    '<meta property="og:title" content="生化危机：爆发夜(2026)在线观看">'
+    '<meta property="og:image" content="https://img.guangsuimage.com/cover/69b183.jpg">'
+    '<meta name="description" content="某医院突然爆发病毒，全城失守的夺命狂奔。">'
+    '</head><body></body></html>'
+)
+
 
 class _FakeHttp:
     """离线假 HttpClient：按 URL/正文特征返回相应 JSON 或 SSE 文本。"""
@@ -82,6 +105,8 @@ class _FakeHttp:
     def __init__(self):
         self.last_body = None
         self.last_post_kw = None
+        self.last_get_url = None
+        self.get_urls = []
         # 所有详情 POST 的 body（related_episodes 会为其它线路再请求若干次，
         # last_body 是最后一次；断言「本次详情请求」要看 first_body）
         self.bodies = []
@@ -92,8 +117,16 @@ class _FakeHttp:
 
     def get_text(self, url, headers=None, proxy=None, timeout=10, retries=3,
                  interval_ms=0, encoding=None, proxy_pool=None, direct=False):
+        self.last_get_url = url
+        self.get_urls.append(url)
         if "library/browse" in url:
             return json.dumps(_BROWSE, ensure_ascii=False)
+        if "/api/lines" in url:
+            return json.dumps(_LINES, ensure_ascii=False)
+        if "/api/play" in url:
+            return json.dumps({"url": _M3U8, "kind": "mp4"}, ensure_ascii=False)
+        if "/title/" in url:
+            return _TITLE_HTML
         return "{}"
 
     def get_json(self, url, **kw):
@@ -185,10 +218,18 @@ def test_source_config_loads():
     assert (se.get("item_fields") or {}).get("title") == "vod_name"
     assert (se.get("item_fields") or {}).get("url") == "/title/{vod_id}?title={vod_name}&source={source}"
     det = api.get("detail") or {}
-    assert det.get("method") == "POST"
-    assert det.get("body") == {"id": "{id}", "source": "{source}", "title": "{title}"}
-    assert (det.get("chapters") or {}).get("items") == "episodes"
-    assert (det.get("chapters") or {}).get("url_template") == "{url}"
+    assert det.get("url") == "/api/lines"
+    assert det.get("method") == "GET"
+    # 站点标题页是 /title/ik<数字>-<名字>，接口只认纯 id
+    assert det.get("id_regex") == "^(ik\\d+)"
+    assert det.get("params") == {"title": "{id}", "source": "{source}"}
+    assert det.get("meta_html") is True
+    assert (det.get("chapters") or {}).get("lines_path") == "lines"
+    # 第三方采集 id 在自家库没有映射（/api/lines 400/404）时，用搜索结果自带的
+    # MacCMS 播放表兜底，避免「点进详情就加载失败」
+    fallback = det.get("fallback") or {}
+    assert fallback.get("strategy") == "search_play_url"
+    assert fallback.get("url_field") == "vod_play_url"
     assert ((src.raw.get("diagnostics") or {}).get("selfcheck") or {}).get("strategy") == "off"
     cats = ((src.raw.get("endpoints") or {}).get("discovery") or {}).get("list_item", {}).get("categories") or []
     assert len(cats) >= 5
@@ -263,11 +304,13 @@ def test_grouped_detail_exposes_source_list_and_switches_by_detail_url():
         "巨量资源", "暴风资源", "极速资源",
     ]
     variant_url = detail.source_list[1]["detail_url"]
+    assert "source=baofeng" in variant_url
     switched, chapters = content.switch_source_url(src, variant_url)
-    assert http.last_body["id"] == "100"
-    assert http.last_body["source"] == "baofeng"
-    assert switched.source_list[0]["source_id"] == "baofeng"
-    assert chapters[0].url == _M3U8
+    # 换线后详情里的分集必须属于目标线路
+    assert chapters and chapters[0].provider == "暴风资源"
+    assert any("source=baofeng" in (item.get("detail_url") or "")
+               for item in switched.source_list)
+    assert chapters[0].url == "/api/play?id=baofeng&ep=1"
 
 
 def test_search_parallel_posts_query_and_sources():
@@ -307,12 +350,21 @@ class _GroupHttp(_FakeHttp):
         ]
         return "data: " + json.dumps({"type": "videos", "videos": rows}, ensure_ascii=False) + "\n\n"
 
-    def post_json(self, url, json_body=None, **kw):
-        self.last_body = dict(json_body or {})
-        payload = json.loads(json.dumps(_DETAIL))
-        payload["data"]["vod_name"] = "测试剧"
-        payload["data"]["episodes"] = [{"name": "第1集", "url": _M3U8, "index": 1}]
-        return payload
+    def get_json(self, url, **kw):
+        if "/api/lines" in url:
+            self.last_get_url = url
+            self.get_urls.append(url)
+            return {"lines": [
+                {"sourceId": sid, "sourceName": name, "episodes": [
+                    {"name": "第1集", "url": f"/api/play?id={sid}&ep=1"},
+                ]}
+                for sid, name in (
+                    ("juliang", "巨量资源"),
+                    ("baofeng", "暴风资源"),
+                    ("jisu", "极速资源"),
+                )
+            ]}
+        return super().get_json(url, **kw)
 
 
 class _IkanppFallbackHttp(_FakeHttp):
@@ -356,17 +408,60 @@ def test_search_parallel_falls_back_to_matching_provider_for_garbled_title():
     assert "wd=%E6%89%91%E6%9D%80%E5%A4%A9%E4%BD%BF" in http.provider_calls[0]
 
 
-def test_fallback_result_detail_keeps_provider_and_m3u8():
-    from framework.search import Search
+class _PlayTableHttp(_FakeHttp):
+    """详情接口失效（第三方采集 id 在自家库 400/404），搜索结果自带播放表。"""
 
-    http = _IkanppFallbackHttp()
+    def get_json(self, url, **kw):
+        self.last_get_url = url
+        self.get_urls.append(url)
+        if "/api/lines" in url:
+            raise RuntimeError("HTTP 404: not found")
+        return {}
+
+    def post_text(self, url, json_body=None, **kw):
+        self.last_post_kw = dict(kw)
+        self.last_body = dict(json_body or {})
+        video = {
+            "source": "juliang",
+            "vod_id": 629487807727009797,
+            "vod_name": "物理魔法使马修",
+            "vod_pic": "https://img.example/mashle.jpg",
+            "vod_content": "魔法世界的不思议少年。",
+            "vod_remarks": "更新至12集",
+            "vod_class": "日韩动漫",
+            "vod_play_from": "jlm3u8$$$jlplayer",
+            "vod_play_url": (
+                "第1集$https://a.example/1.m3u8#第2集$https://a.example/2.m3u8"
+                "$$$第1集$https://b.example/1.mp4"
+            ),
+        }
+        return "data: " + json.dumps(
+            {"type": "videos", "videos": [video]}, ensure_ascii=False
+        ) + "\n\n"
+
+
+def test_detail_falls_back_to_search_play_table_when_lines_api_missing():
     src = _source()
-    result = Search(http, Parser()).search_one(src, "扑杀天使")[0]
+    http = _PlayTableHttp()
     content = Content(http, Parser(), _Checker())
-    detail = content.fetch_detail(src, result.url)
-    assert http.first_body["id"] == "123456"
-    assert http.first_body["source"] == "zuida"
-    assert detail.chapters[0].url == _M3U8
+    url = (
+        f"{_BASE}/title/629487807727009797"
+        "?title=%E7%89%A9%E7%90%86%E9%AD%94%E6%B3%95%E4%BD%BF%E9%A9%AC%E4%BF%AE&source=juliang"
+    )
+    detail = content.fetch_detail(src, url)
+    # 详情接口按纯 id 请求，且不再把字面量占位符发出去
+    lines_url = next(u for u in http.get_urls if "/api/lines" in u)
+    assert "title=629487807727009797" in lines_url
+    assert "source=juliang" in lines_url
+    assert "%7B" not in lines_url and "{" not in lines_url
+
+    assert detail.title == "物理魔法使马修"
+    assert [c.title for c in detail.chapters] == ["第1集", "第2集"]
+    assert detail.chapters[0].url == "https://a.example/1.m3u8"
+    assert detail.chapters[0].provider == "巨量"
+    assert [item["sid"] for item in detail.source_list] == ["jlm3u8", "jlplayer"]
+    # 换线路靠 URL 上的 line 参数指回对应播放表
+    assert "line=jlm3u8" in detail.source_list[0]["detail_url"]
 
 
 class _NoMatchProviderHttp(_IkanppFallbackHttp):
@@ -402,7 +497,7 @@ def test_matching_normalized_title_does_not_trigger_provider_fallback():
     assert http.provider_calls == []
 
 
-def test_title_query_is_encoded_and_detail_decodes_special_characters():
+def test_title_query_is_encoded_and_detail_uses_bare_id():
     from framework.search import Search
 
     class SpecialTitleHttp(_FakeHttp):
@@ -417,30 +512,31 @@ def test_title_query_is_encoded_and_detail_decodes_special_characters():
     assert query["title"] == ["A&B/#?"]
     assert query["source"] == ["jisu"]
     Content(http, Parser(), _Checker()).fetch_detail(src, result.url)
-    # 用首次详情 POST 断言：related_episodes 之后还会发若干线路请求，
-    # last_body 已不是本次详情（其 title 语义也不同）
-    assert http.first_body["title"] == "A&B/#?"
+    # 详情接口只吃纯 id：标题里的特殊字符不会拼进查询（也就不会 400）
+    lines_url = next(u for u in http.get_urls if "/api/lines" in u)
+    assert "title=8" in lines_url
+    assert "A%26B" not in lines_url
 
 
 # --------------------------------------------------------------------------- #
-# fetch_detail API（POST body 注入 {title}）
+# fetch_detail API（GET /api/lines + 页面 og:* 补元数据）
 # --------------------------------------------------------------------------- #
-def test_fetch_detail_posts_title_from_query():
+def test_fetch_detail_requests_lines_for_catalog_id():
     http, c = _content()
     src = _source()
     d = c.fetch_detail(src, f"{_BASE}/title/ik020581?title=生化危机：爆发夜&source=jisu")
-    assert http.first_body["id"] == "ik020581"
-    assert http.first_body["title"] == "生化危机：爆发夜"
-    assert http.first_body["source"] == "jisu"
-    assert d.title == "生化危机：爆发夜2026"
+    lines_url = next(u for u in http.get_urls if "/api/lines" in u)
+    assert "title=ik020581" in lines_url
+    assert "source=jisu" in lines_url
+    assert "%7B" not in lines_url          # 未填充的占位符不再原样发出
+    # 接口只给分集，标题/封面/简介取自详情页 og:*
+    assert d.title == "生化危机：爆发夜"
     assert d.cover == "https://img.guangsuimage.com/cover/69b183.jpg"
-    assert d.status == "抢先版"
-    assert d.author == "保罗·安德森"
-    assert "爱丽丝" in d.actor
-    assert d.tags == ["恐怖片"]
-    assert len(d.chapters) == 1
-    assert d.chapters[0].title == "抢先版"
-    assert d.chapters[0].url == _M3U8  # 直链 m3u8，未进播放页转换
+    assert d.summary.startswith("某医院突然爆发病毒")
+    assert len(d.chapters) == 2
+    assert d.chapters[0].title == "第1集"
+    assert d.chapters[0].url.startswith("/api/play?id=")
+    assert [item["sid"] for item in d.source_list] == ["youxuan"]
 
 
 # --------------------------------------------------------------------------- #

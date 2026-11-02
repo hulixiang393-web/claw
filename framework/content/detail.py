@@ -6,7 +6,7 @@ B4 拆分自 content.py，方法原样迁移，行为不改变。
 from __future__ import annotations
 
 from .shared import (
-    Chapter, ContentMissingError, Detail, _re,
+    Chapter, ContentMissingError, Detail, StreamCancelledError, _re,
     json, log, utils,
 )
 
@@ -193,6 +193,7 @@ class DetailMixin:
         self._check_stream_context(context)
         api_url = str(cfg.get("url") or "")
         params = cfg.get("params") or {}
+        fallback_cfg = cfg.get("fallback") or {}
         filled = {}
         # 详情 URL 的 query（?title=... 等）并入占位符：detail POST 接口需要
         # 精确标题等额外字段（如 ikanpp /api/detail 要 title 才命中正确 vod），
@@ -205,6 +206,15 @@ class DetailMixin:
         _ph = {"id": bvid, "bvid": bvid}
         if _sp.query:
             _ph.update({k: v[0] for k, v in parse_qs(_sp.query).items()})
+        # 路径末段常带 slug（ikanpp 新版 `/title/ik130109-恐怖收集者`），接口只认
+        # 纯 id。cfg.id_regex 从末段里抽出真正的主键；不配则保持原样（老源不受影响）。
+        id_regex = cfg.get("id_regex")
+        if id_regex:
+            m_id = _re.search(str(id_regex), bvid)
+            if m_id:
+                bvid = m_id.group(1) if m_id.groups() else m_id.group(0)
+                _ph["id"] = bvid
+                _ph["bvid"] = bvid
         method = (cfg.get("method") or "GET").upper()
         if method == "POST":
             # JSON API（GraphQL 等）：POST body 递归替换 {id}/{bvid}/{query 参数}
@@ -220,14 +230,26 @@ class DetailMixin:
 
                 signer = get_signer(strategy, self._http)
                 body_filled = signer.sign(body_filled)
-            resp = self._http.post_json(
-                urljoin(source.base_url, api_url),
-                json_body=body_filled,
-                headers=self._endpoint_headers(source, cfg),
-                timeout=(min(self._timeout(source), context.remaining()) if context is not None else self._timeout(source)),
-                retries=(0 if context is not None else self._retries(source)),
-                proxy_pool=source.proxy_pool(),
-            )
+            try:
+                resp = self._http.post_json(
+                    urljoin(source.base_url, api_url),
+                    json_body=body_filled,
+                    headers=self._endpoint_headers(source, cfg),
+                    timeout=(min(self._timeout(source), context.remaining()) if context is not None else self._timeout(source)),
+                    retries=(0 if context is not None else self._retries(source)),
+                    proxy_pool=source.proxy_pool(),
+                )
+            except StreamCancelledError:
+                raise
+            except Exception:  # noqa: BLE001 —— 详情接口失效时走搜索回查兜底
+                alt = (
+                    self._detail_from_search_play(source, url, fallback_cfg, _ph, context)
+                    if fallback_cfg.get("strategy")
+                    else None
+                )
+                if alt is not None:
+                    return alt
+                raise
             self._check_stream_context(context)
         else:
             # URL 路径占位符同样替换（同 episode 分支处理，avgood 类路径 {id} 原样发出会 404）
@@ -238,6 +260,10 @@ class DetailMixin:
                 _val = str(v)
                 for _pk, _pv in _ph.items():
                     _val = _val.replace("{" + _pk + "}", str(_pv))
+                # 占位符没填上（URL 里没带该参数）就整条丢掉：把字面量
+                # `{source}` 发出去只会换来 400，比不发更糟。
+                if _re.search(r"\{[^}]*\}", _val):
+                    continue
                 filled[k] = _val
             sign_cfg = cfg.get("sign") or {}
             strategy = sign_cfg.get("strategy")
@@ -252,13 +278,25 @@ class DetailMixin:
                 abs_url = f"{abs_url}&{qs}"
             else:
                 abs_url = f"{abs_url}?{qs}"
-            resp = self._http.get_json(
-                abs_url,
-                headers=self._endpoint_headers(source, cfg),
-                timeout=(min(self._timeout(source), context.remaining()) if context is not None else self._timeout(source)),
-                retries=(0 if context is not None else self._retries(source)),
-                proxy_pool=source.proxy_pool(),
-            )
+            try:
+                resp = self._http.get_json(
+                    abs_url,
+                    headers=self._endpoint_headers(source, cfg),
+                    timeout=(min(self._timeout(source), context.remaining()) if context is not None else self._timeout(source)),
+                    retries=(0 if context is not None else self._retries(source)),
+                    proxy_pool=source.proxy_pool(),
+                )
+            except StreamCancelledError:
+                raise
+            except Exception:  # noqa: BLE001 —— 详情接口失效时走搜索回查兜底
+                alt = (
+                    self._detail_from_search_play(source, url, fallback_cfg, _ph, context)
+                    if fallback_cfg.get("strategy")
+                    else None
+                )
+                if alt is not None:
+                    return alt
+                raise
             self._check_stream_context(context)
         if not isinstance(resp, dict):
             return Detail(source_id=source.source_id, content_type=source.content_type, url=url)
@@ -390,6 +428,12 @@ class DetailMixin:
                     detail.chapters = keep or line_chapters
                     if menu:
                         detail.source_list = menu
+        # 接口能通但一条线路/分集都没有（第三方 id 在自家库没映射时就是这样）：
+        # 同样回查搜索结果，别让用户对着一个「空详情」。
+        if not detail.chapters and fallback_cfg.get("strategy") == "search_play_url":
+            alt = self._detail_from_search_play(source, url, fallback_cfg, _ph, context)
+            if alt is not None and alt.chapters:
+                return alt
         # 单章即全片（单集视频 API 源）：详情页自身就是唯一分集，接口若不返回
         # 章节列表则按 content.<type>.single_chapter 补一条，避免播放页「无分集」。
         if not detail.chapters:
@@ -407,6 +451,157 @@ class DetailMixin:
                     )
                 )
         self._mark_line_menu(source, detail, cfg, url, data)
+        return detail
+
+    def _detail_from_search_play(self, source: SourceConfig, url: str,
+                                 fb: dict, ph: dict, context=None):
+        """搜索结果自带 MacCMS 播放表（vod_play_from / vod_play_url）时直接成型。
+
+        ikanpp 这类「自家库 + 第三方采集」站：`/api/lines` 只认自家库 id，
+        第三方 vod_id 一律 400/404，搜索点进详情就「加载失败」。而搜索结果本身
+        已经带完整播放表（每线路一串 `分集名$直链`），按标题+来源回查一次即可
+        摊出线路与分集，不必依赖详情接口。
+
+        配置（api_endpoints.detail.fallback）：
+            strategy        "search_play_url"
+            title_param     回查关键词取自 URL 的哪个 query 参数（缺省 title）
+            source_param    来源参数名（缺省 source），命中则只查该采集源
+            line_param      线路选择参数名（缺省 line），换线路时用它指回本线路
+            from_field / url_field / line_names   播放表字段与线路显示名
+        """
+        from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
+
+        # 兜底是一次额外的搜索请求（最多查 max_sources 个采集源）：剩余预算不够
+        # 就直接放弃，别把详情页拖成「转圈十几秒」。
+        if context is not None:
+            try:
+                if context.remaining() <= 5:
+                    return None
+            except Exception:  # noqa: BLE001 —— 预算读不出来就按可执行处理
+                pass
+
+        search_cfg = (source.raw.get("api_endpoints") or {}).get("search") or {}
+        api_url = str(search_cfg.get("url") or "")
+        body_tpl = search_cfg.get("body") or {}
+        if not api_url or not body_tpl:
+            return None
+        title = str(ph.get(fb.get("title_param") or "title") or "").strip()
+        if not title:
+            return None
+        hint = str(ph.get(fb.get("source_param") or "source") or "")
+        line_hint = str(ph.get(fb.get("line_param") or "line") or "")
+        body = utils.fill_json(body_tpl, keyword=title, page="1")
+        sources = body.get("sources")
+        if isinstance(sources, list) and sources:
+            picked = [
+                s for s in sources
+                if isinstance(s, dict) and hint and str(s.get("id")) == hint
+            ]
+            if not picked:
+                limit = max(1, int(fb.get("max_sources") or 25))
+                picked = [s for s in sources if isinstance(s, dict)][:limit]
+            body["sources"] = picked
+
+        try:
+            text = self._http.post_text(
+                urljoin(source.base_url, api_url),
+                json_body=body,
+                headers=self._endpoint_headers(source, search_cfg),
+                timeout=self._timeout(source),
+                retries=0,
+                proxy_pool=source.proxy_pool(),
+                encoding=source.transports().get("charset") or "utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 —— 回查失败按详情失败处理
+            log.info("[%s] 阶段=详情，搜索回查失败：%s", source.source_id, exc)
+            return None
+
+        videos: list = []
+        for event in self._parse_sse_events(text):
+            if event.get("type") == "videos":
+                videos.extend(v for v in (event.get("videos") or []) if isinstance(v, dict))
+        if not videos:
+            return None
+        videos.sort(key=lambda v: (
+            bool(hint) and str(v.get("source") or "") != hint,
+            str(v.get("vod_id") or "") != str(ph.get("id") or ""),
+        ))
+        video = next(
+            (v for v in videos if self._titles_related(str(v.get("vod_name") or ""), title)),
+            videos[0],
+        )
+
+        froms = [
+            p.strip()
+            for p in str(video.get(fb.get("from_field") or "vod_play_from") or "").split("$$$")
+            if p.strip()
+        ]
+        blocks = str(video.get(fb.get("url_field") or "vod_play_url") or "").split("$$$")
+        names = fb.get("line_names") or {}
+        lines: list = []
+        for idx, block in enumerate(blocks):
+            from_name = froms[idx] if idx < len(froms) else f"line{idx + 1}"
+            display = str(names.get(from_name) or from_name)
+            chapters: list = []
+            for item in block.split("#"):
+                item = item.strip()
+                if not item:
+                    continue
+                ep_name, ep_url = (
+                    item.split("$", 1) if "$" in item else ("", item)
+                )
+                ep_url = ep_url.strip()
+                if not ep_url.startswith(("http://", "https://")):
+                    continue
+                chapters.append(
+                    Chapter(
+                        title=ep_name.strip() or f"第{len(chapters) + 1}集",
+                        url=self._abs_url(source, ep_url),
+                        provider=display,
+                    )
+                )
+            if chapters:
+                lines.append((from_name, display, chapters))
+        if not lines:
+            return None
+
+        base = urlsplit(self._abs_url(source, url))
+
+        def _line_url(from_name: str) -> str:
+            q = {k: v[0] for k, v in parse_qs(base.query, keep_blank_values=True).items()}
+            q[fb.get("line_param") or "line"] = from_name
+            return urlunsplit(base._replace(query=urlencode(q)))
+
+        chosen = next(
+            (ln for ln in lines if line_hint and line_hint in (ln[0], ln[1])),
+            lines[0],
+        )
+        detail = Detail(
+            source_id=source.source_id,
+            content_type=source.content_type,
+            url=self._abs_url(source, url),
+            title=str(video.get("vod_name") or title),
+            cover=str(video.get("vod_pic") or video.get("vod_pic_original") or ""),
+            summary=str(video.get("vod_content") or video.get("vod_blurb") or ""),
+            status=str(video.get("vod_remarks") or ""),
+        )
+        tags = str(video.get("vod_class") or video.get("vod_tag") or "")
+        detail.tags = [t.strip() for t in _re.split(r"[,/]", tags) if t.strip()]
+        detail.chapters = list(chosen[2])
+        for ch in chosen[2]:
+            ch.line_switch_url = _line_url(chosen[0])
+            ch.line_switch_source = chosen[0]
+            ch.line_name = chosen[1]
+        detail.source_list = [
+            {
+                "source_id": from_name,
+                "sid": from_name,
+                "name": display,
+                "detail_url": _line_url(from_name),
+                "episodes": [{"title": ch.title, "url": ch.url} for ch in chapters],
+            }
+            for from_name, display, chapters in lines
+        ]
         return detail
 
     def _fill_meta_from_html(self, source: SourceConfig, detail, url: str) -> None:

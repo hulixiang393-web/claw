@@ -103,9 +103,22 @@ def test_omofuna_external_player_config_stays_consistent():
     assert external["prefer_direct"] is True          # 解析站走系统代理会 ReadTimeout
     assert external["cache_ttl_s"] > 0                # 一次成功后复用
     assert external["http_timeout_s"] >= 8            # 实测页面 6~11s 才吐完
+    # 解析站挂掉时的兜底：解析结果落盘，6h 内可继续用上次的直链
+    assert external["stale_ttl_s"] >= 3600
     assert play["probe"]["mode"] == "skip"
     transports = source.raw["transports"]
-    assert transports["prefer_proxy"] is True
+    # 不再全局声明 prefer_proxy：站点直连 0.3~0.9s，代理偏好会让每个新主机
+    # 先白等一次 8s 探测（详情实测 12.7s vs 直连 1.2s）。出口选择交给
+    # framework.http 的按主机自愈（代理失败当场撤销偏好，直连失败才学代理）。
+    assert "prefer_proxy" not in transports
     assert transports["timeout"] <= 8
     resolver = source.raw["stream_resolver"]
     assert resolver["total_budget"] <= 45, "取流失败要在 45s 内收场，不再干等 90s"
+    # 默认线路已改成直链暴风线（sid=2）：正常路径只有一次播放页请求，预算
+    # 只需覆盖「1 次正常请求 + 1 次换线」。旧值 40s 是"先跑解析器线再换线"
+    # 时代留的，留着只会让超时变成长时间干等。
+    assert resolver["total_budget"] <= 30
+    assert resolver["candidate_timeout"] <= 20
+    switch = source.raw["endpoints"]["content"]["episode"]["source_switch"]
+    assert switch["default_sid"] == "2"
+    assert switch["max_switch_attempts"] == 2

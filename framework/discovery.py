@@ -238,8 +238,12 @@ class Discovery:
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
         from . import utils
+        from .content.base import upgrade_insecure_scheme
 
-        return utils.abs_url(source.base_url, url)
+        abs_url = utils.abs_url(source.base_url, url)
+        if not (source.transports() or {}).get("allow_http"):
+            abs_url = upgrade_insecure_scheme(source.base_url, abs_url)
+        return abs_url
 
     def _get(self, source: SourceConfig, url: str) -> str:
         from urllib.parse import quote

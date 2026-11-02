@@ -44,9 +44,20 @@ class ChapterMixin:
             # 当前 sid 从详情 URL 提取；URL 无 sid 时默认用第一个播放源（sid=1）
             m_sid = _re.search(r"sid=(\d+)", detail_url)
             sid = m_sid.group(1) if m_sid else switch_cfg.get("default_sid", "1")
-            return self._fetch_chapters_for_source(
-                source, doc, detail_url, sid
-            )
+            chapters = self._fetch_chapters_for_source(source, doc, detail_url, sid)
+            if not chapters:
+                # 站点不是每个番都有 default_sid 那条线（omofuna 常见：只有「精品」
+                # sid=1，default_sid 却是 2）→ 用页面里真实出现的首条线路重试，
+                # 再不行把全部 /play/ 链接收成分集。直接返回空列表的话播放界面
+                # 就没有任何分集可点，用户看到的就是「加载失败」。
+                real_sid = self._first_episode_sid(doc, switch_cfg)
+                if real_sid and str(real_sid) != str(sid):
+                    chapters = self._fetch_chapters_for_source(
+                        source, doc, detail_url, real_sid
+                    )
+            if not chapters:
+                chapters = self._chapters_from_all_links(source, doc, switch_cfg)
+            return chapters
         # 单章图集：详情页即唯一章节。若同时配置了 list（如 hanime1 详情页
         # 侧边栏「播放清單」= 同系列/相关分集），优先按列表解析；解析失败
         # 或无结果回退单章（detail 自身仍可播）。

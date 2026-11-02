@@ -439,7 +439,11 @@ class VideoMixin:
             # 让上层换线路。omofuna 精品线路（from=mp4，只有不透明 id）实测
             # 渲染 47s 仍拿不到流（解析站 429/空壳），继续渲染等于把好线路
             # 一起拖死：用户看到的就是「取不到播放流」。
-            if self._render_skipped(source, play_cfg, switch_cfg, abs_ep):
+            # 判定要吃**播放页 HTML**（player_aaaa 在里面）：早先这里传的是
+            # 播放页 URL，正则永远匹配不到 → skip 从不生效 → 每条坏线路都先
+            # 白渲染 20~40s。
+            play_html = self._play_page_html_cached(source, abs_ep)
+            if self._render_skipped(source, play_cfg, switch_cfg, play_html):
                 raise ContentMissingError(
                     f"该线路解析器不可用，已跳过（{abs_ep}）",
                     source_id=source.source_id,
@@ -890,6 +894,7 @@ class VideoMixin:
             candidates = self._extract_play_url_candidates(
                 html, source, (block.get("source_switch") or {}),
                 play_cfg, abs_ep, episode_url,
+                deadline=deadline, context=context,
             )
         except Exception:  # noqa: BLE001
             return ""
@@ -1394,15 +1399,41 @@ class VideoMixin:
         return final
 
     def _resolve_external_stream(self, source: SourceConfig, play_cfg: dict,
-                                 player: dict, abs_ep: str) -> str:
+                                 player: dict, abs_ep: str,
+                                 deadline=None, context=None) -> str:
         """第三方播放器线路 → 真实直链（play_url.external_player 配置）。
 
         未配置、from 不匹配、缺 Node、解密失败都返回空串：调用方按原逻辑
         继续（保留不透明 id，让换线/渲染兜底），不影响其它线路。
+
+        预算感知（2026-11 omofuna 现场）：解析器线路的 `budget_s` 是**上限**，
+        不是每次都必须跑满。整次取流只剩几秒时再启动解析，等于把换线机会
+        一起烧掉——现场表现是「取流 25s 后报超时」，而同集直链线路只要 1s。
+        因此这里按剩余总预算收窄预算，剩余不足 `_EXTERNAL_MIN_BUDGET_S` 直接
+        放弃（返回空串 → 上层立刻换线）。
         """
         external = play_cfg.get("external_player") or {}
         if not external:
             return ""
+        budget = 0.0
+        try:
+            budget = float(external.get("budget_s") or 0)
+        except (TypeError, ValueError):
+            budget = 0.0
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining < self._EXTERNAL_MIN_BUDGET_S:
+                log.info(
+                    "[%s] 跳过第三方解析器：剩余预算 %.1fs < %.1fs（%s）",
+                    source.source_id, max(0.0, remaining),
+                    self._EXTERNAL_MIN_BUDGET_S, self._safe_url(abs_ep),
+                )
+                return ""
+            if budget > 0:
+                external = dict(external)
+                # 留 1s 给解析成功后的收尾（拼地址/写缓存/emit），别把预算全
+                # 用在解析站页面上。
+                external["budget_s"] = min(budget, max(2.0, remaining - 1.0))
         try:
             from framework.external_player import resolve_external_player
 
@@ -1415,9 +1446,18 @@ class VideoMixin:
             log.info("[%s] 第三方播放器解析失败：%s", source.source_id, str(exc)[:140])
             return ""
 
+    # 启动第三方解析器至少要有的剩余预算（秒）：低于此值直接换线。
+    # 实测精品线解析成功约 1s，但解析站抽风时必然吃满预算，不值得赌。
+    _EXTERNAL_MIN_BUDGET_S = 3.0
+
+    # 换线至少要有的剩余预算（秒）：一次详情页往返正常 1~2s。低于此值就收尾，
+    # 别把用户的时间花在一条注定跑不完的换线请求上。
+    _SWITCH_MIN_BUDGET_S = 1.5
+
     def _extract_play_url_candidates(
         self, html: str, source: SourceConfig, switch_cfg: dict,
-        play_cfg: dict, abs_ep: str, episode_url: str
+        play_cfg: dict, abs_ep: str, episode_url: str,
+        deadline=None, context=None,
     ) -> list[str]:
         import html as _html
 
@@ -1492,7 +1532,8 @@ class VideoMixin:
                 # 真实直链在播放器页面里由 playData() 解密）→ 直接解出直链，
                 # 免得把 id 当成播放地址交给播放器（那样只会黑屏/被换线）。
                 resolved = self._resolve_external_stream(
-                    source, play_cfg, player, abs_ep
+                    source, play_cfg, player, abs_ep,
+                    deadline=deadline, context=context,
                 )
                 if resolved:
                     add(resolved)
@@ -1628,7 +1669,8 @@ class VideoMixin:
                                            deadline=deadline, context=context)
         self._check_stream_context(context, deadline)
         candidates = self._extract_play_url_candidates(
-            html, source, switch_cfg, play_cfg, abs_ep, episode_url
+            html, source, switch_cfg, play_cfg, abs_ep, episode_url,
+            deadline=deadline, context=context,
         )
         return self._with_relay_candidates(play_cfg, candidates)
 
@@ -1699,6 +1741,26 @@ class VideoMixin:
         elif supports_timeout:
             kwargs["timeout"] = remaining
         return func(*args, **kwargs)
+
+    @staticmethod
+    def _stream_remaining(context, deadline=None):
+        """剩余预算（秒）；无法判断返回 None。
+
+        deadline（绝对单调钟点）与 context.remaining() 都可能存在，取更小的
+        那个 —— 只认 deadline 会漏掉「按 StreamBudget 计时」的调用方（换线
+        阶段就是这样），于是预算早就用光了还去抓下一条线路。
+        """
+        remaining = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+        if context is not None:
+            try:
+                ctx_left = float(context.remaining())
+            except Exception:  # noqa: BLE001 —— 上下文不提供剩余时间就只看 deadline
+                ctx_left = None
+            if ctx_left is not None:
+                remaining = ctx_left if remaining is None else min(remaining, ctx_left)
+        return remaining
 
     @staticmethod
     def _call_with_context(func, args, context, deadline=None):
@@ -1867,7 +1929,18 @@ class VideoMixin:
                 )
             if not candidates:
                 try:
-                    if deadline is not None and time.monotonic() >= deadline:
+                    # 预算闸门：换线 = 又一次详情页往返（正常 1~2s，站点抽风
+                    # 8s 读超时）。剩余预算不够就不再开新战场，把"取流超时"
+                    # 提前成明确失败，而不是让用户干等到总预算耗尽。
+                    # 现场对照：omofuna 首条线路（精品解析器线）白烧 9~16s 后
+                    # 再换线，用户看到的就是「取流很久然后超时」。
+                    remaining = self._stream_remaining(context, deadline)
+                    if remaining is not None and remaining <= self._SWITCH_MIN_BUDGET_S:
+                        log.info(
+                            "[%s] 阶段=换线，剩余预算 %.1fs < %.1fs，停止换线",
+                            source.source_id, max(0.0, remaining),
+                            self._SWITCH_MIN_BUDGET_S,
+                        )
                         break
                     candidates = self._call_with_context(
                         self._switch_candidate_episode_urls,
@@ -1902,8 +1975,10 @@ class VideoMixin:
             )
         if last_err is None:
             last_err = ContentMissingError("未取到播放地址", source_id=source.source_id)
+        # 把最后一条真实原因带出来：界面只显示顶层消息，而"全部线路取流失败"
+        # 本身不说明任何事（是解析站连不上？播放页结构变了？还是超时？）。
         raise ContentMissingError(
-            f"全部线路取流失败（{source.source_id}）",
+            f"全部线路取流失败（{source.source_id}）：{str(last_err)[:140]}",
             source_id=source.source_id,
         ) from last_err
 
@@ -2237,6 +2312,12 @@ class VideoMixin:
             if u and u not in seen:
                 seen.add(u)
                 out.append(u)
+        # 取消的语义必须如实上报：worker 里捕获取消是为了让各线程干净收尾，
+        # 但"跑到一半被取消"的候选表不能当完整结果返回 —— 否则上层会把
+        # 取消当成"没有其它线路可用"，最终报成一条含糊的取流失败。
+        # 只检查取消（不传 deadline），避免"刚好到点"也抛错。
+        if context is not None:
+            self._check_stream_context(context)
         return out
 
     def _detail_url_from_episode(self, source: SourceConfig, episode_url: str) -> str:
@@ -2482,6 +2563,10 @@ class VideoMixin:
         switch = self._get_source_switch_cfg(source)
         if not switch:
             return []
+        # 已取消/超预算时直接中止：这么晚才发现取消，说明上层调用链已经
+        # 不要这次结果了，继续解析（还可能补发 playerconfig 请求）纯属浪费
+        # 预算 —— 而且会把取消吞成「线路表为空」，上层当成"没有别的线路"。
+        self._check_stream_context(context)
         doc = self._parser.parse(html)
         list_sel = switch.get("list_selector")
         attr = switch.get("list_attr", "data-sid")
@@ -2511,6 +2596,21 @@ class VideoMixin:
                         sid = m_sid.group(1) if m_sid.groups() else m_sid.group(0)
                 except Exception:
                     pass
+            # 结构变化兜底：线路 tab 的 href 自带线路坐标（omofuna 2026-11：
+            # `a.play-channel-item[href=/anime/<id>/play/<sid>/<集>.html]`，
+            # 同时还有 data-sid）。站点改版时只要 href 还在就仍能认出线路；
+            # 拿不到 sid 的后果不是"少一条线路"，而是整份线路表为空 →
+            # 换源菜单消失、失败后永远无法换线（用户看到的就是取流一直超时）。
+            if not sid and hasattr(node, "get"):
+                href = str(node.get("href") or "")
+                m_href = _re.search(r"/play/(\d+)/", href)
+                if m_href:
+                    sid = m_href.group(1)
+                else:
+                    # 详情页线路 tab 的形态：`<a href="#playlist1">精品</a>`
+                    m_tab = _re.search(r"#playlist(\d+)", href)
+                    if m_tab:
+                        sid = m_tab.group(1)
             if not sid or sid in seen:
                 continue
             seen.add(sid)
@@ -2664,6 +2764,48 @@ class VideoMixin:
         if source is not None and self._decrypter is not None:
             return self._decrypter.decrypt(source, raw_url, "video_url")
         return raw_url
+
+    def _episode_link_nodes(self, doc, switch_cfg: dict) -> list:
+        """按 ep_href_contains 从详情页 doc 取所有分集链接节点。"""
+        needle = str(switch_cfg.get("ep_href_contains") or "/play/")
+        sel = f'a[href*="{needle}"]'
+        try:
+            return list(self._parser._query(doc, sel, None) or [])
+        except Exception:  # noqa: BLE001 —— 选择器异常按无链接处理
+            return []
+
+    def _first_episode_sid(self, doc, switch_cfg: dict) -> str:
+        """详情页里真实出现的第一条线路号（站点可能没有 default_sid 那条线）。"""
+        for node in self._episode_link_nodes(doc, switch_cfg):
+            href = str(node.get("href") or "") if hasattr(node, "get") else ""
+            m_sid = _re.search(r"/play/(\d+)/", href) or _re.search(r"sid=(\d+)", href)
+            if m_sid:
+                return m_sid.group(1)
+        return ""
+
+    def _chapters_from_all_links(self, source: SourceConfig, doc, switch_cfg: dict) -> List[Chapter]:
+        """线路号未知时，把详情页所有分集链接按出现顺序收成分集。
+
+        最后的兜底：宁可让用户看到「所有线路混排的分集」也不要空列表——空列表
+        等于播放界面没有分集可点，用户看到的就是「加载失败」。
+        """
+        chapters: List[Chapter] = []
+        seen: set = set()
+        for node in self._episode_link_nodes(doc, switch_cfg):
+            href = str(node.get("href") or "") if hasattr(node, "get") else ""
+            if not href or href in seen:
+                continue
+            seen.add(href)
+            title = node.text_content().strip() if hasattr(node, "text_content") else ""
+            m_sid = _re.search(r"/play/(\d+)/", href)
+            chapters.append(
+                Chapter(
+                    title=title or f"第{len(chapters) + 1}集",
+                    url=self._abs_url(source, href),
+                    source_id=m_sid.group(1) if m_sid else "",
+                )
+            )
+        return chapters
 
     def _fetch_chapters_for_source(
         self, source: SourceConfig, doc, detail_url: str, sid: str

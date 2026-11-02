@@ -636,6 +636,8 @@ HTML 发现通常配置：
 `api_endpoints` 的请求方式跟随站点真实接口，不要假定都是 GET：
 
 - `method`／`body`：`search`、`detail`、`episode` 均支持 `POST` 加 JSON `body`，body 里的 `{id}`、`{keyword}`、`{page}`、`{bvid}`、`{cid}`、`{quality}` 占位符由框架替换；接口只接受 POST 时（如 `69tv` 的 `/api/vod/play`，GET 返回 405），必须声明 `method: "POST"`。
+- `id_regex`：详情页 URL 末段带 slug 时（`/title/ik130109-恐怖收集者`）先抽出接口认的纯 id 再填占位符；未填上的占位参数整条丢弃，不把字面量 `{source}` 发出去。
+- 代理出口按主机自愈，不要用 `transports.prefer_proxy` 全局钉死出口：某个站直连 0.3~0.9s、代理探测却要 8s 超时时，偏好会把详情从 1s 拖到 13s。偏好只是「实测直连不通」的结论缓存，代理再次失败时当场撤销，不升级成「代理整体不可用」。
 - `field_extractors`：值为 JSONPath 字符串；对象列表字段（标签、演员）用 `{"path": "labels", "key": "labelName"}` 取出名字列表，避免把对象序列化进标题或标签。
 - 接口返回不含章节的单集视频源：声明 `content.episode.single_chapter: true`，详情接口无章节时框架会补唯一分集（详情 URL），播放页不再空白。
 
@@ -773,6 +775,10 @@ _switch_candidate_episode_urls_parallel，默认线路失败时才触发，串�
 | 页面换源（`source_switch`） | `endpoints.content.episode.source_switch` | MacCMS 类站：详情页有线路 tab（`?sid=`），取流需从 `player_aaaa` 解出 | 详情 HTML 选择器解析出的线路 |
 | 搜索分组（`search.group`） | `api_endpoints.search.group.enabled` | 聚合站搜索把同一作品归并成多采集源 | 搜索时记住的分组结果 |
 | 详情接口换线路（`related_episodes`） | `api_endpoints.detail.chapters.related_episodes` | 聚合站详情接口**只返回一条线路**，换线路要拿线路自己的 id 再请求一次（ikanpp） | 详情时并请求其它线路得到的分集 |
+| 详情接口兜底（`fallback`） | `api_endpoints.detail.fallback`（`strategy=search_play_url`） | 详情接口只认自家库 id 的聚合站（ikanpp 第三方 `vod_id` 一律 400/404），详情页必「加载失败」 | 回查搜索结果，用记录里的 `vod_play_from`/`vod_play_url` 摊出线路与分集；详情请求 4xx/超时或线路为空时自动生效 |
+| 详情主键提取（`id_regex`） | `api_endpoints.detail.id_regex` | 详情页 URL 末段带 slug（`/title/ik130109-恐怖收集者`），接口只认纯 id | 接口参数只带 `ik130109`；未填充的 `{source}` 之类占位参数整条丢弃，不再发出字面量 |
+| 同源 http→https 升级 | `transports.allow_http`（默认 false） | 站点自己吐 `http://` 绝对地址（agedm 目录/搜索 href），80 端口在多数网络连不通 | 详情/分集请求全部落在 443：`Content._abs_url`/`Discovery._abs_url` 只对同 host 升级，跨 host（CDN）不动 |
+| 线路坐标回退（`default_sid` 不存在） | `source_switch.ep_list_selector` + `default_sid` | 详情页只渲染站点真实存在的线路（omofuna 有的番只剩「精品」sid=1，配置却是 2） | 先用页面里真实出现的第一条线路重试，再退化为收全部 `/play/` 链接：分集数不为 0，`provider` 是页面上的线路 |
 
 `related_episodes` 的要点：
 

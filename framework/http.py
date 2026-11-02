@@ -302,6 +302,20 @@ def note_direct_preferred(url: str) -> None:
         _SYSTEM_PROXY_CACHE["url"] = None
 
 
+def system_proxy_url() -> Optional[str]:
+    """当前可用的系统代理 URL（探测结果，带 TTL 缓存）；None = 只能直连。
+
+    给需要「换出口重试」的调用方用（典型：第三方播放器解析站，直连和代理
+    哪个能用会在一天之内翻转，见 framework/external_player.py）。拿到 URL 后
+    作为显式 proxy 传回 get_text，即可强制走代理——显式 proxy 优先于
+    「该主机已知必须直连」的记忆，否则换出口重试会被自己的记忆拦掉。
+    """
+    try:
+        return _live_system_proxy()
+    except Exception:  # noqa: BLE001 —— 探测失败按"没有代理"处理
+        return None
+
+
 def _proxy_failed_for(host: str) -> bool:
     """该主机是否已被判定"走系统代理不通"。"""
     if not host:
@@ -388,6 +402,18 @@ def _note_proxy_success(host: str) -> None:
     with _SYSTEM_PROXY_LOCK:
         _PROXY_OK[host] = time.monotonic() + _PROXY_OK_TTL
         _PROXY_LAST_OK["t"] = time.monotonic()
+
+
+def _forget_proxy_preference(host: str) -> None:
+    """撤销「只有代理能通」的旧结论（代理这次自己失败了）。
+
+    代理偏好一旦写错，代价是每个请求都要先白等一次超时（omofuna 实测
+    详情 12.7s，其中 8s 是等代理读超时）。失败当场撤销，下一次就直接直连。
+    """
+    if not host:
+        return
+    with _SYSTEM_PROXY_LOCK:
+        _PROXY_OK.pop(host, None)
 
 
 def _proxy_preferred(host: str) -> bool:
@@ -936,6 +962,10 @@ class HttpClient:
                 logging.getLogger(__name__).info(
                     "代理偏好失效（%s），改按直连重试：%s", host or url, str(exc)[:120],
                 )
+                # 只撤销「该主机只有代理能通」的结论，不记成"代理整体不可用"：
+                # 一次代理抖动不配触发全局停用（会把别的需要代理的站一起打死），
+                # 撤掉偏好后下一次请求回到"短探测 + 直连优先"的常规决策。
+                _forget_proxy_preference(host)
 
         # 已知"走代理不通、直连能通"的主机：连探测都省掉
         if _proxy_failed_for(host):

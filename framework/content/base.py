@@ -28,6 +28,31 @@ def _unescape_text(value: str) -> str:
     return _html.unescape(value)
 
 
+def upgrade_insecure_scheme(base_url: str, abs_url: str) -> str:
+    """同源的 `http://` 绝对地址升级成 `https://`。
+
+    站点自己的列表页经常吐绝对地址（agedm 的搜索/目录 href 全是
+    `http://www.agedm.io/detail/...`），而 transports.base_url 是 https。
+    原样请求会走 80 端口：多数网络直接连不通（实测 10s 连接超时 → 详情
+    「加载失败」），能连通也白白多一跳。host 与 base_url 一致时统一升级，
+    scheme 由源配置决定（base_url 是 http 的源不受影响）。
+    """
+    if not abs_url:
+        return abs_url
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        b = urlsplit(base_url or "")
+        u = urlsplit(abs_url)
+        if (b.scheme or "").lower() != "https" or (u.scheme or "").lower() != "http":
+            return abs_url
+        if (b.hostname or "").lower() != (u.hostname or "").lower():
+            return abs_url
+        return urlunsplit(u._replace(scheme="https"))
+    except Exception:  # noqa: BLE001 —— 解析失败按原地址返回
+        return abs_url
+
+
 class ContentBase:
     def __init__(
         self,
@@ -192,7 +217,10 @@ class ContentBase:
             raise TimeoutError("stream resolution deadline exhausted")
 
     def _abs_url(self, source: SourceConfig, url: str) -> str:
-        return utils.abs_url(source.base_url, url)
+        abs_url = utils.abs_url(source.base_url, url)
+        if source is None or not (source.transports() or {}).get("allow_http"):
+            abs_url = upgrade_insecure_scheme(source.base_url, abs_url)
+        return abs_url
 
     def _detail_cache_key(self, source: SourceConfig, url: str) -> str:
         """Allow a source to invalidate stale detail/TOC HTML after a redesign."""
