@@ -671,6 +671,30 @@ def _is_anti_scrape_text(text: str) -> bool:
     return any(k in snippet for k in ANTI_SCRAPE_KEYWORDS)
 
 
+def _is_json_document(text: str) -> bool:
+    """响应体是否为一份完整 JSON（API 站的数据体）。
+
+    为什么需要这层判断：`ANTI_SCRAPE_KEYWORDS` 里的词（「被封」「封禁」
+    「验证码」等）是为 **HTML 挑战页** 设计的。JSON 数据体没有标签可剥，
+    词表会直接命中正常内容——纵横搜索的简介「年仅二十便被封为史上最年轻
+    的圣女」含「被封」，整源搜索被判成「反爬特征响应（命中：被封）」，
+    用户侧就是「纵横小说搜索出错」。真正的反爬页是 HTML，`json.loads`
+    必然失败，仍然会被特征词扫到（不放松拦截能力）。
+
+    首字符快速排除 HTML（`<` 开头直接返回 False，不做 24KB 的解析），
+    再用 json.loads 确认完整：`<html>…{"a":1}…</html>` 这类混排页
+    不会被误当成数据体。
+    """
+    stripped = (text or "").lstrip("\ufeff \t\r\n")
+    if not stripped or stripped[0] not in "[{":
+        return False
+    try:
+        json.loads(stripped)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def _log_non_json(url: str, text: str) -> None:
     """记录"响应非 JSON"警告（E1 修复）。
 
@@ -1163,11 +1187,15 @@ class HttpClient:
         timeout: float | None = None,
         retries: int | None = None,
         proxy_pool: Optional[ProxyPool] = None,
+        direct: bool = False,
     ) -> dict:
-        """GET 并解析 JSON 响应。proxy_pool: 代理IP池，反爬/失败时换IP重试。"""
+        """GET 并解析 JSON 响应。proxy_pool: 代理IP池，反爬/失败时换IP重试。
+        direct: 强制直连（屏蔽默认/系统代理），语义同 get_text。"""
         import json
 
-        text = self.get_text(url, headers, proxy, timeout, retries, proxy_pool=proxy_pool)
+        text = self.get_text(
+            url, headers, proxy, timeout, retries, proxy_pool=proxy_pool, direct=direct
+        )
         try:
             return json.loads(text)
         except json.JSONDecodeError:
@@ -1232,7 +1260,9 @@ class HttpClient:
                         )
                         with _urllib_opener(proxy_eff).open(req, timeout=wait_s) as resp:
                             text = resp.read().decode("utf-8", errors="replace")
-                    if _is_anti_scrape_text(text):
+                    # JSON 数据体不做特征词扫描（词表是给 HTML 挑战页的，
+                    # 小说简介里的「被封/验证码」会误报，见 _is_json_document）
+                    if not _is_json_document(text) and _is_anti_scrape_text(text):
                         raise AntiScrapeError(f"反爬特征响应 POST（命中：{_anti_scrape_hit(text)}）{url}")
                     try:
                         return _json.loads(text)
@@ -1316,7 +1346,9 @@ class HttpClient:
                         )
                         with _urllib_opener(proxy_eff).open(req, timeout=wait_s) as resp:
                             text = resp.read().decode(encoding or "utf-8", errors="replace")
-                    if _is_anti_scrape_text(text):
+                    # JSON 数据体不做特征词扫描（词表是给 HTML 挑战页的，
+                    # 小说简介里的「被封/验证码」会误报，见 _is_json_document）
+                    if not _is_json_document(text) and _is_anti_scrape_text(text):
                         raise AntiScrapeError(f"反爬特征响应 POST（命中：{_anti_scrape_hit(text)}）{url}")
                     return text
                 except AntiScrapeError as exc:
@@ -1399,7 +1431,9 @@ class HttpClient:
                                 text = resp.read().decode(encoding, errors="replace")
                             else:
                                 text = resp.read().decode("utf-8", errors="replace")
-                    if _is_anti_scrape_text(text):
+                    # JSON 数据体不做特征词扫描（词表是给 HTML 挑战页的，
+                    # 小说简介里的「被封/验证码」会误报，见 _is_json_document）
+                    if not _is_json_document(text) and _is_anti_scrape_text(text):
                         raise AntiScrapeError(f"反爬特征响应 POST（命中：{_anti_scrape_hit(text)}）{url}")
                     return text
                 except AntiScrapeError as exc:
@@ -1431,7 +1465,9 @@ class HttpClient:
                 text = self._get_once_raw(url, acw_headers, proxy, timeout, encoding)
                 if not _is_acw_challenge(text):
                     return text
-        if _is_anti_scrape_text(text):
+        # JSON 数据体不做特征词扫描（词表是给 HTML 挑战页的，小说简介里的
+        # 「被封/验证码」会误报，见 _is_json_document）
+        if not _is_json_document(text) and _is_anti_scrape_text(text):
             raise AntiScrapeError(f"反爬特征响应（命中：{_anti_scrape_hit(text)}）{url}")
         # Cloudflare 等边缘节点对瞬时流量偶发返回 200 空 body（首个连接常发，
         # 无 Set-Cookie/无内容，第 2 次请求即正常）。空文本对 HTML 解析无意义，

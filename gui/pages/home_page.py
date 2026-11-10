@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, QSize, Signal, QTimer
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
     QListWidget,
@@ -40,6 +44,19 @@ from gui.components import (
 from .base_page import BasePage
 
 
+_PLAYBACK_ROW_HEIGHT = 34  # 单行高度：够放下 26px 的「删除」按钮 + 上下留白
+
+
+def _playback_view_height(rows: int) -> int:
+    """最近播放列表的期望高度：随条数增长，最少 3 行、最多 9 行。
+
+    行高与 _PLAYBACK_ROW_HEIGHT 对齐，保证每行（标题 + 删除按钮）完整可见；
+    条数少时不白占版面，条数多时不会把单行压扁。
+    """
+    visible = min(max(rows, 3), 9)
+    return visible * _PLAYBACK_ROW_HEIGHT + 10
+
+
 class _PlaybackRow(QWidget):
     """Clickable history row with an independent delete action."""
 
@@ -48,23 +65,120 @@ class _PlaybackRow(QWidget):
     def __init__(self, record: dict, parent=None):
         super().__init__(parent)
         self._record = record
+        self._full_text = ""
+        # 行高自己钉死：QListWidget 用 item.sizeHint 定行高，但行内控件
+        # 在被 setItemWidget 接管时可能只拿到很矮的初始高度，会把按钮切掉。
+        self.setFixedHeight(_PLAYBACK_ROW_HEIGHT)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 0, 4, 0)
-        label = QLabel("")
-        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        layout.addWidget(label, stretch=1)
+        layout.setContentsMargins(6, 2, 4, 2)
+        layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignVCenter)
+        self.label = QLabel("")
+        self.label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # Ignored：标题再长也不撑宽行宽（否则「删除」按钮会被挤出可视区），
+        # 超出部分交给 elidedText 打省略号。
+        self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.label.setMinimumWidth(0)
+        layout.addWidget(self.label, stretch=1)
         self.delete_btn = QPushButton("删除")
         self.delete_btn.setFixedWidth(50)
         self.delete_btn.setFixedHeight(26)
-        layout.addWidget(self.delete_btn)
+        layout.addWidget(self.delete_btn, alignment=Qt.AlignVCenter)
 
     def set_label(self, text: str) -> None:
-        self.layout().itemAt(0).widget().setText(text)
+        """完整标题存起来，按当前可用宽度做省略号裁剪（悬浮可看全文）。"""
+        self._full_text = text
+        self.label.setToolTip(text)
+        self._sync_label()
+
+    def text(self) -> str:
+        return self._full_text
+
+    def _sync_label(self) -> None:
+        avail = self.label.width()
+        if avail <= 0:
+            self.label.setText(self._full_text)
+            return
+        self.label.setText(
+            self.label.fontMetrics().elidedText(
+                self._full_text, Qt.TextElideMode.ElideRight, avail
+            )
+        )
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._sync_label()
 
     def mousePressEvent(self, event):  # noqa: N802
         if event.button() == Qt.LeftButton:
             self.clicked.emit(self._record)
         super().mousePressEvent(event)
+
+
+class _NoItemTextDelegate(QStyledItemDelegate):
+    """列表项不画自己的文本：这一行的文本只由 _PlaybackRow 的 QLabel 负责。
+
+    QListWidgetItem 的 text() 仍然保留（键盘导航、无障碍、测试要用），但绘制
+    权只给行控件。否则同一行会画两遍同样的文本：不透明主题色下行控件/QLabel
+    的 bg2 底色把 item 文本盖住，看不出问题；一旦启用背景图，
+    `app._bg_overlay_qss()` 把 `QFrame`（QLabel 的基类）改成
+    `background: transparent`，item 文本就整条透出来，和行控件文本错开几个
+    像素叠在一起 —— 这就是「首页历史记录有重影、去掉背景图就没有」的根因。
+
+    只清 option.text，不动背景/选中态：`QListWidget::item:selected` 的高亮
+    仍由代理按 style option 绘制。
+    """
+
+    def initStyleOption(self, option, index):  # noqa: N802
+        super().initStyleOption(option, index)
+        option.text = ""
+
+
+class _PlaybackList(QListWidget):
+    """最近播放列表：行内控件尺寸跟随列表排版。
+
+    QListWidget 通过 setItemWidget 放进去的控件只用一次几何计算，右侧会
+    留出多余空白、窗口改变后也不跟手；这里在每次重排后把行控件对齐到
+    该行的可视矩形，保证标题可铺满整行、「删除」按钮贴右。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # item 文本不参与绘制（见 _NoItemTextDelegate），避免与行控件文本叠加。
+        self.setItemDelegate(_NoItemTextDelegate(self))
+
+    def release_item_widgets(self) -> None:
+        """清空列表前显式拆掉行控件。
+
+        `QListWidget.clear()` 只删 item；`setItemWidget` 挂上去的控件不在 model
+        里，会作为 viewport 的子控件留在原地。背景图模式下这些残留控件以及它们
+        的文本是透明的 —— 留在屏上就是另一份可见文本（重影的第二个来源）。
+        """
+        for row in range(self.count()):
+            widget = self.itemWidget(self.item(row))
+            if widget is None:
+                continue
+            widget.hide()
+            widget.setParent(None)
+            widget.deleteLater()
+
+    def fit_item_widgets(self) -> None:
+        for row in range(self.count()):
+            item = self.item(row)
+            widget = self.itemWidget(item)
+            if widget is None:
+                continue
+            rect = self.visualRect(self.indexFromItem(item))
+            if rect.width() > 0 and rect.height() > 0 and widget.geometry() != rect:
+                widget.setGeometry(rect)
+
+    def updateGeometries(self):  # noqa: N802
+        super().updateGeometries()
+        self.fit_item_widgets()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        self.fit_item_widgets()
 
 
 def _open_playback_record(home, record) -> None:
@@ -295,6 +409,20 @@ class HomePage(BasePage):
         self._privacy = privacy
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 整页放进滚动区：窗口变矮时页面滚动，而不是把各卡片压扁/裁掉
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        layout.addWidget(self._scroll)
+
+        body = QWidget()
+        self._scroll.setWidget(body)
+        layout = QVBoxLayout(body)
         layout.setContentsMargins(24, 16, 24, 16)
         layout.setSpacing(16)
 
@@ -338,10 +466,22 @@ class HomePage(BasePage):
         self.clear_playback_btn.clicked.connect(self._clear_playback_history)
         playback_header.addWidget(self.clear_playback_btn)
         layout.addLayout(playback_header)
-        self.playback_list = QListWidget()
-        self.playback_list.setMaximumHeight(180)
+
+        # 最近播放：高度随条数自适应（3~9 行），有富余空间时继续向下伸展，
+        # 单行固定 _PLAYBACK_ROW_HEIGHT，避免标题与「删除」按钮被挤成一条缝。
+        self.playback_list = _PlaybackList()
+        self.playback_list.setUniformItemSizes(True)
+        self.playback_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.playback_list.setMinimumHeight(_playback_view_height(0))
+        self.playback_list.setMaximumHeight(380)
         self.playback_list.itemClicked.connect(self._on_playback_clicked)
-        layout.addWidget(self.playback_list)
+        layout.addWidget(self.playback_list, stretch=1)
+
+        self.playback_empty_hint = QLabel("暂无播放记录")
+        self.playback_empty_hint.setStyleSheet(
+            "color: #000000; font-size: 12px; padding: 6px 2px;"
+        )
+        layout.addWidget(self.playback_empty_hint)
 
         # 迷你任务进度
         self.mini_progress = MiniProgress(event_bus)
@@ -405,8 +545,13 @@ class HomePage(BasePage):
             return
         self._history_snapshot = snapshot
         self.recent.reload()
+        # 先拆旧行控件再清 item：否则残留的行控件（透明背景下）会和新行叠在一起。
+        self.playback_list.release_item_widgets()
         self.playback_list.clear()
         self.playback_title.setText(f"最近播放（{len(records)}）")
+        self.playback_list.setMinimumHeight(_playback_view_height(len(records)))
+        self.playback_list.setVisible(bool(records))
+        self.playback_empty_hint.setVisible(not records)
         for record in records:
             seconds = (record.get("location") or {}).get("seconds")
             stamp = "仅记录集数"
@@ -416,6 +561,7 @@ class HomePage(BasePage):
             label = f"{record.get('title') or record.get('book_url', '')} · {record.get('chapter_title', '')} · {stamp}"
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, record)
+            item.setSizeHint(QSize(0, _PLAYBACK_ROW_HEIGHT))
             self.playback_list.addItem(item)
             # Keep QListWidgetItem text/data for keyboard and existing callers;
             # the delete action is supplied by a lightweight row widget.
@@ -428,6 +574,8 @@ class HomePage(BasePage):
             )
             row.clicked.connect(self._on_playback_record)
             self.playback_list.setItemWidget(item, row)
+        # 列表隐藏时行矩形还算不出来，showEvent / updateGeometries 里会再对齐一次。
+        self.playback_list.fit_item_widgets()
 
     def _update_empty_state(self) -> None:
         has_sources = len(self._manager.all()) > 0

@@ -13,6 +13,7 @@ import logging
 import math
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -455,9 +456,10 @@ def _sync_source_visibility(settings, source_manager, event_bus=None) -> None:
     )
 
 
-def _make_reading_progress(path: Path, shelf_cb, repository=None):
+def _make_reading_progress(path: Path, shelf_cb, repository=None, max_items: int = 20):
     from framework.reading_progress import ReadingProgress
-    return ReadingProgress(path, shelf_cb=shelf_cb, repository=repository, defer_cleanup=True)
+    return ReadingProgress(path, shelf_cb=shelf_cb, repository=repository,
+                           defer_cleanup=True, max_items=max_items)
 
 
 def _legacy_chapters_root(base_dir: Path) -> Path:
@@ -565,12 +567,28 @@ class _CentralArea(QWidget):
     Qt 的 QSS `background-image` 对普通 QWidget 不生效（即使 WA_StyledBackground
     也只画 background-color），所以背景图必须用 paintEvent 画——这是可靠方案：
     先画背景图铺满，再让 QTabWidget 等子控件（透明/半透明）浮在其上。
+
+    必须自带 WA_OpaquePaintEvent：背景图模式（`_bg_overlay_qss`）把 pane、
+    滚动区、列表全部改成透明/半透明后，控件链上再没有别的不透明祖先了。
+    Qt 重绘脏区时会一路向上找「能整块盖住这个区域」的控件，找不到就只重绘
+    脏区本身——半透明层叠在上一帧的像素上，旧文本/旧行会留在屏上，表现为
+    滚动或列表重排后出现重影。声明自己 opaque 并每帧铺满整块矩形后，任何
+    子控件重绘都会先把这块区域刷成本帧的背景图，残影不会再累积。
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._bg_pixmap = None  # 由 App 层注入（合成后的背景图）
         self._bg_scaled = None  # 按窗口尺寸预缩放的绘制用缓存（避免每次重绘都缩放）
+        self._fill_color = None  # 无背景图时铺的主题底色（None = 用 palette）
+        # 自己铺满整块矩形，所以可以告诉 Qt「这个区域我全画了」。
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+    def set_fill_color(self, color) -> None:
+        """无背景图时用来铺底的主题色（QColor 或 None）。"""
+        self._fill_color = color
+        self.update()
 
     def set_bg_pixmap(self, pixmap) -> None:
         """注入背景图（QPixmap 或 None 关闭）。"""
@@ -607,13 +625,21 @@ class _CentralArea(QWidget):
         )
 
     def paintEvent(self, event) -> None:  # noqa: N802
+        # WA_OpaquePaintEvent 的契约：每次都必须把整块矩形画满，不能留下
+        # 上一帧的像素。所以这里是「要么背景图、要么底色」的绝对兜底。
+        painter = QPainter(self)
+        painted = False
         if self._bg_pixmap is not None and not self._bg_pixmap.isNull():
             self._ensure_bg_scaled()
             if self._bg_scaled is not None and not self._bg_scaled.isNull():
-                painter = QPainter(self)
                 painter.drawPixmap(0, 0, self._bg_scaled)
-                painter.end()
-        super().paintEvent(event)
+                painted = True
+        if not painted:
+            color = self._fill_color
+            if color is None:
+                color = self.palette().color(self.backgroundRole())
+            painter.fillRect(self.rect(), color)
+        painter.end()
 
 
 class MainWindow(QMainWindow):
@@ -664,8 +690,11 @@ class MainWindow(QMainWindow):
         self.ikanpp_provider_memory = None
         self.search = None
         self.download_queue = None
+        from framework.settings_manager import history_max_items
+
         self.reading_progress = _make_reading_progress(
-            base_dir / "data" / "reading_progress.json", self._favorite_has
+            base_dir / "data" / "reading_progress.json", self._favorite_has,
+            max_items=history_max_items(self.settings),
         )
         self._runtime_state = "UNINITIALIZED"
         self._runtime_generation = 0
@@ -1582,6 +1611,37 @@ class MainWindow(QMainWindow):
             return True
         return store.reading_status(library_url) not in {"completed", "unknown"}
 
+    @staticmethod
+    def _pick_local_episode(parent, names: list, cur: int):
+        """多集本地视频选一集：返回索引；取消返回 None。
+
+        抽成独立方法便于测试替换；弹窗定宽，避免长文件名把窗口撑开。
+        """
+        from PySide6.QtWidgets import (
+            QComboBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout,
+        )
+
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("选择集数")
+        dlg.setMaximumWidth(400)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel("选择要播放的集："))
+        combo = QComboBox()
+        combo.setEditable(False)
+        combo.addItems(names)
+        combo.setCurrentIndex(cur)
+        layout.addWidget(combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("播放")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return combo.currentIndex()
+
     def _play_local_video(self, rec: dict) -> None:
         """播本地视频：记住上次看到哪集（下次默认定位该集）；单集直接播，多集弹选择。"""
         paths = list(rec.get("episode_paths") or [])
@@ -1602,11 +1662,11 @@ class MainWindow(QMainWindow):
                 prev_title = (recp or {}).get("chapter_title", "")
 
         target = paths[0]
+        cur = 0
         if len(paths) > 1:
             names = [Path(p).name for p in paths]
 
             # 文件名模糊匹配：线上集标题（如"第5集"）未必等于文件名（如"第5集.mp4"）
-            cur = 0
             if prev_title:
                 for i, n in enumerate(names):
                     if prev_title in n or n in prev_title:
@@ -1614,52 +1674,54 @@ class MainWindow(QMainWindow):
                         break
             # 自定义弹窗替代 QInputDialog：QInputDialog.getItem 会按最长文本
             # 自动撑得太宽（mp4 文件名通常很长），设最大宽度统一弹窗尺寸。
-            from PySide6.QtWidgets import (
-                QComboBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout,
-            )
-
-            dlg = QDialog(self)
-            dlg.setWindowTitle("选择集数")
-            dlg.setMaximumWidth(400)
-            layout = QVBoxLayout(dlg)
-            layout.setContentsMargins(16, 14, 16, 14)
-            layout.setSpacing(10)
-            layout.addWidget(QLabel("选择要播放的集："))
-            combo = QComboBox()
-            combo.setEditable(False)
-            combo.addItems(names)
-            combo.setCurrentIndex(cur)
-            layout.addWidget(combo)
-            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            buttons.button(QDialogButtonBox.Ok).setText("播放")
-            buttons.accepted.connect(dlg.accept)
-            buttons.rejected.connect(dlg.reject)
-            layout.addWidget(buttons)
-            if dlg.exec() != QDialog.Accepted:
+            picked = MainWindow._pick_local_episode(self, names, cur)
+            if picked is None:
                 return
-            target = paths[combo.currentIndex()]
+            cur = picked
+            target = paths[cur]
         key = key or str(Path(target).resolve())
         can_resume = MainWindow._local_progress_allowed(self, rec.get("url") or "")
         resume = self.reading_progress.resume(key) if self.reading_progress is not None and can_resume else None
         location = (resume.get("location") or {}) if resume and resume.get("chapter_url") == target else {}
-        metadata = {
-            "key": key, "chapter_url": target, "chapter_title": Path(target).name,
-            "title": rec.get("title") or Path(key).name,
-            "library_url": rec.get("url") or "", "folder": rec.get("folder") or "",
-        }
+        # 当前集是可变状态：外播里点「下一集 / 上一集」后要跟着换，
+        # 否则进度会一直记在起播那一集上。mute_until：切集瞬间收到的
+        # time-pos 还可能是上一集的位置，这段时间内的回写先丢掉。
+        state = {"index": cur, "mute_until": 0.0}
+        # 进度落盘是 UI 线程上的整块 JSON 写（shelf 缓存 upsert + prune +
+        # atomic_write），实测单次 0.5~1.3s。播放中 time-pos 每秒来一次，
+        # 不节流等于每个采样都卡住界面（ui_perf 日志：10 分钟 173 次
+        # STALL，最长 1337ms）。按"播放进度前进 5 秒"节流，切集/暂停/退出
+        # 另有立即落盘的路径，最多丢最后 5 秒的位置。
+        save_mark = {"seconds": -1.0}
+
+        def current_meta() -> dict:
+            index = state["index"]
+            path = paths[index] if 0 <= index < len(paths) else target
+            return {
+                "key": key, "chapter_url": path, "chapter_title": Path(path).name,
+                "title": rec.get("title") or Path(key).name,
+                "library_url": rec.get("url") or "", "folder": rec.get("folder") or "",
+            }
 
         def changed(seconds, duration, position):
-            self._on_local_progress({**metadata, "location": {
+            if time.monotonic() < state["mute_until"]:
+                return
+            if seconds - save_mark["seconds"] < 5.0:
+                return
+            save_mark["seconds"] = seconds
+            meta = current_meta()
+            self._on_local_progress({**meta, "location": {
                 "seconds": seconds, "duration": duration,
-                "chapter_url": target, "engine": "embedded",
+                "chapter_url": meta["chapter_url"], "engine": "embedded",
             }})
 
         def handed_off():
-            if self.reading_progress is not None and MainWindow._local_progress_allowed(self, metadata["library_url"]):
+            meta = current_meta()
+            if self.reading_progress is not None and MainWindow._local_progress_allowed(self, meta["library_url"]):
                 self.reading_progress.save(
-                    "", key, "video", target, metadata["chapter_title"],
-                    title=metadata["title"], library_url=metadata["library_url"],
-                    folder=metadata["folder"], detail_url=target,
+                    "", key, "video", meta["chapter_url"], meta["chapter_title"],
+                    title=meta["title"], library_url=meta["library_url"],
+                    folder=meta["folder"], detail_url=meta["chapter_url"],
                 )
 
         # 本地视频：VLC 内嵌窗口已下线，改由播放后端（mpv + JSON IPC）播放。
@@ -1673,16 +1735,43 @@ class MainWindow(QMainWindow):
         from framework.player_session import PlayerSession
 
         player = PlayerSession()
+
+        def followed_position(index) -> None:
+            """外播列表切集：当前集跟着换，并把「看到哪一集」重新落盘。"""
+            try:
+                index = int(index)
+            except (TypeError, ValueError):
+                return
+            if 0 <= index < len(paths) and index != state["index"]:
+                state["index"] = index
+                state["mute_until"] = time.monotonic() + 1.0
+                save_mark["seconds"] = -1.0     # 新一集立刻允许落盘
+                handed_off()
+
         player.time_changed.connect(
             lambda ms: MainWindow._emit_local_progress(player, changed))
         player.length_changed.connect(
             lambda _ms: MainWindow._emit_local_progress(player, changed))
         player.state_changed.connect(
             lambda st: handed_off() if st in (2, 3) else None)
+        # 只有 mpv 有 IPC；其它播放器拿不到当前位置 → 保持起播那一集
+        pos_signal = getattr(player, "playlist_pos_changed", None)
+        if pos_signal is not None:
+            pos_signal.connect(followed_position)
         self._local_player = player
         start_s = int((location or {}).get("seconds") or 0)
-        player.play(Path(target).as_uri(), title=metadata["title"],
-                    start_s=start_s)
+        title = current_meta()["title"]
+        # 整部作品的选集列表：播放器（mpv/VLC/PotPlayer）因此自带「下一集」，
+        # 切集不用回 App 重建会话；本地文件用 file:// URI，列表照样能播。
+        entries = [(Path(p).resolve().as_uri(), Path(p).name) for p in paths]
+        try:
+            player.play(
+                Path(target).as_uri(), title=title, start_s=start_s,
+                playlist=entries if len(paths) > 1 else None,
+                playlist_index=cur,
+            )
+        except TypeError:  # 旧播放后端/测试桩不认 playlist → 退回单文件
+            player.play(Path(target).as_uri(), title=title, start_s=start_s)
         handed_off()
 
     @staticmethod
@@ -2036,6 +2125,13 @@ class MainWindow(QMainWindow):
 
         # 设置全局 Palette：即使某控件未被 QSS 覆盖，也用主题主色而非黑色
         tokens = self.theme_manager.current_tokens()
+        # 中央区声明了 WA_OpaquePaintEvent（必须整块铺满）；没有背景图时用它
+        # 铺主题底色，和 QSS 的 QMainWindow background-color 保持一致。
+        if hasattr(self, "_central_area"):
+            try:
+                self._central_area.set_fill_color(QColor(tokens["bg"]))
+            except Exception:  # noqa: BLE001
+                log.debug("中央区底色设置失败", exc_info=True)
         palette = QPalette()
         palette.setColor(QPalette.Window, QColor(tokens["bg"]))
         palette.setColor(QPalette.WindowText, QColor(tokens["text"]))
@@ -2374,6 +2470,14 @@ QLabel#statsValue, QLabel#statsLabel, QLabel#brokenBadge {{
                         self.settings.get("ui", "reading_bg", "") or "",
                         int(self.settings.get("ui", "reading_font_size", 0) or 0),
                     )
+
+            # 5) 历史保留条数（影视+小说+漫画，书架收藏不受影响）
+            if _changed("history.max_items"):
+                from framework.settings_manager import history_max_items
+
+                progress = getattr(self, "reading_progress", None)
+                if progress is not None:
+                    progress.set_max_items(history_max_items(self.settings))
 
         QTimer.singleShot(0, _refresh)
 

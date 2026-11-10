@@ -24,7 +24,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from framework.config import SourceConfig  # noqa: E402
 from framework.content import Content  # noqa: E402
-from framework.stream_resolver import StreamBudget, StreamCancelledError  # noqa: E402
+from framework.errors import ContentMissingError  # noqa: E402
+from framework.stream_resolver import (  # noqa: E402
+    StreamBudget, StreamCancelledError, stream_resolver_options,
+)
 from framework.decrypter import Decrypter  # noqa: E402
 from framework.discovery import Discovery  # noqa: E402
 from framework.parser import Parser  # noqa: E402
@@ -38,6 +41,18 @@ PATH = os.path.join(ROOT, "sources", "omofuna.json")
 def source():
     with open(PATH, encoding="utf-8") as f:
         return SourceConfig.from_dict(json.load(f), PATH)
+
+
+def probe_enabled(src):
+    """打开播放地址探测（现网 omofuna 配的是 probe.mode=skip）。
+
+    站点直链对直接请求恒 403、只有本地媒体代理能取，所以线上把探测关了。
+    但本文件里测的是**探测/死线黑名单/候选回退**这套机制本身，与站点是否
+    跳过探测无关，故这些用例先摘掉 probe 段。
+    """
+    play = src.raw["endpoints"]["content"]["episode"]["play_url"]
+    play.pop("probe", None)
+    return src
 
 
 # 真实列表/搜索卡片（type 页与 search 页同构）
@@ -73,9 +88,26 @@ _DETAIL_HTML = """<html><body><div class="container">
 </div></div></div></body></html>"""
 
 
+# 2026-11 播放页实测裁剪（/anime/fdd1ae735172e5b711ae99f0/play/2/1.html?sid=2）：
+# 线路 tab 是 a.play-channel-item[href][data-count][data-sid]，只剩两条线路
+# （1=精品 第三方解析器线、2=暴风 CDN 直链线）；分集在 ul.play-list-content。
+# 站点改版前这里还有 3/4（天堂/量子），现在已不存在。
+_PLAY_PAGE_HTML = """<html><body><div class="play-channel">
+<a class="play-channel-item" href="/anime/e7f12f9fc5b567f379a2cc2b/play/1/1.html" data-count="24" data-sid="1">精品</a>
+<a class="play-channel-item" href="/anime/e7f12f9fc5b567f379a2cc2b/play/2/1.html" data-count="24" data-sid="2">暴风</a>
+</div>
+<ul class="play-list-content"><li class="play-list-content-item" data-name="1-50"><a href="/anime/e7f12f9fc5b567f379a2cc2b/play/2/1.html" title="第01集" data-num="1">第01集</a></li><li class="play-list-content-item" data-name="1-50"><a href="/anime/e7f12f9fc5b567f379a2cc2b/play/2/2.html" title="第02集" data-num="2">第02集</a></li></ul>
+<script>var player_aaaa={"flag":"play","encrypt":1,"from":"bfzym3u8","server":"no","sid":2,"nid":1,"id":"fdd1ae735172e5b711ae99f0","url":"https%3A%2F%2Fp.bvvvvvvvvv1f.com%2Fvideo%2Freplace0001%2F20250310yN2SDZnWindex.m3u8%2Findex.m3u8"}</script>
+</body></html>"""
+
+# 同一页面但线路 tab 只剩 href（站点改版 / 抽样式改动的风险形态）
+_PLAY_PAGE_HREF_ONLY = _PLAY_PAGE_HTML.replace(
+    ' data-count="24" data-sid="1"', ""
+).replace(' data-count="24" data-sid="2"', "")
+
+
 class _FakeHttp:
     defaults = type("D", (), {"timeout": 10, "retries": 0, "interval_ms": 0})()
-
     def __init__(self, pages=None):
         self.pages = pages or {}
 
@@ -107,13 +139,31 @@ def test_omofuna_categories_and_channels():
     cats = src.get_discovery_config()["list_item"]["categories"]
     assert [x["title"] for x in cats] == ["日漫", "国漫", "动画", "剧场", "特摄", "美漫"]
     switch = src.raw["endpoints"]["content"]["episode"]["source_switch"]
-    assert switch["default_sid"] == "3"
-    assert switch["max_switch_attempts"] == 4
-    # 线路 sid 在 href="#playlistN"（站无 data-sid 属性）
-    assert switch["list_attr"] == "href"
-    assert switch["sid_regex"] == r"playlist(\d+)"
+    # 2026-11 现场：线路只剩 1=精品（第三方解析器线）、2=暴风（CDN 直链线）。
+    # 默认线路必须走直链线：精品线要 art.v2player.top 二次解密，实测必败且
+    # 吃掉整段预算，这正是「取流 20s+ 然后超时」的直接原因。
+    assert switch["default_sid"] == "2"
+    assert switch["max_switch_attempts"] == 2
+    # 线路 tab 现在是 a.play-channel-item[data-sid][href=/play/<sid>/<ep>.html]
+    assert switch["list_selector"] == ".play-channel-item"
+    assert switch["list_attr"] == "data-sid"
+    assert switch["sid_regex"] == ""
     # 分集 href 是 /anime/{id}/play/{sid}/{ep}.html（框架缺省 /tv/ 会全部过滤）
     assert switch["ep_href_contains"] == "/play/"
+    # 线路菜单从首集播放页补（详情页 0 个 .play-channel-item）
+    assert switch["probe_from_chapter"] is True
+
+
+def test_omofuna_external_player_budget_is_capped():
+    """解析器线预算必须小：它会和换线抢同一份总预算。"""
+    src = source()
+    play = src.raw["endpoints"]["content"]["episode"]["play_url"]
+    assert play["external_player"]["budget_s"] <= 10
+    assert play["external_player"]["http_timeout_s"] <= 8
+    budgets = src.raw["stream_resolver"]
+    # 两条线路各一次机会即可，别留出"跑满 40s 才报错"的空档
+    assert budgets["candidate_timeout"] < 20
+    assert budgets["total_budget"] <= 30
 
 
 def test_omofuna_episode_and_player_rules():
@@ -124,6 +174,62 @@ def test_omofuna_episode_and_player_rules():
     decrypt = src.raw["decryption"]["targets"]["video_url"]
     assert decrypt["strategy"] == "js_custom"
     assert decrypt["script"] == "function decrypt(d) { return decodeURIComponent(d); }"
+
+
+def test_external_player_skipped_when_budget_too_low(monkeypatch):
+    """剩余预算不足时**不启动**第三方解析器，直接换线。
+
+    现场（2026-11-02 日志）：`第三方播放器解析失败 … art.v2player.top:8989`
+    每次都要吃满预算，而同一集直链线路只要 1s。预算已经不多时再赌一次解析，
+    等于把最后的换线机会一起烧掉 —— 用户看到的就是「取流很久然后超时」。
+    """
+    src = source()
+    cont = _content({})
+    play = src.raw["endpoints"]["content"]["episode"]["play_url"]
+    calls = []
+
+    import framework.external_player as external_mod
+
+    def fake(http, cfg, player, abs_ep):
+        calls.append(dict(cfg))
+        return "https://cdn.example/live.m3u8"
+
+    monkeypatch.setattr(external_mod, "resolve_external_player", fake)
+    player = {"from": "mp4", "url": "cb4eb195e96af271670c19b4a98ea3b4"}
+    ep = "https://www.omofuna.com/anime/demo/play/1/1.html?sid=1"
+
+    # 只剩 1s：解析器一步都别迈
+    assert cont._resolve_external_stream(
+        src, play, player, ep, deadline=time.monotonic() + 1.0
+    ) == ""
+    assert calls == []
+
+    # 剩 10s：跑，但预算被压到配置上限以内（不能吃满剩余时间）
+    assert cont._resolve_external_stream(
+        src, play, player, ep, deadline=time.monotonic() + 10.0
+    ) == "https://cdn.example/live.m3u8"
+    assert calls and calls[0]["budget_s"] <= 9
+    assert calls[0]["budget_s"] <= 10
+
+
+def test_external_player_budget_shrinks_with_remaining_time(monkeypatch):
+    """剩余预算比配置上限还小时，按剩余预算收窄（留 1s 收尾）。"""
+    src = source()
+    cont = _content({})
+    play = src.raw["endpoints"]["content"]["episode"]["play_url"]
+    calls = []
+
+    import framework.external_player as external_mod
+
+    monkeypatch.setattr(
+        external_mod, "resolve_external_player",
+        lambda http, cfg, player, abs_ep: calls.append(dict(cfg)) or "",
+    )
+    cont._resolve_external_stream(
+        src, play, {"from": "mp4"}, "https://www.omofuna.com/play/1/1.html",
+        deadline=time.monotonic() + 5.0,
+    )
+    assert calls and calls[0]["budget_s"] == pytest.approx(4.0, abs=0.3)
 
 
 def test_omofuna_maccms_url_decodes_public_player_value():
@@ -163,11 +269,18 @@ def test_omofuna_episode_selector_parses_links():
 
 
 def test_omofuna_detail_channels_and_chapters():
-    """真实详情页：四线路 source_list（sid 来自 #playlistN href）+ 默认 sid=3 分集。"""
+    """2026-11 详情页：**没有**线路 tab，线路菜单改由首集播放页补。
+
+    改版前详情页是 `ul.channel-tab > a[href=#playlistN]`；现在线路 tab 只渲染在
+    播放页（`a.play-channel-item[data-sid]`）。详情解析拿不到线路时必须走
+    `source_switch.probe_from_chapter` 补一次首集页请求，否则换源菜单为空、
+    默认线路失败后永远无法换线（用户看到的就是取流一直超时）。
+    """
     src = source()
-    detail = _content({"/anime/": _DETAIL_HTML}).fetch_detail(
-        src, "/anime/e7f12f9fc5b567f379a2cc2b.html"
-    )
+    detail = _content({
+        "play/2/1.html": _PLAY_PAGE_HTML,
+        "e7f12f9fc5b567f379a2cc2b.html": _DETAIL_HTML,
+    }).fetch_detail(src, "/anime/e7f12f9fc5b567f379a2cc2b.html")
     assert detail.title == "无上神帝"
     assert detail.cover == "https://as.cfhls.top/upload/vod/20230723-6/420b20f28b350c6654be8034f790be81.jpg"
     assert "残魂沉睡万年之后觉醒" in detail.summary
@@ -175,15 +288,43 @@ def test_omofuna_detail_channels_and_chapters():
     assert detail.author == "项方"
     # tags 只取「类型：」那一个 p（另有 更新 hidden-xs p，选择器过宽会混入空串）
     assert detail.tags == ["动画,热血,战斗,剧情,奇幻,玄幻,动作"]
-    # 四条线路：天堂3 / 精品1 / 暴风2 / 量子4（页签顺序）
-    sids = [s["sid"] for s in detail.source_list]
-    assert sids == ["3", "1", "2", "4"]
-    assert detail.source_list[0]["name"].startswith("天堂")
-    # 默认 sid=3 分集（ep_href_contains=/play/ 过滤后仍非空），URL 带 sid 参数
+    # 线路菜单来自首集播放页：精品1 / 暴风2（顺序与页面一致）
+    assert [s["sid"] for s in detail.source_list] == ["1", "2"]
+    assert [s["name"] for s in detail.source_list] == ["精品", "暴风"]
+    # 默认线路 = default_sid=2（暴风直链线），分集 URL 带 sid=2
     urls = [ch.url for ch in detail.chapters]
-    assert len(urls) == 2
-    assert urls[0] == "https://www.omofuna.com/anime/e7f12f9fc5b567f379a2cc2b/play/3/1.html?sid=3"
-    assert [ch.title for ch in detail.chapters] == ["第01集", "第02集"]
+    assert urls == [
+        "https://www.omofuna.com/anime/e7f12f9fc5b567f379a2cc2b/play/2/1.html?sid=2"
+    ]
+    assert [ch.title for ch in detail.chapters] == ["第01集"]
+
+
+def test_omofuna_line_menu_parses_new_channel_items():
+    """线路 tab 新结构：a.play-channel-item[data-sid][data-count][href]。"""
+    src = source()
+    menu = _content({})._parse_source_list(src, _PLAY_PAGE_HTML)
+    assert [(m["sid"], m["name"]) for m in menu] == [("1", "精品"), ("2", "暴风")]
+
+
+def test_omofuna_line_sid_falls_back_to_href():
+    """改版只剩 href（没有 data-sid）时仍要认出线路。
+
+    拿不到 sid 不是"少一条线路"，而是整份线路表为空 → 换源菜单消失、
+    取流失败后无线路可换。
+    """
+    src = source()
+    menu = _content({})._parse_source_list(src, _PLAY_PAGE_HREF_ONLY)
+    assert [m["sid"] for m in menu] == ["1", "2"]
+
+
+def test_omofuna_line_menu_empty_page_is_not_an_error():
+    """播放页确实没有线路块时返回空表，不抛异常（交给上层决定要不要重试）。"""
+    src = source()
+    html = (
+        "<html><body><ul class='play-list-content'>"
+        "<li><a href='/anime/demo/play/2/1.html'>第01集</a></li></ul></body></html>"
+    )
+    assert _content({})._parse_source_list(src, html) == []
 
 
 def test_omofuna_list_items_from_real_card():
@@ -270,13 +411,23 @@ def test_omofuna_switch_derives_detail_url_from_episode():
     )
 
 
+_CHANNEL_STRIP = (
+    '<div class="play-channel">'
+    '<a class="play-channel-item" href="/anime/demo/play/3/1.html" '
+    'data-count="24" data-sid="3">天堂</a>'
+    '<a class="play-channel-item" href="/anime/demo/play/1/1.html" '
+    'data-count="24" data-sid="1">精品</a>'
+    "</div>"
+)
 _PLAY3_DEAD = (
-    '<html><body><script>var player_aaaa={"flag":"play","encrypt":0,'
+    "<html><body>" + _CHANNEL_STRIP +
+    '<script>var player_aaaa={"flag":"play","encrypt":0,'
     '"url":"https://dead.example/xx.m3u8","from":"player","ps":0}'
     "</script></body></html>"
 )
 _PLAY1_LIVE = (
-    '<html><body><script>var player_aaaa={"flag":"play","encrypt":0,'
+    "<html><body>" + _CHANNEL_STRIP +
+    '<script>var player_aaaa={"flag":"play","encrypt":0,'
     '"url":"https://live.example/xx.m3u8","from":"player","ps":0}'
     "</script></body></html>"
 )
@@ -318,22 +469,33 @@ def test_fetch_video_streams_passes_deadline_and_context_to_resolver(source_lock
     assert cont.fetch_video_streams(
         src, "episode", "720p", True, deadline=deadline, context=context, source_lock=source_lock
     ) == ("video", "audio")
+    # 源级预算（stream_resolver.candidate_timeout / total_budget）必须一起传给
+    # resolver：慢站不放预算就会在候选阶段被判超时、异常被吞成空地址（黑屏）。
     assert calls == [((src, "episode", "720p", True), {
         "deadline": deadline, "context": context, "source_lock": source_lock,
+        **stream_resolver_options(src),
     })]
 
 
 def test_fetch_video_streams_keeps_legacy_four_argument_call_compatible():
     src = source()
     cont = _content({})
-    cont._stream_resolver = type(
-        "Resolver", (), {"resolve": lambda self, *args, **kwargs: (args, kwargs)}
-    )()
+    calls = []
 
-    args, kwargs = cont.fetch_video_streams(src, "episode", "720p", True)
+    def resolve(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return "video", "audio"
 
+    cont._stream_resolver = type("Resolver", (), {"resolve": resolve})()
+
+    assert cont.fetch_video_streams(src, "episode", "720p", True) == ("video", "audio")
+
+    args, kwargs = calls[0]
     assert args == (src, "episode", "720p", True)
-    assert kwargs == {"deadline": None, "context": None, "source_lock": False}
+    assert kwargs == {
+        "deadline": None, "context": None, "source_lock": False,
+        **stream_resolver_options(src),
+    }
 
 
 def test_player_aaaa_cancelled_decryption_is_not_fallback(monkeypatch):
@@ -543,6 +705,9 @@ def test_source_switch_stops_after_resolver_deadline(monkeypatch):
     from framework.stream_resolver import StreamResolver
 
     src = source()
+    # 源级 stream_resolver.total_budget 会覆盖实例预算（设计如此），这里要测的是
+    # 「换线阶段不得越过 resolver 的剩余预算」，所以先把源级预算摘掉。
+    src.raw.pop("stream_resolver", None)
     cont = _content({})
     next_line_calls = []
     candidate_deadlines = []
@@ -552,7 +717,10 @@ def test_source_switch_stops_after_resolver_deadline(monkeypatch):
         candidate_deadlines.append(deadline)
         time.sleep(0.05)
         candidate_finished.set()
-        return ["https://dead.example/live.m3u8"]
+        # 本线路空手而归（现网 omofuna 的直链解析实际也常这样：播放页拿到了，
+        # player_aaaa 里的地址却拼不出来）。此时才轮到换线 —— 而预算已耗尽，
+        # 换线必须一步都不迈出去。
+        return []
 
     monkeypatch.setattr(Content, "_fetch_play_url_candidates_once", fetch_candidates)
     monkeypatch.setattr(
@@ -573,12 +741,13 @@ def test_source_switch_stops_after_resolver_deadline(monkeypatch):
         result = cont.fetch_video_streams(
             src, "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
         )
-    except TimeoutError:
+    except (TimeoutError, ContentMissingError):
+        # 预算耗尽的两种合法收尾：超时 / 明确失败（都不能是"看起来成功"）
         result = ("", "")
     assert result == ("", "")
     assert candidate_finished.wait(1)
     assert candidate_deadlines and candidate_deadlines[0] is not None
-    assert next_line_calls == []
+    assert next_line_calls == [], "预算耗尽后不得再发起换线请求"
 
 
 def test_omofuna_dead_line_remembered_and_skipped(monkeypatch):
@@ -596,7 +765,7 @@ def test_omofuna_dead_line_remembered_and_skipped(monkeypatch):
         "play/1/1.html": _PLAY1_LIVE,
         "e7f12f9fc5b567f379a2cc2b.html": _DETAIL_HTML,
     }
-    src = source()
+    src = probe_enabled(source())
     http = _RouterHttp(pages)
     cont = Content(http, Parser(), _Checker(), decrypter=Decrypter(http))
     probes = []
@@ -621,7 +790,7 @@ def test_omofuna_dead_line_remembered_and_skipped(monkeypatch):
 
 
 def test_omofuna_stream_candidates_fall_back_within_one_line(monkeypatch):
-    src = source()
+    src = probe_enabled(source())
     ep = "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
     html = (
         '<script>var player_aaaa={"url":"https://dead.example/one.m3u8",'
@@ -686,7 +855,7 @@ def test_stream_candidates_support_escaped_json_m3u8():
 
 
 def test_stream_fallback_error_does_not_include_signed_candidate():
-    src = source()
+    src = probe_enabled(source())
     ep = "https://www.omofuna.com/anime/demo/play/3/1.html?sid=3"
     secret = "https://dead.example/live.m3u8?token=secret-signature"
     cont = _content({"play/3/1.html": f'<video><source src="{secret}"></video>'})
@@ -919,7 +1088,7 @@ def test_playerconfig_cancellation_is_not_swallowed():
 def test_source_switch_cancellation_stops_before_next_probe(monkeypatch):
     from framework.stream_resolver import StreamCancelledError
 
-    src = source()
+    src = probe_enabled(source())
     cont = _content({})
     context = StreamBudget()
     probes = []
@@ -1091,7 +1260,10 @@ def test_slow_playwright_result_is_discarded_after_budget_expires(monkeypatch):
     with pytest.raises(TimeoutError):
         cont._fetch_play_url_once(src, "https://video.example/watch/1", context=context)
 
-    assert seen == [context]
+    # 渲染**故意不接** context：慢站光 iframe 解析站就要 8~12s，外层预算常被
+    # 前面的 HTTP 解析吃掉，带进来必然超时（实测带 context 68.9s 失败、不带
+    # 3.5s 成功）。渲染只用自己的 timeout_ms，回来后再由外层判定预算。
+    assert seen == [None]
 
 
 def test_expired_detail_context_does_not_write_detail_cache():

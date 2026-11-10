@@ -87,6 +87,20 @@ DEFAULTS: dict = {
             "concurrency": 1,
             "timeout_ms": 30000,
         },
+        "hls": {
+            # 主清单只下发**一个**变体（默认开）。
+            #
+            # 实测（tools/_probe_startup.py，本地合成上游 + 真 mpv）：ffmpeg/mpv
+            # 打开带 3 个 #EXT-X-STREAM-INF 的主清单时，会把**每个**变体的清单
+            # 都打开，并从每个变体各读头部若干片（探测编码参数）。于是：
+            #   3 个变体 × 头部预取 + 播放器正在播的那一路 = 起播瞬间 3~4 路
+            #   同时抢同一条出口带宽；慢 CDN（实测单连接 100~300KB/s、3000k
+            #   变体要 375KB/s）上首帧直接晚好几秒，且每个变体各占一个磁盘
+            #   缓存目录（max_videos=5 时一部片子吃掉 3 个槽）。
+            # 折叠成单变体后 mpv 侧只剩 1 路：请求数与起播耗时都按变体数收敛。
+            # 想恢复多画质探测（例如需要播放器自动降码率）就把它设成 false。
+            "single_variant": True,
+        },
     },
 
     "hls_prefetch": {
@@ -120,6 +134,11 @@ DEFAULTS: dict = {
         "max_book_mb": 256,
         "max_total_mb": 8192,
     },
+    "history": {
+        # 播放/阅读历史保留条数（影视+小说+漫画合计）。已加入书架的记录
+        # 永久保留且不占名额；0 = 不限制（只按时间过期清理）。
+        "max_items": 20,
+    },
     "sources_runtime": {
 
         "broken_source_warn_interval_hours": 24,
@@ -131,6 +150,9 @@ DEFAULTS: dict = {
         # 播放 URL 可达性探测超时上限（秒）：probe 只做可达性判断，
         # 不必等满源配置超时；有效范围 1..30，越界钳制。
         "play_url_probe_timeout_cap": 5,
+        # 「检测播放源」严格模式：除清单+首个分片外，再用 App 的播放器（mpv）
+        # 真解几帧，只有播放器能播才标「可播放」。每条线路多花 5~25s，默认关。
+        "verify_player_probe": False,
     },
 }
 
@@ -208,12 +230,27 @@ def media_source_probe_settings(settings_manager) -> dict:
         probe = {}
     return {
         "enabled": bool(probe.get("enabled", True)),
-        "max_sources": _clamp_int(probe.get("max_sources", 5), 1, 5, 5),
+        # 上限 12：聚合站（洛雪TV）一个作品能聚出 10+ 条采集源线路，
+        # 上限 5 时「检测播放源」只能测前 5 条。真正并发仍是 1，逐条来。
+        "max_sources": _clamp_int(probe.get("max_sources", 5), 1, 12, 5),
         "concurrency": 1,
         "timeout_ms": _clamp_int(
             probe.get("timeout_ms", 30000), 1000, 2_147_483_647, 30000
         ),
     }
+
+
+def media_hls_settings(settings_manager) -> dict:
+    """播放链路的 HLS 通用策略（全局，不属于单个源）。
+
+    目前只有 ``single_variant``：主清单是否折叠成单变体下发。默认 True ——
+    mpv/ffmpeg 会为每个变体都读头部若干片，多画质主清单等于开局把带宽按变体
+    数均分（见 DEFAULTS 里的实测说明）。任何读取异常都回退默认 True。
+    """
+    hls = settings_manager.get("media", "hls", {}) if settings_manager else {}
+    if not isinstance(hls, dict):
+        hls = {}
+    return {"single_variant": bool(hls.get("single_variant", True))}
 
 
 def reader_prefetch_settings(settings_manager) -> dict:
@@ -245,3 +282,8 @@ def shelf_cache_settings(settings_manager) -> dict:
         "max_book_mb": _clamp_int(g("shelf_cache", "max_book_mb", 256), 16, 65536, 256),
         "max_total_mb": _clamp_int(g("shelf_cache", "max_total_mb", 8192), 256, 131072, 8192),
     }
+
+
+def history_max_items(settings_manager) -> int:
+    """历史保留条数（0 = 不限制，按时间过期清理）。"""
+    return _clamp_int(settings_manager.get("history", "max_items", 20), 0, 500, 20)

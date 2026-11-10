@@ -37,7 +37,7 @@ import logging
 import mimetypes
 import os
 import shutil
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import posixpath
 import re
 import threading
@@ -107,6 +107,102 @@ _trusted_source_id = trusted_source_id
 
 _PREFETCH_MAX_WORKERS = 8
 _PREFETCH_MAX_PENDING = 32
+
+# 主清单折叠开关（media.hls.single_variant，默认开）的读取缓存。
+# 每个清单请求都去读一遍 app_config.json 没必要；30s 内改配置即生效。
+_SINGLE_VARIANT_TTL = 30.0
+_SINGLE_VARIANT_STATE = [0.0, True]   # [过期时刻, 取值]
+_SINGLE_VARIANT_LOCK = threading.Lock()
+
+_STREAM_INF_PREFIX = "#EXT-X-STREAM-INF"
+_ATTR_PAIR_RE = re.compile(r'([A-Za-z0-9-]+)=("[^"]*"|[^,]*)')
+_RESOLUTION_RE = re.compile(r"(\d+)x(\d+)")
+
+
+def _single_variant_enabled() -> bool:
+    """media.hls.single_variant：主清单是否只下发一个变体（默认 True）。"""
+    with _SINGLE_VARIANT_LOCK:
+        if time.monotonic() < _SINGLE_VARIANT_STATE[0]:
+            return bool(_SINGLE_VARIANT_STATE[1])
+    value = True
+    try:
+        from .media_cache import _base_dir
+        from .settings_manager import SettingsManager, media_hls_settings
+
+        sm = SettingsManager(_base_dir() / "app_config.json")
+        value = bool(media_hls_settings(sm).get("single_variant", True))
+    except Exception:  # noqa: BLE001 —— 配置读不到：按默认（开）
+        value = True
+    with _SINGLE_VARIANT_LOCK:
+        _SINGLE_VARIANT_STATE[0] = time.monotonic() + _SINGLE_VARIANT_TTL
+        _SINGLE_VARIANT_STATE[1] = value
+    return value
+
+
+def _stream_attrs(line: str) -> dict:
+    """解析 #EXT-X-STREAM-INF 的属性列表（BANDWIDTH=…,RESOLUTION=…）。"""
+    payload = line.split(":", 1)[1] if ":" in line else ""
+    return {key.upper(): value.strip().strip('"')
+            for key, value in _ATTR_PAIR_RE.findall(payload)}
+
+
+def _variant_score(attrs: dict) -> tuple:
+    """变体排序键：码率优先，再看平均码率与分辨率（与播放器选法一致）。"""
+    def number(name):
+        try:
+            return int(float(attrs.get(name) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    match = _RESOLUTION_RE.search(attrs.get("RESOLUTION") or "")
+    pixels = int(match.group(1)) * int(match.group(2)) if match else 0
+    return (number("BANDWIDTH"), number("AVERAGE-BANDWIDTH"), pixels)
+
+
+def collapse_master_variants(text: str) -> str:
+    """主清单只保留**一个**变体（码率最高那路），其余 STREAM-INF 块整段删掉。
+
+    为什么必须折叠（实测，见 tools/_probe_startup.py）：mpv/ffmpeg 打开带多个
+    ``#EXT-X-STREAM-INF`` 的主清单时，会把每个变体的清单都打开，并从每个变体
+    各读头部若干片来探测编码参数。3 个变体 + 我们自己的起播头部预取 = 起播
+    瞬间 3~4 路并发抢同一条出口带宽，慢 CDN 上首帧直接晚好几秒；连带每个变体
+    各占一个磁盘缓存目录（``max_videos=5`` 时一部片子吃掉 3 个槽）。
+
+    折叠后播放器只看到 1 路，行为与它本来就会选的那路一致（最高码率）。
+    ``#EXT-X-MEDIA``（独立音轨组）等其它标签原样保留。
+
+    形状不认识（STREAM-INF 后面不是 URI 行）时**原样返回**：宁可多请求，
+    也不能把一份看不懂的清单改坏。
+    """
+    lines = text.splitlines()
+    blocks = []  # [(STREAM-INF 行下标, URI 行下标, 排序键)]
+    for index, line in enumerate(lines):
+        if not line.strip().startswith(_STREAM_INF_PREFIX):
+            continue
+        uri_index = None
+        for nxt_index in range(index + 1, len(lines)):
+            nxt = lines[nxt_index].strip()
+            if not nxt:
+                continue
+            if nxt.startswith("#"):
+                return text          # 形状不认识：不猜
+            uri_index = nxt_index
+            break
+        if uri_index is None:
+            return text
+        blocks.append((index, uri_index, _variant_score(_stream_attrs(line.strip()))))
+    if len(blocks) < 2:
+        return text
+    keep = max(range(len(blocks)), key=lambda i: (blocks[i][2], -i))
+    dropped = set()
+    for index, (tag_index, uri_index, _score) in enumerate(blocks):
+        if index == keep:
+            continue
+        dropped.add(tag_index)
+        dropped.add(uri_index)
+    return "\n".join(line for i, line in enumerate(lines) if i not in dropped)
+
+
 _PREFETCH_TIMEOUT = 10.0
 # 预取一个分片的**下载阶段**预算按体积换算：32KB/s 视为可接受下限。
 # 慢速 CDN（实测 agedm/18av 单连接 100KB/s 左右、2.5MB 的片子要 25s）上，
@@ -361,47 +457,33 @@ def _ts_shift_bytes(data: bytes, first_dts: float):
         # 往下走：bump 为负，把整片拉回到锚点开始（等同于"删掉这段空白"）
     bump = anchor - min_ts
 
-    # 帧间隔：同流相邻 DTS 差的中位数（90kHz）。样本太少就不做连续性修正。
-    diffs = []
+    # 单流单调性自检：同一路流的 DTS 必须递增（B 帧只影响 PTS，不影响 DTS）。
+    # 倒退说明源片内部就有硬拼/回绕，整片平移救不了它 —— 此时**不动字节**
+    # 直接返回 None，让播放器按原始时间轴处理。宁可偶尔卡一下，也不能交出一个
+    # 时基可疑的分片。
+    # 容忍 33 位时间戳回绕：回绕时 prev 接近 2^33、dts 很小，差值巨大，
+    # 只有「倒退量小于 1 小时」才算真的倒退。
     last_by_stream = {}
     for off, values in entries:
         key = _stream_key(buf, off, values)
         dts = values[-1][1]
         prev = last_by_stream.get(key)
-        if prev is not None and 0 < dts - prev < 90000 * 3:
-            diffs.append(dts - prev)
+        if prev is not None and 0 < prev - dts < 90000 * 3600:
+            return None
         last_by_stream[key] = dts
-    gap = sorted(diffs)[len(diffs) // 2] if diffs else 0
 
-    resid = 0
-    last_by_stream = {}
-    delta_by_off = {}
-    for off, values in entries:
-        key = _stream_key(buf, off, values)
-        prev = last_by_stream.get(key)
-        if gap and prev is not None:
-            # values 是**原始**时间戳（必须先加已累计的 resid 再比较），否则
-            # 每次比较都会把 resid 重复算一遍 → 后续包被越推越远。
-            want = prev + gap
-            dts = values[-1][1] + bump + resid
-            if dts <= prev or dts - want > max(gap, 90000 * 0.5):
-                resid += want - dts
-        delta = bump + resid
-        delta_by_off[off] = delta
-        if delta:
+    # 整片只用一个 delta（PES 与 PCR 同一个）：
+    # 旧实现会按「流内连续性」逐包推进 resid，而 resid 只作用于**之后的**包；
+    # 音、视频包在同一片里交错，一旦某条流触发了修正，同一片内音频被推到
+    # X、视频被推到 X+resid —— 两条流拿到不同时基，现场就是「画面和声音
+    # 越播越不同步」。整片同 delta 时，音视频相对偏移在数学上不可能被改变
+    # （跨片跳变仍由锚点整片平直，效果不变）。
+    if bump:
+        for _off, values in entries:
             for p, _v in values:
-                _encode_ts5(buf, p, _decode_ts5(buf, p) + delta)
-        last_by_stream[key] = values[-1][1] + delta
-    if pcrs:
-        idx = 0
-        cur_delta = bump
-        ordered = [(off, delta_by_off[off]) for off, _v in entries]
-        for off, p in pcrs:
-            while idx < len(ordered) and ordered[idx][0] <= off:
-                cur_delta = ordered[idx][1]
-                idx += 1
-            if cur_delta:
-                _shift_ts_pcr(buf, p, cur_delta)
+                _encode_ts5(buf, p, _decode_ts5(buf, p) + bump)
+        for _off, p in pcrs:
+            _shift_ts_pcr(buf, p, bump)
     return bytes(buf), duration
 
 
@@ -1367,6 +1449,29 @@ class _FileTee:
         except Exception:
             pass
 
+    def pause(self) -> None:
+        """被播放请求接管：关句柄但**保留已下载的 .part**。
+
+        与 abort() 的差别就是那几个字节。撞车时（预取正在下第 N 片，播放器也
+        来要第 N 片）旧行为是 `_cancel_prefetch_url` + `abort()`：预取已经拿到
+        的字节直接删掉，播放器再从 0 重新下一遍。慢 CDN 上单片 2~4MB、只有
+        100~300KB/s，这一扔就是几秒到十几秒，正好落在"点开一集"的那段时间里
+        （用户感受＝载入慢）。保留 .part 后 `_serve_cache` 会带
+        `Range: bytes=<已下载>-` 续取剩余部分。
+        """
+        if self.done or self.aborted:
+            return
+        self.done = True
+        try:
+            if self.fh is not None and not self.fh.closed:
+                self.fh.close()
+        except Exception:
+            pass
+        try:
+            self.cache.inflight_remove(self.key)
+        except Exception:
+            pass
+
 
 def _send_range_error(handler, status: int, headers: dict) -> None:
     handler.send_response(status)
@@ -1598,10 +1703,17 @@ class MediaProxy:
         self._pf_lock = threading.Lock()
         self._pf_cancel = threading.Event()
         self._pf_cancelled_urls: dict[str, threading.Event] = {}
+        # 被播放器"接管"的分片（canonical URL）：取消预取时保留已下载字节
+        # （tee.pause）。与 stop()/换会话时的取消区分开——那是整场结束，
+        # 半截 .part 没有续传价值，直接丢。
+        self._pf_takeover: set[str] = set()
         self._pf_responses: dict[str, object] = {}
         self._pf_generation = 0
         self._pf_failures = 0
         self._pf_disabled = False
+        # 起播剖面：cache_key → {"playlist": t, "first_segment": t}（单调时钟）。
+        # 只为了把"为什么载入慢"写进 logs/framework-*.jsonl，不参与任何逻辑。
+        self._start_marks: dict[str, dict] = {}
         self._start_idle_watch()
         atexit.register(self.stop)
 
@@ -1646,6 +1758,36 @@ class MediaProxy:
         with self._pf_lock:
             self._seg_order[cache_key] = segs
             self._seg_pos[cache_key] = {u: i for i, u in enumerate(segs)}
+
+    # ------------------------------------------------------------------ #
+    # 起播剖面（诊断用，只写日志）
+    # ------------------------------------------------------------------ #
+    _START_MARK_LIMIT = 64
+
+    def _note_start_stage(self, cache_key: str, stage: str) -> None:
+        """记录「清单就绪 → 播放器要首片」这一段耗时。
+
+        "全部视频载入慢"这类报告一直缺一把尺子：解析、清单、首片、播放器起播
+        四段混在一起，改哪一段都只能靠猜。这里把代理侧两段（清单完成、首片
+        请求）落进日志，播放器侧的首帧耗时由 VideoView 记另一条
+        `[起播] 首帧 …`，两条对齐即可定位瓶颈。
+        """
+        if not cache_key:
+            return
+        now = time.monotonic()
+        with self._pf_lock:
+            marks = self._start_marks.get(cache_key)
+            if marks is None:
+                if len(self._start_marks) >= self._START_MARK_LIMIT:
+                    self._start_marks.pop(next(iter(self._start_marks)), None)
+                marks = {"playlist": now}
+                self._start_marks[cache_key] = marks
+            if stage in marks:
+                return
+            marks[stage] = now
+            ready_at = marks["playlist"]
+        if stage == "first_segment":
+            _log.info("[起播] 清单→首片 %.2fs（key=%s）", now - ready_at, cache_key[:8])
 
     def _ensure_pf_pool(self):
         old_pool = None
@@ -1699,6 +1841,8 @@ class MediaProxy:
             self._pf_scheduled.clear()
             self._seg_order.clear()
             self._seg_pos.clear()
+            # 每次开播都重置起播剖面：一集一条日志，重播也能看到当前这次。
+            self._start_marks.clear()
         for response in responses:
             try:
                 response.close()
@@ -1893,6 +2037,10 @@ class MediaProxy:
                         self._note_prefetch_success()
                     return
                 except (requests.ConnectionError, requests.Timeout, UpstreamReadError) as exc:
+                    # 撞车被播放请求取消：既不是"慢但在动"也不是故障，不计数
+                    # （计数会 3 次熔断整场预取，正好在最需要它的时候关掉）。
+                    if self._prefetch_url_cancelled(canonical, generation):
+                        return
                     # 只有「超时且已经写进字节」才算「慢但在动」：这不是预取
                     # 不可用，不能记失败——慢速 CDN 上 3 次就会把整场播放的
                     # 预取熔断掉（agedm/18av 实测）。分片体被上游提前截断
@@ -1906,7 +2054,18 @@ class MediaProxy:
                     return
                 finally:
                     if tee is not None and not tee.done:
-                        tee.abort()
+                        if self._prefetch_url_cancelled(canonical, generation):
+                            # 播放器接管了这一片 → 已下载字节留给它续传
+                            # （见 _FileTee.pause 的实测说明）；其它取消
+                            # （stop / 换会话 / 清单结束）仍然整片丢掉。
+                            with self._pf_lock:
+                                takeover = canonical in self._pf_takeover
+                            if takeover:
+                                tee.pause()
+                            else:
+                                tee.abort()
+                        else:
+                            tee.abort()
                     resp.close()
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
@@ -1918,6 +2077,7 @@ class MediaProxy:
                 self._pf_responses.pop(canonical, None)
                 self._pf_scheduled.discard(canonical)
                 self._pf_cancelled_urls.pop(canonical, None)
+                self._pf_takeover.discard(canonical)
             if resp is not None:
                 try:
                     resp.close()
@@ -1960,6 +2120,7 @@ class MediaProxy:
             self._pf_futures.clear()
             self._pf_responses.clear()
             self._pf_cancelled_urls.clear()
+            self._pf_takeover.clear()
             self._seg_order.clear()
             self._seg_pos.clear()
             self._pf_scheduled.clear()
@@ -2855,6 +3016,14 @@ class MediaProxy:
         # 判定与下载路径 filter_m3u8 一致）
         if not skip_ad_filter:
             text = self._filter_ad_segments(text, base, ad_block, req_headers, source_id)
+        # 主清单折叠：只给播放器一路变体。mpv/ffmpeg 会为每个变体都读头部若干片，
+        # 多画质主清单等于起播瞬间按变体数均分出口带宽（详见 collapse_master_variants）。
+        if _single_variant_enabled():
+            collapsed = collapse_master_variants(text)
+            if collapsed != text:
+                _log.info("[hls] 主清单折叠为单变体（保留最高码率一路）：%s",
+                          urlparse(base).hostname or base)
+                text = collapsed
         if manifest_key is not None:
             self._manifest_cache[manifest_key] = (time.monotonic(), text, base)
         key = None
@@ -2876,6 +3045,8 @@ class MediaProxy:
                                         force_proxy=force_proxy,
                                         public_base=public_base,
                                         source_id=source_id)
+        if key:
+            self._note_start_stage(key, "playlist")
 
         self._emit_m3u8(handler, rewritten)
 
@@ -3398,6 +3569,42 @@ class MediaProxy:
         return out
 
 
+    # 起播时"播放器要第 N 片、预取正在下第 N 片"几乎必然撞车（预取是清单刚
+    # 下发时排的队，播放器下一个请求就到了）。所以握手窗口必须**短**：本地
+    # 300KB 片约 42ms 就能写完，150ms 足够覆盖"预取已到尾巴、只差 rename"的
+    # 情形；再长就是拿播放器的起播时间去赌一个多半还在慢 CDN 上爬的下载。
+    # 等不到就打断 + 保留 .part 续传（慢速上游实测 2.00× → 约 1.1~1.2× 字节）。
+    _PREFETCH_HANDOVER_WAIT = 0.15
+
+    @contextmanager
+    def _segment_guard(self, lock, target: str, seg_name: str,
+                       shared_fetch: bool):
+        """分片请求与预取抢同一片时的入场券：先给预取一次短窗口，等不到才打断。
+
+        - 预取正好在这片上且快写完了：让它收尾 → 随后直接命中本地文件，
+          一片只回源一次；
+        - 预取还在慢爬：标记为"播放器接管"后打断它（关掉响应），已下载字节
+          留在 `.part`（`_FileTee.pause`），本请求带 `Range` 续取剩余部分。
+        """
+        if not shared_fetch:
+            yield
+            return
+        acquired = lock.acquire(timeout=self._PREFETCH_HANDOVER_WAIT)
+        if not acquired:
+            cache = self._cache_obj()
+            if cache is not None:
+                canonical = cache.key_of(target)
+                with self._pf_lock:
+                    self._pf_takeover.add(canonical)
+            self._cancel_prefetch_url(target)
+            lock.acquire()
+            _log.debug("[hls] 分片预取 %.2fs 内未收尾，改由播放请求接管：%s",
+                       self._PREFETCH_HANDOVER_WAIT, seg_name)
+        try:
+            yield
+        finally:
+            lock.release()
+
     # ------------------------------------------------------------------ #
     def _serve_cache(self, handler: "_ProxyHandler", path: str,
                      public_base: str | None = None) -> None:
@@ -3420,6 +3627,11 @@ class MediaProxy:
 
         cache_key = parts[0]
         seg_name = unquote(parts[1])
+        if not seg_name.endswith(".m3u8"):
+            # 播放器开始要分片了：与"清单就绪"合起来就是代理侧的载入延迟。
+            self._note_start_stage(cache_key, "first_segment")
+            _log.debug("[hls] 分片请求 %s Range=%r", seg_name,
+                       handler.headers.get("Range"))
         with self._lock:
             ctx = self._cache_ctx.get(cache_key)
         if ctx is None:
@@ -3434,16 +3646,35 @@ class MediaProxy:
         # 分片级预取钩子：取到第 seg_name 片后把后续 depth 片排队落盘。
         # 放锁外：预取自身会取同名 path_lock，锁内触发会自死锁。
         if not seg_name.endswith(".m3u8"):
-            self._cancel_prefetch_url(target)
+            # 注意顺序：**先**排队后续分片，**不要**在这里取消本片的在途预取。
+            # 本片若正被预取下，正确的做法是等它把文件写完（见 _segment_guard），
+            # 取消再自己下一遍等于同一片下载两次 —— 慢 CDN 上就是"点开一集多等
+            # 好几秒"（实测见 collapse_master_variants 的说明与
+            # tools/_probe_startup.py 的对照数据）。
             self._maybe_prefetch(cache_key, target)
 
         fetch_key = cache.key_of(target)
         fetch_owner = False
         fetch_state = None
-        shared_fetch = not handler.headers.get("Range")
+        client_range = handler.headers.get("Range")
+        # mpv/ffmpeg 对**每个** HLS 分片都发 `Range: bytes=0-`（实测，见
+        # tools/_probe_startup.py 的日志）。它的语义是"要整片"，不是拖动。
+        # 按 Range 处理会一次性绕开四件事：分片路径锁/预取握手、暂停分片的
+        # 续传、以及 `_full_zero_offset_response` 判定的落盘 —— 结果是同一片
+        # 回源两次、预取下的字节白扔、播放路径压根不写缓存（只有预取在写）。
+        # 所以只有"从中间取"（真拖动/seek）才算 Range。
+        #
+        # 只对**清单里出现过的分片**这样归类：`/c/<key>/<整片 mp4>` 这种"单文件
+        # 走缓存路由"的请求保持原语义（Range 不进单飞、各自独立回源），拖动
+        # 语义与既有测试都依赖它。
+        known_segment = target in (self._seg_pos.get(cache_key) or {})
+        range_start = _parse_range_start(client_range)
+        from_head = range_start is None or (range_start == 0 and known_segment)
+        effective_range = None if from_head else client_range
+        shared_fetch = from_head
         # 分片时间戳重写只作用于"播放"（播放器顺序拉片、无 Range）；下载器用
         # Range 顺序读段，整理会打乱字节偏移，必须保持原始分片。
-        remux = _remux_active(ad_block) and not handler.headers.get("Range")
+        remux = _remux_active(ad_block) and not client_range
         if not seg_name.endswith(".m3u8"):
             final = cache.hls_segment_final(cache_key, seg_name)
             entry = cache.entry(cache_key)
@@ -3467,7 +3698,21 @@ class MediaProxy:
 
         # 定位到本段在缓存里的路径；已知总长才 tee（见 _content_total）。
         lock = cache.path_lock(target) if shared_fetch else nullcontext()
-        with lock:
+        with self._segment_guard(lock, target, seg_name, shared_fetch):
+            if not seg_name.endswith(".m3u8"):
+                # 等锁期间预取可能已经把这一片写完（见 _segment_guard 的握手）：
+                # 锁内重查一次命中，否则同一片会回源两次（mpv 起播时正好撞上）。
+                handover_final = cache.hls_segment_final(cache_key, seg_name)
+                handover_entry = cache.entry(cache_key)
+                if (handover_entry and handover_entry.get("complete")
+                        and handover_final.is_file()):
+                    cache.touch(cache_key)
+                    _record_cache_diagnostic(target, base_headers, "hit")
+                    if remux and self._serve_remux_from_file(
+                            handler, cache_key, seg_name, target, handover_final):
+                        return
+                    self._serve_local_file(handler, handover_final)
+                    return
             if seg_name.endswith(".m3u8") or target.lower().split("?", 1)[0].endswith(".m3u8"):
                 # 嵌套/变体播放列表：按自身 URL 的独立 key 缓存放过滤文本；
                 # 命中且已缓存 → 复用过滤结果，只重写（免上游往返/免重复过滤）
@@ -3526,14 +3771,17 @@ class MediaProxy:
 
             req_headers = dict(base_headers)
             req_headers["Accept-Encoding"] = "identity"
-            rng = handler.headers.get("Range")
-            if rng and not seg_name.endswith(".m3u8"):
+            rng = client_range
+            if rng and not from_head and not seg_name.endswith(".m3u8"):
+                # 真拖动才把 Range 透给上游；`bytes=0-` 要的是整片，别让上游
+                # 回 206 把落盘/续传的判定搅乱。
                 req_headers["Range"] = rng
-            # 跨重启续传：同一分片存在未完成 `.part` 且客户端未带 Range →
-            # 从已下载偏移向上游续取剩余字节，不重复下载已完成部分。
+            # 跨重启续传：同一分片存在未完成 `.part` → 从已下载偏移向上游续取
+            # 剩余字节，不重复下载已完成部分。对客户端仍是完整 200（见下方
+            # resume 分支），所以 `bytes=0-` 的播放器请求同样适用。
             resume_offset = 0
             part_path = None
-            if not seg_name.endswith(".m3u8") and not rng:
+            if not seg_name.endswith(".m3u8") and from_head:
                 part_path = cache.hls_segment_part(cache_key, seg_name)
                 try:
                     if part_path.is_file():
@@ -3609,7 +3857,7 @@ class MediaProxy:
                     return
                 total = len(first) if whole else _content_total(resp)
                 resume = bool(
-                    resume_offset and not handler.headers.get("Range")
+                    resume_offset and from_head
                     and total and total > resume_offset
                     and _is_contiguous_206(resp, resume_offset))
                 head_bytes = b""
@@ -3633,7 +3881,7 @@ class MediaProxy:
                         cache_key, seg_name, body, req_headers)
                     payload = out if out is not None else body
                     if total and _full_zero_offset_response(
-                            resp, handler.headers.get("Range")):
+                            resp, effective_range):
                         self._store_segment_bytes(
                             cache, cache_key, seg_name, payload)
                         if out is not None:
@@ -3665,7 +3913,7 @@ class MediaProxy:
                 # /c/ 分片：新抓（完整 200）或续传（206 偏移）都落盘；拖动产生的
                 # 非 0 Range 不落盘（不满足顺序写前提），与 mp4 tee 规则一致。
                 if total and (resume or _full_zero_offset_response(
-                        resp, handler.headers.get("Range"))):
+                        resp, effective_range)):
                     final = cache.hls_segment_final(cache_key, seg_name)
                     st = _FileTee(cache, cache_key, cache.hls_segment_part(cache_key, seg_name),
                                   final, total, is_mp4=False,

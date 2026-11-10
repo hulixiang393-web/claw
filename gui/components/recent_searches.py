@@ -77,11 +77,16 @@ class RecentSearches(QWidget):
 
     def reload(self) -> None:
         """从 SearchHistory 重渲染。"""
-        # 清旧
+        # 清旧：deleteLater 要等事件循环，期间旧行控件仍是可见子控件（拿走
+        # 布局项并不会隐藏它）。背景图模式下行底色是透明的，新旧两批文本会
+        # 在同一位置叠着显示 = 重影。先 hide + 断开父级，再交给 deleteLater。
         while self._list_layout.count():
             child = self._list_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            widget = child.widget()
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
 
         items = self._history.recent()
         if not items:

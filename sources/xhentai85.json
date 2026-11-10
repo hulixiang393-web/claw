@@ -8,14 +8,17 @@
   "$metadata": {
     "adult": true,
     "homepage": "https://xhentai85.xyz",
-    "description": "xhentai85 - 日韓全彩成人漫畫（GBK，?novelN 作品）",
-    "lang": "zh-CN",
+    "description": "xhentai85（站内现名「老司機禁漫 / 无尽漫画」，日韓全彩成人漫畫，GBK）。2026-11 站方改版：全站路由改为「查询串即路径」形式——作品 ?comic/{id}、章节 ?comic/{id}/{token}、分类 ?comics/{分类}/ob/{排序}/st/{进度}/page/{n}。旧 ?novel{N}/、?latest/index_2.html 已 404（发现页整页空白即此原因）。注意：站点边缘（aaPanel/nginx）对查询串里带百分号编码的请求一律返回 404，因此分类只能用 ASCII 路由，中文分类/中文搜索（?search/{中文}、/catalog.php?key=）目前站方不可用，本源不配搜索。封面与正文图走 new.niaopic.com / img.nnpic.xyz，无防盗链，直连即可取图。",
+    "lang": "zh-TW",
     "region": "cn",
     "tags": [
       "漫画",
       "成人",
-      "彩色"
-    ]
+      "彩色",
+      "日漫",
+      "韩漫"
+    ],
+    "last_verified": "2026-11-06T10:20:00+08:00"
   },
   "transports": {
     "base_url": "https://xhentai85.xyz",
@@ -27,105 +30,97 @@
     },
     "timeout": 15,
     "retries": 3,
-    "interval_ms": 800
+    "interval_ms": 700
   },
   "endpoints": {
     "discovery": {
-      "list_url": "/?latest/index_2.html",
+      "list_url": "/?comics/all/ob/time/st/all/page/{page}",
       "list_paginator": {
-        "type": "increment",
-        "page_placeholder": "(?<=index_)\\d+(?=\\.html)"
+        "type": "increment"
       },
       "list_item": {
         "categories": [
           {
             "title": "最新更新",
-            "url": "/?latest/index_2.html"
+            "url": "/?comics/all/ob/time/st/all/page/{page}"
           },
           {
-            "title": "連載更新",
-            "url": "/?release/index_2.html"
+            "title": "連載中",
+            "url": "/?comics/all/ob/time/st/serialized/page/{page}"
           },
           {
-            "title": "人氣排行",
-            "url": "/?popular/index_2.html"
+            "title": "已完結",
+            "url": "/?comics/all/ob/time/st/completed/page/{page}"
           },
           {
-            "title": "完結漫畫",
-            "url": "/?completed/index_2.html"
+            "title": "本週熱門",
+            "url": "/?comics/all/ob/hits/st/all/page/{page}"
           },
           {
-            "title": "韓漫",
-            "url": "/?hanman/index_2.html"
+            "title": "熱門連載",
+            "url": "/?comics/all/ob/hits/st/serialized/page/{page}"
           },
           {
-            "title": "日漫",
-            "url": "/?riman/index_2.html"
+            "title": "熱門完結",
+            "url": "/?comics/all/ob/hits/st/completed/page/{page}"
           },
           {
-            "title": "3D",
-            "url": "/?3d/index_2.html"
+            "title": "評分最高",
+            "url": "/?comics/all/ob/stars/st/all/page/{page}"
           },
           {
-            "title": "同人",
-            "url": "/?doujin/index_2.html"
-          },
-          {
-            "title": "單篇",
-            "url": "/?single/index_2.html"
-          },
-          {
-            "title": "短篇",
-            "url": "/?short/index_2.html"
-          },
-          {
-            "title": "cosplay",
-            "url": "/?cosplay/index_2.html"
-          },
-          {
-            "title": "CG",
-            "url": "/?cg/index_2.html"
+            "title": "高分完結",
+            "url": "/?comics/all/ob/stars/st/completed/page/{page}"
           }
         ]
       },
       "works_list_item": {
         "root_selector": {
-          "css": "div.each_truyen"
+          "css": "div.comic-list > a[href^='?comic/']"
         },
         "fields": {
           "title": {
-            "css": "a",
-            "attr": "title"
+            "css": "div.title"
           },
           "url": {
-            "css": "a",
+            "xpath": "self::a",
             "attr": "href"
           },
           "cover": {
-            "css": "img",
+            "css": "picture img",
             "attr": "src"
+          },
+          "update": {
+            "css": "div.last-time"
           }
+        },
+        "clean": {
+          "update": [
+            [
+              "re:\\s*\\d+(?:\\.\\d+)?分\\s*$",
+              ""
+            ]
+          ]
         }
       }
     },
     "detail": {
       "fields": {
         "title": {
-          "css": "h2.single_title"
+          "css": "div.detail h1"
         },
         "cover": {
-          "css": "img.wp-post-image",
+          "css": "div.detail-cover img",
           "attr": "src"
         },
         "author": {
-          "css": "a[itemprop='author']",
-          "attr": "title"
+          "css": "div.detail td a[href^='?search/']"
         },
         "summary": {
-          "css": "div.desc-text"
+          "css": "div.mt-4.text-break"
         },
         "tags": {
-          "css": "a[itemprop='genre']"
+          "css": "div.detail td a[href^='?comics/']"
         }
       }
     },
@@ -133,25 +128,25 @@
       "page": {
         "list": {
           "root_selector": {
-            "css": "div#list-chapter ul.list-chapter li.chap-right5"
+            "css": "div.vol-item"
           },
           "fields": {
             "title": {
-              "css": "span.chapter-text"
+              "css": "span.vol-item-info a"
             },
             "url": {
-              "css": "a[href*='/chapter']",
+              "css": "a[href^='?comic/']",
               "attr": "href"
             }
           }
         },
         "body": {
           "root_selector": {
-            "css": "img[src*='hmpic/']"
+            "css": "img[data-index]"
           },
           "fields": {
             "url": {
-              "css": "img[src*='hmpic/']",
+              "xpath": "self::img",
               "attr": "src"
             }
           }

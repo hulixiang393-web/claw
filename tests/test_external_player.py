@@ -58,8 +58,14 @@ def _tmp_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(ep, "_cache_dir", lambda: str(tmp_path))
     # 解析结果缓存是进程级状态：不清会跨用例命中，失败用例就测不到异常路径。
     ep._STREAM_CACHE.clear()
+    ep._HOST_DOWN.clear()
+    ep._HOST_ROUTE.clear()
+    # 测试不依赖本机代理出口
+    monkeypatch.setattr(ep.http_mod, "system_proxy_url", lambda: None)
     yield
     ep._STREAM_CACHE.clear()
+    ep._HOST_DOWN.clear()
+    ep._HOST_ROUTE.clear()
 
 
 @pytest.mark.skipif(not ep.node_available(), reason="需要 Node.js")

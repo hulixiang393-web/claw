@@ -87,8 +87,14 @@ def test_relay_skips_non_manifest_candidates():
     assert out == [mp4]
 
 
-def test_omofuna_source_declares_hls_relay():
-    """回归守卫：omofuna 的清单只能经站点中继取，配置里必须声明。"""
+def test_omofuna_source_does_not_relay_manifest():
+    """回归守卫：omofuna 的清单**不**走站点中继。
+
+    中继 `m3u8xx.sgzm.net:2087` 实测已停用（清单经中继 7.7s、直取 3.5s；且中继会
+    把相对分片 0000000.ts 拼成中继地址 → 404/SSL EOF，播放器反复重试 = 卡顿）。
+    现在只保留 `hls_relay_note` 记录原因，配置里不得再出现 `hls_relay`——
+    一旦重新打开，取流会重新慢一倍并开始丢分片。
+    """
     import json
     from pathlib import Path
 
@@ -96,4 +102,5 @@ def test_omofuna_source_declares_hls_relay():
     data = json.loads((root / "sources" / "omofuna.json").read_text(
         encoding="utf-8-sig"))
     play = data["endpoints"]["content"]["episode"]["play_url"]
-    assert play.get("hls_relay") == "https://m3u8xx.sgzm.net:2087/{url}"
+    assert not play.get("hls_relay")
+    assert "m3u8xx.sgzm.net" in play.get("hls_relay_note", "")

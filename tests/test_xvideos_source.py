@@ -117,6 +117,43 @@ def test_discovery_pagination_is_zero_indexed(source):
         "https://www.xvideos.com/tags/xvedio?page=2")
 
 
+def test_search_paginator_is_zero_indexed_p(source):
+    """搜索分页参数是 `p` 且 0 索引（实测 `?k=…&page=N` 被站点忽略，每页都回第 1 页）。
+
+    配错的表现：搜索只出第一页、结果「显示不完全」。
+    """
+    pag = source.get_search_config().get("paginator") or {}
+    assert pag.get("param") == "p"
+    assert pag.get("start") == 0
+
+
+def test_search_pagination_depth_is_project_standard(source):
+    """搜索翻页深度：60 页、不按条数截断。
+
+    旧值 max_pages=10 / max_results=300 会把常见词（milf 等）的搜索结果
+    截在约 250 条，用户看到的就是「数量不对」；站点实测 p=50 仍返回新结果，
+    故按用户要求放到 60 页（每页约 25 条）。
+    """
+    cons = source.raw["constraints"]["search"]
+    assert cons["max_pages"] == 60
+    assert cons["max_results"] == 0
+
+
+def test_search_page_urls_follow_site_zero_indexing(source):
+    from framework.search import Search
+
+    def build(page):
+        return Search._build_page_url(
+            source=source, base_url="/", keyword="xvedio", kw_param="k",
+            page=page, page_param="p", page_start=0,
+        )
+
+    assert build(1) == "https://www.xvideos.com/?k=xvedio&p=0"
+    assert build(2) == "https://www.xvideos.com/?k=xvedio&p=1"
+    # 页码互不相同，才不会被「重复页保护」提前收敛成 1 页
+    assert build(1) != build(2) != build(3)
+
+
 def test_detail_fields_parse_free_video(source, parser):
     detail_cfg = source.get_detail_config()
     doc = parser.parse(_fixture("video_free.html"))

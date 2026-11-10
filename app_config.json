@@ -16,11 +16,11 @@
     }
   },
   "ui": {
-    "theme": "sakura",
+    "theme": "mint",
     "font_scale": 1.5,
     "cover_cache_size_mb": 256,
     "default_page_size": 20,
-    "background_image": "D:/code/claw/薇尔莉特.jpg",
+    "background_image": "E:/code/claw/薇尔莉特.jpg",
     "background_opacity": 0.4,
     "reading_bg": "#FBF3D2",
     "reading_font_size": 0
@@ -48,7 +48,7 @@
   },
   "video_cache": {
     "enabled": true,
-    "max_videos": 5,
+    "max_videos": 12,
     "max_bytes_mb": 8192
   },
   "media": {
@@ -57,6 +57,9 @@
       "max_sources": 5,
       "concurrency": 1,
       "timeout_ms": 30000
+    },
+    "hls": {
+      "single_variant": true
     }
   },
   "hls_prefetch": {
@@ -91,12 +94,16 @@
     "max_book_mb": 256,
     "max_total_mb": 8192
   },
+  "history": {
+    "max_items": 20
+  },
   "sources_runtime": {
     "broken_source_warn_interval_hours": 24,
     "auto_disable_after_failures": 3,
     "selfcheck_strategy": "soft",
     "dead_line_ttl_seconds": 600,
     "play_url_probe_timeout_cap": 5,
+    "verify_player_probe": false,
     "sources_selected": true
   },
   "video": {

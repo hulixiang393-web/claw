@@ -73,6 +73,10 @@
       "base_url": "/",
       "method": "GET",
       "keyword_param": "k",
+      "paginator": {
+        "param": "p",
+        "start": 0
+      },
       "item": {
         "root_selector": {
           "css": "div.thumb-block",
@@ -153,8 +157,8 @@
   },
   "constraints": {
     "search": {
-      "max_pages": 10,
-      "max_results": 300
+      "max_pages": 60,
+      "max_results": 0
     },
     "detail": {
       "max_pages": 1

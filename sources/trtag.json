@@ -146,6 +146,20 @@
       }
     }
   },
+  "ad_block": {
+    "enabled": true,
+    "block_url_regex": [
+      "/video/adjump(?:/|$)"
+    ],
+    "hls_rules": {
+      "drop_short_blocks": {
+        "enabled": true,
+        "max_duration": 30,
+        "max_ratio": 0.05,
+        "require_boundary": true
+      }
+    }
+  },
   "constraints": {
     "search": {
       "max_pages": 30,

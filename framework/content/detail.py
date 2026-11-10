@@ -285,6 +285,7 @@ class DetailMixin:
                     timeout=(min(self._timeout(source), context.remaining()) if context is not None else self._timeout(source)),
                     retries=(0 if context is not None else self._retries(source)),
                     proxy_pool=source.proxy_pool(),
+                    direct=bool(source.transports().get("direct")),
                 )
             except StreamCancelledError:
                 raise
@@ -377,6 +378,7 @@ class DetailMixin:
                 title_key = chapters_cfg.get("title") or "title"
                 url_key = chapters_cfg.get("url_key") or "url"
                 line_chapters: list = []
+                per_line: list = []
                 for line in lines:
                     if not isinstance(line, dict):
                         continue
@@ -388,6 +390,7 @@ class DetailMixin:
                     episodes = line.get(items_key)
                     if not isinstance(episodes, list):
                         continue
+                    line_eps: list = []
                     for it in episodes:
                         if not isinstance(it, dict):
                             continue
@@ -404,30 +407,52 @@ class DetailMixin:
                             chapter.line_switch_url = switch_url
                             chapter.line_switch_source = line_id
                             chapter.line_name = line_name or line_id
+                        line_eps.append(chapter)
                         line_chapters.append(chapter)
+                    if line_eps:
+                        per_line.append((line_id, line_eps))
                 if line_chapters:
-                    # 多线路接口（一行一集）不能把所有线路的集都当分集：21 条线
-                    # 各 1 集会显示成「21 集」。按 URL 上的线路坐标只留当前线路
-                    # 的分集，其它线路全部进线路菜单（source_list）供切换。
-                    build_menu = getattr(self, "line_menu_from_chapters", None)
-                    menu = build_menu(line_chapters) if build_menu else []
-                    param = chapters_cfg.get("current_line_param") or "source"
-                    current = self._query_param(url, param)
-                    keep = [
-                        ch for ch in line_chapters
-                        if getattr(ch, "line_switch_source", "") == current
-                    ] if current else []
-                    if not keep and menu:
-                        # URL 里的 source 是发现/搜索的来源坐标，不一定是线路
-                        # id（ikanpp 的 lines 用 youxuan/jisu/…）→ 默认取首条线路
-                        default_sid = menu[0].get("sid") or ""
+                    if str(chapters_cfg.get("pick_line") or "") == "direct_media":
+                        # 「同一作品多条线路、其中只有一条是直链媒体」的接口
+                        # （洛雪TV：jlm3u8 直链 / jlplayer 分享页；官采线路是
+                        # 优酷/爱奇艺页面）。取第一条分集就是直链媒体的线路，
+                        # 且**不建线路菜单**——线路坐标在同一 URL 里切不过去，
+                        # 菜单项点下去只会用错 source 重新请求详情。
+                        chosen = next(
+                            (
+                                eps
+                                for _lid, eps in per_line
+                                if eps and self._looks_like_direct_media(eps[0].url)
+                            ),
+                            None,
+                        )
+                        detail.chapters = [
+                            Chapter(title=c.title, url=c.url, provider=c.provider)
+                            for c in (chosen or line_chapters)
+                        ]
+                    else:
+                        # 多线路接口（一行一集）不能把所有线路的集都当分集：21 条线
+                        # 各 1 集会显示成「21 集」。按 URL 上的线路坐标只留当前线路
+                        # 的分集，其它线路全部进线路菜单（source_list）供切换。
+                        build_menu = getattr(self, "line_menu_from_chapters", None)
+                        menu = build_menu(line_chapters) if build_menu else []
+                        param = chapters_cfg.get("current_line_param") or "source"
+                        current = self._query_param(url, param)
                         keep = [
                             ch for ch in line_chapters
-                            if getattr(ch, "line_switch_source", "") == default_sid
-                        ]
-                    detail.chapters = keep or line_chapters
-                    if menu:
-                        detail.source_list = menu
+                            if getattr(ch, "line_switch_source", "") == current
+                        ] if current else []
+                        if not keep and menu:
+                            # URL 里的 source 是发现/搜索的来源坐标，不一定是线路
+                            # id（ikanpp 的 lines 用 youxuan/jisu/…）→ 默认取首条线路
+                            default_sid = menu[0].get("sid") or ""
+                            keep = [
+                                ch for ch in line_chapters
+                                if getattr(ch, "line_switch_source", "") == default_sid
+                            ]
+                        detail.chapters = keep or line_chapters
+                        if menu:
+                            detail.source_list = menu
         # 接口能通但一条线路/分集都没有（第三方 id 在自家库没映射时就是这样）：
         # 同样回查搜索结果，别让用户对着一个「空详情」。
         if not detail.chapters and fallback_cfg.get("strategy") == "search_play_url":

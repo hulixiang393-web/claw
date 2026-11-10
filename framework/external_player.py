@@ -23,6 +23,7 @@ import tempfile
 import time
 from urllib.parse import quote, unquote, urlsplit
 
+from framework import http as http_mod
 from framework.errors import ContentMissingError
 
 log = logging.getLogger(__name__)
@@ -39,6 +40,22 @@ _HTTP_TIMEOUT = 12.0
 # 「取页面 + Node 解密」（实测一次 7~12s）。
 _STREAM_CACHE: dict = {}
 _STREAM_CACHE_TTL = 900.0
+
+# 解析结果**落盘**缓存：内存缓存一重启就没了，而解析站（art.v2player.top）
+# 一挂常常是几十分钟到几小时。这时「用上次解析出的直链」远好过「整条精品线
+# 不可用」——直链是 CDN 地址，通常几小时内仍有效。
+_DISK_CACHE_NAME = "resolved.json"
+_DISK_CACHE_MAX = 200
+# 兜底窗口（源可用 stale_ttl_s 覆盖）：超过这个年龄的直链不再当兜底。
+_STALE_TTL = 6 * 3600.0
+# 解析站传输层失败后的冷却：期间不再尝试取页面，直接走兜底或换线。
+# 只对「连不上」生效；页面结构变化（找不到 playData）不进冷却，否则结构一变
+# 就再也看不到真实报错。
+_HOST_DOWN_TTL = 180.0
+_HOST_DOWN: dict = {}
+# 每个主机上次成功的出口（"direct"/"proxy"）：解析站的 TLS/端口常常只有一个
+# 出口能用，且会在一天之内翻转，所以按主机记忆、下次优先试上次成功的那个。
+_HOST_ROUTE: dict = {}
 
 _NODE_RUNNER = r"""
 const fs = require('fs');
@@ -115,6 +132,95 @@ def _cache_dir() -> str:
     return path
 
 
+def _short_error(exc) -> str:
+    """异常 → 「类型: 原因」，把 URL 从原因里摘掉。
+
+    原来的报错是 `请求失败 GET <很长的播放器 URL>：<原因>`，日志/界面按 90~120
+    字截断时**原因永远被截掉**——线上只能看到半条 URL，看不出到底是超时、
+    502 还是证书错（2026-11-02 现场就是这样，白查一轮）。
+    """
+    text = str(exc)
+    text = re.sub(r"^(?:请求失败\s+)?(?:GET|POST)\s+\S+?：", "", text)
+    text = re.sub(r"https?://\S+", "<url>", text)
+    text = " ".join(text.split())
+    return f"{type(exc).__name__}: {text[:180]}" if text else type(exc).__name__
+
+
+def _host_down_remaining(host: str) -> float:
+    """该主机距离冷却结束还有多少秒（0 = 没在冷却）。"""
+    if not host:
+        return 0.0
+    until = _HOST_DOWN.get(host) or 0.0
+    return max(0.0, until - time.monotonic())
+
+
+def _mark_host_down(host: str) -> None:
+    if host:
+        _HOST_DOWN[host] = time.monotonic() + _HOST_DOWN_TTL
+
+
+def _disk_path() -> str:
+    return os.path.join(_cache_dir(), _DISK_CACHE_NAME)
+
+
+def _disk_read() -> dict:
+    try:
+        with open(_disk_path(), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _disk_write(data: dict) -> None:
+    """原子写（先写临时文件再替换），最多保留 _DISK_CACHE_MAX 条。"""
+    target = _disk_path()
+    tmp = target + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _disk_get(key: str):
+    """返回 (url, 年龄秒)；没有则 (None, 0)。"""
+    entry = _disk_read().get(key)
+    if not isinstance(entry, dict):
+        return None, 0.0
+    url = str(entry.get("url") or "")
+    if not url.startswith(("http://", "https://")):
+        return None, 0.0
+    try:
+        age = max(0.0, time.time() - float(entry.get("ts") or 0.0))
+    except (TypeError, ValueError):
+        return None, 0.0
+    return url, age
+
+
+def _disk_put(key: str, url: str, stale_ttl: float) -> None:
+    now = time.time()
+    data = _disk_read()
+    data[key] = {"url": url, "ts": now}
+    if len(data) > _DISK_CACHE_MAX:
+        ordered = sorted(
+            ((k, v) for k, v in data.items() if isinstance(v, dict)),
+            key=lambda item: float(item[1].get("ts") or 0.0),
+            reverse=True,
+        )
+        data = dict(ordered[:_DISK_CACHE_MAX])
+    # 顺手清掉远超兜底窗口的旧条目，别让文件无限长
+    horizon = max(stale_ttl, _STALE_TTL) * 2
+    for name in [k for k, v in data.items()
+                 if isinstance(v, dict) and now - float(v.get("ts") or 0.0) > horizon]:
+        data.pop(name, None)
+    _disk_write(data)
+
+
 class ExternalPlayer:
     """按源配置解析第三方播放器页面里的加密直链。"""
 
@@ -147,6 +253,91 @@ class ExternalPlayer:
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(content)
         return name
+
+    def _fetch_page(self, url: str, headers: dict) -> str:
+        """取播放器页面：按「上次成功的出口」优先，另一个出口再试一次。
+
+        现场（2026-11-02）：`art.v2player.top:8989` 直连 TCP 超时、经系统代理
+        502/RemoteDisconnected，而前一天同一个域名直连 200。出口好坏会翻转，
+        所以不能先把主机钉死在某一个出口上（旧实现声明 prefer_direct 之后
+        就只走直连，等于放弃了另一半成功率）。
+        """
+        host = urlsplit(url).hostname or ""
+        order = ["direct", "proxy"]
+        if _HOST_ROUTE.get(host) == "proxy":
+            order = ["proxy", "direct"]
+        errors = []
+        for mode in order:
+            if self._left() <= 1.5:
+                break
+            # 单个出口的超时不超过剩余预算（下限 2s，别把最后一次机会压成 0.2s）
+            timeout = max(2.0, min(self._http_timeout, self._left()))
+            try:
+                if mode == "direct":
+                    text = self._http.get_text(
+                        url, headers=headers, retries=0, timeout=timeout, direct=True
+                    )
+                else:
+                    proxy = http_mod.system_proxy_url()
+                    if not proxy:
+                        continue
+                    text = self._http.get_text(
+                        url, headers=headers, retries=0, timeout=timeout, proxy=proxy
+                    )
+            except Exception as exc:  # noqa: BLE001 —— 换出口再试
+                from framework.stream_resolver import StreamCancelledError
+
+                if isinstance(exc, (StreamCancelledError, TimeoutError)):
+                    raise
+                errors.append(exc)
+                continue
+            if text:
+                _HOST_ROUTE[host] = mode
+                # 同一出口后续请求免探测（下次仍以它为优先，但保留换出口机会）
+                if mode == "direct":
+                    http_mod.note_direct_preferred(url)
+                else:
+                    http_mod.note_proxy_preferred(url)
+                self._log.info(
+                    "external_player 页面出口=%s 主机=%s", mode, host or "?"
+                )
+                return text
+        if errors:
+            _mark_host_down(host)
+            raise ContentMissingError(
+                "第三方播放器页面获取失败：" + "；".join(_short_error(e) for e in errors)
+            )
+        raise ContentMissingError("第三方播放器页面为空")
+
+    def _probe_playable(self, url: str, headers: dict) -> bool:
+        """兜底直链先确认还能取到字节（CDN 的签名地址会过期）。
+
+        两个出口都试：兜底链路的出口偏好和解析站不一样（解析站在国内机房里，
+        CDN 可能在境外），只按直连判断会把本来能播的地址误判成失效。
+        """
+        for mode in ("direct", "proxy"):
+            if self._left() <= 1.0:
+                return False
+            timeout = max(1.5, min(3.0, self._left()))
+            try:
+                if mode == "direct":
+                    data = self._http.get_bytes(
+                        url, headers=dict(headers, Range="bytes=0-2047"),
+                        retries=0, timeout=timeout, direct=True,
+                    )
+                else:
+                    proxy = http_mod.system_proxy_url()
+                    if not proxy:
+                        continue
+                    data = self._http.get_bytes(
+                        url, headers=dict(headers, Range="bytes=0-2047"),
+                        retries=0, timeout=timeout, proxy=proxy,
+                    )
+            except Exception:  # noqa: BLE001 —— 换个出口再判
+                continue
+            if data:
+                return True
+        return False
 
     def _run_node(self, files: list[str], cipher: str, key: str) -> str:
         node = node_available()
@@ -253,48 +444,77 @@ class ExternalPlayer:
             if hit and time.monotonic() - hit[0] < ttl:
                 self._log.info("external_player 缓存命中：%s", hit[1][:90])
                 return hit[1]
-        if cfg.get("prefer_direct"):
-            # 解析站主机常与站点主域不同出口：art.v2player.top 实测直连 200、
-            # 经系统代理 ReadTimeout。源声明后按主机绕过代理，否则每次取流
-            # 都要先白等一次代理超时。
-            try:
-                from framework.http import note_direct_preferred
+            disk_url, disk_age = _disk_get(player_url)
+            if disk_url and disk_age < ttl:
+                self._log.info(
+                    "external_player 落盘缓存命中（%.0f 分钟前）：%s",
+                    disk_age / 60.0, disk_url[:90],
+                )
+                _STREAM_CACHE[player_url] = (time.monotonic(), disk_url)
+                return disk_url
+        try:
+            stale_ttl = float(cfg.get("stale_ttl_s", _STALE_TTL))
+        except (TypeError, ValueError):
+            stale_ttl = _STALE_TTL
+        try:
+            url = self._resolve_from_page(cfg, player_url, headers, ttl, stale_ttl)
+        except ContentMissingError as exc:
+            # 解析站不可用（连不上/502/证书）时，用上一次成功解析出的直链兜底：
+            # CDN 地址通常几小时内仍有效，比"整条精品线不可用"好得多。
+            stale_url, stale_age = _disk_get(player_url)
+            if not stale_url or stale_age > stale_ttl:
+                raise
+            if not self._probe_playable(stale_url, headers):
+                self._log.warning(
+                    "external_player 兜底直链已失效（%.0f 分钟前）：%s",
+                    stale_age / 60.0, stale_url[:90],
+                )
+                raise
+            self._log.warning(
+                "external_player 解析站不可用（%s），改用 %.0f 分钟前解析出的直链：%s",
+                exc, stale_age / 60.0, stale_url[:90],
+            )
+            return stale_url
+        return url
 
+    def _resolve_from_page(self, cfg: dict, player_url: str, headers: dict,
+                           ttl: float, stale_ttl: float) -> str:
+        """取播放器页面 → 解出直链（不含兜底逻辑）。"""
+        if cfg.get("prefer_direct"):
+            # 解析站主机常与站点主域不同出口：源声明后把依赖也标记成直连优先，
+            # 省掉一次注定失败的代理探测；但 `_fetch_page` 仍保留换出口重试。
+            try:
                 for dep in [player_url] + [str(item) for item in (cfg.get("scripts") or [])]:
-                    note_direct_preferred(dep)
+                    http_mod.note_direct_preferred(dep)
             except Exception:  # noqa: BLE001 —— 只是优化，失败照常请求
                 pass
-        page = ""
-        last_error: Exception | None = None
+        host = urlsplit(player_url).hostname or ""
+        cooling = _host_down_remaining(host)
+        if cooling > 0:
+            raise ContentMissingError(
+                f"第三方播放器主机 {host} 冷却中（{cooling:.0f}s 前刚连不上）"
+            )
         try:
             attempts = max(1, int(cfg.get("attempts") or 1))
         except (TypeError, ValueError):
             attempts = 1
+        page = ""
+        last_error: Exception | None = None
         for attempt in range(attempts):
             if self._left() <= 1.5:
                 break
             try:
-                page = self._http.get_text(
-                    player_url, headers=headers, retries=0,
-                    timeout=max(3.0, min(self._http_timeout, self._left())),
-                )
-            except Exception as exc:  # noqa: BLE001 —— TLS 抖动/超时：短退避再试
-                from framework.stream_resolver import StreamCancelledError
-
-                if isinstance(exc, (StreamCancelledError, TimeoutError)):
-                    raise
+                page = self._fetch_page(player_url, headers)
+            except ContentMissingError as exc:
                 last_error = exc
-                page = ""
-                if attempt + 1 < attempts:
+                if attempt + 1 < attempts and self._left() > 3.0:
                     time.sleep(min(1.2, 0.4 * (attempt + 1)))
                 continue
             if page:
                 break
-        if not page and last_error is not None:
-            raise ContentMissingError(
-                f"第三方播放器页面获取失败（{attempts} 次）：{str(last_error)[:90]}"
-            )
         if not page:
+            if last_error is not None:
+                raise last_error
             raise ContentMissingError("第三方播放器页面为空")
 
         pattern = str(cfg.get("cipher_regex") or r"playData\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)")
@@ -321,6 +541,7 @@ class ExternalPlayer:
             for stale in [k for k, (t, _) in _STREAM_CACHE.items() if now - t >= ttl]:
                 _STREAM_CACHE.pop(stale, None)
             _STREAM_CACHE[player_url] = (now, url)
+            _disk_put(player_url, url, stale_ttl)
         return url
 
 

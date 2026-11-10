@@ -238,3 +238,43 @@ def test_offscreen_video_progress_uncollected_and_old_session(_qapp, tmp_path, m
     assert progress.resume("book")["location"]["seconds"] == 124
     reader.deleteLater()
     _qapp.processEvents()
+
+
+def test_offscreen_home_playback_rows_stay_full_height(_qapp, tmp_path):
+    """最近播放：行高随条数自适应，单行不被压扁（标题 + 删除按钮完整可见）。"""
+    from framework.events import EventBus
+    from framework.settings_manager import SettingsManager
+    from framework.source_manager import SourceManager
+    from framework.theme_manager import ThemeManager
+    from gui.pages.home_page import HomePage, _PLAYBACK_ROW_HEIGHT
+
+    progress = ReadingProgress(tmp_path / "progress.json")
+    for i in range(6):
+        progress.save("demo", f"book{i}", "video", "ep", "第一集", title=f"作品{i}", location={"seconds": 30})
+    settings = SettingsManager(tmp_path / "settings.json")
+    manager = SourceManager(tmp_path / "sources", health_file=tmp_path / "health.json")
+    home = HomePage(manager, EventBus(), ThemeManager(settings), settings,
+                    SearchHistory(tmp_path / "search.json"), reading_progress=progress)
+    home.resize(900, 640)
+    home.show()
+    _qapp.processEvents()
+
+    lst = home.playback_list
+    assert lst.count() == 6
+    # 列表高度按条数撑开（6 行），不再固定挤在 180px 里
+    assert lst.minimumHeight() >= 6 * _PLAYBACK_ROW_HEIGHT
+    for i in range(lst.count()):
+        rect = lst.visualRect(lst.indexFromItem(lst.item(i)))
+        assert rect.height() == _PLAYBACK_ROW_HEIGHT
+        row = lst.itemWidget(lst.item(i))
+        assert row.height() == _PLAYBACK_ROW_HEIGHT
+        assert row.delete_btn.height() <= row.height()
+        assert row.delete_btn.geometry().right() <= row.width()
+
+    # 其他区块仍按自身尺寸显示（整页靠滚动容纳，而不是互相挤压）
+    for widget in (home.topbar, home.stats_row, home.recent, home.mini_progress,
+                   home.batch_update):
+        if widget.isVisible():
+            assert widget.height() >= widget.sizeHint().height()
+    home.deleteLater()
+    _qapp.processEvents()

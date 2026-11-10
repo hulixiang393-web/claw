@@ -95,6 +95,28 @@ def _synchronized(method):
     return call
 
 
+def _normalize_max_items(value) -> int:
+    """历史上限归一：非法值回退 20；>0 才是有效上限（0 = 不限制）。"""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return 20
+    return max(0, limit)
+
+
+def _record_timestamp(record: dict) -> float:
+    """记录时间戳：video 用 history_timestamp（秒），其它用 updated_at。"""
+    value = record.get("history_timestamp")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and math.isfinite(value):
+        return float(value)
+    try:
+        return time.mktime(time.strptime(str(record.get("updated_at", "")),
+                                         "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError, OSError, TypeError):
+        return 0.0
+
+
 class ReadingProgress:
     def __init__(
         self,
@@ -102,14 +124,20 @@ class ReadingProgress:
         shelf_cb: Optional[Callable[[str], bool]] = None,
         repository=None,
         defer_cleanup=False,
+        max_items: int = 20,
     ):
         """shelf_cb(book_url) -> bool：该书是否已入书架。
 
         传入后 save/prune 对已收藏的书永久保留续读（超 24h 也不删），
         仅清理未收藏的过期记忆——修复"收藏的书也丢续读位置"。
+
+        max_items：未入书架的进度记录最多保留多少条（影视+小说+漫画合计，
+        按最近一次阅读/播放时间倒序）。0 或负数 = 不限制。已入书架的记录
+        不受上限影响、也不会挤占名额。
         """
         self.path = Path(path)
         self.shelf_cb = shelf_cb
+        self.max_items = _normalize_max_items(max_items)
         self._repository = repository
         self._lock = threading.RLock()
         self._data: dict = self._load()
@@ -122,11 +150,42 @@ class ReadingProgress:
         with self._lock:
             self._defer_cleanup = False
             self._prune_video_history(force=True)
+            self._cap_records(self.shelf_cb)
 
 
     def attach_repository(self, repository) -> None:
         with self._lock:
             self._repository = repository
+
+    def set_max_items(self, value) -> None:
+        """改历史上限（设置页实时生效）：立即裁剪并落盘。"""
+        with self._lock:
+            self.max_items = _normalize_max_items(value)
+            self._cap_records(self.shelf_cb)
+
+    def _cap_records(self, shelf_cb: Optional[Callable[[str], bool]] = None) -> int:
+        """非书架记录最多保留 max_items 条（超出的删最旧）。
+
+        书架收藏不删也不占名额：用户明确要「收藏到书架的永久保存，其它最多
+        20 部」。limit<=0 视为不限制（只保留 TTL 清理）。返回删除条数。
+        """
+        limit = int(self.max_items or 0)
+        if limit <= 0:
+            return 0
+        candidates = [( _record_timestamp(rec), url)
+                      for url, rec in self._data.items()
+                      if not (shelf_cb and shelf_cb(url))]
+        excess = len(candidates) - limit
+        if excess <= 0:
+            return 0
+        candidates.sort(key=lambda item: item[0])
+        removed = 0
+        for _, url in candidates[:excess]:
+            if self._data.pop(url, None) is not None:
+                removed += 1
+        if removed:
+            self._save()
+        return removed
 
     def _prune_video_history(self, force: bool = False):
         if self._defer_cleanup:
@@ -304,6 +363,7 @@ class ReadingProgress:
             removed += 1
         if removed:
             self._save()
+        removed += self._cap_records(shelf_cb)
         return removed
 
     @_synchronized

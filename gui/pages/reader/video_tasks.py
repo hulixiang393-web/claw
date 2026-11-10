@@ -111,14 +111,17 @@ class _ProbeSourcesTask(QRunnable):
         super().__init__()
         self.signals = _ProbeSignals()
         self._content = content
-        limit = max(1, min(5, int(max_sources)))
+        limit = max(1, min(12, int(max_sources)))
         self._candidates = []
         seen = set()
         for candidate in candidates:
             source_id = str(candidate.get("source_id") or candidate.get("sid") or "")
-            if not source_id or source_id in seen:
+            # 去重键：同源采集源线路 sid 相同（洛雪TV 的 jl 会有多条），
+            # 必须用 key（detail_url 优先）才能各测各的。
+            key = str(candidate.get("key") or source_id)
+            if not key or key in seen:
                 continue
-            seen.add(source_id)
+            seen.add(key)
             self._candidates.append(candidate)
             if len(self._candidates) >= limit:
                 break
@@ -149,19 +152,63 @@ class _ProbeSourcesTask(QRunnable):
             kwargs["context"] = context
         return self._content.fetch_video_streams(source, url, **kwargs)
 
+    def _fetch_line(self, source, detail_url, episode_title, episode_index, context):
+        """同源采集源线路：真取该线路详情 + 走播放链路验一次分集地址。
+
+        framework.probe_line_playable 返回 {ok,url,episodes,reason,via,segment}；
+        detail_url 型线路换源就是重取详情，所以只能靠这条路判断能不能播。
+        聚合站对连续请求会偶发限流/超时，`detail:` 类失败重试一次再判死——
+        一次抖动把好线路标成「不可用」比不检测更误导。
+        """
+        probe = getattr(self._content, "probe_line_playable", None)
+        if not callable(probe):
+            return {"ok": False, "url": "", "episodes": 0, "reason": "unsupported"}
+        try:
+            parameters = inspect.signature(probe).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        kwargs = {"episode_title": episode_title, "context": context}
+        if "episode_index" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            kwargs["episode_index"] = episode_index
+        result = probe(source, detail_url, **kwargs)
+        reason = str((result or {}).get("reason") or "")
+        # 站点限流/网络抖动（detail 取不到、读超时）重试一次再判死：
+        # 403/404 这类确定性失败不重试。
+        if reason.startswith(("detail:", "error:", "segment_error:")):
+            time.sleep(0.4)
+            try:
+                retry = probe(source, detail_url, **kwargs)
+            except Exception:  # noqa: BLE001 —— 重试也失败就用第一次的结果
+                return result
+            if isinstance(retry, dict) and retry.get("ok"):
+                return retry
+        return result
+
     def run(self) -> None:
         results = {}
+        self.reasons = {}
         total = len(self._candidates)
         for number, candidate in enumerate(self._candidates, 1):
             if self._cancelled.is_set():
                 return
             source_id = str(candidate.get("source_id") or candidate.get("sid") or "")
+            key = str(candidate.get("key") or source_id)
             try:
-                self.signals.progress.emit(number, total, source_id, self)
+                self.signals.progress.emit(number, total, key, self)
             except RuntimeError:
                 return
             source = candidate.get("source")
             url = candidate.get("url") or candidate.get("episode_url") or ""
+            detail_url = str(candidate.get("detail_url") or "")
+            episode_title = str(candidate.get("episode_title") or "")
+            episode_index = candidate.get("episode_index", -1)
+            try:
+                episode_index = int(episode_index)
+            except (TypeError, ValueError):
+                episode_index = -1
             context = StreamBudget(time.monotonic() + self._timeout_ms / 1000.0)
             with self._context_lock:
                 self._context = context
@@ -171,7 +218,12 @@ class _ProbeSourcesTask(QRunnable):
 
             def fetch():
                 try:
-                    value.append(self._fetch(source, url, context))
+                    if detail_url:
+                        value.append(self._fetch_line(
+                            source, detail_url, episode_title, episode_index, context
+                        ))
+                    else:
+                        value.append(self._fetch(source, url, context))
                 except Exception as exc:
                     error.append(exc)
                 finally:
@@ -188,17 +240,27 @@ class _ProbeSourcesTask(QRunnable):
             if self._cancelled.is_set():
                 return
             if timed_out:
-                results[source_id] = "timeout"
+                results[key] = "timeout"
                 continue
             if error:
                 if isinstance(error[0], StreamCancelledError):
                     return
-                results[source_id] = "failed"
+                results[key] = "failed"
+                self.reasons[key] = f"{type(error[0]).__name__}: {error[0]}"
+                continue
+            if detail_url:
+                probe = value[0] if value else {}
+                ok = bool(isinstance(probe, dict) and probe.get("ok"))
+                results[key] = "ok" if ok else "failed"
+                if not ok:
+                    self.reasons[key] = str(
+                        (probe or {}).get("reason") or "unreachable"
+                    )
                 continue
             pair = value[0] if value else ("", "")
             video = pair[0] if isinstance(pair, (tuple, list)) and pair else pair
             audio = pair[1] if isinstance(pair, (tuple, list)) and len(pair) > 1 else ""
-            results[source_id] = "ok" if video or audio else "failed"
+            results[key] = "ok" if video or audio else "failed"
         try:
             self.signals.finished.emit(results, self._generation, self)
         except RuntimeError:

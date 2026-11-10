@@ -567,9 +567,11 @@ def test_hls_cache_hit_emits_one_cache_diagnostic_without_upstream_call(source, 
     assert second.content == _FakeSource.segs["seg0"]
     assert _FakeSource.hits["/hls/seg0.ts"] == hits_before
     records = mp._read_upstream_route_diagnostics()
-    assert len(records) == 1
-    assert records[0]["route"] == "cache"
-    assert records[0]["cache_state"] == "hit"
+    # 只看这次请求自己产生的缓存诊断：起播预取是后台并发的，它会在同一窗口里
+    # 写下 route="proxy" 的上游记录（属于别的分片），不能算进这条断言。
+    cache_records = [r for r in records if r.get("route") == "cache"]
+    assert len(cache_records) == 1
+    assert cache_records[0]["cache_state"] == "hit"
 
 
 def test_hls_segments_cached(source, proxy_ctx):

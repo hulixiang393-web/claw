@@ -319,7 +319,8 @@ _AUDIO_ARG = {
 
 def build_argv(key: str, exe: str, url: str, headers: dict | None = None,
                title: str = "", start_s: int = 0, fullscreen: bool = False,
-               extra_args=(), audio_url: str = "", ipc_server: str = "") -> list:
+               extra_args=(), audio_url: str = "", ipc_server: str = "",
+               playlist_start=None) -> list:
     """按播放器类型拼命令行。未识别的播放器按 mpv 风格兜底（最通用）。"""
     if not url:
         raise ValueError("缺少播放地址")
@@ -334,6 +335,15 @@ def build_argv(key: str, exe: str, url: str, headers: dict | None = None,
         if flag:
             # 各播放器都把媒体地址放在最后一位：音频参数插在它前面
             argv.insert(len(argv) - 1, flag + audio_url)
+    # 播放列表起始项：mpv 用 --playlist-start 在整份列表里定位当前集，
+    # 其它播放器不认这个参数（调用方会把列表裁到当前集开头）。
+    if playlist_start is not None and key == "mpv":
+        try:
+            start_index = int(playlist_start)
+        except (TypeError, ValueError):
+            start_index = 0
+        if start_index > 0:
+            argv.insert(len(argv) - 1, "--playlist-start=%d" % start_index)
     # JSON IPC 只有 mpv 支持（App 靠它读进度/发控制命令）
     if ipc_server and key == "mpv":
         argv.insert(len(argv) - 1, "--input-ipc-server=" + ipc_server)
@@ -401,7 +411,7 @@ def _spawn(argv: list) -> subprocess.Popen:
 def launch(url: str, preferred: str = "auto", explicit_path: str = "",
            headers: dict | None = None, title: str = "", start_s: int = 0,
            fullscreen: bool = False, extra_args=(), audio_url: str = "",
-           ipc_server: str = "") -> Launched:
+           ipc_server: str = "", playlist_start=None) -> Launched:
     """用外部播放器打开 ``url``（通常是本地代理地址）。"""
     key, exe = resolve(preferred, explicit_path)
     if not key or not exe:
@@ -410,7 +420,7 @@ def launch(url: str, preferred: str = "auto", explicit_path: str = "",
     argv = build_argv(key, exe, url, headers=headers, title=title,
                       start_s=start_s, fullscreen=fullscreen,
                       extra_args=extra_args, audio_url=audio_url,
-                      ipc_server=ipc_server)
+                      ipc_server=ipc_server, playlist_start=playlist_start)
     _reap_finished()
     proc = _spawn(argv)
     _RUNNING.append(proc)

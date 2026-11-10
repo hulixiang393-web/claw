@@ -111,6 +111,55 @@ def test_build_page_url_template_keyword_and_page():
     assert url == "https://ex.com/s/kw/3"
 
 
+def test_build_page_url_default_page_start_is_one():
+    """缺省页码基准 = 1：其它源 URL 不能因为新增 start 支持而变化。"""
+    url = Search._build_page_url(
+        source=_SrcStub(),
+        base_url="/",
+        keyword="kw",
+        kw_param="k",
+        page=2,
+        page_param="p",
+    )
+    assert url == "https://ex.com/?k=kw&p=2"
+
+
+def test_build_page_url_zero_based_page_start():
+    """0 索引站点（xvideos 搜索）：第 1 页 = p=0，第 2 页 = p=1。"""
+    def build(page):
+        return Search._build_page_url(
+            source=_SrcStub(),
+            base_url="/",
+            keyword="kw",
+            kw_param="k",
+            page=page,
+            page_param="p",
+            page_start=0,
+        )
+
+    assert build(1) == "https://ex.com/?k=kw&p=0"
+    assert build(2) == "https://ex.com/?k=kw&p=1"
+
+
+def test_search_uses_paginator_start(tmp_path):
+    """paginator.start=0 必须落到请求 URL 上（0 不是「未配置」，不能被 or 吞掉）。"""
+    src = _synth(
+        tmp_path,
+        {"base_url": "/", "method": "GET", "keyword_param": "k",
+         "paginator": {"param": "p", "start": 0}, "item": _item_cfg()},
+        {"max_pages": 3, "max_results": 0},
+    )
+    http = FakeHttp()
+    Search(http, Parser()).search_one(src, "kw")
+    # 波内并发抓 3 页，完成顺序不定 → 按集合比较
+    urls = sorted(c[1] for c in http.calls)
+    assert urls == [
+        "https://x.test/?k=kw&p=0",
+        "https://x.test/?k=kw&p=1",
+        "https://x.test/?k=kw&p=2",
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # 3) 框架：重复页去重保护
 # --------------------------------------------------------------------------- #

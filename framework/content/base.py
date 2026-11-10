@@ -352,6 +352,30 @@ class ContentBase:
             (".m3u8", ".mpd", ".mp4", ".m4v", ".flv", ".webm", ".mkv", ".mov", ".ts", ".m4a")
         )
 
+    @staticmethod
+    def _apply_media_url_rewrite(source: SourceConfig, url: str) -> str:
+        """按 `media.url_rewrite` 改写播放地址（正则替换，逐条生效）。
+
+        CDN 会给「同一个库」下发多个镜像主机名，其中个别主机对非浏览器
+        出口直接回 403（洛雪TV 的 `jimaoys94.com`：分集 m3u8 全是 403，同
+        路径换 `jimaoys95/88/83` 就 200）。这类映射写在源 JSON 里而不是
+        代码里，主机轮换时改配置即可。
+        """
+        rules = ((source.raw.get("media") or {}).get("url_rewrite")) or []
+        if not url or not isinstance(rules, list):
+            return url
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            pattern = str(rule.get("pattern") or "")
+            if not pattern:
+                continue
+            try:
+                url = _re.sub(pattern, str(rule.get("replacement") or ""), url)
+            except Exception:  # noqa: BLE001 坏正则只跳过该条，不影响播放
+                log.warning("[%s] media.url_rewrite 正则无效：%s", source.source_id, pattern)
+        return url
+
     def _get(self, source: SourceConfig, url: str, http=None, deadline=None, context=None) -> str:
         """抓取页面 HTML。http 可传独立 HttpClient（并行翻页时避免共享
         self._http 的 requests.Session 跨线程竞态）；缺省用共享实例。"""

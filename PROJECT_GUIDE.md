@@ -338,6 +338,41 @@
 验收：`tests/test_video_prefetch_timing.py` 覆盖窗口边界、锁存、巡检兜底与
 重试提额、串行、memo 命中跳过、与本集取流去重。
 
+### 6.9.1.1 外部播放器的「下一集」（播放列表）
+
+- `VideoView._play` 播放前注册惰性系列（`MediaProxy.register_series`），并把整部
+  作品写成 m3u 播放列表交给播放后端：当前集用已铸好的 `/s/<token>`，其余集是
+  `/e/<key>/<idx>`。播放器因此自带「下一集」，不必由 App 现场取流。
+- mpv 拿整份列表 + `--playlist-start`（`player_session._prepare_playlist`），
+  `PlayerSession.playlist_next/playlist_prev` 走 JSON IPC 的
+  `playlist-next/prev weak`，`>`/`<` 由 `keybind` 绑定。VLC/PotPlayer 不认起始项，
+  列表裁到当前集开头。
+- 播放器切集时 `/e/` 的 `on_play` 回调经 `_series_played` 信号回主线程，更新
+  `_current_idx`/选集高亮/`episode_changed`（进度记忆）；App 的切集按钮优先让
+  播放器换项，播放器不支持时才退回 App 取流重开。因此播放列表模式下
+  `_on_media_ended` **不得**再调下一集（会跳过一集），也不重开播放器。
+- 预取命中链路：4 分钟窗口里取到的流地址经 `_warm_next_episode` 写进 series
+  memo；播放器请求 `/e/<key>/<idx>` 时直接 302 到该地址（秒开）。TTL 覆盖不了
+  窗口时不预热（§6.9.1 第 6 条）。
+- DASH 双流（`audio_url` 非空）与 yt-dlp 引擎（`_source_needs_merged`）不给
+  播放列表，退回原「App 取流 + 重开播放器」。
+- **续播点不能交给 `--start`**：`start` 是**逐文件**选项，会应用到列表的每一项
+  （2026-11-04 实测 mpv v0.41：`--start=4` + 两项列表，`playlist-next` 之后第 2
+  项仍从第 4 秒起播）。续到 20 分钟再点下一集 = 每集都被切掉开头 20 分钟。
+  列表模式下 `play()` 对播放器传 `start_s=0`，把续播点记在 `_pending_resume_s`，
+  等当前集 `file-loaded` 之后发一次 `seek <秒> absolute`（只发一次，切集不重复
+  应用；没有 IPC 的播放器照旧走 `--start`）。
+- 验收：`tests/test_player_playlist.py`（m3u 生成/裁剪、mpv 起始项、下一集交给
+  播放器、播放器切集回写当前集、续播点走 IPC seek 而非 `--start`）。
+
+### 6.9.1.2 播放/阅读历史保留上限
+
+- `ReadingProgress(max_items=…)`：未入书架的记录按最近使用时间倒序，最多保留
+  N 条（影视+小说+漫画合计）；书架收藏永久保留且不占名额；0 = 不限制。
+- 设置页「历史」→「最多保留(部)」（`history.max_items`，默认 20）；应用后
+  `MainWindow._schedule_settings_refresh` 即时 `set_max_items` 裁剪，无需重启。
+- 验收：`tests/test_history_limit.py`。
+
 ### 6.9.2 「卡顿恢复后跳帧/丢音」的责任边界
 
 这个现象要先分清是**数据坏了**还是**播放器追帧**，否则会一直改错层。判定顺序：
@@ -363,6 +398,103 @@
 `MediaProxy.prime_episode_segments`（把下一集首几片提前落盘）。验收：
 `tests/test_vlc_audio_flags.py`（只断言参数，**不启动 VLC**——启动播放器会抢
 用户焦点，任何验证都必须在纯 Python 层完成）。
+
+#### 6.9.2.1 「看着看着音画不同步」= 播放侧时钟漂移，用 avsync 看门狗治（2026-11 omofuna）
+
+现场（2026-11-02，`data/cache/video/cc6d9e63…`，339 片、1372s 一集）：
+
+- 缓存目录里**没有** `.remuxed` 标记 → 这一集走的是纯透传，`_ts_shift_bytes`
+  一次都没跑。也就是说这次不同步与代理的时间戳整理无关，不要再去改 remux。
+- 逐片量首末 PTS：音视频偏移全程 0.000~0.023s、0 次 TS 连续计数错误 →
+  分片数据本身是同步的。
+- 清单 `#EXTINF` 一律 3.00s，而真实帧周期是 3.12s（75 帧@24fps，477 片累计少算
+  约 57s）→ **清单时间轴与媒体时间轴差约 4%**。
+
+结论：数据侧干净、清单侧偏短、播放器以音频为主时钟，长时间播放/多次续播之后
+"音频比画面快一点"会累积到肉眼可辨。这不是丢帧（丢帧只影响流畅度），换线路、
+换清晰度、重开播放器都只是重新计时，治不了根。
+
+修法在 `framework/player_session.py` 的 `_on_avsync`（看门狗）：
+
+- 观察 mpv 的 `avsync`（它自己算的音视频差值，正 = 音频领先）与 `audio-delay`；
+- `audio-delay += avsync` 就是把音频拉回画面，纠偏量经 `sync_corrected` 信号报出；
+- 防抖必须齐全，否则用户听到的是"声音一顿一顿跳"：起播 5s 内不判（起播抖动
+  会报 0.2~0.5s 假偏差）、0.25~0.6s 需连续两次采样、两次纠偏间隔 ≥12s、
+  一次会话最多 4 次（超了说明片源时序本身坏了，保持原样让用户换线路）；
+- 用户附加参数里的 `--audio-delay=` 是**基线**，纠偏在其上叠加，不能抹成 0。
+- **预热按墙钟算，不按 `time-pos`**（2026-11-04 加固）：续播/列表模式会把
+  `time-pos` 直接顶到几十分钟，只看 `time-pos < 5000` 等于「一开播就算预热完」。
+  现场日志 `音画漂移纠偏：avsync=-3.616s → audio-delay=-3.000s（第 1/4 次，
+  播放到 5.0s）` 就是播放到 5.0s 的**第一个**采样被当真，声音被推飞 3 秒。
+  现在 `_sync_armed_at` 在 `file-loaded` 记 monotonic，预热 5s（`AVSYNC_WARMUP_S`）。
+- **单次采样 >1.5s 的偏差一律当起播噪声丢弃**（`AVSYNC_MAX_PLAUSIBLE_S`）：
+  真漂移是慢慢累积的，不会一步跳到 3s；这类样本也不占用纠偏次数。
+  累计纠偏量仍封顶 ±`AVSYNC_MAX_DELAY_S`。
+
+验收：`tests/test_player_avsync.py`（预热期/暂停期不动作、单次尖峰不动作、
+硬阈值一次到位、负数回退、基线叠加、冷却期、次数上限、切集重置、无 IPC 静默、
+续播位置不跳过预热、>1.5s 噪声样本被丢弃）。
+
+限界：`avsync` 是 mpv ≥0.36 的属性；观察失败只是收不到事件，不影响播放。
+清单 `#EXTINF` 的 4% 偏差本身**没有**改（改它要按源抓分片实测再缩放整份清单，
+每集多一轮请求、且引入新失败面），它的可见影响是时长/续播定位偏 4%，不在
+不同步这条线上；若要动，必须先有「实测分片时长」的持久化测量再谈。
+
+复核命令（都离线、不启播放器）：
+
+```powershell
+python tools\_probe_extinf.py <缓存目录>   # EXTINF vs 真实帧跨度、片内 a-v 偏移
+python tools\_probe_av_sync.py <缓存目录>  # 逐片 a-v 偏移表 + 跨片连续性
+```
+
+`_probe_extinf.py` 在 `cc6d9e63…` 上的输出（2026-11-02）：周期样本 286，清单
+`EXTINF` 中位 3.000s vs 真实周期中位 3.120s（**−3.8%**）；片内 a-v 偏移**恒定**
+为 −0.072s（音频首 PTS 比视频早约 1.7 帧）。恒定偏移不会累积，属于站点封装
+口径，**不触发**看门狗（阈值 0.25s）——若用户仍觉得"一直有点对不上嘴"，那是
+固定唇音差，正确做法是在播放器附加参数里给 `--audio-delay`（现在会被当作基线
+保留），不要为此把阈值调低。
+
+#### 6.9.2.2 「画面重影」先分清片源混帧还是显示链路混帧（2026-11-04）
+
+同一个词对应两种完全不同的根因，判据必须落在像素上：
+
+1. **片源/文件混帧**：错帧率转换、blend 去隔行 → 每一帧都是相邻两帧的平均值。
+   文件侧能直接测（时间混合测试）。
+2. **显示链路混帧**：hwdec / GPU 合成 / 远程串流 / 合成器缩放 → 文件干净，屏幕上
+   那一帧却是两帧的混合。只有把**屏幕实际像素**与解码帧对齐才能判。
+
+本次实测（`downloads\苍兰诀2 影三界篇\苍兰诀2 影三界篇_001_1.mp4`，正在播放，
+mpv v0.41 `--hwdec=auto-safe`）：
+
+- 文件侧：1920x1080 / yuv420p / **progressive** / 25fps CFR；`idet` 多帧 TFF/BFF
+  均为 0；视频包 35776 个、DTS 步长恒 0.04s、0 次倒退；4s 窗口内无重复帧；
+  640s 处时间混合测试 `d(blend)/d(邻帧) = 3.4`（>1 即"不是混帧"）。
+- 显示侧：抓 mpv 窗口 → 在当前位置前后抽解码帧做最佳匹配，14 个样本中运动足够
+  的样本 `d_self` 1.1~2.2、`d_blend` 明显更大（例：motion=18.1 时
+  `d_self=1.30` / `d_blend=21.4`）→ 屏幕上那一帧就是**单帧**。
+
+结论：当时这条链路（本地文件 + mpv + 本机 GPU）**没有**重影，别再凭感觉改渲染
+参数。复现时按下面命令取证：
+
+```powershell
+python tools\_probe_ghosting.py                        # 自动找 mpv 窗口与 IPC
+python tools\_probe_ghosting.py --samples 20 --interval 1.0
+```
+
+判据：运动足够（相邻帧差 >1.5）且 `d_blend < min(d_prev,d_next)` → 混帧（显示
+链路）；`d_self` 最小 → 单帧（正常）；静止镜头样本没有判定力，探针标
+`inconclusive`。探针只读截屏、不改播放状态、不启动播放器（要先在 App 里开播）。
+
+#### 6.9.2.3 播放中进度落盘按 5 秒节流（UI 线程别整块写盘）
+
+`MainWindow._play_local_video` 的 `changed()` 原来每次 `time-pos` 都调
+`reading_progress.save`，而落盘是 `shelf_cache_repository.upsert_book` +
+`prune_video_history` + `atomic_io.atomic_write_json` 的整块 JSON 写。`ui_perf`
+日志 16:00–16:10 有 **173 次 STALL**（单次 573~1337ms），栈全在
+`reading_progress.save` → 播放中界面等于幻灯片。
+
+现在按「播放进度前进 5 秒」节流（`save_mark`）；切集（`followed_position`）重置
+标记立刻落盘，暂停/开头仍走 `handed_off()`。代价是最多丢最后 5 秒的位置。
 
 ### 6.9.3 内嵌播放器（外播 → 内嵌的架构约定）
 
@@ -592,9 +724,51 @@ HTML 发现通常配置：
 
 ### 7.5 search
 
-常用字段：`base_url`、`method`、`keyword_param`、`headers`、`extra_params`、`paginator.url_template`、`item.root_selector`、`item.fields`、`render_config`。
+常用字段：`base_url`、`method`、`keyword_param`、`headers`、`extra_params`、`paginator.param`、`paginator.start`、`paginator.url_template`、`item.root_selector`、`item.fields`、`render_config`。
+
+`paginator.start` 是**第 1 页对应的站点页码值**，缺省 1（页码从 1 起，历史行为）。0 索引站点必须显式配 `"start": 0`：`xvideos` 搜索第 1 页是 `?k=kw&p=0`、第 2 页 `p=1`，`?page=N` 会被站点忽略（每页都回第 1 页），表现为「搜索结果只显示第一页 / 显示不完全」。0 是合法基准值，代码里不能用 `or 1` 兜底。
 
 搜索结果字段至少需要标题和详情 URL；封面、作者、更新信息可选。动态搜索页必须先确认浏览器实际 DOM 和等待条件，再决定 `render: playwright`，不要仅因请求返回 200 就认为结果可解析。
+
+API 搜索（`api_endpoints.search`）另有三个可选键：`exclude_providers` 按采集源 id 过滤结果、`group.providers` 提供采集源中文名与排序、`group.enabled` 开启按标题聚合线路（详见 §7.12.7）。
+
+#### 7.5.1 JSON 数据体不做 HTML 反爬特征词扫描（2026-11 纵横搜索「出错」）
+
+现场（2026-11-03 07:42，搜「真牛圣女」）：搜索页小说类五源并发，纵横状态条
+`❌ 纵横中文网`，tooltip 只有 `反爬特征响应（命中：被封）
+https://search.zongheng.com/search/book?keyword=…`；而 `logs/framework-*.jsonl`
+**一条相关记录都没有**（API 搜索的异常当时只冒泡、不打日志）。
+
+复现：同一关键词直接打接口，HTTP 200 + 完整 JSON（`code:0`，26 页 513 条），
+命中词来自结果里某本书的简介——「年仅二十便被**封**为史上最年轻的圣女」。
+`ANTI_SCRAPE_KEYWORDS` 的「被封」命中了小说正文内容。
+
+根因：`_is_anti_scrape_text` 是**为 HTML 挑战页**写的（先剥注释/标签、取前
+6000 字符、小写后匹配特征词）。JSON 没有标签可剥，简介、书名、章节名里的
+「被封 / 封禁 / 验证码 / waf」原样留给词表 → 合法数据被判反爬。详情页没踩到，
+是因为简介在 `<meta … content="…">` 的**属性**里，会随标签一起被剥掉；JSON 没有
+这层「属性保护」。
+
+修法（`framework/http.py`）：
+
+1. 新增 `_is_json_document(text)`：首字符 `{`/`[` 且 `json.loads` 成功才算数据体
+   （HTML 里夹一段 JSON 的混排页不算）。
+2. GET/POST 四处特征词判定改成 `not _is_json_document(text) and
+   _is_anti_scrape_text(text)`。HTTP 状态码判定（403/429/5xx）不变。
+3. 拦截能力不放松：真挑战页是 HTML，`json.loads` 必失败，仍按特征词拦。
+   站点改回 HTML 挑战（哪怕挂在 JSON 接口上）也照样命中。
+4. `framework/search.py::search_one` 的 API 分支把异常记一条
+   `[源id] API 搜索失败：<异常类型>: <原因>` 再抛——GUI 每个源一个任务，
+   没有这条日志就只能看到状态条上的红叉。
+
+限界：JSON 里若返回 `{"code":403,"msg":"访问过于频繁"}` 这类**结构化限流**，
+不再触发 `AntiScrapeError`（会按空结果处理）。要区分得由源配置声明 `code`
+语义，别把 HTML 词表硬套回 JSON。
+
+验收：`tests/test_http_json_not_antiscrape.py`（9 条：JSON 带「被封」不报反爬、
+GET/POST 三路径、`get_json` 拿得到 payload、HTML 封禁页仍抛 `AntiScrapeError`、
+混排页不算 JSON、纵横真实配置解析字段/标题清洗/封面前缀/`keyword` 参数名、
+API 失败必留日志）。
 
 ### 7.6 detail
 
@@ -684,6 +858,78 @@ _switch_candidate_episode_urls_parallel，默认线路失败时才触发，串�
 验收：	ests/test_stream_speed.py（快路径判定与等价性、播放页缓存/并发合并、
 候选并行、渲染缓存与签名寿命）。
 
+### 7.10.2 第四条硬约束：默认线路必须是直链线（2026-11 omofuna 改版后）
+
+改版后 omofuna 只剩两条线路，而「默认线路」成了取流超时的最大来源：
+
+| sid | 名称 | `player_aaaa.from` | 取流代价 |
+| --- | --- | --- | --- |
+| 1 | 精品 | `mp4`（不透明 32 位 id） | 要走 `art.v2player.top` 的 `playData(密文,key)` 二次解密，实测长期失败，一次尝试吃满预算 |
+| 2 | 暴风 | `bfzym3u8`（percent 编码的 CDN m3u8） | 一次 HTTP 直取，1~2s 出画面 |
+
+站点把「精品」放在页签第一位，早先的默认线路就是它（`default_sid` 还写着站点
+根本不存在的 `3`）。于是每次开播的路径是：抓播放页 → 解析器线失败（可能持续
+10~16s）→ 换线 → 再抓播放页（站点抽风时 8s 读超时 × 重试）→ 才出画面。日志
+现场：`第三方播放器解析失败 … art.v2player.top:8989/player/`，紧跟着取流超时。
+
+由此固化成配置与代码两条规则：
+
+1. `source_switch.default_sid` 指向直链线（`"2"`），`max_switch_attempts` 等于
+   **真实线路数**（`2`；留 4 次只会去打不存在的 sid，白烧两轮）；
+   `stream_resolver` 预算同步收紧到 `candidate_timeout=15 / total_budget=28`。
+2. 代码侧两道预算闸门，保证「慢线不会把换线机会一起烧掉」：
+   - `_resolve_external_stream`：剩余预算 < `_EXTERNAL_MIN_BUDGET_S`(3s) **不启动**
+     解析器，直接换线；否则按剩余预算收窄它的 `budget_s`（解析器的 `budget_s`
+     是上限，不是每次都该跑满）；
+   - `_fetch_play_url_auto_switch`：换线前用 `_stream_remaining()`（deadline 与
+     `context.remaining()` 取小）把关，不足 `_SWITCH_MIN_BUDGET_S`(1.5s) 就收尾 ——
+     换线是一次实打实的详情页往返，不该在"注定跑不完"时发起。
+
+改版同时改了线路 tab 的结构：从 `ul.channel-tab a[href=#playlistN]` 变成
+`a.play-channel-item[data-sid][data-count][href=/anime/<id>/play/<sid>/<n>.html]`，
+且**详情页一个都没有、只在播放页渲染**（靠 `probe_from_chapter` 补一次首集页）。
+`_parse_source_list` 的 sid 取值顺序因此是：`list_attr(data-sid)` → `sid_regex`
+→ **`href` 里的 `/play/(\d+)/`**。最后这条兜底别删：改版时只要 href 还在就能认出
+线路；拿不到 sid 的后果不是"少一条线路"，而是整份线路表为空 → 换源菜单消失、
+失败后永远无法换线。
+
+验收：`tests/test_omofuna_source.py`、`tests/test_omofuna_channels.py`、
+`tests/test_omofuna_end_to_end_local.py`（默认线路、预算上限、解析器预算收窄、
+新结构解析、只有 href 时的 sid 兜底、换线预算闸门）。
+
+### 7.10.3 第三方解析站不可用时的三层兜底（2026-11-02 omofuna 精品线现场）
+
+精品线（`from=mp4`）的真实地址要靠第三方解析站二次解密，而**解析站和站点主域
+是同一台机器**：`art.v2player.top → 23.225.223.180`，与 `www.omofuna.com` 同 IP。
+2026-11-02 早上这台机器对直连是 TCP 超时、经系统代理是 502/`RemoteDisconnected`，
+两个出口同时不可用 → 精品线一整天取不到流，而暴风线（分片打散在别的 CDN 域名）
+正常。旧实现因此有三个问题，现在按三层兜底修：
+
+1. **出口不是固定的**。`prefer_direct` 原来会把主机钉死成直连，等于放弃了另一半
+   成功率；而这两个出口的好坏会在一小时之内翻转。现在 `_fetch_page` 按
+   「上次成功的出口」优先，另一个出口再试一次（`system_proxy_url()` 取探测到的
+   系统代理，作为**显式** proxy 传入——显式 proxy 才优先于「该主机已知必须直连」
+   的记忆）。成功一次后按主机记下出口偏好（`_HOST_ROUTE`）。
+2. **解析结果落盘**（`LOCALAPPDATA/claw/external-player/resolved.json`）。
+   `cache_ttl_s` 内直接命中（连解析站都不碰）；超出新鲜期但仍在 `stale_ttl_s`
+   （omofuna 配 6h）内，且解析站失败时，用它兜底续播——**先**用 `Range: 0-2047`
+   试取字节确认 CDN 直链没过期（两个出口都试，CDN 在境外的概率不低）。
+3. **失败要快、要能看出原因**。传输层失败（连不上/502/证书）→ 该主机冷却
+   `_HOST_DOWN_TTL`=180s，期间不再请求播放页，直接走兜底或换线；页面能取到但
+   找不到 `playData` 属于结构变化，**不进冷却**（否则结构一变就再也看不到真实
+   报错）。报错文本改成「页面获取失败：`<异常类型>: <原因>`」——旧版是
+   `请求失败 GET <很长的 URL>：<原因>`，日志/界面按 90~120 字截断时**原因永远
+   被截掉**，线上只能看到半条 URL。
+
+另外 `_fetch_play_url_auto_switch` 抛出的顶层错误现在带最后一条真实原因
+（`全部线路取流失败（omofuna）：第三方播放器页面获取失败：RequestError: …`），
+界面不再只显示一句什么都不说明的"全部线路取流失败"。
+
+验收：`tests/test_external_player_fallback.py`（落盘复用 / 兜底续播 + 直链失效
+被丢弃 / 超窗口不用旧链 / 传输失败冷却但结构变化不冷却 / 直连失败换代理出口 /
+报错保留原因），既有 `tests/test_external_player.py`、
+`tests/test_external_player_robustness.py` 覆盖缓存与重试语义。
+
 ### 7.11 constraints 与 diagnostics
 
 `constraints` 常用：`max_concurrency`、`search.max_pages/max_results`、`detail.max_pages`、`chapter.max_pages/max_items`。`diagnostics.selfcheck.strategy` 可为 `off`、`soft`、`strict`；慢或会触发额外请求的源可关闭自检，但应在诊断说明中记录原因。
@@ -709,8 +955,9 @@ _switch_candidate_episode_urls_parallel，默认线路失败时才触发，串�
 |---|---|---|
 | `18j` | `ad_block.hls_rules.drop_leading_block`；片头仅在短时长、首个分界、媒体主机切换、未加密到 AES-128 切换等独立信号同时满足时删除，并受 `max_duration`/`max_ratio` 限制 | 仅按第一段短时长会误删正片；规则变化还可能使音视频时间戳异常 |
 | `ikanpp` | `ad_block.block_url_regex` 过滤暴风源 `/video/adjump/` 中插广告；`hls_rules.drop_short_blocks` 兜底识别「被 DISCONTINUITY 夹住、时长极短、占比极小」的广告块（广告与正片**同主机同目录**、URL 无广告词，只有「短」这一个结构特征） | 暴风广告不是稳定的固定时长，且广告 CDN 会轮换域名，单靠 URL 特征会漏；反过来，要求「主机切换」也识别不到真实广告（2026-10 实测：json1080 源广告块与正片同主机，旧 `drop_inserted_blocks` 一条都没命中，广告原样播放）。短块规则必须同时保留时长上限、占比上限和「清单内至少两个正片块」三重约束，放宽任一条都可能误删正片 |
+| `trtag`（提线影院，暴风线 `bfzym3u8`） | `ad_block.block_url_regex` 命中 `/video/adjump/`（与 `ikanpp` 共用同一套暴风 CDN 广告目录）；`hls_rules.drop_short_blocks` 兜底识别被 `DISCONTINUITY` 夹住的 25.76 s 短块 | 2026-11 实测《苍兰诀》第18集：687 片 / 2,729.56 s / 5 个边界，两个 9 片 25.76 s 中插广告块（片序号 75..83、609..617），分片 `/video/adjump/time/<id>.ts` 与正片**同主机同目录**。该源原先没声明 `ad_block`，默认引擎一条都命中不了：内置路径特征不含 `adjump`，短块又不满足 `<3 s`（R3）或 `<10 s`（R6）的阈值，广告原样播放——这就是用户反馈的「苍澜诀第 18 集二十来秒广告」 |
 | `xuandm`、`avgood`、`bilibili`、`kanav`、`omofuna` | 继续使用各自已声明的通用 URL/HTML/HLS 规则 | 删除 `ad_block` 会让播放、下载和投屏行为不一致 |
-| `xvideos` | 列表/搜索的 `root_selector.exclude` 同时剔除频道卡（`.thumb-block-profile`）与付费卡（卡内含 `.is-premium`）；标签页分页按站点 0 索引，统一用 `?page=N`；取流走 `play_url.http_chain`：详情页取 `html5player.setEncodedIdVideo('…')` → `GET /html5player/getvideo/{encoded}`（Referer=详情页）→ JSON 字段 `hls`，旧版内联 `html5player.setVideoHLS('…')` 只作 regex 兜底 | 频道卡点进去是用户主页、付费卡（`?premium=1` tab）打开也只有预告，用户明确要求「只保留免费」；分页若用路径式 `/{N}` 会与站点 0 索引错位、第二页起全部重复第一页（实测 `/tags/xvedio/1` 与基底同页）；2026-11 起详情页不再内联 `setVideoHLS`/`setVideoUrlHigh`，也没有明文 m3u8（播放器 JS 改用 getvideo 接口取地址），只靠旧 regex 会「匹配不到播放地址」；相关视频的缩略图预览是 `preview.mp4`，宽匹配 `.m3u8`/`.mp4` 会把预览当正片 |
+| `xvideos` | 列表/搜索的 `root_selector.exclude` 同时剔除频道卡（`.thumb-block-profile`）与付费卡（卡内含 `.is-premium`）；标签页分页按站点 0 索引，统一用 `?page=N`；搜索分页是**另一套参数**：`paginator.param: "p"` + `paginator.start: 0`（第 1 页 `p=0`）；取流走 `play_url.http_chain`：详情页取 `html5player.setEncodedIdVideo('…')` → `GET /html5player/getvideo/{encoded}`（Referer=详情页）→ JSON 字段 `hls`，旧版内联 `html5player.setVideoHLS('…')` 只作 regex 兜底 | 频道卡点进去是用户主页、付费卡（`?premium=1` tab）打开也只有预告，用户明确要求「只保留免费」；标签页分页若用路径式 `/{N}` 会与站点 0 索引错位、第二页起全部重复第一页（实测 `/tags/xvedio/1` 与基底同页）；搜索页实测 `?page=N` 被站点忽略（page=1/2 与首页 27 条完全相同），只认 `p` 且 0 索引，配错就是「搜索结果只出第一页」；2026-11 起详情页不再内联 `setVideoHLS`/`setVideoUrlHigh`，也没有明文 m3u8（播放器 JS 改用 getvideo 接口取地址），只靠旧 regex 会「匹配不到播放地址」；相关视频的缩略图预览是 `preview.mp4`，宽匹配 `.m3u8`/`.mp4` 会把预览当正片 |
 
 #### 7.12.2 HLS 代理、密钥和预取
 
@@ -760,6 +1007,7 @@ _switch_candidate_episode_urls_parallel，默认线路失败时才触发，串�
 | `xuandm` | 选集顺序声明为 `desc`，播放地址从嵌入 JSON 提取 | 这是源的真实顺序，不得由通用默认排序覆盖；播放 URL 要做候选和有效性验证 |
 | `zongheng` | 支持 `auth` 声明的登录/授权字段 | 凭据只来自运行时安全存储，不能写进源 JSON、测试夹具或日志 |
 | `69tv` | 发现走 SSR HTML（原站 13 个频道 `/movies/{id}?page=N`，每页 30 条）；详情、搜索、取流走独立 API 域名 `POST` JSON：`/api/vod/content`、`/api/vod/movies`（搜索分页参数是 `pageNum`）、`/api/vod/play`（GET 405，返回带 token/expires 的 m3u8） | API 域名来自首页运行时配置 `window.__NUXT__.config.public.apiBase`，轮换后需更新；详情接口不给章节，靠 `single_chapter` 补唯一分集；搜索快速连发约 6 次以上会触发站点反爬，`max_pages` 与 `pageSize` 保持保守 |
+| `lxyy` | 搜索 `GET /api/proxy.php?action=search&wd=&page=`、详情 `GET /api/proxy.php?action=detail&source=&id=`；搜索结果自带采集源坐标（`source`+`id`），`search.group` 把同一作品聚成一条采集源一条线路，`group.providers` 提供中文线与排序；`exclude_providers` 排掉官采源 `qilin`/`fy`（分集是优酷/爱奇艺/B 站官方页，要站点自己的 `svip.qlplayer.cyou/api/resolve.php?token=` 或 `/json-player.php?route=&grant=` 解析，直连实测 404）；详情 `details.0.episodes[]` 是「线路→分集」，`chapters.pick_line=direct_media` 只留分集是 m3u8 直链的那条线（jl 的 `jlplayer` 是分享页）；`transports.direct: true` 让 JSON 搜索/详情也强制直连 | 官采源不可回填进搜索结果：拿到的只是内容页 URL，播放必失败；`pick_line` 生效时**不得建线路菜单**（线路坐标在同一 URL 里切不过去，切下去只会用错 `source` 重新请求详情）；首页 `/api/proxy.php?action=home` 固定回 `home_source=qilin`，探测 `source`/`src`/`from`/`channel` 均无效，故本源只做搜索入口，不加发现页；jl 的 CDN 镜像 `jimaoys94.com` 对非浏览器出口统一 403（m3u8 直接 403，同路径 `jimaoys95/88/83` 都是 200），用 `media.url_rewrite` 改主机，不要写死进代码 |
 | `lxxlxx` | 标签/榜单列表是路径式分页且第 1 页无页码（`/tags/X/`），第 N 页是 `/tags/X/N/`；分类 URL 统一写 `/tags/X//`，由 `page_placeholder: "(?<=/)(?=/$)"` 在末尾两个斜杠之间插入页码；取流用 `content.episode.play_url.http_chain` 三段：详情页 `/vjs/{vid}.js` → `m4-player-*.gotojs.xyz` 播放器脚本 → `<source src=...mp4>` | 分类 URL 不能写成 `/tags/X/{page}/`（第 1 页 `/1/` 是 404），也不能构造缺尾斜杠的 `/tags/X/N`（站点 301 到 http 后被阻断）。三段链必须逐跳按响应内容提取（`-en/-cn/-zhs` 语言域的播放器与 CDN 主机各不相同，不得写死主机名），链尾 mp4 声明 `fetch: false` 不再回源；媒体域按地域限制访问，取流成功但播放 404 属 CDN 侧限制，需换出口网络验证 |
 
 以上表格不是新增功能清单，而是防误删清单。新增源若出现 `decryption`、`render`/`render_config`、`api_endpoints`、`media`、`ad_block`、`auth`、`cover_backfill` 或自定义章节顺序，必须在本节登记其目的、调用入口和验收方式。
@@ -812,6 +1060,89 @@ _switch_candidate_episode_urls_parallel，默认线路失败时才触发，串�
 换线路后 `switch_source_url()` 必须把 `Detail.url` 更新成目标 URL：线路坐标
 （ikanpp 是 query 的 `id`/`source`）就是从详情 URL 推导的，沿用旧 URL 会让下一次
 取流又切回原线路。
+
+#### 7.12.7 GET 型聚合接口的四个补充键（2026-11 洛雪TV）
+
+ikanpp 的 `/api/search-parallel` 是 POST，采集源名单躺在 body 里，框架从
+`body.sources` 就能拿到线路 id、中文名和优先级。换成 GET 型聚合站（洛雪TV
+`/api/proxy.php?action=search`）后这三样都没有了，于是补了下面几个键——**都不
+改变老源行为，缺省即旧行为**：
+
+| 键 | 位置 | 作用 |
+|---|---|---|
+| `exclude_providers` | `api_endpoints.search` | 按采集源 id 过滤搜索结果。用于「该采集源的分集不是媒体地址」的情况：官采源给的是优酷/爱奇艺/B 站内容页，播放端必然取不到流；留在结果里只会让默认线路点到必败的一条 |
+| `group.providers` | `api_endpoints.search.group` | `[{id, name, priority}]`：GET 体没有 `body.sources` 时提供线路展示名与排序。搜索卡片的 `provider_name`、变体标签、线路菜单名字都读它；缺省线路名会退化成品 id（`mj`/`jl`） |
+| `pick_line` | `api_endpoints.detail.chapters` | `"direct_media"`：嵌套线路接口里有「直链媒体线」和「内容页线」（洛雪TV 的 `jlm3u8` / `jlplayer`）时，取第一条**首集就是媒体直链**的线路；生效时不建线路菜单（`line_switch_url` 靠改同一个 URL 的线路坐标，这类站切不过去），分集上的 `line_switch_*` 字段也不会残留 |
+| `url_rewrite` | `media` | `[{pattern, replacement}]` 正则改写播放地址，在直链 passthrough 返回前按序生效。用于同一库的 CDN 镜像主机里有的主机对非浏览器出口一律 403（`jimaoys94.com` → 同路径 `jimaoys95.com` 就 200）。映射写在源 JSON 里，主机轮换只改配置；坏正则只跳过该条并打 warning |
+
+验收口径：`tests/test_lxyy_source.py`（离线假 HttpClient）覆盖请求参数、官采源
+排除、同名作品聚线路、中文线路名、`pick_line` 选中直链线且 `source_list` 为空、
+官采分集原样保留、m3u8 直链 passthrough 不发请求、`url_rewrite` 只改被墙主机。
+
+`transports.direct` 现在也作用于 `api_endpoints` 的 JSON 请求（`_search_api` 与
+`_fetch_detail_api` 的 `get_json` 都带 `direct=`，`HttpClient.get_json` 随之接受
+该参数）。此前只有 HTML GET 走直连，国内直连站在加速器/系统代理下每条搜索都要
+先吃一次代理探测超时；洛雪TV 配了 `transports.direct: true` 后搜索从 6~14s
+降到 1~3s。
+
+同分组内同一采集源回多条时（洛雪TV 的 jl 常见 4 条同名「自营」）线路名会追加
+更新信息与序号（`自营·HD中字`、`ikun·正片 2`），否则换线路菜单里是一串同名条目。
+
+#### 7.12.8 检测播放源（线路可用性）2026-11
+
+播放界面的「检测播放源」按钮有两条分支，判断口径不同——别用一条的结论去解释另一条：
+
+| 线路形态 | 检测方式 | 结论来源 |
+|---|---|---|
+| 无 `detail_url`（`related_episodes` 并入的其它源线路、跨源候选） | `fetch_video_streams` 真解一次流 | 拿到视频/音频地址即「可播放」 |
+| 有 `detail_url`（同源采集源线路，`search.group` 产出） | `framework.probe_line_playable()`：取该线路详情 → 取**同序号那一集** → `_probe_playback_chain`（媒体代理 → 清单 → 变体 → 首个分片） | 整条链路都通才「可播放」；`reason` 记录 `detail:…`/`no_episodes`/`http403`/`html`/`no_variant`/`no_segment`/`segment_http403`/`segment_empty`/`timeout` |
+
+要点：
+
+1. **只看详情接口有没有数据不算可用。** 洛雪TV 的 jl 详情有分集，但分集指向的
+   CDN 镜像 `jimaoys94.com` 对非浏览器出口统一 403：详情正常、播放必失败。
+2. **清单 HTTP 200 也不算可用**（这是「显示可播放却黑屏」的主因）：播放器要的是
+   清单里的分片。分片 403/返回 HTML 错误页/清单为空/变体清单 403 时，清单本身
+   依然是 200。所以必须走完整条链：`#EXTM3U` → 有 `#EXTINF` → 首个分片
+   HTTP<400 且非空非 HTML（`segment_http403`/`segment_empty`/`segment_html`）。
+3. **探测与播放同路**：`_probe_playback_chain` 用 `proxy_url_for` 把地址包成本地
+   媒体代理 URL（带源 `ad_block` 配置），清单经过 m3u8 重写 + 广告段过滤再验分片
+   —— 代理这一层把清单改坏同样是黑屏，直连探测看不到。代理起不来时退回直连
+   （`via=direct`），探测不因此失败。`media.url_rewrite` 也在探测前执行。
+4. **探测的分集必须与播放口径一致**：换线路后 App 按**序号**映射同一集
+   （`current_episode_no()`），所以探 `episode_index`；只测首集时「第 3 集是死的」
+   线路会被标成可播放。
+5. **同 sid 的多条线路要分开记账**：`_probe_key()` 有 `detail_url` 就用它当主键，
+   否则用 sid。旧实现按 sid 记账 + 按 sid 去重，导致洛雪TV 的 4 条 jl 只剩 1 条
+   被测、结果互相覆盖。
+6. **`detail:` 类失败重试一次**再判死：聚合站连续请求会偶发限流，一次抖动把好
+   线路标成「不可用」比不检测更误导（实测 6 条里有 2 条被瞬时抖动误判过）。
+7. 检测顺序「当前正在看的线路优先」，`media.source_probe.max_sources` 上限从 5
+   放宽到 12（一个作品聚出 10+ 条线路是常态），并发仍为 1，逐条测。
+8. 结果标注进下拉框与播放器内菜单：`（可播放）` / `（不可用）` / `（超时）`，
+   失败原因进 tooltip（`Qt.ToolTipRole` / `QAction.setToolTip`），按钮文本给出
+   `可播放 N/M`。检测不改变当前线路，是否切换由用户决定。
+9. **真实播放失败要能改判**：探测只能证明「这一刻清单和分片取得到」，播不出还有
+   播放器/解码/代理重写等层。`_on_player_error`（播放器报错）与
+   `_on_stream_loaded` 的取流失败分支都调 `_mark_current_line_unplayable()`，把该
+   线路从「可播放」翻成「不可用」并把原因写进 tooltip——界面不能继续骗人。
+10. **严格模式（可选，默认关）**：`sources_runtime.verify_player_probe=true` 时，
+    链路通过后再用 App 的播放器（mpv，`--vo=null --ao=null --frames=8`）拿**同一个
+    代理地址**真解 8 帧，rc=0 才标「可播放」（失败记 `player_failed` /
+    `player_timeout`）。本机没装播放器返回 `no_player`，不判死。代价每条线路
+    5~25s，所以默认关；需要「播放器证明过才算可播放」的用户自己打开。
+11. **清单要分块读**：`raw.read(262144)` 会卡在等满 256KB，聚合站 2500+ 段的大
+    清单经代理转发时经常读满超时（实测把 2 条好线路判成 `error:ReadTimeout`）。
+    `_probe_read_manifest` 按 8KB 分块读、够分类且拿到首个 URI 就停：全 12 条
+    线路的检测从 63.7s（含 2 条误判）降到 37.5s（12/12 通过）。
+12. 同 sid 但 `detail_url` 不同的线路必须能切换（`_on_source_switch` 只比 sid 时
+    「点了没反应」）；下拉框选中态、菜单勾选态都按 `detail_url` 优先匹配。
+
+验收：`tests/test_playback_probe_chain.py`（分片 403/HTML/空清单/变体 403/直链
+mp4/代理不可用回退/超时/分块早停/严格模式播放器判定，全离线）+
+`tests/test_video_probe_sources.py`（按钮可见性、候选顺序与去重、`episode_index`
+口径、按 `detail_url` 标注 + tooltip、播放失败改判、同 sid 换线路）+
+`tests/test_lxyy_source.py::test_probe_line_playable_*`（ok/死 CDN/同序号/no_episodes）。
 
 ## 8. 选择器、解析和统一化规则
 
@@ -1043,6 +1374,7 @@ git diff --check
 | `18j` | 45,350 B、439 片、1,748.492 s | 44,824 B、434 片、1,734.867 s | 删除 5 个片头广告片段；首个正片分片 HTTP 206，AES key HTTP 200 |
 | `ikanpp` 暴风 | 51,933 B、2,060 片、6,188.32 s、4 个边界 | 50,913 B、2,042 片、6,136.24 s、2 个边界 | 删除 18 个广告片段、两组约 26.04 s；`EXTINF` 与媒体 URL 数量一致，广告路径清除 |
 | `ikanpp` json1080（「澳门新葡京」中插广告真实样本） | 38,363 B、706 片、2,820.44 s、6 个边界 | 37,632 B、691 片、2,761.92 s、3 个边界 | 删除 3 个广告块（16.47 s / 17.67 s / 16.47 s，共 50.52 s、15 片）；`EXTINF` 691 = 媒体 URL 691，片尾无孤立边界，剩余 3 块均为正片（497.72 / 1,296.04 / 968.16 s） |
+| `trtag` 暴风（《苍兰诀》第18集，`play-0-17`） | 17,012 B、687 片、2,729.56 s、5 个边界 | 15,992 B、669 片、2,678.04 s、3 个边界 | 删除 18 个广告片段（两组 25.76 s，共 51.52 s）；`EXTINF` 669 = 媒体 URL 669、`adjump` 归零；首片 `0000000.ts` 经代理取回 HTTP 200 / 77,644 B（`video/mp2t`）；结尾无孤立边界 |
 | `ikanpp` 光速（回归对照） | 47,318 B、590 片、2,494.38 s、0 个边界 | 不变 | 单一正片块，`drop_short_blocks` 因 `len(blocks)<3` 直接跳过 → 规则不会在无边界清单上误删 |
 
 如果前后字节数、分片数或时长没有变化，不能直接宣称“广告已去除”；如果变化大于规则预期，先停止发布并检查是否误删正片、key、map 或音视频段。真实 CDN 出现 SSL EOF/504 属于源站可用性问题，不能归因于过滤成功或失败。
@@ -1162,7 +1494,7 @@ block4 244片 973.16s 正片 | block5  4片 16.47s 广告（片尾）
 
 #### 已知限制（尚未修，别误以为已解决）
 
-- 播放器请求某片时，若该片正在被预取，`_serve_cache` 会**取消预取**再自己下一遍（`_cancel_prefetch_url`），已下载的 `.part` 字节被丢弃。后果：每次"撞车"浪费一次部分下载，预取的实际收益来自**其它** worker 提前填好的后几片（磁盘命中）。要彻底消除得让播放器请求**接管**在途预取（等待 + 续传），或在分片内做多连接 Range 下载——都属于未验证的改动，不要在没做 3--5 分钟实测前直接上。
+- ~~播放器请求某片时，若该片正在被预取，`_serve_cache` 会取消预取再自己下一遍，已下载的 `.part` 字节被丢弃。~~ 已修（见 §12.8 根因三）：`_segment_guard` 先等预取收尾，等不到才打断并保留 `.part` 续传。仍存在的只是"取消瞬间在途但未落盘的字节"。
 - `_PREFETCH_TIMEOUT` 仍是**建连/抢锁**的预算；若 CDN 在建连阶段就慢（TLS 握手 20s），预取依然会被判超时，这类样本要单独看 `logs/framework-*.jsonl` 的失败原因。
 - 本节全部结论来自 `data/cache/video` 的真实落盘时间戳与 `EXTINF` 对齐，没有做VLC内部缓冲事件采集；要更硬的结论需接 VLC 的 `--stats` 或 HTTP 控制接口取 `demux_lost_frames`。
 
@@ -1191,7 +1523,13 @@ block4 244片 973.16s 正片 | block5  4片 16.47s 广告（片尾）
   | f2286663/841c53f7… | 1.400 | 1.457 | 两流均为 98.6 |
   | ecd3d114/7ea04a55… | 31.305 | 31.307 | 两流均为 68.695122 |
 
-  两流位移必须恒等，否则就是"声音断断续续"的来源；逐流 `resid` 修正只允许在单流内部连续性真正坏掉时触发。
+  两流位移必须恒等，否则就是"声音断断续续"的来源。因此**整片只算一个 `bump`**：
+  先扫全片得到「最小时戳 → 目标起点」的位移，再对所有 PES 与 PCR 套同一个值；
+  任何"逐包/逐流微调"（旧实现的 `resid`、`delta_by_off`）都可能让音频与视频在
+  同一片内各自走表，一片差 20ms、几百片之后就是肉眼可辨的音画不同步。
+  单流内部连续性真的坏掉时**不修**：直接返回 `None` 让该片直通（`0 < prev-dts
+  < 1h` 视为倒退，33 位回绕不算），交给播放器自己处理 —— 一个正确的错误比一个
+  悄悄改坏的时间轴更容易诊断。
 - 播放分片路径**不得**起 ffmpeg/ffprobe 等子进程；确需子进程时必须走 `framework/subprocess_no_window.py` 的 `run()`/`popen()`（或显式 `**no_window_kwargs()`），否则 Windows 上就是一个个黑窗口。
 
 #### 验收
@@ -1199,12 +1537,77 @@ block4 244片 973.16s 正片 | block5  4片 16.47s 广告（片尾）
 1. 播一集 omofuna，`Get-Process` 里不应出现 ffmpeg，任务栏不应再闪控制台窗口；
 2. `data/cache/video/<key>/` 的 `.remuxed` 数量只应随**真正需要平移**的分片增长（本来连续的片不写标记也不改写）；
 3. 与源站同集对比音画同步；`python tools/_probe_playback.py remux` 输出的各流位移必须一致。
+4. `tests/test_hls_remux_sync.py`：单 delta 不变式（音视频偏移 tick 级保持不变、
+   PCR 与 PES 同 delta、跨片前向 splicing 保持偏移、单流倒退返回 `None`、33 位
+   回绕不被误判）；`tests/test_media_proxy_remux_timeline.py` 守住既有时间轴规则。
 
 #### 适用范围（别扩散结论）
 
 - 分片整理/时间轴平移**只在声明了 `ad_block.hls_rules.remux_timestamps` 的源生效**，当前只有 `omofuna`。`agedm`、`18av` 从不走这条路径，它们没有 ffmpeg 参与，因此它们的"卡顿/掉帧/音频断续"属于 §12.6 的交付问题（实测 1.05~1.14× 实时、大量分片慢于自身时长），用预取与缓冲治理；两个机制的账要分开算。
 - 静态闸门 `tests/test_no_console_windows.py`：扫 `framework/` 与 `gui/` 里所有 `subprocess.run/Popen/call/check_output`，没带 `**no_window_kwargs()`（或显式 `creationflags=`）就失败；posix-only 的 `xdg-open` 在白名单里。以后新增调用点不会再悄悄弹窗。
 - 判断"窗口是谁弹的"：先 `Get-Process ffmpeg,ffprobe,yt-dlp,node` 看有没有进程，再看 `data/cache/video/<key>/*.remuxed` 计数。子进程都不存在时还闪窗口，来源就不在应用进程里（例如开发者终端里自己跑的诊断命令），不要继续改播放代码。
+
+### 12.8 起播延迟：变体扇出 + 同一片重复下载（2026-11-01 实测）
+
+用户报的是"**全部**视频载入都慢"。注意区分两件事：**交付速率**（能不能跟上播放）与**起播延迟**（点开一集到出画）。先量再改：
+
+```powershell
+python tools\_probe_playback.py delivery      # 交付速率：2.72× ~ 9.12× 实时 → 不是带宽问题
+python tools\_probe_startup.py proxy          # 代理侧：清单→首片、分片回源次数
+python tools\_probe_startup.py all            # 真 mpv 起播：spawn → state3
+```
+
+`_probe_startup.py` 自带一个本地合成上游（主清单 + 3 变体 + 每片 300KB，支持 Range，`PROBE_SEG_RATE_KBPS` 可限速），所以结论可复现、不依赖当天网络。
+
+#### 根因一：主清单的三路变体各被打开一遍
+
+真实缓存目录给出的证据（用户机 `data/cache/video/`）：同一集在 **1 秒内**建了 3 个 key 目录（`hls-1080p` / `hls-360p` / `hls-250p`），清单落盘时间 23:35:37–38，首片分别晚 10s / 36s / 43s 才出现——三路在抢同一条出口带宽。合成上游复现：修前 `清单请求数=4 分片请求数=18`，`/v720.m3u8`、`/v360.m3u8` 的前三片都在抓。
+
+`max_videos` 的 LRU 下，一部片子吃 3 个槽，等于顺手把"重看第二遍能秒开"的缓存挤掉。折叠后一部片子只占 1 个槽，所以 `app_config.json` 的 `video_cache.max_videos` 从 5 调到 12（字节上限仍是 8GB，按实际看过的分片占位）：重看/连播时命中的是一整集，而不是被自己的另外两个画质挤出去。
+
+修法：`collapse_master_variants()`（`framework/media_proxy.py`）在主清单下发前只留**最高码率**一路（与播放器本来就会选的那路一致），`#EXT-X-MEDIA` 独立音轨组原样保留；看不懂的清单形状（`STREAM-INF` 后不是 URI 行）**原样返回**，宁可多请求不许改坏。旋钮 `media.hls.single_variant`（默认 `true`）。修后：`清单请求数=2 分片请求数=12`，`v720`/`v360` 一次都没被请求。
+
+#### 根因二：mpv 对**每一片**都发 `Range: bytes=0-`，旧代码当"拖动"处理
+
+实测（`_probe_startup.py all` 的 DEBUG 日志）：`Range='bytes=0-'` 出现在每个分片请求上。旧代码 `shared_fetch = not handler.headers.get("Range")`、`_full_zero_offset_response(resp, handler.headers.get("Range"))` 都把它当拖动，于是同时丢了四件事：分片路径锁 / 预取握手、`.part` 续传、以及**播放路径的落盘**（只有预取在写缓存 → 关掉预取就永远没有第二次命中）。现在只有"从中间取"才算 Range：`from_head = range_start is None or (range_start == 0 and known_segment)`，`bytes=0-` 在**清单里出现过的分片**上按整片处理（真拖动仍是 Range，语义不变）。
+
+`known_segment`（`target in self._seg_pos[cache_key]`）这个限定不能省：`/c/<key>/<整片 mp4>` 是"单文件走缓存路由"，它的 `Range` 必须保持"不进单飞、各自独立回源"的老语义，`tests/test_media_cache.py::test_cached_route_range_misses_bypass_single_flight` 锁的就是这条；否则两个并发 `bytes=0-` 会被合并成一次上游请求，下载器/拖动行为随之改变。
+
+#### 根因三：撞车就是"取消 + 重下"
+
+旧行为：播放器要第 N 片时无条件 `_cancel_prefetch_url()`，预取 `abort()` 掉已下载字节，播放器从 0 重下。合成上游（300KB/片、150KB/s 限速）实测：同一片被完整下载两遍。
+
+现行为：
+
+1. `_segment_guard()` 先给在途预取 `_PREFETCH_HANDOVER_WAIT = 0.15s` 收尾，写完了直接命中本地。**窗口必须短**：起播时撞车几乎必然发生（预取是清单刚下发时排的队，播放器下一个请求就到），在慢 CDN 上赌"它快写完了"等于白拿起播时间换一次大概率失败的等待；150ms 只用来覆盖"已到尾巴、只差 rename"这一种。
+2. 等不到才打断，并把这片标记进 `_pf_takeover`：只有"播放器接管"才走 `_FileTee.pause()` **保留 `.part`**；`stop()`／换会话／清单结束这类取消仍然 `abort()` 整片丢掉（半截字节没有续传价值）。
+3. 本请求带 `Range: bytes=<已下载>-` 续取，并且对客户端仍是完整 200（头部字节从磁盘回放 + 续流剩余部分）。
+4. 拿锁之后再查一次命中（等锁期间预取可能刚好写完）。
+
+限速实测（300KB/片、150KB/s、12 片）：
+
+| | 分片回源次数 | 上游分片字节 |
+|---|---|---|
+| 修前（取消 + abort） | 每撞一次多一整片 | **2.00×**（同一片完整下两遍） |
+| 修后（0.15s 握手 + 续传） | 18 次 / 11 个不同分片 | **1.19×** |
+
+不限速（本地合成上游）修后是 11 次请求 / 11 个不同分片 = **1.00×**，一片不多下。多出来的那 19% 是取消瞬间已进 socket 但还没落盘的字节，回收不了（要回收得在分片内做多连接 Range，未验证）。
+
+#### 验收
+
+1. `python tools\_probe_startup.py all`（可加 `PROBE_SEG_RATE_KBPS=150` 模拟慢 CDN）：同一 `segNNN.ts` 在上游表里只应出现一次；末行 `分片上游总字节` 应≈`单份 的 1.00×`；`state3` 在本地应在 1s 内；
+2. `tests/test_hls_single_variant.py`、`tests/test_hls_segment_handover.py` 全绿（分别锁折叠行为、`bytes=0-` 命中/续传/有界握手/接管标记/`pause` 保留字节）；
+3. 真机复看：`data/cache/video/` 一集只应有一个 key；`logs/framework-*.jsonl` 出现 `[起播] 清单→首片 x.xxs` 与 `[起播] 首帧 x.xxs`（`video_view._on_player_time` 打点），拿这两个数说话，别再凭感觉。
+
+#### 已知遗留（与本节改动无关，别记错账）
+
+`tests/test_hls_throughput_tuning.py` 里 `test_prefetch_stops_at_playlist_end` 与 `test_slow_progressing_prefetch_does_not_open_circuit` 在**本次改动前的基线**上同样失败（用 `git stash` 掉 `framework/media_proxy.py` 复跑确认过），属于预取状态机自身的旧账；要修另开一轮，别把它们当成起播回归。
+
+#### 尚未覆盖
+
+- `_PREFETCH_TIMEOUT` 仍是建连/抢锁预算，TLS 握手就慢 20s 的 CDN 依旧判超时；
+- 撞车时的"取消瞬间在途字节"无法回收（要回收得在分片内做多连接 Range，未验证）；
+- 当晚真实网络本身也有问题（`系统代理不通…改直连重试`、`Read timed out (read timeout=8.0)`、`命中限流页，11s 后重试`、WAF `AntiScrapeError`），这类日志说明还有**环境/源站**因素，不能全记在本地代理账上。
 
 ## 13. 已知限制与边界
 - 目标网站可以随时改版、关闭、启用 WAF、修改 Cookie 或返回不同地区内容。

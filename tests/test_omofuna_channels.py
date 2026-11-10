@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
-"""omofuna 线路（精品/暴风）解析与「精品」线取流。
+"""omofuna 线路（精品/暴风）解析与「默认线路」选择。
 
-站点 2026-10-31 改版后的真实结构：
-    <a class="play-channel-item" href="/anime/<hash>/play/1" data-count="24" data-sid="1">精品</a>
-    <a class="play-channel-item" href="/anime/<hash>/play/2" data-count="24" data-sid="2">暴风</a>
+站点 2026-10-31 改版后的真实结构（2026-11-02 复核仍然如此）：
+    <a class="play-channel-item" href="/anime/<hash>/play/1/<n>.html"
+       data-count="24" data-sid="1">精品</a>
+    <a class="play-channel-item" href="/anime/<hash>/play/2/<n>.html"
+       data-count="24" data-sid="2">暴风</a>
 
 旧配置 `.channel-tab li a` + `sid_regex: playlist(\\d+)` 在新页面上**一个都匹配不到**，
-线路列表恒为空 → 换线失效；`default_sid` 又写成站点根本不存在的 "3"。
+线路列表恒为空 → 换线失效。
 
-另外「精品」线（sid=1）的 `player_aaaa.from` 是 `mp4`、`url` 是不透明加密 id，
-曾经被 `render_skip_from: ["mp4"]` 直接判死。实际它能播：渲染播放页后
-Artplayer 把真实地址（tiktokcdn 的 272MB mp4，时长 23.9min）**赋给 video 的
-property**，`get_attribute("src")` 读不到、`currentSrc` 才能读到。
+2026-11 起站点只保留两条线，且「精品」（sid=1）退化成第三方解析器线：
+`player_aaaa.from=mp4`、`url` 是不透明加密 id，要靠 art.v2player.top 的
+`playData(密文, key)` 二次解密。实测该解析站 5xx/长期无响应，一次尝试就吃掉
+整段取流预算（日志：`第三方播放器解析失败 … art.v2player.top:8989/player/`），
+随后换到暴风线才能出画面 —— 用户看到的就是「取流很久然后超时」。
+所以默认线路必须是直链的暴风线（sid=2），精品线留在菜单里供需要时手动切。
 """
 from __future__ import annotations
 
@@ -70,10 +74,16 @@ def test_source_list_ignores_legacy_selector(source):
     assert _content()._parse_source_list(source, old_page) == []
 
 
-def test_default_sid_is_premium_line(source):
-    """站点默认线路是「精品」（sid=1），配置必须对齐，否则取不到片源。"""
+def test_default_sid_is_the_direct_cdn_line(source):
+    """默认线路必须是暴风（sid=2，CDN 直链）。
+
+    精品（sid=1）是解析器线：一次解析往返就是整段预算，且现场解析站不可用。
+    默认走它 = 每次开播都先等一次注定失败的解密，再换线（取流超时的直接原因）。
+    """
     switch = source.to_dict()["endpoints"]["content"]["episode"]["source_switch"]
-    assert switch["default_sid"] == "1"
+    assert switch["default_sid"] == "2"
+    # 站点只有两条线，换线尝试次数不必留 4 次（多的两次会去打不存在的 sid）
+    assert switch["max_switch_attempts"] == 2
 
 
 def test_source_switch_selectors_match_site(source):
@@ -85,14 +95,20 @@ def test_source_switch_selectors_match_site(source):
     assert not switch.get("sid_regex")
 
 
-def test_premium_line_is_not_skipped_by_render(source):
-    """`render_skip_from` 含 mp4 会把整条精品线判死（它 from=mp4）。
+def test_premium_line_skips_render_and_uses_external_player(source):
+    """精品线（from=mp4）不许再走 playwright 渲染，只能走外部解析器且预算受限。
 
-    实测精品线渲染后能拿到 272MB / 23.9min 的可播地址，所以这里必须为空。
+    实测渲染 47s 仍拿不到地址（Artplayer 把地址赋给 property，等不到就是等不到），
+    白等一轮渲染比「直接换线」慢一个数量级；解析器也有独立预算上限，
+    这样即使它挂了，整次取流仍然在总预算内收得住。
     """
     play = source.to_dict()["endpoints"]["content"]["episode"]["play_url"]
-    assert play.get("render_skip_from") == []
+    assert play.get("render_skip_from") == ["mp4"]
     assert play.get("render") == "playwright_fallback"
+    external = play["external_player"]
+    assert external["from"] == ["mp4"]
+    assert external["budget_s"] <= 10
+    assert external["http_timeout_s"] <= 8
 
 
 def test_video_scan_reads_js_assigned_src():

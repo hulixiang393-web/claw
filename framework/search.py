@@ -317,9 +317,19 @@ class Search:
                 http,
             )
         if search_cfg:
-            results = self._decrypt_results(
-                source, self._search_api(source, keyword, http=http), http
-            )
+            # API 搜索的异常原本只冒泡到调用方（GUI 每个源一个任务，失败只剩状态
+            # 条上的 ❌ 与 tooltip，日志里一条都没有 → 现场无法判断是结构变更、
+            # 反爬还是网络）。这里统一记一条带源 id/异常类型的 WARNING 再抛。
+            try:
+                results = self._decrypt_results(
+                    source, self._search_api(source, keyword, http=http), http
+                )
+            except Exception as exc:
+                log.warning(
+                    "[%s] API 搜索失败：%s: %s",
+                    source.source_id, type(exc).__name__, exc,
+                )
+                raise
             return self._group_provider_results(source, search_cfg, results)
         return self._search_html(source, keyword, http=http, on_page=on_page)
 
@@ -416,6 +426,11 @@ class Search:
             max_results = int(max_results)
         paginator_cfg = search_cfg.get("paginator") or {}
         page_param = paginator_cfg.get("param") or "page"
+        # 页码基准：第 1 页对应站点上的页码值。默认 1（页码从 1 起，与历史行为一致）；
+        # 0 索引站点（如 xvideos 搜索 `p=0` 才是第 1 页）配 start: 0。
+        # 注意 0 是合法基准值，不能用 `or 1` 取缺省（0 会被当成假值）。
+        _start_raw = paginator_cfg.get("start")
+        page_start = 1 if _start_raw is None else int(_start_raw)
         url_template = paginator_cfg.get("url_template") or ""
         # 关键词 URL 变形（站点特殊 slug 规则）：[[old, new], ...] 按序字符串替换，
         # 在 URL 编码前应用。如 xasiat 要求空格→"-"、原连字符→"--"（/search/{kw}/）。
@@ -430,6 +445,7 @@ class Search:
                 source=source, base_url=base_url, keyword=keyword,
                 kw_param=kw_param, page=p, page_param=page_param,
                 url_template=url_template, keyword_replace=keyword_replace,
+                page_start=page_start,
             )
 
         # 分页去重保护：若构造出的第 N 页 URL 与第 N-1 页相同（模板漏了 {page}
@@ -460,6 +476,7 @@ class Search:
                 source=source, base_url=base_url, keyword=keyword,
                 kw_param=kw_param, page=1, page_param=page_param,
                 url_template=url_template, keyword_replace=keyword_replace,
+                page_start=page_start,
             )
             try:
                 text = self._http_get(source, abs_url, http=http)
@@ -501,6 +518,7 @@ class Search:
                 source=source, base_url=base_url, keyword=keyword,
                 kw_param=kw_param, page=1, page_param=page_param,
                 url_template=url_template, keyword_replace=keyword_replace,
+                page_start=page_start,
             )
             return self._decrypt_results(
                 source,
@@ -520,7 +538,7 @@ class Search:
                 if method == "POST" and not url_template:
                     # POST：body 加 page 参数（配了 url_template 则改用 GET 模板拼 URL）
                     abs_url = urljoin(source.base_url, base_url)
-                    body = {kw_param: keyword, page_param: page}
+                    body = {kw_param: keyword, page_param: page + page_start - 1}
                     for k, v in extra.items():
                         body.setdefault(k, v)
                     pre = search_cfg.get("pre_fetch") or {}
@@ -594,6 +612,8 @@ class Search:
         seen_urls: set = set()
         # 已合并回调的最大页序（跨波递增，防重复并入/回调）
         last_merged = 0
+        # 本波新增（去重后）条数：用于识别「站点把超范围页码 clamp 回最后一页」
+        wave_added = 0
 
         def _merge_and_notify(wave_items: dict) -> bool:
             """把新抓完的页按页序去重并入 results，并逐页回调 on_page（边抓边显）。
@@ -603,7 +623,8 @@ class Search:
             触发波循环 break，不会合并进来。
             返回 True 表示已达 max_results 上限（须停发后续波）。
             """
-            nonlocal last_merged
+            nonlocal last_merged, wave_added
+            wave_added = 0
             for page in sorted(wave_items):
                 if page <= last_merged:
                     continue
@@ -620,6 +641,7 @@ class Search:
                     if url in seen_urls:
                         continue  # URL 去重（trtag 等站搜索页 DOM 有重复节点）
                     seen_urls.add(url)
+                    wave_added += 1
                     if dec is not None:
                         title = dec.decrypt(source, title, target="search_title")
                     results.append(
@@ -670,6 +692,13 @@ class Search:
                 # 达到结果总数上限（页级精确截断）：停发后续波。
                 if reached_cap:
                     break
+                # 整波无新增（本波每页都只是已见 URL 的重复）→ 已翻到站点末页。
+                # 有的站把超范围页码 clamp 回最后一页（xvideos 搜索 p 超界返回
+                # 「page N」最后一页），返回的是重复内容而非空页，只靠「全空页」
+                # 判尾会白抓到 max_pages（10 页搜索多 6 次请求）。要求整波都无新增
+                # 才停，单页重复/单页失败不会误停。
+                if end < max_pages and wave_added == 0:
+                    break
                 start = end + 1
                 # 已抓够 max_results 条 → 不再发下一波。此前在合并阶段才按
                 # max_results 截断，导致 wave 循环把 max_pages 全部页抓完
@@ -691,6 +720,7 @@ class Search:
         page_param: str = "page",
         url_template: str = "",
         keyword_replace=None,
+        page_start: int = 1,
     ) -> str:
         """构造搜索第 page 页的 URL（分页拼接规则由源配置决定）。
 
@@ -705,20 +735,27 @@ class Search:
         [[old, new], ...] 按序字符串替换，在 URL 编码前应用到关键词
         （站点 slug 特殊规则，如 xasiat 空格→"-"、原连字符→"--"）。
 
+        page_start（endpoints.search.paginator.start）：逻辑第 1 页对应的站点页码
+        值，默认 1。0 索引站点（xvideos 搜索 `?k=…&p=0` 才是第 1 页）配 0，
+        第 N 页即页码 `N-1`；配错会整体错位（第 1 页抓成第 2 页）。
+
         全部参数用关键字传递（* 强制），避免位置错位生成 `&1=page` 的错误 URL。
         """
         if keyword_replace:
             for old, new in keyword_replace:
                 keyword = keyword.replace(old, new)
+        # 站点页码 = 逻辑页序 + 基准偏移（默认 1 → 与历史行为完全一致）；0 是合法基准
+        _base = 1 if page_start is None else int(page_start)
+        page_no = page + _base - 1
         if url_template:
             if "{keyword}" in url_template:
                 tpl = url_template.replace("{keyword}", quote(keyword)).replace(
-                    "{page}", str(page)
+                    "{page}", str(page_no)
                 )
                 if tpl.startswith(("http://", "https://")):
                     return tpl
                 return source.base_url.rstrip("/") + "/" + tpl.lstrip("/")
-            seg = url_template.replace("{page}", str(page))
+            seg = url_template.replace("{page}", str(page_no))
             if seg.startswith("?"):
                 sep = "&" if "?" in base_url else "?"
                 return source.base_url.rstrip("/") + "/" + (
@@ -734,7 +771,7 @@ class Search:
             return source.base_url.rstrip("/") + "/" + (path + seg).lstrip("/")
         # 默认逻辑：{page} 占位 或 ?page=N
         if "{page}" in base_url:
-            tpl = base_url.replace("{page}", str(page)).replace(
+            tpl = base_url.replace("{page}", str(page_no)).replace(
                 "{keyword}", quote(keyword)
             )
             return source.base_url.rstrip("/") + "/" + tpl.lstrip("/")
@@ -744,11 +781,11 @@ class Search:
             base_url = base_url.replace("{keyword}", quote(keyword))
             sep = "&" if "?" in base_url else "?"
             return source.base_url.rstrip("/") + "/" + (
-                f"{base_url}{sep}{page_param}={page}"
+                f"{base_url}{sep}{page_param}={page_no}"
             ).lstrip("/")
         sep = "&" if "?" in base_url else "?"
         return source.base_url.rstrip("/") + "/" + (
-            f"{base_url}{sep}{kw_param}={quote(keyword)}&{page_param}={page}"
+            f"{base_url}{sep}{kw_param}={quote(keyword)}&{page_param}={page_no}"
         ).lstrip("/")
 
     def _search_html_rendered(
@@ -1111,6 +1148,15 @@ class Search:
                     continue
                 provider_id = str(provider["id"])
                 provider_names[provider_id] = str(provider.get("name") or provider_id)
+        # GET 搜索体没有 body.sources 时，采集源展示名来自 group.providers
+        # （结果卡片的 source_name / 变体标签都读 provider_name）。
+        for provider in (cfg.get("group") or {}).get("providers") or []:
+            if not isinstance(provider, dict) or not provider.get("id"):
+                continue
+            provider_id = str(provider["id"])
+            provider_names.setdefault(
+                provider_id, str(provider.get("name") or provider_id)
+            )
 
         # 翻页：读 constraints.search.max_pages（默认 1），多页合并去重
         constraints = source.raw.get("constraints") or {}
@@ -1118,6 +1164,11 @@ class Search:
 
         results: List[SearchResult] = []
         seen_urls: set = set()
+        excluded_providers = {
+            str(item).strip().lower()
+            for item in (cfg.get("exclude_providers") or [])
+            if str(item).strip()
+        }
         sse_field = str(cfg.get("sse_field") or "")
         is_sse = bool(cfg.get("sse"))
         for page in range(1, max_pages + 1):
@@ -1184,6 +1235,9 @@ class Search:
                     headers=source.request_headers(),
                     timeout=float(source.transports().get("timeout") or http.defaults.timeout),
                     proxy_pool=source.proxy_pool(),
+                    # 国内直连站的 API 必须在加速器/系统代理下强制直连，
+                    # 否则每条搜索先吃一次代理超时（transports.direct）。
+                    direct=bool(source.transports().get("direct")),
                 )
                 items = resp
                 rpath = cfg.get("response_path")
@@ -1228,6 +1282,11 @@ class Search:
                 provider_id = str(self._tpl(it, item_fields.get("provider")) or "").strip()
                 if not provider_id:
                     provider_id = str((parse_qs(parts.query).get("source") or [""])[0])
+                if provider_id and provider_id.lower() in excluded_providers:
+                    # 官方采集源（优酷/爱奇艺/B 站页面）要第三方解析才能成型，
+                    # 播放端拿到的只是内容页 URL → 该采集源整体不出现在结果里，
+                    # 免得用户默认线路就点到必然失败的那条。
+                    continue
                 cover = self._clean_cover(self._tpl(it, item_fields.get("cover")))
                 results.append(
                     SearchResult(
@@ -1298,6 +1357,18 @@ class Search:
                 orders[provider_id] = int(provider.get("priority") or index)
             except (TypeError, ValueError):
                 orders[provider_id] = index
+        # GET 搜索体没有 body.sources（洛雪TV /api/proxy.php?action=search）：
+        # 采集源名单与展示名改由 group.providers 提供，源头用 provider
+        # 字段带出来。线路菜单的排序和中文名都靠这张表，缺了只能显示 mj/jl。
+        for index, provider in enumerate(group_cfg.get("providers") or [], 1):
+            if not isinstance(provider, dict) or not provider.get("id"):
+                continue
+            provider_id = str(provider["id"])
+            names[provider_id] = str(provider.get("name") or provider_id)
+            try:
+                orders[provider_id] = int(provider.get("priority") or index)
+            except (TypeError, ValueError):
+                orders[provider_id] = index
 
         groups: dict[str, list[SearchResult]] = {}
         order: list[str] = []
@@ -1317,15 +1388,35 @@ class Search:
             items.sort(key=lambda item: orders.get(item.provider, 10**9))
             head = items[0]
             merged.append(replace(head, variants=items[1:]))
-            remembered = [
-                {
-                    "provider": item.provider,
-                    "name": item.provider_name or names.get(item.provider, item.provider),
-                    "url": item.url,
-                    "order": orders.get(item.provider, 10**9),
-                }
-                for item in items
-            ]
+            # 同一采集源可能对同一标题回多条（不同季/版本/清晰度，洛雪TV 的 jl
+            # 常见 4 条同名「自营」）。线路名追加更新信息，否则换线路菜单里
+            # 会出现一串完全同名的条目，用户无法区分。
+            counts: dict[str, int] = {}
+            for item in items:
+                counts[item.provider] = counts.get(item.provider, 0) + 1
+            remembered = []
+            seen_names: dict[str, int] = {}
+            for item in items:
+                name = (
+                    item.provider_name or names.get(item.provider, item.provider)
+                ).strip()
+                if counts.get(item.provider, 0) > 1:
+                    hint = str(item.update or "").strip()
+                    if hint:
+                        name = f"{name}·{hint}"
+                if name in seen_names:
+                    seen_names[name] += 1
+                    name = f"{name} {seen_names[name]}"
+                else:
+                    seen_names[name] = 1
+                remembered.append(
+                    {
+                        "provider": item.provider,
+                        "name": name,
+                        "url": item.url,
+                        "order": orders.get(item.provider, 10**9),
+                    }
+                )
             remember_group(source.source_id, head.title, remembered)
         return merged
 

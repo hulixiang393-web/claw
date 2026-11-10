@@ -389,6 +389,10 @@ class VideoView(QWidget):
     # 顺序保证：start() 不停本地播放器，只有电视报 PLAYING 才走到这条信号。
     _cast_local_player_stop = Signal()
     _progress_position = Signal(int, float, float)
+    # 外部播放器切到播放列表的某一集时，媒体代理 /e/ 的 on_play 回调在
+    # HTTP 线程里触发；这里统一 emit 回主线程，让 App 的当前集/进度记忆
+    # 跟随播放器实际播放的那一集（播放器自己的「下一集」也能被感知）。
+    _series_played = Signal(int)
 
     # spec §6.4 步骤 6：投屏启动后轮询到电视 PLAYING 的超时（毫秒）
     CAST_PLAYING_TIMEOUT_MS = 8000
@@ -470,6 +474,7 @@ class VideoView(QWidget):
         self._source_probe_settings = None
         self._probe_results = {}
         self._probe_names = {}
+        self._probe_reasons = {}
         self._prefetch_task = None
         self._prefetch_idx = -2  # 正在预拉下一集（<0 空闲）
         self._prefetch_attempted: set = set()
@@ -486,6 +491,8 @@ class VideoView(QWidget):
         self.player_menu = None       # 「播放器」子菜单（_build_settings_menu 里建）
         self._fs_win = None  # 全屏顶层窗口
         self._last_pos_save_ts = 0.0  # 上次播放进度存盘时间戳（节流 2s 存一次）
+        self._play_started_at = 0.0   # 起播剖面：_play 进入时刻（单调时钟）
+        self._first_frame_at = None   # 起播剖面：首帧到达时刻（None = 还没到）
         self._pending_position = None  # 打开书续读播放位置（0~1），播放开始后 seek
         self._has_played = False  # 是否真正开始过播放（未播放不落盘，防覆盖恢复进度）
         # 内嵌播放：进度的两个驱动源与续播锚点
@@ -499,14 +506,17 @@ class VideoView(QWidget):
         self._line_menu_generation = 0
         self._pending_play = None  # 取流完成但视图不可见 → 暂存 (video, audio, title)，显示后再播
         self._click_pending = False  # 单击/双击判定
-        # 惰性系列（media_proxy /e/）只在投屏/历史遗留路径可能注册；内嵌播放
-        # 直接走 /s/ 与 /c/，故 _series_key 通常为空，_unregister_series 幂等。
+        # 惰性系列（media_proxy /e/）承载「外部播放器的下一集」：播放列表里
+        # 后续集都指向 /e/<key>/<idx>，切集时由代理按需解析或直接命中预取 memo。
         self._series_key = ""
         self._series_urls: list[str] = []
+        # 注册时的画质：换画质后 memo 里是旧画质的地址，必须重建系列
+        self._series_quality = ""
         # 播放代数：换作品/换源自增，用于丢弃在途的旧取流/预取回调
         self._play_gen = 0
         self._stream_gen = 0
         self._progress_position.connect(self._on_progress_position)
+        self._series_played.connect(self._on_series_played)
         self._last_ep_toast_ts = 0.0  # 「已是最后一集」提示去抖时间戳
         from framework.media_tuner import MediaTuner
 
@@ -1075,12 +1085,18 @@ class VideoView(QWidget):
         """
         self.source_menu.clear()
         self._source_actions = []
+        current_url = str(getattr(self._detail, "url", "") or "")
         for i, item in enumerate(self._source_list):
             name = item.get("name") if isinstance(item, dict) else str(item)
             sid = (item.get("source_id") or item.get("sid")) if isinstance(item, dict) else str(item)
             act = self.source_menu.addAction(str(name))
             act.setCheckable(True)
-            act.setChecked(str(sid) == self._current_sid)
+            # 同名同 sid 的多条线路靠 detail_url 区分勾选态
+            item_url = str(item.get("detail_url") or "") if isinstance(item, dict) else ""
+            act.setChecked(
+                item_url == current_url if item_url
+                else str(sid) == self._current_sid
+            )
             act.triggered.connect(
                 lambda _=False, _i=i: self._select_source(_i))
             self._source_actions.append(act)
@@ -1516,16 +1532,32 @@ class VideoView(QWidget):
             "timeout_ms": 30000,
         }
 
+    @staticmethod
+    def _probe_key(item) -> str:
+        """线路/probe 结果的主键：有 detail_url 用它，否则用 sid。
+
+        同一源的采集源线路（洛雪TV 的 jl 会有「自营·全22集」「自营·HD中字」
+        等多条）sid 完全相同，只用 sid 当主键会把它们并成一条，检测结果互相
+        覆盖、下拉框也切不过去。
+        """
+        if isinstance(item, dict):
+            detail_url = str(item.get("detail_url") or "").strip()
+            if detail_url:
+                return detail_url
+            return str(item.get("source_id") or item.get("sid") or "")
+        return str(getattr(item, "source_id", "") or "")
+
     def _update_probe_button(self) -> None:
         enabled = bool(self._probe_config().get("enabled", True))
-        probeable = any(
-            not (isinstance(item, dict) and item.get("detail_url"))
-            for item in self._source_list
-        )
-        available = bool(self._detail is not None and self._source_list and probeable)
+        # 两类线路都能检测：
+        # - 无 detail_url 的（其它源的搜索结果/related_episodes 并入线路）
+        # - 有 detail_url 的（同源采集源线路），检测方式是真取该线路详情再探
+        #   一次分集地址——只看详情有没有数据不够，分集可能是死 CDN。
+        available = bool(self._detail is not None and self._source_list)
         running = self._probe_task is not None
         self.probe_btn.setVisible(available)
         self.probe_btn.setEnabled(enabled and available and not running)
+
 
     # ------------------------------------------------------------------ #
     # 线路菜单延迟加载（不阻塞详情）
@@ -1603,6 +1635,9 @@ class VideoView(QWidget):
         episode_url = getattr(self._detail, "url", "") or ""
         if 0 <= self._current_idx < len(self._episodes):
             episode_url = getattr(self._episodes[self._current_idx], "url", "") or episode_url
+        episode_title = ""
+        if 0 <= self._current_idx < len(self._episodes):
+            episode_title = (getattr(self._episodes[self._current_idx], "title", "") or "").strip()
         candidates = []
         seen = set()
         for item in getattr(self._detail, "source_list", None) or []:
@@ -1610,11 +1645,28 @@ class VideoView(QWidget):
                 (item.get("source_id") or item.get("sid"))
                 if isinstance(item, dict) else getattr(item, "source_id", "")
             )
-            if not source_id or source_id in seen:
+            if not source_id:
                 continue
+            key = self._probe_key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
             if isinstance(item, dict) and item.get("detail_url"):
+                # 同源采集源线路：换线路＝用该线路自己的坐标重取详情，所以
+                # 检测＝取它的详情 + 走播放同一条链路验一遍分集地址
+                # （framework.probe_line_playable → 代理/清单/变体/首个分片）。
+                # episode_index 与播放的映射口径一致：换线路后 App 按序号取同一集，
+                # 所以探测也必须测同一集，只测首集会漏掉「这一集是死的」。
+                candidates.append({
+                    "source_id": source_id,
+                    "key": key,
+                    "source": self._source,
+                    "detail_url": str(item.get("detail_url")),
+                    "episode_title": episode_title,
+                    "episode_index": int(self._current_idx),
+                    "mode": "line",
+                })
                 continue
-            seen.add(source_id)
             source = item.get("source", self._source) if isinstance(item, dict) else self._source
             url = ""
             if isinstance(item, dict):
@@ -1627,10 +1679,24 @@ class VideoView(QWidget):
                 url = re.sub(r"([?&]sid=)[^&#]+", rf"\g<1>{source_id}", episode_url)
                 if url == episode_url and source_id:
                     url = f"{episode_url}{'&' if '?' in episode_url else '?'}sid={source_id}"
-            candidates.append({"source_id": source_id, "source": source, "url": url})
+            candidates.append({
+                "source_id": source_id, "key": key, "source": source, "url": url,
+            })
         if not candidates:
             self._update_probe_button()
             return
+        limit = max(1, min(12, int(config.get("max_sources", 5) or 5)))
+        # 当前正在看的线路先测：用户最关心「我现在这条能不能播」。
+        current_key = ""
+        for item in getattr(self._detail, "source_list", None) or []:
+            if isinstance(item, dict) and str(item.get("detail_url") or "") == str(
+                getattr(self._detail, "url", "") or ""
+            ):
+                current_key = self._probe_key(item)
+                break
+        if current_key:
+            candidates.sort(key=lambda c: 0 if c.get("key") == current_key else 1)
+        candidates = candidates[:limit]
         self._cancel_probe_task()
         self._probe_candidates = candidates
         self._probe_task = object()
@@ -1655,15 +1721,21 @@ class VideoView(QWidget):
 
     def _restore_probe_names(self) -> None:
         for i, item in enumerate(self._source_list):
+            key = self._probe_key(item)
             sid = str(item.get("source_id") or item.get("sid") or "")
-            name = self._probe_names.get(sid, str(item.get("name") or f"源{sid}"))
+            name = self._probe_names.get(key) or self._probe_names.get(sid) or str(
+                item.get("name") or f"源{sid}"
+            )
             if i < self.source_combo.count():
                 self.source_combo.setItemText(i, name)
+                self.source_combo.setItemData(i, "", Qt.ToolTipRole)
             if i < len(self._source_actions):
                 self._source_actions[i].setText(name)
+                self._source_actions[i].setToolTip("")
 
     def _clear_probe_state(self) -> None:
         self._probe_results = {}
+        self._probe_reasons = {}
         self.probe_btn.setText("检测播放源")
         self._restore_probe_names()
 
@@ -1684,22 +1756,86 @@ class VideoView(QWidget):
             return
         self._probe_results = dict(results or {})
         self._probe_task = None
+        reasons = dict(getattr(task, "reasons", None) or {})
+        self._probe_reasons = reasons
         self.probe_btn.setText("检测播放源")
+        ok_count = self._apply_probe_marks(reasons)
+        if self._probe_results:
+            # 检测完给一句总结：用户一眼能看出「有没有能播的线路」
+            total = len(self._probe_results)
+            self.probe_btn.setText(
+                f"可播放 {ok_count}/{total}" if ok_count else "全部不可用"
+            )
+        self._update_probe_button()
+
+    def _apply_probe_marks(self, reasons: dict | None = None) -> int:
+        """把检测结果写进下拉框/播放器内菜单（文案 + 失败原因 tooltip）。
+
+        返回可播放的线路数。`_mark_current_line_unplayable` 也用它——真实播放
+        失败时把「可播放」改判成「不可用」，探测结论错了就让现实纠正它。
+        """
+        reasons = dict(self._probe_reasons if reasons is None else reasons)
+        ok_count = 0
         for i, item in enumerate(self._source_list):
+            key = self._probe_key(item)
             sid = str(item.get("source_id") or item.get("sid") or "")
-            status = self._probe_results.get(sid)
-            base = self._probe_names.get(sid, str(item.get("name") or f"源{sid}"))
+            status = self._probe_results.get(key)
+            if status is None and key != sid:
+                status = self._probe_results.get(sid)
+            base = self._probe_names.get(key) or self._probe_names.get(sid) or str(
+                item.get("name") or f"源{sid}"
+            )
+            tip = ""
             if status == "ok":
+                ok_count += 1
                 text = f"{base}（可播放）"
+                tip = "播放链路验证通过（清单 + 首个分片可达）"
             elif status == "timeout":
                 text = f"{base}（超时）"
+                tip = "检测超时：站点响应慢或该线路不可用"
+            elif status in ("fail", "failed"):
+                text = f"{base}（不可用）"
+                reason = str(reasons.get(key) or reasons.get(sid) or "")
+                tip = f"不可播放：{reason}" if reason else "不可播放"
             else:
                 text = base
             if i < self.source_combo.count():
                 self.source_combo.setItemText(i, text)
+                self.source_combo.setItemData(i, tip, Qt.ToolTipRole)
             if i < len(self._source_actions):
                 self._source_actions[i].setText(text)
-        self._update_probe_button()
+                self._source_actions[i].setToolTip(tip)
+        return ok_count
+
+    def _mark_current_line_unplayable(self, reason: str = "") -> None:
+        """真实播放失败 → 把当前线路从「可播放」改判「不可用」。
+
+        探测只能证明「这一刻清单和分片都取得到」，播不出还有播放器/解码/代理
+        重写等层。用户已经在播，这一层的失败是**最可信的判据**，所以把标记
+        翻掉并留下原因，避免界面继续骗人。
+        """
+        if not self._source_list or not self._probe_results:
+            return
+        cur_url = str(getattr(self._detail, "url", "") or "")
+        item = None
+        for cand in self._source_list:
+            if isinstance(cand, dict) and str(cand.get("detail_url") or "") == cur_url:
+                item = cand
+                break
+        if item is None:
+            return
+        key = self._probe_key(item)
+        if self._probe_results.get(key) != "ok":
+            return
+        self._probe_results[key] = "failed"
+        text = str(reason or "播放失败")
+        self._probe_reasons = dict(getattr(self, "_probe_reasons", None) or {})
+        self._probe_reasons[key] = text
+        ok_count = self._apply_probe_marks()
+        total = len(self._probe_results)
+        self.probe_btn.setText(
+            f"可播放 {ok_count}/{total}" if ok_count else "全部不可用"
+        )
 
     def _cancel_probe_task(self) -> None:
         self._probe_generation += 1
@@ -1970,12 +2106,18 @@ class VideoView(QWidget):
 
     def _populate_source_combo(self, detail: Detail) -> None:
         self._source_list = detail.source_list or []
-        self._probe_names = {
-            str(item.get("source_id") or item.get("sid") or ""): str(
-                item.get("name") or f"源{item.get('source_id') or item.get('sid')}"
+        self._probe_names = {}
+        for item in self._source_list:
+            sid = str(
+                (item.get("source_id") or item.get("sid"))
+                if isinstance(item, dict) else getattr(item, "source_id", "")
             )
-            for item in self._source_list
-        }
+            name = str(
+                (item.get("name") if isinstance(item, dict) else "")
+                or f"源{sid}"
+            )
+            self._probe_names.setdefault(sid, name)
+            self._probe_names[self._probe_key(item)] = name
         self._switching = False
         try:
             self.source_combo.currentIndexChanged.disconnect(self._on_source_switch)
@@ -1984,7 +2126,7 @@ class VideoView(QWidget):
         self.source_combo.clear()
         for s in self._source_list:
             sid = s.get("source_id") or s.get("sid")
-            name = self._probe_names.get(str(sid), f"源{sid}")
+            name = self._probe_names.get(self._probe_key(s)) or f"源{sid}"
             self.source_combo.addItem(name, sid)
         has = bool(self._source_list)
         self.source_label.setVisible(has)
@@ -1992,15 +2134,23 @@ class VideoView(QWidget):
         self._update_probe_button()
         if has:
             cur_sid = self._current_sid
+            cur_url = str(getattr(detail, "url", "") or "")
             if not cur_sid:
                 query = parse_qs(urlsplit(str(getattr(detail, "url", "") or "")).query)
                 cur_sid = str((query.get("sid") or query.get("source") or [""])[0])
                 self._current_sid = cur_sid
+            # 先按「详情 URL 相同」定位（同一采集源常有多条同名线路，sid 一样），
+            # 再回退按 sid 匹配第一条。
             idx = 0
             for i, s in enumerate(self._source_list):
-                if str(s.get("source_id") or s.get("sid")) == str(cur_sid):
+                if cur_url and str(s.get("detail_url") or "") == cur_url:
                     idx = i
                     break
+            else:
+                for i, s in enumerate(self._source_list):
+                    if str(s.get("source_id") or s.get("sid")) == str(cur_sid):
+                        idx = i
+                        break
             self.source_combo.setCurrentIndex(idx)
         self.source_combo.currentIndexChanged.connect(self._on_source_switch)
         self._refresh_source_menu()  # 播放器内换源菜单同步
@@ -2019,7 +2169,17 @@ class VideoView(QWidget):
         if self._switching or idx < 0 or not self._source_list:
             return
         sid = self.source_combo.itemData(idx)
-        if not sid or sid == self._current_sid:
+        if not sid:
+            return
+        item = self._source_list[idx] if 0 <= idx < len(self._source_list) else {}
+        target_url = str(item.get("detail_url") or "") if isinstance(item, dict) else ""
+        current_url = str(getattr(self._detail, "url", "") or "")
+        # 同一采集源可能有多条同名线路（洛雪TV 的 jl），sid 相同但 detail_url
+        # 不同：只比 sid 会「点了没反应」。sid 相同且目标 URL 就是当前 URL 才算
+        # 原地不动。
+        if str(sid) == str(self._current_sid) and (
+            not target_url or target_url == current_url
+        ):
             return
         self._current_sid = str(sid)
         self._locked_source_id = str(sid)
@@ -2027,8 +2187,6 @@ class VideoView(QWidget):
         self._play_gen += 1
         self._clear_probe_state()
         self._cancel_probe_task()
-        item = self._source_list[idx] if 0 <= idx < len(self._source_list) else {}
-        target_url = str(item.get("detail_url") or "") if isinstance(item, dict) else ""
         self._populate_source_combo(self._detail)
         self.source_changed.emit((self._detail, str(sid), target_url))
         self._video_frame.setFocus()  # 换源后快捷键继续可用
@@ -2225,19 +2383,40 @@ class VideoView(QWidget):
     def _on_prev_ep(self) -> None:
         """上一集（全屏/非全屏均可用）。"""
         idx = self._current_idx - 1
-        if 0 <= idx < len(self._episodes):
-            self._select_episode(idx)
+        if not (0 <= idx < len(self._episodes)):
+            return
+        if self._playlist_step(self._player, "playlist_prev"):
+            return
+        self._select_episode(idx)
 
     def _on_next_ep(self) -> None:
         """下一集（全屏/非全屏均可用）。
 
-        已是最后一集/无分集（season 页）→ 提示「已是最后一集」而非静默。
+        外部播放器加载了播放列表时交给播放器自己前进（playlist-next）：
+        该集的 /e/ 地址通常已被预取写进代理 memo，切集等于直接开播；
+        其它播放器/无 IPC 时退回 App 取流播放。已是最后一集 → 提示。
         """
         idx = self._current_idx + 1
-        if 0 <= idx < len(self._episodes):
-            self._select_episode(idx)
-        else:
+        if not (0 <= idx < len(self._episodes)):
             self._notify_last_episode()
+            return
+        if self._playlist_step(self._player, "playlist_next"):
+            return
+        self._select_episode(idx)
+
+    @staticmethod
+    def _playlist_step(player, method: str) -> bool:
+        """让外部播放器在播放列表里前进/后退一项；不可用时返回 False。"""
+        if player is None or not getattr(player, "has_playlist", False):
+            return False
+        step = getattr(player, method, None)
+        if not callable(step):
+            return False
+        try:
+            return bool(step())
+        except Exception:  # noqa: BLE001 —— IPC 竞态：退回 App 取流
+            log.debug("外部播放器切集失败（%s）", method, exc_info=True)
+            return False
 
     def _on_speed_changed(self, text: str) -> None:
         """倍速（0.5x~2.0x，交给 播放器 set_rate）。"""
@@ -2282,7 +2461,10 @@ class VideoView(QWidget):
         self._cancel_prefetch_for(ep_url, quality)
         if err or not video:
             if self._is_current_stream(ep_url, quality):
-                self._show_status(f"获取播放流失败：{_safe_error_text(err) if err else '无播放地址'}")
+                detail_text = _safe_error_text(err) if err else "无播放地址"
+                # 取流失败同样是「这条线路播不了」的实证，翻掉「可播放」标记
+                self._mark_current_line_unplayable(detail_text)
+                self._show_status(f"获取播放流失败：{detail_text}")
             return
         self._stream_cache_set(self._stream_cache_key(ep_url, quality), video, audio)
         if not self._is_current_stream(ep_url, quality):
@@ -2363,19 +2545,28 @@ class VideoView(QWidget):
 
     @staticmethod
     def _call_player_play(player, play_url: str, audio_url: str, title: str,
-                          kind: str, caching_ms: int) -> None:
-        """调用播放器的 play()，并把源级 network_caching 传下去。
+                          kind: str, caching_ms: int,
+                          playlist=None, playlist_index: int = 0) -> None:
+        """调用播放器的 play()，并把源级 network_caching / 播放列表传下去。
 
-        旧签名/测试桩只接受 (url, audio, title, kind)：这类实现不带该关键字，
-        退化为不覆盖缓冲值即可——不能为一个调优参数把播放链路整体打断。
+        旧签名/测试桩只接受 (url, audio, title, kind)：按实际接受的参数逐级
+        降级，不能为一个增强参数把播放链路整体打断。
         """
         try:
-            player.play(play_url, audio_url, title, kind=kind,
-                        network_caching_ms=caching_ms)
-        except TypeError as exc:
-            if "network_caching_ms" not in str(exc):
-                raise
-            player.play(play_url, audio_url, title, kind=kind)
+            parameters = inspect.signature(player.play).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs = {}
+        if accepts_kwargs or "network_caching_ms" in parameters:
+            kwargs["network_caching_ms"] = caching_ms
+        if playlist and (accepts_kwargs or "playlist" in parameters):
+            kwargs["playlist"] = playlist
+            kwargs["playlist_index"] = playlist_index
+        player.play(play_url, audio_url, title, kind=kind, **kwargs)
 
     def _embedded_play_url(self, video: str, audio: str, hdrs: dict,
                            ad_block: dict) -> tuple[str, str]:
@@ -2408,6 +2599,96 @@ class VideoView(QWidget):
             return video, audio
 
 
+    def _ensure_series(self) -> str:
+        """注册/复用惰性系列，供外部播放器的播放列表按集切流（失败返回 ""）。
+
+        系列项是 ``/e/<key>/<idx>``：播放器点「下一集」时才请求它；预取已把
+        该集的流地址写进代理 memo 时直接 302 开播，命中不了才现解析。
+        """
+        if self._source is None or not self._episodes or self._source_needs_merged():
+            return ""
+        if self._series_key and self._series_quality == self._quality:
+            return self._series_key
+        self._unregister_series()
+        try:
+            from framework.media_proxy import MediaProxy, trusted_media_context
+
+            proxy = MediaProxy.instance()
+            headers = {}
+            request_headers = getattr(self._source, "request_headers", None)
+            if callable(request_headers):
+                headers = request_headers() or {}
+            ad_block = dict((getattr(self._source, "raw", None) or {}).get("ad_block") or {})
+            episodes = list(self._episodes)
+            quality = self._quality
+            content = self._content
+            source = self._source
+
+            def resolver(idx):
+                episode = episodes[int(idx)]
+                video, audio = content.fetch_video_streams(
+                    source, episode.url, quality=quality, merged=True
+                )
+                return video, audio, dict(headers), dict(ad_block)
+
+            key = proxy.register_series(
+                resolver,
+                # 代理线程回调：只 emit 信号，UI/进度都在主线程槽里更新
+                on_play=lambda idx, video="", audio="": self._series_played.emit(int(idx)),
+                count=len(episodes),
+                force_proxy=self._force_proxy_enabled(),
+                source_id=trusted_media_context(getattr(source, "source_id", "")),
+            )
+        except Exception:  # noqa: BLE001 —— 系列只是增强，失败退化单集播放
+            log.warning("注册惰性系列失败（外部播放器无法切下一集）", exc_info=True)
+            return ""
+        self._series_key = key
+        self._series_quality = quality
+        return key
+
+    def _playlist_entries(self, current_url: str, series_key: str) -> list:
+        """整部作品的播放列表：当前集用已铸好的 /s/ 地址，其余走 /e/ 惰性系列。"""
+        try:
+            from framework.media_proxy import MediaProxy
+
+            proxy = MediaProxy.instance()
+        except Exception:  # noqa: BLE001 —— 代理不可用：不给列表
+            return []
+        entries = []
+        for index, episode in enumerate(self._episodes):
+            title = getattr(episode, "title", "") or f"第{index + 1}集"
+            if index == self._current_idx:
+                url = current_url
+            else:
+                url = proxy.series_episode_url(series_key, index)
+            entries.append((url, title))
+        return entries
+
+    def _on_series_played(self, idx: int) -> None:
+        """外部播放器切到某一集：只跟随当前集，不重新取流、不重开播放器。
+
+        播放器请求 /e/ 时会话的流已经由代理给出，这里同步 UI/选集高亮与
+        进度记忆的「当前集」标识；随后进度心跳会按新集继续驱动 4 分钟预取。
+        """
+        if not (0 <= idx < len(self._episodes)) or idx == self._current_idx:
+            return
+        self._selection_mode = False
+        self._current_idx = idx
+        self._last_pos_save_ts = 0.0
+        episode = self._episodes[idx]
+        # 播放器已经在解析这一集（/e/），同一集的预取再跑一遍只是重复请求
+        self._cancel_prefetch_for(episode.url, self._quality)
+        try:
+            self._paint_card_selection()
+            self._update_ep_check()
+            self._refresh_fs_title()
+        except (RuntimeError, AttributeError):
+            pass
+        try:
+            self.episode_changed.emit((self._detail, episode.title, episode.url))
+        except RuntimeError:
+            pass
+
     def _play(self, video: str, audio: str, title: str) -> None:
         """播放当前集：把代理地址交给播放后端（mpv + IPC，见 player_session）。
 
@@ -2418,6 +2699,10 @@ class VideoView(QWidget):
         self._current_audio = audio
         self._current_title = title
         self._play_gen += 1
+        # 起播剖面（配合 media_proxy 的 [起播] 清单→首片）：取流已在本函数
+        # 之前完成，这里开始计"播放器起播段"，首帧到达时打一条日志。
+        self._play_started_at = time.monotonic()
+        self._first_frame_at = None
         hdrs = {}
         _rh = getattr(self._source, "request_headers", None)
         if callable(_rh):
@@ -2456,6 +2741,17 @@ class VideoView(QWidget):
             self._sync_overlay_state(playing=False)
             return
         play_url, audio_url = self._embedded_play_url(video, audio, hdrs, ad_block)
+        # 外部播放器「下一集」：把整部作品作为播放列表交给播放器，后续集指向
+        # 媒体代理的 /e/<key>/<idx>。切集时预取过的集直接命中 memo（302 秒开），
+        # 播放器不重启进程，也不经过 App 的现场取流。
+        playlist = ()
+        playlist_index = 0
+        if (self._episodes and not audio_url
+                and 0 <= self._current_idx < len(self._episodes)):
+            series_key = self._ensure_series()
+            if series_key:
+                playlist = self._playlist_entries(play_url, series_key)
+                playlist_index = self._current_idx
         # 媒体类型提示必须按**上游原始 URL** 判：包成代理 URL 后扩展名线索
         # 就没了（classify 会落到 unknown 档，缓冲偏小 → HLS 频繁卡）。
         kind = "hls" if "m3u8" in (video or "").lower() else (
@@ -2478,7 +2774,8 @@ class VideoView(QWidget):
             pass
         try:
             player = self._ensure_player(hdrs)
-            self._call_player_play(player, play_url, audio_url, title, kind, caching_ms)
+            self._call_player_play(player, play_url, audio_url, title, kind, caching_ms,
+                                   playlist, playlist_index)
         except Exception as exc:  # noqa: BLE001 —— mpv 缺失/拉起失败
             # 必须落日志：只弹 UI 的话现场完全无法定位（历史上一次「播放失败」
             # 就是这样查不到痕迹的）。
@@ -2533,6 +2830,13 @@ class VideoView(QWidget):
 
     def _on_player_time(self, time_ms: int) -> None:
         """播放进度心跳：驱动进度回写（节流）+ 预取时基（不节流）。"""
+        # 首帧耗时：与代理侧 [起播] 那两条日志拼起来，就能分清"慢在取流/
+        # 清单/首片还是慢在播放器起播"，不用再靠猜。
+        if time_ms > 0 and self._first_frame_at is None:
+            self._first_frame_at = time.monotonic()
+            if self._play_started_at:
+                log.info("[起播] 首帧 %.2fs（播放器起播段）",
+                         self._first_frame_at - self._play_started_at)
         duration_ms = self._player_length_ms
         if duration_ms <= 0 and self._player is not None:
             # LengthChanged 事件可能缺席（部分容器只在首帧后才报长度）：
@@ -2767,6 +3071,9 @@ class VideoView(QWidget):
     def _on_player_error(self, message: str) -> None:
         """播放器报错：提示并允许重试（不静默黑屏）。"""
         log.warning("内嵌播放器报错：%s", message)
+        # 真实播放失败＝最可信的判据：把这条线路的「可播放」改判「不可用」，
+        # 否则界面继续标着「可播放」而用户点了就是黑屏。
+        self._mark_current_line_unplayable(_safe_error_text(message))
         self._show_status(f"播放出错：{_safe_error_text(message)}")
         self._sync_overlay_state(playing=False)
         self._stop_progress_ticker()
@@ -2774,6 +3081,12 @@ class VideoView(QWidget):
     def _on_media_ended(self) -> None:
         """当前集播完 → 自动下一集（末集则提示）。"""
         if self._cast_active:
+            return
+        player = self._player
+        if (player is not None and getattr(player, "has_playlist", False)
+                and 0 <= self._current_idx < len(self._episodes) - 1):
+            # 外部播放器自己会前进到列表下一项（请求 /e/ 预取地址）：
+            # 这里再调一次下一集就会跳过一集，交给播放器。
             return
         if 0 <= self._current_idx < len(self._episodes) - 1:
             self._stop_progress_ticker()
@@ -2932,8 +3245,10 @@ class VideoView(QWidget):
         投屏/历史路径一旦注册过也能被正确回收。
         """
         if not self._series_key:
+            self._series_quality = ""
             return
         key, self._series_key = self._series_key, ""
+        self._series_quality = ""
         self._series_urls = []
         try:
             from framework.media_proxy import MediaProxy

@@ -48,6 +48,33 @@ def _signed_url_remaining_ttl(values) -> float:
     return max(0.0, min(expiries) - time.time() - 5.0)
 
 
+# ---- 播放链路探测的小工具（见 VideoMixin._probe_playback_chain） ----
+_PROBE_CHUNK = 8192          # 分块读清单的块大小：一次读满整份大清单会卡到超时
+
+
+def _probe_wants_manifest(url: str, ctype: str) -> bool:
+    text = f"{url or ''} {ctype or ''}".lower()
+    return ".m3u8" in text or "mpegurl" in text
+
+
+def _probe_manifest_ready(text: str) -> bool:
+    """够判定了吗：能分类（master/media）+ 已拿到首个 URI。
+
+    读到「首个分片」就够验可达性，不必等整份清单（2500+ 段 = 200KB+）。
+    """
+    if "#EXTM3U" not in text[:512]:
+        return "#EXT-X-ENDLIST" in text
+    if "#EXT-X-ENDLIST" in text:
+        return True
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    has_uri = any(not line.startswith("#") for line in lines)
+    if not has_uri:
+        return False
+    return any(
+        line.startswith(("#EXT-X-STREAM-INF", "#EXTINF")) for line in lines
+    )
+
+
 class VideoMixin:
     def fetch_video_streams(self, source: SourceConfig, episode_url: str, quality: str = "",
                             merged: bool = False, deadline=None, context=None,
@@ -272,7 +299,7 @@ class VideoMixin:
                 # 51cg1 页面内嵌 JSON 常把 URL 写成 `https:\/\/...`，仅该源还原。
                 direct_url = str(episode_url or "").replace("\\/", "/").replace('\\"', '"')
             if self._looks_like_direct_media(direct_url):
-                return direct_url
+                return self._apply_media_url_rewrite(source, direct_url)
         # JSON API 播放地址（api_endpoints.episode）
         episode_api = api.get("episode") or {}
         if episode_api:
@@ -2083,6 +2110,10 @@ class VideoMixin:
             raise
         if not url or not url.startswith(("http://", "https://")):
             return False
+        # 探测必须和实际播放走同一个地址：源声明 media.url_rewrite 时（洛雪TV
+        # 把被墙的 CDN 镜像主机改成同路径的另一台），拿原地址探测会 403 误判
+        # 「这条线路不可用」，而播放时其实是好的。
+        url = self._apply_media_url_rewrite(source, url)
         headers = dict(self._headers(source))
         # 探测尽量带播放页 Referer（防盗链 CDN 可能只认播放页）。
         episode_ref = str(headers.pop("X-Episode-Referer", "") or "")
@@ -2128,6 +2159,354 @@ class VideoMixin:
         except Exception:  # noqa: BLE001
             self._check_stream_context(context, deadline)
             return False
+
+    # ------------------------------------------------------------------ #
+    # 线路可用性探测（「检测播放源」的同源线路分支）
+    # ------------------------------------------------------------------ #
+    def probe_line_playable(
+        self,
+        source: SourceConfig,
+        detail_url: str,
+        episode_title: str = "",
+        episode_index: int = -1,
+        deadline=None,
+        context=None,
+    ) -> dict:
+        """探测一条「详情 URL 型」线路能不能正常播放。
+
+        搜索分组（`search.group`）与 related_episodes 产出的线路项只有
+        `detail_url`：换线路 = 用该线路自己的 source/id 重新取详情。所以
+        「这个源能不能播」不能只看详情接口有没有回数据，必须真取一次它的
+        分集地址，再走**和播放同一条链路**（本地媒体代理 → 清单 → 变体 →
+        首个分片）验一遍——洛雪TV 的 jl 详情有分集，但分集指向的 CDN 镜像
+        主机（`jimaoys94.com`）对非浏览器出口统一 403：只看详情、甚至只看
+        清单 HTTP 200，都会把一条播不了的线路报成「可播放」（清单 200 但
+        分片 403 时，播放器就是黑屏）。
+
+        选集规则与播放一致：优先 `episode_index`（App 换线路后按序号映射
+        同一集），`<0` 时按标题匹配，都没有取首集。
+
+        返回 `{"ok", "url", "episodes", "reason", "via", "segment"}`：
+        - `ok` 整条链路可播（清单有 `#EXTINF`、首个分片 HTTP<400 且非空非 HTML）
+        - `reason` 失败原因：`detail:…` / `no_episodes` / `no_url` /
+          `http403` / `html` / `no_variant` / `no_segment` /
+          `segment_http403` / `segment_empty` / `timeout` / `probe:…`
+        任何异常都收敛成 `ok=False`，探测不能影响播放界面。
+        """
+        result = {
+            "ok": False, "url": "", "episodes": 0, "reason": "",
+            "via": "direct", "segment": "",
+        }
+        if not detail_url:
+            result["reason"] = "no_detail_url"
+            return result
+        try:
+            detail = self.fetch_detail(source, detail_url, context=context)
+        except StreamCancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 线路详情取不到＝这条线路不可用
+            result["reason"] = f"detail:{type(exc).__name__}"
+            return result
+        chapters = list(getattr(detail, "chapters", None) or [])
+        result["episodes"] = len(chapters)
+        if not chapters:
+            result["reason"] = "no_episodes"
+            return result
+        target = None
+        wanted = (episode_title or "").strip()
+        index = int(episode_index) if isinstance(episode_index, (int, float)) else -1
+        if 0 <= index < len(chapters):
+            target = chapters[index]
+        elif wanted:
+            for chapter in chapters:
+                if (getattr(chapter, "title", "") or "").strip() == wanted:
+                    target = chapter
+                    break
+        if target is None:
+            target = chapters[0]
+        url = str(getattr(target, "url", "") or "")
+        result["url"] = url
+        if not url:
+            result["reason"] = "no_url"
+            return result
+        try:
+            chain = self._probe_playback_chain(
+                source, url, deadline=deadline, context=context
+            )
+        except StreamCancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            result["reason"] = f"probe:{type(exc).__name__}"
+            return result
+        result["via"] = str(chain.get("via") or "direct")
+        result["segment"] = str(chain.get("segment") or "")
+        result["ok"] = bool(chain.get("ok"))
+        if not result["ok"]:
+            result["reason"] = str(chain.get("reason") or "unreachable")
+            return result
+        # 严格模式：再用 App 的播放器真解几帧（默认关，见 verify_player_probe）
+        try:
+            strict = bool(self._settings_opt("verify_player_probe", False))
+        except Exception:  # noqa: BLE001
+            strict = False
+        if not strict:
+            return result
+        played = self._probe_player_playback(source, url, deadline=deadline, context=context)
+        if played.get("ok") is False:
+            result["ok"] = False
+            result["reason"] = str(played.get("reason") or "player_failed")
+        elif played.get("ok") is None:
+            result["reason"] = ""       # 没装播放器：不判死，保留链路结论
+        return result
+
+    def _probe_player_playback(
+        self, source: SourceConfig, url: str, deadline=None, context=None
+    ) -> dict:
+        """严格模式：拿 App 播的同一个代理地址，用 mpv 真解几帧。
+
+        「显示可播放却播不了」还有一层链路探测看不到的：播放器/解码/代理重写
+        在真实会话里的失败。这里直接用 App 的播放器（mpv）跑 8 帧：能出帧就是
+        真的能播。没装 mpv 返回 `ok=None`（跳过，不能本机没装就把所有线路判死）。
+
+        代价：每条线路 5~25s（HLS 起播要拉清单+分片+解码），所以默认关闭，
+        由 `sources_runtime.verify_player_probe` 打开。
+        """
+        result = {"ok": None, "reason": ""}
+        if not url or not url.startswith(("http://", "https://")):
+            result["reason"] = "not_http"
+            return result
+        try:
+            from framework import desktop_player
+
+            _key, exe = desktop_player.resolve("mpv")
+        except Exception:  # noqa: BLE001
+            exe = ""
+        if not exe:
+            result["reason"] = "no_player"
+            return result
+        target = url
+        try:
+            from framework.media_proxy import proxy_url_for
+
+            raw = getattr(source, "raw", None) or {}
+            ad = raw.get("ad_block") if isinstance(raw, dict) else None
+            ad_cfg = ad if isinstance(ad, dict) and ad.get("enabled") else None
+            proxied = proxy_url_for(
+                self._apply_media_url_rewrite(source, url),
+                self._probe_headers(source),
+                ad_cfg,
+                source_id=getattr(source, "source_id", None),
+            )
+            if proxied:
+                target = proxied
+        except Exception:  # noqa: BLE001
+            target = url
+        timeout = self._probe_timeout(source, context, deadline)
+        budget = 30.0 if timeout is None else max(15.0, min(60.0, timeout * 6))
+        cmd = [
+            exe, "--no-config", "--vo=null", "--ao=null", "--frames=8",
+            "--msg-level=all=error", "--really-quiet", target,
+        ]
+        try:
+            from framework.subprocess_no_window import run as _run
+
+            done = _run(cmd, capture_output=True, text=True, timeout=budget)
+        except Exception as exc:  # noqa: BLE001
+            result["ok"] = False
+            result["reason"] = (
+                "player_timeout"
+                if "Timeout" in type(exc).__name__ or "timeout" in str(exc).lower()
+                else f"player_error:{type(exc).__name__}"
+            )
+            return result
+        if int(getattr(done, "returncode", 1) or 0) != 0:
+            result["ok"] = False
+            result["reason"] = "player_failed"
+            return result
+        result["ok"] = True
+        return result
+
+    # ---- 播放链路探测（与播放同路：媒体代理 → 清单 → 变体 → 分片） ----
+    def _probe_headers(self, source: SourceConfig) -> dict:
+        headers = dict(self._headers(source))
+        # 探测尽量带播放页 Referer（防盗链 CDN 可能只认播放页）。
+        episode_ref = str(headers.pop("X-Episode-Referer", "") or "")
+        if episode_ref.startswith(("http://", "https://")):
+            headers["Referer"] = episode_ref
+        return headers
+
+    def _probe_timeout(self, source: SourceConfig, context, deadline) -> float | None:
+        """单次探测请求的超时；预算耗尽返回 None（＝不发了）。"""
+        try:
+            probe_cap = float(self._settings_opt("play_url_probe_timeout_cap", 5.0) or 5.0)
+        except (TypeError, ValueError):
+            probe_cap = 5.0
+        probe_cap = max(1.0, min(30.0, probe_cap))
+        configured = min(float(self._timeout(source)) or 10.0, probe_cap)
+        if context is not None:
+            remaining = context.remaining()
+            if remaining <= 0:
+                return None
+            return min(configured, remaining)
+        if deadline is None:
+            return max(3.0, configured)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        return min(configured, remaining)
+
+    def _probe_fetch(
+        self, source, url, headers, context, deadline, read: int = 8192
+    ):
+        """读一次 URL 的前 `read` 字节；返回 (status, body, content_type)。"""
+        timeout = self._probe_timeout(source, context, deadline)
+        if timeout is None:
+            return None, b"", ""
+        import requests as _req
+
+        with _req.get(url, headers=headers, timeout=timeout, stream=True) as resp:
+            status = int(resp.status_code)
+            ctype = str(resp.headers.get("Content-Type", "") or "")
+            if read > _PROBE_CHUNK and _probe_wants_manifest(url, ctype):
+                body = self._probe_read_manifest(resp, context, deadline, read)
+            else:
+                body = resp.raw.read(read) or b""
+        self._check_stream_context(context, deadline)
+        return status, body, ctype
+
+    def _probe_read_manifest(self, resp, context, deadline, limit: int) -> bytes:
+        """小块读清单，够判定/够取出首个分片就停。
+
+        一次性 `raw.read(262144)` 会卡在「等满 256KB 或 EOF」上：聚合站的大清单
+        （2500+ 段、200KB+，经媒体代理再转发）经常读满超时 → 把好线路判成
+        `error:ReadTimeout`。分块读到「能分类 + 拿到首段 URI」就够，实测单条
+        线路从 ~19s 降到 1~3s。
+        """
+        chunk_size = _PROBE_CHUNK
+        chunks: list = []
+        total = 0
+        while total < limit:
+            chunk = resp.raw.read(min(chunk_size, limit - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            self._check_stream_context(context, deadline)
+            text = b"".join(chunks).decode("utf-8", "ignore")
+            if _probe_manifest_ready(text):
+                break
+        return b"".join(chunks)
+
+    @staticmethod
+    def _probe_abs(base: str, uri: str) -> str:
+        from urllib.parse import urljoin
+
+        if not uri:
+            return base
+        return urljoin(base, uri)
+
+    def _probe_playback_chain(
+        self, source: SourceConfig, url: str, deadline=None, context=None
+    ) -> dict:
+        """按播放链路验证：媒体代理 → 清单 → 变体 → 首个分片。
+
+        为什么不能只看清单 HTTP 200：源站给 HLS 的 200 只说明「清单文本拿到了」，
+        播放器真正要的是清单里的分片。分片 403/空/HTML 错误页时播放器就是黑屏，
+        而清单依然 200 —— 「显示可播放却不能播」几乎都是这一层。
+
+        为什么走本地媒体代理：App 播的是代理 URL（`proxy_url_for`），清单要经过
+        m3u8 重写与广告段过滤。代理这一层把清单改坏（剔除关键段、重写 URI 失效）
+        同样是黑屏，直连探测看不到。代理没起来时退回直连，探测不因此失败。
+        """
+        result = {"ok": False, "reason": "", "url": url, "via": "direct", "segment": ""}
+        context = self._stream_context(context, deadline)
+        self._check_stream_context(context, deadline)
+        if not url or not url.startswith(("http://", "https://")):
+            result["reason"] = "not_http"
+            return result
+        url = self._apply_media_url_rewrite(source, url)
+        result["url"] = url
+        headers = self._probe_headers(source)
+        target = url
+        try:
+            from framework.media_proxy import proxy_url_for
+
+            raw = getattr(source, "raw", None) or {}
+            ad = raw.get("ad_block") if isinstance(raw, dict) else None
+            ad_cfg = ad if isinstance(ad, dict) and ad.get("enabled") else None
+            proxied = proxy_url_for(
+                url, headers, ad_cfg, source_id=getattr(source, "source_id", None)
+            )
+            if proxied and proxied != url:
+                target = proxied
+                result["via"] = "proxy"
+        except Exception:  # noqa: BLE001 —— 代理不可用不影响探测本身
+            target = url
+
+        for _depth in range(3):
+            try:
+                status, body, _ctype = self._probe_fetch(
+                    source, target, headers, context, deadline, read=65536
+                )
+            except StreamCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                result["reason"] = f"error:{type(exc).__name__}"
+                return result
+            if status is None:
+                result["reason"] = "timeout"
+                return result
+            if status >= 400:
+                result["reason"] = f"http{status}"
+                return result
+            text = body.decode("utf-8", "ignore")
+            if text.lstrip().startswith("<"):
+                result["reason"] = "html"      # 200 的错误页，播放器黑屏
+                return result
+            if "#EXTM3U" not in text[:256]:
+                # 非 HLS 直链媒体（mp4 等）：读到字节即视为可播
+                result["ok"] = bool(body)
+                if not body:
+                    result["reason"] = "empty"
+                return result
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            uris = [line for line in lines if not line.startswith("#")]
+            if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
+                if not uris:
+                    result["reason"] = "no_variant"
+                    return result
+                target = self._probe_abs(target, uris[0])
+                continue
+            if not any(line.startswith("#EXTINF") for line in lines):
+                result["reason"] = "no_segment"
+                return result
+            segment = self._probe_abs(target, uris[0])
+            result["segment"] = segment
+            try:
+                seg_status, seg_body, _seg_ctype = self._probe_fetch(
+                    source, segment, headers, context, deadline, read=4096
+                )
+            except StreamCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                result["reason"] = f"segment_error:{type(exc).__name__}"
+                return result
+            if seg_status is None:
+                result["reason"] = "timeout"
+                return result
+            if seg_status >= 400:
+                result["reason"] = f"segment_http{seg_status}"
+                return result
+            if not seg_body:
+                result["reason"] = "segment_empty"
+                return result
+            if seg_body[:1] == b"<":
+                result["reason"] = "segment_html"
+                return result
+            result["ok"] = True
+            return result
+        result["reason"] = "chain_too_deep"
+        return result
 
     def _switch_candidate_episode_urls_fast(
         self, source: SourceConfig, episode_url: str

@@ -32,9 +32,11 @@ def test_media_source_probe_settings_clamps_limits(tmp_path):
         {"max_sources": 99, "concurrency": 8, "timeout_ms": 500},
     )
 
+    # max_sources 上限 12（2026-11 从 5 放宽）：聚合站一个作品能聚出 10+ 条
+    # 采集源线路（洛雪TV「第六感」实测 12 条），上限 5 时检测只能测前 5 条。
     assert media_source_probe_settings(settings) == {
         "enabled": True,
-        "max_sources": 5,
+        "max_sources": 12,
         "concurrency": 1,
         "timeout_ms": 1000,
     }

@@ -55,9 +55,15 @@ class FakeHttp:
 @pytest.fixture(autouse=True)
 def _clean(tmp_path, monkeypatch):
     ep._STREAM_CACHE.clear()
+    ep._HOST_DOWN.clear()
+    ep._HOST_ROUTE.clear()
     monkeypatch.setattr(ep, "_cache_dir", lambda: str(tmp_path))
+    # 测试环境不依赖本机代理：默认只留「直连」一个出口，换出口重试另有专门用例
+    monkeypatch.setattr(ep.http_mod, "system_proxy_url", lambda: None)
     yield
     ep._STREAM_CACHE.clear()
+    ep._HOST_DOWN.clear()
+    ep._HOST_ROUTE.clear()
 
 
 @pytest.mark.skipif(not ep.node_available(), reason="需要 Node.js")
@@ -90,11 +96,15 @@ def test_attempts_retries_transient_page_failure():
 
 
 def test_attempts_exhausted_raises_content_missing():
-    http = FakeHttp(fail_times=3)
+    # 每次 _fetch_page 会试两个出口，所以失败次数要够大才能耗尽
+    http = FakeHttp(fail_times=10)
     cfg = dict(CFG, attempts=2)
     with pytest.raises(ep.ContentMissingError) as excinfo:
         ep.ExternalPlayer(http).resolve(cfg, PLAYER, EPISODE)
     assert "页面获取失败" in str(excinfo.value)
+    # 报错必须能看出**原因**，不能只剩半条 URL（2026-11-02 现场踩过）
+    assert "RuntimeError" in str(excinfo.value)
+    assert "TLS handshake reset" in str(excinfo.value)
 
 
 @pytest.mark.skipif(not ep.node_available(), reason="需要 Node.js")
@@ -108,14 +118,10 @@ def test_http_timeout_and_budget_come_from_source_config():
 def test_prefer_direct_marks_parser_host(monkeypatch):
     seen = []
 
-    class _Note:
-        @staticmethod
-        def note_direct_preferred(url):
-            seen.append(url)
+    def _note(url):
+        seen.append(url)
 
-    import framework.http as http_mod
-
-    monkeypatch.setattr(http_mod, "note_direct_preferred", _Note.note_direct_preferred)
+    monkeypatch.setattr(ep.http_mod, "note_direct_preferred", _note)
     http = FakeHttp()
     try:
         ep.ExternalPlayer(http).resolve(dict(CFG, prefer_direct=True), PLAYER, EPISODE)

@@ -200,6 +200,7 @@ class SettingsPage(BasePage):
         "reader.prefetch_ahead",
         "reader.prefetch_behind",
         "reader.show_images",
+        "history.max_items",
     )
 
     def __init__(self, settings, theme_manager, parent=None):
@@ -224,6 +225,7 @@ class SettingsPage(BasePage):
         self._build_adblock()
         self._build_content()
         self._build_reader()
+        self._build_history()
         layout.addWidget(self.tabs, stretch=1)
 
 
@@ -450,6 +452,14 @@ class SettingsPage(BasePage):
         self._reader_show_images = sec._check("显示正文图片", "show_images")
         self.tabs.addTab(sec, "阅读")
 
+    def _build_history(self) -> None:
+        sec = _Section()
+        self._history_max = sec._spin(
+            "最多保留(部)", "max_items", 0, 200, " 部",
+            "影视/小说/漫画合计；书架收藏永久保留且不占名额；0=不限制",
+        )
+        self.tabs.addTab(sec, "历史")
+
 
     # ------------------------------------------------------------------ #
 
@@ -508,6 +518,7 @@ class SettingsPage(BasePage):
         self._reader_prefetch_ahead.setValue(int(g("reader", "prefetch_ahead", 3)))
         self._reader_prefetch_behind.setValue(int(g("reader", "prefetch_behind", 1)))
         self._reader_show_images.setChecked(bool(g("reader", "show_images", True)))
+        self._history_max.setValue(int(g("history", "max_items", 20)))
 
         # 加载完成 → 记录基线；所有设置项修改标记复位为 False
         self._baseline = self._read_setting_values()
@@ -554,6 +565,7 @@ class SettingsPage(BasePage):
             "reader.prefetch_ahead": self._reader_prefetch_ahead.value(),
             "reader.prefetch_behind": self._reader_prefetch_behind.value(),
             "reader.show_images": self._reader_show_images.isChecked(),
+            "history.max_items": self._history_max.value(),
         }
 
     def _write_setting(self, key: str, value) -> None:

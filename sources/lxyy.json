@@ -1,0 +1,168 @@
+{
+  "$schema_version": 2,
+  "$id": "lxyy",
+  "$type": "video",
+  "$name": "洛雪TV",
+  "$enabled": true,
+  "$weight": 1.0,
+  "$metadata": {
+    "homepage": "https://tv.lxyy.club/",
+    "description": "洛雪TV 影视聚合站（tv.lxyy.club）。搜索走 GET /api/proxy.php?action=search&wd=&page=，一次请求并回全站 8 个采集源的结果（qilin 官采蓝光 / mj 4K60帧 / jl 自营 / 360zy / dytt / ik / md / fy 官方源），item 自带 source + id，url 模板把两者带进 /watch.php 的 query，详情必须靠这两个坐标。详情走 GET /api/proxy.php?action=detail&source=&id=，details[0].episodes[] 是「线路 → 分集」结构：mj/dytt/ik/md/360zy 的线路分集是 CDN m3u8 直链（fetch_video_episode 直链 passthrough），jl 同一条目有 jlm3u8（直链）与 jlplayer（分享页）两条，故 chapters.pick_line=direct_media 只取分集是直链的那条线路；jl 的 CDN 镜像 jimaoys94.com 对非浏览器出口统一 403、同路径 95 正常，用 media.url_rewrite 改主机（配置项，不写死代码）。qilin/fy 是优酷/爱奇艺/B 站官采页，必须经站点自己的第三方解析接口（svip.qlplayer.cyou / json-player.php）才能成型，本客户端拿到的只是内容页 URL → search.exclude_providers 把它们整体排除，避免默认线路必然失败。多源播放：search.group 按标题聚合 6 个采集源，每条采集源一条线路（中文名与顺序见 group.providers），换线路 = 用该线路自己的 source+id 重新取详情。",
+    "lang": "zh-CN",
+    "region": "cn",
+    "tags": [
+      "视频",
+      "影视",
+      "聚合",
+      "多源",
+      "hls"
+    ],
+    "last_verified": "2026-11-03"
+  },
+  "transports": {
+    "base_url": "https://tv.lxyy.club",
+    "headers": {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      "Accept": "application/json, text/plain, */*",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://tv.lxyy.club/"
+    },
+    "timeout": 12,
+    "retries": 2,
+    "interval_ms": 300,
+    "charset": "utf-8",
+    "direct": true
+  },
+  "api_endpoints": {
+    "search": {
+      "url": "/api/proxy.php",
+      "method": "GET",
+      "params": {
+        "action": "search",
+        "wd": "{keyword}",
+        "page": "{page}"
+      },
+      "response_path": "results",
+      "exclude_providers": [
+        "qilin",
+        "fy"
+      ],
+      "group": {
+        "enabled": true,
+        "providers": [
+          {
+            "id": "mj",
+            "name": "4K60帧",
+            "priority": 1
+          },
+          {
+            "id": "jl",
+            "name": "自营",
+            "priority": 2
+          },
+          {
+            "id": "dytt",
+            "name": "电影天堂",
+            "priority": 3
+          },
+          {
+            "id": "ik",
+            "name": "ikun",
+            "priority": 4
+          },
+          {
+            "id": "md",
+            "name": "魔都",
+            "priority": 5
+          },
+          {
+            "id": "360zy",
+            "name": "360资源",
+            "priority": 6
+          }
+        ]
+      },
+      "item_fields": {
+        "title": "name",
+        "url": "/watch.php?title={name}&source={source}&id={id}",
+        "cover": "pic",
+        "author": "area",
+        "update": "remarks",
+        "provider": "source"
+      }
+    },
+    "detail": {
+      "url": "/api/proxy.php",
+      "method": "GET",
+      "params": {
+        "action": "detail",
+        "source": "{source}",
+        "id": "{id}"
+      },
+      "field_extractors": {
+        "title": "details.0.name",
+        "cover": "details.0.pic",
+        "summary": "details.0.content",
+        "author": "details.0.actor",
+        "status": "details.0.remarks",
+        "tags": "details.0.type"
+      },
+      "chapters": {
+        "lines_path": "details.0.episodes",
+        "line_name": "group",
+        "line_id": "group",
+        "line_items": "episodes",
+        "title": "name",
+        "url_key": "url",
+        "pick_line": "direct_media"
+      }
+    }
+  },
+  "ad_block": {
+    "enabled": true
+  },
+  "media": {
+    "format": "hls",
+    "select": {
+      "video": {
+        "quality": "best"
+      }
+    },
+    "merge": {
+      "tool": "ffmpeg",
+      "output_format": "mp4"
+    },
+    "hls": {
+      "workers": 4
+    },
+    "url_rewrite": [
+      {
+        "pattern": "https?://jimaoys94\\.com/",
+        "replacement": "https://jimaoys95.com/"
+      }
+    ]
+  },
+  "constraints": {
+    "search": {
+      "max_pages": 1,
+      "max_results": 300
+    },
+    "detail": {
+      "max_pages": 1
+    },
+    "episode": {
+      "max_pages": 1,
+      "max_items": 500
+    }
+  },
+  "diagnostics": {
+    "selfcheck": {
+      "strategy": "off"
+    },
+    "notes": [
+      "2026-11-03 实测：mj/dytt/ik/md/360zy 分集为 CDN m3u8 直链，200 可播；jl 的 jlm3u8 走 jimaoys88/89/90/91/92/93/95/96 均 200，唯独 jimaoys94 对非浏览器出口统一 403（m3u8 内容也是 access_denied JSON）→ media.url_rewrite 把 94 改到同路径 95；jlplayer 是分享页不是媒体地址，故 pick_line 只认直链线路。",
+      "qilin/fy 的线路是优酷/爱奇艺/B 站官方页，站点用 svip.qlplayer.cyou/api/resolve.php?token=… 或 /json-player.php?route=…&grant=… 解析；直连解析接口实测 404（官采页需站点侧授权/出口），故整体排除。",
+      "首页 /api/proxy.php?action=home 固定返回 home_source=qilin 的官采条目，探测 source/src/from/channel 参数均无效 → 本源只提供搜索入口，不做发现页。"
+    ]
+  }
+}
